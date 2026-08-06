@@ -1,13 +1,14 @@
 /*
-MRMCP 0.10.22 — single-file Deno MCP desktop server.
-Runtime data: .mrmcp beside this script.
+MRMCP 0.10.23 — single-file Deno MCP desktop server.
+Runtime data: .mrmcp beside the script or standalone executable.
 GUI: jsr:@webview/webview@0.9.0
 Run: deno run -A --unstable-ffi --unstable-worker-options mrmcp.js
 */
 
 import { DatabaseSync } from "node:sqlite";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { inflateRawSync } from "node:zlib";
+import { createBrotliCompress, createGzip, inflateRawSync } from "node:zlib";
+import { Readable } from "node:stream";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isIP } from "node:net";
@@ -16,7 +17,8 @@ import { parse as parseYaml, stringify as stringifyYaml } from "jsr:@std/yaml@1.
 import { contentType as mediaContentType, typeByExtension } from "jsr:@std/media-types@1.1.0";
 
 const SELF = new URL(import.meta.url);
-const APP_DIR = dirname(fileURLToPath(SELF));
+const MODULE_DIR = dirname(fileURLToPath(SELF));
+const APP_DIR = Deno.build.standalone ? dirname(Deno.execPath()) : MODULE_DIR;
 const COMMANDS_PATH = join(APP_DIR, "commands.yaml");
 const IS_BACKEND = SELF.searchParams.get("backend") === "1";
 const GUI_PORT = 7332;
@@ -35,18 +37,23 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL, "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const MCP_DEFAULT_PROTOCOL = "2025-11-25";
-const VERSION = "0.10.22";
+const VERSION = "0.10.23";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const MCP_UI_EXTENSION = "io.modelcontextprotocol/ui";
 const MCP_UI_MIME_TYPE = "text/html;profile=mcp-app";
 const FILE_PREVIEW_UI_URI = "ui://mrmcp/image-preview-v3.html";
 const enc = new TextEncoder(), dec = new TextDecoder();
 
-const json = (x, status = 200, headers = {}) => new Response(JSON.stringify(x), {
-  status, headers: { "content-type": "application/json; charset=utf-8", ...headers },
-});
+const stringResponse = (body, status, type, headers = {}) => {
+  body = String(body);
+  const responseHeaders = new Headers({ "content-type": type, ...headers });
+  if (!responseHeaders.has("content-length")) responseHeaders.set("content-length", String(new Blob([body]).size));
+  return new Response(body, { status, headers: responseHeaders });
+};
+const json = (x, status = 200, headers = {}) =>
+  stringResponse(JSON.stringify(x), status, "application/json; charset=utf-8", headers);
 const text = (x, status = 200, type = "text/plain; charset=utf-8", headers = {}) =>
-  new Response(String(x), { status, headers: { "content-type": type, ...headers } });
+  stringResponse(x, status, type, headers);
 const htmlEscape = s => String(s ?? "").replace(/[&<>"']/g, c => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
 }[c]));
@@ -82,6 +89,60 @@ async function bodyText(req, max = MAX_REQUEST_BODY) {
 }
 const bodyJson = async req => JSON.parse(await bodyText(req) || "{}");
 const form = async req => new URLSearchParams(await bodyText(req));
+const HTTP_COMPRESSION_MIN_BYTES = 1024;
+function appendVary(headers, value) {
+  const values = new Map((headers.get("vary") || "").split(",")
+    .map(x => x.trim()).filter(Boolean).map(x => [x.toLowerCase(), x]));
+  values.set(value.toLowerCase(), value);
+  headers.set("vary", [...values.values()].join(", "));
+}
+function preferredContentEncoding(value) {
+  const qualities = new Map();
+  for (const item of String(value || "").split(",")) {
+    const [rawName, ...params] = item.trim().split(";");
+    const name = rawName.trim().toLowerCase();
+    if (!name) continue;
+    let quality = 1;
+    for (const param of params) {
+      const match = param.trim().match(/^q\s*=\s*(.*)$/i);
+      if (!match) continue;
+      const valid = match[1].match(/^(0(?:\.\d{0,3})?|1(?:\.0{0,3})?)$/);
+      quality = valid ? Number(valid[1]) : 0;
+    }
+    qualities.set(name, Math.max(qualities.get(name) || 0, quality));
+  }
+  const quality = name => qualities.has(name) ? qualities.get(name) : (qualities.get("*") || 0);
+  return [["br", quality("br"), 2], ["gzip", quality("gzip"), 1]]
+    .filter(([, q]) => q > 0)
+    .sort((a, b) => b[1] - a[1] || b[2] - a[2])[0]?.[0] || "";
+}
+function compressibleContentType(value) {
+  const type = String(value || "").split(";", 1)[0].trim().toLowerCase();
+  return type.startsWith("text/") || type === "application/json" || type.endsWith("+json") ||
+    type === "application/javascript" || type === "application/xml" || type.endsWith("+xml") ||
+    type === "application/yaml" || type === "application/x-yaml" || type === "image/svg+xml";
+}
+function compressHttpResponse(req, response) {
+  if (!response.body || req.method === "HEAD" || [204, 205, 304].includes(response.status)) return response;
+  const headers = new Headers(response.headers);
+  if (new URL(req.url).pathname.startsWith("/oauth/") || headers.has("set-cookie")) return response;
+  if (!compressibleContentType(headers.get("content-type"))) return response;
+  appendVary(headers, "Accept-Encoding");
+  const rebuild = body => new Response(body, {
+    status: response.status, statusText: response.statusText, headers,
+  });
+  const length = Number(headers.get("content-length"));
+  if (headers.has("content-encoding") || headers.has("content-range") ||
+      /(?:^|,)\s*no-transform\s*(?:,|$)/i.test(headers.get("cache-control") || "") ||
+      !Number.isFinite(length) || length < HTTP_COMPRESSION_MIN_BYTES) return rebuild(response.body);
+  const encoding = preferredContentEncoding(req.headers.get("accept-encoding"));
+  if (!encoding) return rebuild(response.body);
+  headers.set("content-encoding", encoding);
+  headers.delete("content-length");
+  const source = Readable.fromWeb(response.body);
+  const compressed = source.pipe(encoding === "br" ? createBrotliCompress() : createGzip());
+  return rebuild(Readable.toWeb(compressed));
+}
 const within = (root, path) => {
   const r = relative(root, path);
   return r === "" || (r !== ".." && !r.startsWith(".." + sep) && !isAbsolute(r));
@@ -2742,7 +2803,9 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     headers.set("referrer-policy", "no-referrer");
     headers.set("permissions-policy", "camera=(), microphone=(), geolocation=()");
     if (!headers.has("cache-control")) headers.set("cache-control", "no-store");
-    return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+    return compressHttpResponse(req, new Response(response.body, {
+      status: response.status, statusText: response.statusText, headers,
+    }));
   }
 
 
@@ -3843,7 +3906,7 @@ document.addEventListener('input',e=>{if(e.target.closest('form,#settings'))dirt
       "cache-control": "no-store", "x-content-type-options": "nosniff",
     });
     if (u.pathname === "/morphlex.js") {
-      const source = await Deno.readTextFile(join(APP_DIR, "morphlex.js"));
+      const source = await Deno.readTextFile(join(MODULE_DIR, "morphlex.js"));
       return text(source, 200, "text/javascript; charset=utf-8", {
         "cache-control": "public, max-age=31536000, immutable", "x-content-type-options": "nosniff",
       });

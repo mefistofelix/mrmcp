@@ -10,7 +10,7 @@ Run beside `morphlex.js`:
 deno run -A --unstable-ffi --unstable-worker-options mrmcp.js
 ```
 
-Target runtime: Deno 2.9.x. Runtime data is stored in `.mrmcp` beside the script.
+Target runtime: Deno 2.9.x. During `deno run`, runtime data is stored in `.mrmcp` beside the script. In a `deno compile` standalone executable, runtime data and `commands.yaml` are stored beside the executable, while the embedded `morphlex.js` resource is read from the compiled module filesystem.
 
 The ZIP contains only:
 
@@ -36,6 +36,20 @@ The listener topology is not configurable from the GUI:
 The GUI port is fixed at `7332`. It has no URL argument or environment-variable override and is never publicly bound.
 
 Port 80 must return `404` for every request other than an active ACME HTTP-01 token. It must never expose MCP, OAuth, GUI or metadata routes.
+
+## HTTP response compression
+
+The public HTTPS wrapper negotiates `br` and `gzip` from `Accept-Encoding`, respects quality values and prefers Brotli when qualities are equal. Compression applies only to compressible JSON/text/JavaScript/YAML/XML/SVG responses whose declared body size is at least 1024 bytes.
+
+Rules:
+
+- add `Vary: Accept-Encoding` to compressible responses;
+- do not compress responses below 1024 bytes;
+- do not compress binary/already-compressed media such as raster images, PDF, archives, executables or databases;
+- do not transform responses with `Content-Encoding`, `Content-Range`, or `Cache-Control: no-transform`;
+- remove `Content-Length` when a streaming compressor is applied;
+- use streaming Node-compatible Brotli/gzip transforms rather than buffering large MCP results;
+- HTTP/TLS compression are distinct; TLS-level compression must not be enabled.
 
 ## TLS lifecycle
 
@@ -337,6 +351,8 @@ Before publishing:
 8. Confirm no port controls remain in Settings.
 9. Confirm the self-signed paths are separate from production paths.
 10. Confirm ACME backoff and retry timestamps are persistent.
+11. Test Brotli/gzip negotiation, quality-value selection, the 1024-byte threshold, `Vary: Accept-Encoding`, and binary/no-transform exclusions.
+12. Compile a standalone executable with `--include morphlex.js` and confirm `.mrmcp` plus `commands.yaml` resolve beside the executable.
 
 
 ## 0.10.1 OAuth consent submission
@@ -365,6 +381,14 @@ Some ChatGPT authorization contexts submit the consent form with an opaque or Ch
 - Tool calls left active by an unclean shutdown are marked `orphaned` at startup.
 
 ## Changelog
+
+### 0.10.23
+
+- Added negotiated HTTP response compression for public MCP and metadata traffic using Brotli or gzip according to `Accept-Encoding` quality values, while excluding OAuth and cookie-setting responses.
+- Added a 1024-byte compression threshold, `Vary: Accept-Encoding`, and exclusions for binary, already encoded, partial and `no-transform` responses.
+- Kept compression streaming through Node-compatible zlib transforms so large text and JSON results are not buffered solely for compression.
+- Added standalone `deno compile` support: runtime data and `commands.yaml` resolve beside the executable while `morphlex.js` can be embedded with `--include morphlex.js`.
+- Expanded `README.md` into a user guide covering Deno execution/compilation, project permissions, ChatGPT Web developer-mode setup, write-action enablement, sslip.io/Let's Encrypt architecture, compression behavior and every built-in tool argument.
 
 ### 0.10.22
 
