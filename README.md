@@ -4,6 +4,8 @@ MRMCP is a desktop Model Context Protocol server for Deno. It gives ChatGPT and 
 
 The server includes a local WebView administration interface for projects, roots, authentication, enabled tools, execution policy, TLS, logs, processes, and downloadable command configuration.
 
+![MRMCP administration window](mrmcp-screenshot.png)
+
 ## What is included
 
 - `mrmcp.js` — server, backend, local administration GUI, OAuth, TLS, MCP tools and process management.
