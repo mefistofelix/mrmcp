@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.52 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
+MrMCP 0.10.53 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -29,7 +29,7 @@ const ADMIN_TOKEN = SELF.searchParams.get("admin") || cliValue("--admin") ||
 const BASE_TOOLS = [
   "create_context", "context_info", "read_file", "read_files", "write_file", "write_files",
   "edit", "replace", "glob", "grep",
-  "file_info", "create_directory", "copy_path", "move_path", "delete_path",
+  "file_info", "create_directory", "copy_path", "move_path", "trash_paths", "untrash_action",
   "publish_file", "list_commands", "exec", "exec_start", "exec_poll", "exec_write", "exec_kill", "exec_list",
   "js", "js_add_node_module_dir", "js_reset",
 ];
@@ -40,7 +40,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.52";
+const VERSION = "0.10.53";
 const DB_SCHEMA_VERSION = 4;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -2222,7 +2222,17 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       create_directory: ["Create a directory and its parents.", { properties: { path: { type: "string" }, ...contextInput }, required: ["path"] }],
       copy_path: ["Copy a file or directory recursively.", { properties: { from: { type: "string" }, to: { type: "string" }, ...contextInput }, required: ["from", "to"] }],
       move_path: ["Move or rename a path.", { properties: { from: { type: "string" }, to: { type: "string" }, ...contextInput }, required: ["from", "to"] }],
-      delete_path: ["Delete a file or directory.", { properties: { path: { type: "string" }, recursive: { type: "boolean", default: false }, ...contextInput }, required: ["path"] }],
+      trash_paths: [
+        "Move files or directories selected by explicit root-relative paths and/or one glob into a reversible .trash action. Each call creates one timestamped action directory plus a sibling JSON manifest; use untrash_action with the returned action_id to restore the whole action.",
+        { anyOf: [{ required: ["paths"] }, { required: ["glob"] }], properties: {
+          paths: { type: "array", minItems: 1, maxItems: 200, items: { type: "string" } },
+          glob: { type: "string" }, ...contextInput,
+        } },
+      ],
+      untrash_action: [
+        "Restore every file and directory from one trash_paths action. Restore is all-or-nothing: if any original target is unavailable, nothing is restored.",
+        { properties: { action_id: { type: "string" }, ...contextInput }, required: ["action_id"] },
+      ],
       publish_file: [
         "Publish an existing file from the current root. Use this for generated images, PDFs, archives, databases and other binary outputs; never read or Base64-encode binary files manually.",
         { properties: {
@@ -2334,7 +2344,8 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       create_directory: outputSchema({ path: { type: "string" } }),
       copy_path: outputSchema({ from: { type: "string" }, to: { type: "string" } }),
       move_path: outputSchema({ from: { type: "string" }, to: { type: "string" } }),
-      delete_path: outputSchema({ path: { type: "string" } }),
+      trash_paths: outputSchema({ action_id: { type: "string" }, trash_path: { type: "string" }, manifest_path: { type: "string" }, paths: stringArray }),
+      untrash_action: outputSchema({ action_id: { type: "string" }, paths: stringArray }),
       publish_file: outputSchema({ path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" }, size: { type: "integer" }, return_mode: { type: "string" }, inline: { type: "boolean" }, linked: { type: "boolean" }, uri: { type: "string" }, markdown: { type: "string" }, expires_at: { type: "string" }, one_time: { type: "boolean" }, inline_omitted_reason: { type: "string" } }),
       list_commands: outputSchema({ query: { type: "string" }, page: { type: "integer" }, page_size: { type: "integer" }, total: { type: "integer" }, pages: { type: "integer" }, has_more: { type: "boolean" }, bin_directory: { type: "string" }, config_file: { type: "string" }, path_precedence: { type: "string" }, invocation: { type: "object", additionalProperties: true }, commands: objectArray }),
       exec: outputSchema(processProperties),
@@ -2353,14 +2364,15 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     const titles = {
       create_context: "Create context", context_info: "Context info", read_file: "Read", read_files: "Read batch",
       write_file: "Write", write_files: "Write batch", edit: "Edit", replace: "Replace",
-      glob: "Glob", grep: "Grep", publish_file: "Publish file", list_commands: "Command catalog",
+      glob: "Glob", grep: "Grep", trash_paths: "Trash paths", untrash_action: "Restore trash action",
+      publish_file: "Publish file", list_commands: "Command catalog",
       exec: "Run command", exec_start: "Start command", exec_poll: "Process output", exec_write: "Write stdin",
       exec_kill: "Terminate process", exec_list: "List processes", js: "JavaScript kernel",
       js_add_node_module_dir: "Add module directory", js_reset: "Reset JavaScript kernel",
     };
     const annotations = name => ({
       readOnlyHint: READ_TOOLS.has(name) || name === "publish_file",
-      destructiveHint: ["write_file", "write_files", "edit", "replace", "move_path", "delete_path", "exec", "exec_start", "exec_write", "exec_kill", "js", "js_add_node_module_dir", "js_reset"].includes(name),
+      destructiveHint: ["write_file", "write_files", "edit", "replace", "move_path", "exec", "exec_start", "exec_write", "exec_kill", "js", "js_add_node_module_dir", "js_reset"].includes(name),
       idempotentHint: (READ_TOOLS.has(name) && name !== "publish_file") || ["write_file", "write_files", "edit", "create_directory", "js_reset"].includes(name),
       openWorldHint: name.startsWith("exec") || name === "js" || name === "publish_file",
     });
@@ -3088,11 +3100,116 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       }
       return { from: from.display, to: to.display };
     }
-    if (name === "delete_path") {
-      const target = await resolvePath(args.path);
-      if (resolve(target.path) === resolve(await Deno.realPath(target.root.path))) throw new Error("Cannot delete the current root");
-      await Deno.remove(target.path, { recursive: !!args.recursive });
-      return { path: target.display };
+    if (name === "trash_paths" || name === "untrash_action") {
+      const rootReal = await Deno.realPath(selection.root.path);
+      const trashRoot = join(rootReal, ".trash");
+      const exists = async path => {
+        try { await Deno.lstat(path); return true; }
+        catch (error) { if (error instanceof Deno.errors.NotFound) return false; throw error; }
+      };
+      const slash = path => relative(rootReal, path).replaceAll("\\", "/") || ".";
+      if (name === "trash_paths") {
+        const candidates = [];
+        const addCandidate = async raw => {
+          const target = await resolvePath(raw);
+          if (!await exists(target.path)) throw new Error(`Path not found: ${raw}`);
+          if (resolve(target.path) === resolve(rootReal)) throw new Error("Cannot trash the current root");
+          if (within(trashRoot, target.path) || within(target.path, trashRoot)) throw new Error("Cannot trash .trash or a path containing it");
+          candidates.push(target);
+        };
+        for (const raw of args.paths || []) await addCandidate(raw);
+        const pattern = String(args.glob || "").trim();
+        if (pattern) {
+          const match = globRegex(pattern);
+          async function visit(dir) {
+            for await (const entry of Deno.readDir(dir)) {
+              const absolute = join(dir, entry.name), display = slash(absolute);
+              if (display === ".trash" || display.startsWith(".trash/")) continue;
+              const matched = match.test(display);
+              if (matched) await addCandidate(display);
+              if (entry.isDirectory && !matched) await visit(absolute);
+              if (candidates.length > 10000) throw new Error("trash_paths glob matched more than 10000 paths");
+            }
+          }
+          await visit(rootReal);
+        }
+        if (!candidates.length) throw new Error("trash_paths matched no paths");
+        const unique = new Map();
+        for (const target of candidates) {
+          const key = Deno.build.os === "windows" ? resolve(target.path).toLowerCase() : resolve(target.path);
+          if (!unique.has(key)) unique.set(key, target);
+        }
+        const ordered = [...unique.values()].sort((a, b) =>
+          a.display.split("/").length - b.display.split("/").length || a.display.localeCompare(b.display));
+        const selected = [];
+        for (const target of ordered) {
+          if (selected.some(parent => resolve(parent.path) !== resolve(target.path) && within(parent.path, target.path))) continue;
+          selected.push(target);
+        }
+        const date = new Date(), pad = value => String(value).padStart(2, "0");
+        const baseId = `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+        let actionId = baseId, increment = 1;
+        for (;;) {
+          const actionDir = join(trashRoot, actionId), manifestPath = join(trashRoot, `${actionId}.json`);
+          if (!await exists(actionDir) && !await exists(manifestPath)) break;
+          actionId = `${baseId}-${++increment}`;
+        }
+        const actionDir = join(trashRoot, actionId), manifestPath = join(trashRoot, `${actionId}.json`);
+        const trashRootExisted = await exists(trashRoot), moved = [];
+        try {
+          await Deno.mkdir(actionDir, { recursive: true });
+          for (const target of selected) {
+            const destination = join(actionDir, ...target.display.split("/"));
+            await Deno.mkdir(dirname(destination), { recursive: true });
+            await Deno.rename(target.path, destination);
+            moved.push({ source: target.path, destination });
+          }
+          await Deno.writeTextFile(manifestPath, JSON.stringify({
+            action_id: actionId,
+            created_at: new Date().toISOString(),
+            paths: selected.map(target => target.display),
+          }, null, 2) + "\n");
+        } catch (error) {
+          for (const item of moved.reverse()) await Deno.rename(item.destination, item.source).catch(() => {});
+          await Deno.remove(actionDir, { recursive: true }).catch(() => {});
+          if (!trashRootExisted) await Deno.remove(trashRoot).catch(() => {});
+          throw error;
+        }
+        return {
+          action_id: actionId,
+          trash_path: `.trash/${actionId}`,
+          manifest_path: `.trash/${actionId}.json`,
+          paths: selected.map(target => target.display),
+        };
+      }
+      const actionId = String(args.action_id || "").trim();
+      if (!/^\d{8}-\d{6}(?:-\d+)?$/.test(actionId)) throw new Error("Invalid trash action_id");
+      const actionDir = join(trashRoot, actionId), manifestPath = join(trashRoot, `${actionId}.json`);
+      const manifest = JSON.parse(await Deno.readTextFile(manifestPath));
+      const paths = Array.isArray(manifest.paths) ? manifest.paths.map(String) : [];
+      if (!paths.length) throw new Error("Trash action contains no paths");
+      const items = [];
+      for (const display of paths) {
+        const source = resolve(actionDir, ...display.replaceAll("\\", "/").split("/"));
+        if (!within(actionDir, source) || !await exists(source)) throw new Error(`Trashed path is unavailable: ${display}`);
+        const target = await resolvePath(display);
+        if (await exists(target.path)) throw new Error(`Restore target already exists: ${display}`);
+        if (!await exists(dirname(target.path))) throw new Error(`Restore parent is unavailable: ${display}`);
+        items.push({ source, target: target.path, display });
+      }
+      const restored = [];
+      try {
+        for (const item of items) {
+          await Deno.rename(item.source, item.target);
+          restored.push(item);
+        }
+      } catch (error) {
+        for (const item of restored.reverse()) await Deno.rename(item.target, item.source).catch(() => {});
+        throw error;
+      }
+      await Deno.remove(actionDir, { recursive: true });
+      await Deno.remove(manifestPath);
+      return { action_id: actionId, paths };
     }
     if (name === "publish_file") {
       const target = await resolvePath(args.path);

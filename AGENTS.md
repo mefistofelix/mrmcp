@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.52 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.53 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `commands.yaml` — extra-command catalog.
@@ -246,6 +246,8 @@ Do not invoke shell commands, `uv` or Python to list, search, inspect, edit or r
 
 Preserve source encoding, BOM and line endings unless conversion is explicitly requested.
 
+Filesystem removal is trash-only; do not reintroduce a permanent delete tool. `trash_paths` accepts explicit paths and/or one glob, supports files and directories, collapses nested selections, and moves each action under `.trash/<action_id>/` with sibling `.trash/<action_id>.json`. Action ids use local date/time to the second with an incrementing numeric suffix only on collision. The manifest stays minimal (`action_id`, creation time and original paths); do not add hashes or redundant integrity metadata. Assume `.trash` is managed by MrMCP, but keep the preflight required to guarantee `untrash_action` restores the entire action or nothing and rolls back any mid-restore moves. Neither `trash_paths` nor `untrash_action` is destructive; do not add them to `destructiveHint`.
+
 ## Documentation requirements
 
 README must describe current behavior, not only past changes. It must include:
@@ -292,4 +294,6 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 28. Confirm the Roots page groups Sessions by `root_id`, labels the right-hand root-id-0 group **Sessions / No root assigned**, shows creation and last-access timestamps on Session items, accepts native drag/drop to named roots or root id `0`, routes the assignment through Deno, and the Sessions page has no root selector.
 29. Confirm browser drag handling only transports the numeric Session PK/target root and performs no imperative visible DOM mutation.
 30. Confirm the archive contains exactly the four root project files plus the versioned `assets/` directory, with Morphlex and all branding/static files there and no duplicate assets in the root.
-31. Run the desktop WebView on a machine with Deno and platform dependencies.
+31. Verify `trash_paths` creates one `.trash/<action_id>/` plus sibling `.json`, supports explicit paths/directories and globs, collapses nested selections, and leaves no partial trash action after rollback.
+32. Verify `untrash_action` preflights the complete action and either restores every path or restores none; confirm both trash tools have `destructiveHint: false` and no permanent filesystem-delete tool is published.
+33. Run the desktop WebView on a machine with Deno and platform dependencies.

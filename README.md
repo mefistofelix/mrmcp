@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.52
+# MrMCP 0.10.53
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -135,7 +135,7 @@ Filesystem and text:
 
 - `read_file`, `read_files`, `write_file`, `write_files`;
 - `glob`, `grep`, `edit`, `replace`;
-- `file_info`, `create_directory`, `copy_path`, `move_path`, `delete_path`;
+- `file_info`, `create_directory`, `copy_path`, `move_path`, `trash_paths`, `untrash_action`;
 - `publish_file`.
 
 Commands and persistent execution:
@@ -145,6 +145,8 @@ Commands and persistent execution:
 - `js`, `js_add_node_module_dir`, `js_reset`.
 
 `edit` accepts multiple files and multiple ordered exact edits per file. Each file is read once, its edits are applied sequentially in memory, every expected occurrence count is validated, and all files are written atomically with rollback.
+
+`trash_paths` is the removal path for files and directories. It accepts explicit root-relative `paths`, an optional root-relative `glob`, or both. Each call creates `.trash/<action_id>/` plus sibling metadata `.trash/<action_id>.json`; the action id is the local date/time to the second with `-2`, `-3`, ... added only on collision. Nested selections are collapsed so moving a selected directory does not separately move its children. `untrash_action(action_id)` restores the whole action or restores nothing: it preflights every original target first and rolls back any moves if a restore step fails. MrMCP intentionally exposes no permanent filesystem-delete tool; removal is reversible through trash actions.
 
 `glob`, `grep` and `replace` are intended to remove the need for improvised `uv`, Python or shell scripts during ordinary repository work:
 
@@ -261,6 +263,14 @@ MrMCP uses fixed public listeners:
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
 ## Development changelog
+
+### 0.10.53
+
+- Added reversible `trash_paths` for files, directories and glob selections. Each call stores one timestamped action below `.trash/` with a sibling JSON manifest and returns its `action_id`.
+- Added `untrash_action(action_id)` with all-or-nothing restore semantics and rollback on a mid-restore failure.
+- Kept trash actions intentionally simple: no hashes or redundant integrity metadata; MrMCP assumes `.trash` is managed only by MrMCP while retaining the preflight needed for transactional restore.
+- `trash_paths` and `untrash_action` are not annotated as destructive because they move data reversibly; removed the permanent `delete_path` tool so filesystem removal is trash-only.
+- No database schema change; schema version remains 4.
 
 ### 0.10.52
 
