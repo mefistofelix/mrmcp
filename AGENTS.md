@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.58 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.59 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
@@ -23,7 +23,7 @@ Use only the direct Deno import `jsr:@webview/webview@0.9.0`.
 - Do not add a native tray or drag-and-drop bridge unless explicitly requested.
 - Keep WebView/static resources in `assets/` and serve them only through authenticated `/assets/...` routes. Source mode reads the directory from disk; standalone builds embed it with `deno compile --include assets` so the same paths resolve from Deno's virtual filesystem.
 - Keep `commands.yaml` in the repository root, not `assets/`. Source mode reads/writes that physical file directly. Standalone builds must additionally compile with `--include commands.yaml`; treat the embedded copy only as a first-run template and materialize it beside the executable if the physical file is absent. Never overwrite an existing user-edited `commands.yaml` from the VFS template.
-- Keep root records conventional: logical name, user-entered path, enabled state, edit and delete. Root paths may be absolute or relative; store the entered path string unchanged in SQLite and resolve relative values against `APP_DIR` only when an operation actually needs an absolute root. Session-to-root assignment belongs on the Roots page through server-routed drag/drop; do not put a root selector back on Sessions. The Roots assignment view labels the left column **Roots** and the right column **Sessions / No root assigned**. Session items show creation time, last activity and Tool Calls count. The Default-root card explains that it uses the program folder but does not print the absolute program-folder path.
+- Keep root records conventional: logical name, user-entered path, enabled state, edit and delete. Root paths may be absolute or relative; store the entered path string unchanged in SQLite and resolve relative values against `APP_DIR` only when an operation actually needs an absolute root. Validate Root/Command path existence/type on blur, never on every input keystroke. Invalid named-root paths must render red wherever that Root path is shown administratively. Session-to-root assignment belongs on the Roots page through server-routed drag/drop; do not put a root selector back on Sessions. The Roots assignment view labels the left column **Roots** and the right column **Sessions / No root assigned**. Session drag items keep Session id/client on the first line and Created, Last Activity, Status and `Tool Calls: N` together underneath; do not repeat generic OAuth/auth-kind text there. The Default-root card explains that it uses the program folder but does not print the absolute program-folder path.
 
 ## Database: clean schema only
 
@@ -207,7 +207,7 @@ Inactive sections must neither render nor query their tables. Sidebar selection,
 
 ### Dialogs and drafts
 
-Root, Command, Settings, confirmation and message state belongs to Deno. Input events update the corresponding server draft even when no immediate render is needed, so an unrelated MCP/SSE update cannot erase partially entered values. Confirmations and errors must be Eta-rendered dialogs, not browser `confirm()` or `alert()` calls.
+Root, Command, Settings, confirmation and message state belongs to Deno. Input events update the corresponding server draft even when no immediate render is needed, so an unrelated MCP/SSE update cannot erase partially entered values. Root/Command path checks run only on blur; the blur event must carry the next focus target (or explicit null) so a validation render cannot steal focus. Confirmations and errors must be Eta-rendered dialogs, not browser `confirm()` or `alert()` calls. For every managed dialog kind, Eta owns open/closed state and renders the `open` attribute from `uiState.dialog`; never call `showModal()`/`show()` or close a dialog imperatively in browser JavaScript. Use server-rendered markup plus CSS overlay for modal presentation; Escape may only send a close intent back to Deno.
 
 ## Tool-call UI
 
@@ -254,7 +254,7 @@ Do not invoke shell commands, `uv` or Python to list, search, inspect, edit or r
 
 Preserve source encoding, BOM and line endings unless conversion is explicitly requested.
 
-Filesystem removal is trash-only; do not reintroduce a permanent delete tool. `trash_paths` accepts explicit paths and/or one glob, supports files and directories, collapses nested selections, and moves each action under `.trash/<action_id>/` with sibling `.trash/<action_id>.json`. Action ids use local date/time to the second with an incrementing numeric suffix only on collision. The manifest stays minimal (`action_id`, creation time and original paths); do not add hashes or redundant integrity metadata. Assume `.trash` is managed by MrMCP, but keep the preflight required to guarantee `untrash_action` restores the entire action or nothing and rolls back any mid-restore moves. Neither `trash_paths` nor `untrash_action` is destructive; do not add them to `destructiveHint`.
+Filesystem removal is trash-only; do not reintroduce a permanent delete tool. `trash_paths` accepts explicit paths and/or one glob, supports files and directories, collapses nested selections, and moves each action under the selected Root's reserved `.mrmcp/trash/<action_id>/` with sibling `.mrmcp/trash/<action_id>.json`. Never create a top-level `.trash` directory. Exclude the entire `.mrmcp` metadata directory from explicit trash targets and trash globs. Action ids use local date/time to the second with an incrementing numeric suffix only on collision. The manifest stays minimal (`action_id`, creation time and original paths); do not add hashes or redundant integrity metadata. Assume `.mrmcp/trash` is managed by MrMCP, but keep the preflight required to guarantee `untrash_action` restores the entire action or nothing and rolls back any mid-restore moves. Neither `trash_paths` nor `untrash_action` is destructive; do not add them to `destructiveHint`.
 
 ## Documentation requirements
 
@@ -291,7 +291,7 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 17. Confirm every visible open/close/select/navigation transition is represented in Deno `uiState` and is produced by Eta, not by an imperative browser DOM mutation.
 18. Confirm expanded-row state uses database primary keys and remains correct when pagination or new rows change table order.
 19. Confirm inactive sections perform no section-specific database queries during a render.
-20. Confirm the WebView only sends normalized input envelopes, receives SSE renders, invokes Morphlex and restores Deno-supplied focus/scroll metadata.
+20. Confirm the WebView only sends normalized input envelopes (including blur with the next focus target), receives SSE renders, invokes Morphlex and restores Deno-supplied focus/scroll metadata.
 21. Confirm `context_info` returns the current absolute root and the root-level `AGENTS.md` / `agents.md` path when present, and returns `null` when absent.
 22. Confirm every built-in tool exposes a strict tool-specific output schema layered on the common context envelope.
 23. Confirm `glob`, `grep` and `replace` implement every documented traversal, exclusion, encoding, size-limit and expected-count argument without shell, `uv` or Python helpers.
@@ -299,11 +299,11 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 25. Confirm Session rows, Tool-call rows and the Tool-call Session filter use `contexts.id` / `logs.context_id`, while MCP requests still use the opaque handle.
 26. Confirm OAuth client rows count `contexts.oauth_client_id` matches and their View sessions action opens Sessions with that client filter; clearing the filter restores all Sessions.
 27. Confirm current-day GUI timestamps omit the calendar date while preserving time and any relative-age suffix.
-28. Confirm the Roots page groups Sessions by `root_id`, labels the right-hand root-id-0 group **Sessions / No root assigned**, shows creation time, last activity and Tool Calls count on Session items, omits the absolute program-folder path from the Default-root card, accepts native drag/drop to named roots or root id `0`, routes the assignment through Deno, and the Sessions page has no root selector. Confirm named-root paths preserve the exact stored absolute/relative string in the GUI while runtime operations resolve relative values against `APP_DIR`.
+28. Confirm the Roots page groups Sessions by `root_id`, labels the right-hand root-id-0 group **Sessions / No root assigned**, renders Session id/client alone on the first drag-item line and Created, Last Activity, Status and `Tool Calls: N` together underneath without generic OAuth/auth-kind text, omits the absolute program-folder path from the Default-root card, accepts native drag/drop to named roots or root id `0`, routes the assignment through Deno, and the Sessions page has no root selector. Confirm named-root paths preserve the exact stored absolute/relative string in the GUI while runtime operations resolve relative values against `APP_DIR`, and invalid named-root paths render red in both Roots and Sessions.
 29. Confirm browser drag handling only transports the numeric Session PK/target root and performs no imperative visible DOM mutation.
 30. Confirm the archive contains exactly the four root project files plus the versioned `assets/` directory, with Morphlex and all branding/static files there and no duplicate assets in the root; `commands.yaml` remains a root configuration file, not an asset.
 31. Confirm standalone builds include both `assets/` and root `commands.yaml`, and that first standalone startup materializes `commands.yaml` beside the executable only when absent without overwriting an existing file.
-32. Verify `trash_paths` creates one `.trash/<action_id>/` plus sibling `.json`, supports explicit paths/directories and globs, collapses nested selections, and leaves no partial trash action after rollback.
+32. Verify `trash_paths` creates one `.mrmcp/trash/<action_id>/` plus sibling `.json` inside the selected Root, never creates top-level `.trash`, excludes `.mrmcp` metadata from explicit/glob selections, supports files/directories and globs, collapses nested selections, and leaves no partial trash action after rollback.
 33. Verify `untrash_action` preflights the complete action and either restores every path or restores none; confirm both trash tools have `destructiveHint: false` and no permanent filesystem-delete tool is published.
 34. Verify `exec`/`exec_start` schemas describe argv as verbatim ordered arguments, expose combined `output` by default, and add individual stdout/stderr only when `separate_streams: true` is requested; verify `exec_poll` advances `output_offset` correctly.
 35. Verify `recent_tool_calls` returns only prior rows for the supplied `context_handle`, excludes its own current row, and makes no claim about upstream requests that never reached MrMCP.
@@ -311,5 +311,6 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 37. Verify Tool Call pagination/table/compact rows/detail rows use stable ids keyed by log database primary key and a live insert does not replace unrelated existing rows during Morphlex reconciliation.
 38. Verify visible GUI headings, action buttons and dialog titles use consistent Title Case while ordinary field labels/body prose remain sentence case.
 39. Confirm the Windows standalone build uses `--no-terminal` and its PE subsystem is GUI/Windows rather than console, while source-mode `deno run` remains terminal-attached.
-40. Verify Root path existence/type checks render as live inline warnings without blocking save, and Command path validation errors remain inline without closing the dialog.
-41. Run the desktop WebView on a machine with Deno and platform dependencies.
+40. Verify Root/Command path existence/type checks run on blur rather than per keystroke, render inline warnings without blocking Root save, preserve the next focused control through the render, and keep Command path validation errors inline without closing the dialog.
+41. Verify every managed Root/Command/Confirm/Message dialog is opened solely by Eta-rendered `open` state plus CSS overlay, with no browser `showModal()`/`show()`/imperative close path; Escape only sends a Deno close intent.
+42. Run the desktop WebView on a machine with Deno and platform dependencies.

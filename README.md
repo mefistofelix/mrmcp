@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.58
+# MrMCP 0.10.59
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -114,7 +114,7 @@ The current schema gives every context a numeric administrative primary key in `
 
 ## Roots and filesystem isolation
 
-The Roots page lets the operator register named directories and assign one current root to each Session. Root paths may be absolute or relative; MrMCP stores the entered value unchanged, and resolves relative roots against the program folder only when the Root is actually used. The page is split into **📁 Roots** on the left and **💬 Sessions** with **No root assigned** on the right. Each named-root card contains its current Session assignments, and every Session item shows its creation time, last activity and Tool Calls count. The Default-root card explains that unassigned Sessions use the program folder without printing that folder's absolute path.
+The Roots page lets the operator register named directories and assign one current root to each Session. Root paths may be absolute or relative; MrMCP stores the entered value unchanged, and resolves relative roots against the program folder only when the Root is actually used. Path existence/type validation runs when the path field loses focus and never blocks saving; invalid named-root paths are shown in red anywhere the administrative UI displays them. The page is split into **📁 Roots** on the left and **💬 Sessions** with **No root assigned** on the right. Each named-root card contains its current Session assignments. Session drag items keep the first line to Session id/client only and render Created, Last Activity, Status and `Tool Calls: N` together as compact metadata underneath; generic OAuth text is omitted there. The Default-root card explains that unassigned Sessions use the program folder without printing that folder's absolute path.
 
 - Drag a Session from the right-hand Sessions column into a named root to assign it.
 - Drag a Session from a named root back to the right-hand Sessions column to remove its named-root association; root id `0` is stored immediately.
@@ -159,7 +159,7 @@ Command execution tools (`exec`, `exec_start`, `exec_poll` and custom commands) 
 
 `recent_tool_calls` reads only the supplied Session's `context_handle` history and excludes its own currently running call. It proves which requests reached MrMCP and shows their input, resolved result/output, status, timing and errors. A request rejected by a client/platform wrapper before MCP dispatch cannot be present, and MrMCP cannot expose an upstream reason code that was never delivered to the server.
 
-`trash_paths` is the removal path for files and directories. It accepts explicit root-relative `paths`, an optional root-relative `glob`, or both. Each call creates `.trash/<action_id>/` plus sibling metadata `.trash/<action_id>.json`; the action id is the local date/time to the second with `-2`, `-3`, ... added only on collision. Nested selections are collapsed so moving a selected directory does not separately move its children. `untrash_action(action_id)` restores the whole action or restores nothing: it preflights every original target first and rolls back any moves if a restore step fails. MrMCP intentionally exposes no permanent filesystem-delete tool; removal is reversible through trash actions.
+`trash_paths` is the removal path for files and directories. It accepts explicit root-relative `paths`, an optional root-relative `glob`, or both. Each call creates `.mrmcp/trash/<action_id>/` plus sibling metadata `.mrmcp/trash/<action_id>.json` inside the selected Root; the action id is the local date/time to the second with `-2`, `-3`, ... added only on collision. `.mrmcp` is reserved metadata and is excluded from trash selections/globs. Nested selections are collapsed so moving a selected directory does not separately move its children. `untrash_action(action_id)` restores the whole action or restores nothing: it preflights every original target first and rolls back any moves if a restore step fails. MrMCP intentionally exposes no permanent filesystem-delete tool; removal is reversible through trash actions.
 
 `glob`, `grep` and `replace` are intended to remove the need for improvised `uv`, Python or shell scripts during ordinary repository work:
 
@@ -235,7 +235,7 @@ The backend keeps one ephemeral `uiState` object containing:
 
 The WebView does not keep an application-state object and does not query administrative JSON endpoints. Its responsibilities are deliberately narrow:
 
-1. delegate click, change, input, submit, focus, keyboard, scroll and native drag/drop events;
+1. delegate click, change, input, blur/focus, submit, keyboard, scroll and native drag/drop events;
 2. serialize those events and send them to Deno over `/api/ui-input` WebSocket; the drag data carries only the numeric Session PK and never mutates visible DOM state;
 3. receive complete server-rendered UI HTML over `/api/events` SSE;
 4. apply the HTML to `#app` with Morphlex;
@@ -247,7 +247,7 @@ Rendering is queued rather than performed synchronously inside the triggering op
 
 Eta chooses the active section with a conditional. `buildUiRenderModel()` queries only the data required by that section, then Eta renders the sidebar, active section, dialogs and section-specific rows. Inactive sections are neither rendered nor queried. Expanded Tool-call and HTTP rows are identified by their unique database primary key and are reconstructed by Eta after relevant backend events.
 
-Native confirmation and alert state is not kept in the browser. Confirmations, errors and forms are represented in Deno `uiState` and rendered as ordinary Eta dialogs. The browser may perform a local clipboard write and may use the native drag `DataTransfer` object transiently to carry a Session PK to a root drop target; neither operation carries persistent or graphical application state.
+Native confirmation and alert state is not kept in the browser. Confirmations, errors and forms are represented in Deno `uiState`; Eta alone decides whether every Root, Command, Confirm or Message dialog exists and renders it with the `open` attribute. The browser never calls `showModal()` or otherwise opens/closes dialogs imperatively; a CSS overlay provides modal presentation and Escape is only transported back to Deno as a close intent. The browser may perform a local clipboard write and may use the native drag `DataTransfer` object transiently to carry a Session PK to a root drop target; neither operation carries persistent or graphical application state.
 
 ### Help
 
@@ -278,6 +278,15 @@ MrMCP uses fixed public listeners:
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
 ## Development changelog
+
+### 0.10.59
+
+- Made all Root, Command, Confirm and Message dialogs fully Deno/Eta-owned: Eta renders `open`, the WebView no longer calls `showModal()`, and CSS supplies the modal overlay without browser-side dialog state.
+- Moved Root and Command path validation from per-keystroke rendering to blur-time validation, preserving draft updates while typing and carrying the next focus target through the render pipeline so validation cannot steal focus/caret.
+- Marked invalid named-root paths red in both Roots and Sessions, with the validation reason available as a tooltip.
+- Simplified Roots drag/drop Session items: the first line now contains only Session id/client, while Created, Last Activity, Status and `Tool Calls: N` share one compact metadata row; generic OAuth text was removed.
+- Moved reversible trash storage under each Root's reserved `.mrmcp/trash/` metadata directory instead of a top-level `.trash/` directory.
+- No database schema change; schema version remains 4.
 
 ### 0.10.58
 
@@ -319,9 +328,9 @@ The Settings and Dashboard pages display listener state, active certificate, val
 
 ### 0.10.53
 
-- Added reversible `trash_paths` for files, directories and glob selections. Each call stores one timestamped action below `.trash/` with a sibling JSON manifest and returns its `action_id`.
+- Added reversible `trash_paths` for files, directories and glob selections. Each call stores one timestamped action below `.mrmcp/trash/` with a sibling JSON manifest and returns its `action_id`.
 - Added `untrash_action(action_id)` with all-or-nothing restore semantics and rollback on a mid-restore failure.
-- Kept trash actions intentionally simple: no hashes or redundant integrity metadata; MrMCP assumes `.trash` is managed only by MrMCP while retaining the preflight needed for transactional restore.
+- Kept trash actions intentionally simple: no hashes or redundant integrity metadata; MrMCP assumes `.mrmcp/trash` is managed only by MrMCP while retaining the preflight needed for transactional restore.
 - `trash_paths` and `untrash_action` are not annotated as destructive because they move data reversibly; removed the permanent `delete_path` tool so filesystem removal is trash-only.
 - No database schema change; schema version remains 4.
 
