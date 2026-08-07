@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.54 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.55 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
@@ -212,6 +212,8 @@ Root, Command, Settings, confirmation and message state belongs to Deno. Input e
 
 - Display and filter by the numeric operator Session primary key, never the long `context_handle` or generic context label.
 - Apply text, Session, status and page-size filter changes automatically through Deno-owned state; do not add a Tool-call Search button or a second refresh path.
+- Give Tool Call pagination, the table, every compact row and every expanded detail row stable DOM ids derived from the log database primary key so Morphlex preserves row identity when new calls are inserted ahead of existing rows.
+- Expanded `exec`, `exec_start` and `exec_poll` rows show a terminal-style command/cwd/stdout/stderr block before the MCP input/result JSON; prefer live managed-process output when the linked process is still in memory.
 - Use numbered pagination above the table.
 - Keep input/output JSON out of compact rows.
 - Render details only for the selected primary key.
@@ -222,6 +224,8 @@ Root, Command, Settings, confirmation and message state belongs to Deno. Input e
 
 The system-PATH setting is enabled by default.
 
+- `exec` and `exec_start` must describe `args` as the exact ordered argv passed verbatim to the executable; agents should consult the command's `--help` rather than reinterpret uncertain option syntax.
+- Process result schemas must explicitly tell agents to inspect both `stdout` and `stderr` together with status/exit code when diagnosing what a command did; successful CLIs may legitimately write useful output to stderr.
 - ON: prepend `.mrmcp/bin` to the supplied or inherited `PATH`.
 - OFF: use only `.mrmcp/bin` in the child `PATH`.
 - Use `ComSpec` on Windows and `SHELL` or `/bin/sh` on Unix.
@@ -298,4 +302,7 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 31. Confirm standalone builds include both `assets/` and root `commands.yaml`, and that first standalone startup materializes `commands.yaml` beside the executable only when absent without overwriting an existing file.
 32. Verify `trash_paths` creates one `.trash/<action_id>/` plus sibling `.json`, supports explicit paths/directories and globs, collapses nested selections, and leaves no partial trash action after rollback.
 33. Verify `untrash_action` preflights the complete action and either restores every path or restores none; confirm both trash tools have `destructiveHint: false` and no permanent filesystem-delete tool is published.
-34. Run the desktop WebView on a machine with Deno and platform dependencies.
+34. Verify `exec`/`exec_start` schemas describe argv as verbatim ordered arguments and describe stdout/stderr as diagnostic outputs to inspect together with status/exit code.
+35. Verify expanded `exec`, `exec_start` and `exec_poll` Tool Call rows render the terminal block above MCP JSON and prefer live process output when available.
+36. Verify Tool Call pagination/table/compact rows/detail rows use stable ids keyed by log database primary key and a live insert does not replace unrelated existing rows during Morphlex reconciliation.
+37. Run the desktop WebView on a machine with Deno and platform dependencies.
