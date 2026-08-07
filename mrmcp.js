@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.48 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
+MrMCP 0.10.50 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -39,8 +39,8 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.48";
-const DB_SCHEMA_VERSION = 3;
+const VERSION = "0.10.50";
+const DB_SCHEMA_VERSION = 4;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CONTEXT_HANDLE_INPUT_DESCRIPTION = "Required opaque capability returned by create_context. Pass the exact value unchanged; never invent, modify, shorten, derive or substitute it.";
@@ -268,7 +268,7 @@ async function backend() {
   const db = new DatabaseSync(DB_PATH);
   let uiRevision = 0;
   const uiRenderStreams = new Set();
-  const UI_SECTIONS = new Set(["dashboard", "sessions", "roots", "commands", "logs", "debug", "oauth", "settings"]);
+  const UI_SECTIONS = new Set(["dashboard", "sessions", "logs", "roots", "commands", "debug", "oauth", "settings", "help"]);
   const uiState = {
     currentSection: "dashboard",
     scrollBySection: { dashboard: [0, 0] },
@@ -278,6 +278,7 @@ async function backend() {
     settingsDraft: null,
     lastInputSequence: 0,
     commands: { page: 1, query: "", pageSize: 25, includeMissing: true },
+    sessions: { oauthClientId: "" },
     logs: { page: 1, query: "", context: "", status: "", pageSize: 25, openRowId: "", selfTest: null },
     debug: { query: "", method: "", status: "", openRowId: "" },
   };
@@ -515,6 +516,10 @@ async function backend() {
       updated_at INTEGER NOT NULL,
       last_active_at INTEGER NOT NULL DEFAULT 0,
       protocol_version TEXT NOT NULL DEFAULT '',
+      auth_kind TEXT NOT NULL DEFAULT '',
+      oauth_client_id TEXT NOT NULL DEFAULT '',
+      client_name TEXT NOT NULL DEFAULT '',
+      user_agent TEXT NOT NULL DEFAULT '',
       FOREIGN KEY(server_id) REFERENCES server_config(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS contexts_server ON contexts(server_id,updated_at DESC);
@@ -564,7 +569,7 @@ async function backend() {
   const requiredSchema = {
     server_config: ["oauth", "basic_enabled", "basic_username", "basic_secret_enc"],
     roots: ["server_id", "name", "path", "enabled"],
-    contexts: ["id", "handle", "server_id", "root_id", "created_at", "updated_at", "last_active_at", "protocol_version"],
+    contexts: ["id", "handle", "server_id", "root_id", "created_at", "updated_at", "last_active_at", "protocol_version", "auth_kind", "oauth_client_id", "client_name", "user_agent"],
     process_runs: ["context_id", "context_handle", "root_id", "root_name", "root_path", "stdout_tail", "stderr_tail"],
     logs: ["id", "server_name", "tool", "status", "input_json", "context_id", "context_handle", "root_id", "root_name", "root_path"],
     oauth_refresh_tokens: ["token_hash", "client_id", "server_id", "resource", "scope", "last_used_at"],
@@ -1652,12 +1657,12 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
   }
 
   // Context handles are globally unique bearer capabilities over the stateless MCP transport.
-  // Each context has exactly one current root; root id 0 is the mrmcp.js folder fallback.
+  // Each context has exactly one current root; root id 0 is the program folder fallback.
   const serverRoots = p => all(
     "SELECT * FROM roots WHERE server_id=? AND enabled=1 ORDER BY id", p.id,
   );
   const fallbackWorkspaceRoot = p => ({
-    id: 0, server_id: p.id, name: "mrmcp.js folder", path: APP_DIR, enabled: 1, fallback: true,
+    id: 0, server_id: p.id, name: "Program folder", path: APP_DIR, enabled: 1, fallback: true,
   });
   const validRootName = name => {
     const value = String(name || "").trim();
@@ -1675,13 +1680,15 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       Number(id), p.id,
     ) : null;
   }
-  function createContext(p, protocolVersion = "") {
+  function createContext(p, protocolVersion = "", client = {}) {
     let handle;
     do handle = `ctx_${randomToken(24)}`;
     while (one("SELECT 1 FROM contexts WHERE handle=?", handle));
     const now = Date.now();
-    run(`INSERT INTO contexts(handle,server_id,root_id,label,created_at,updated_at,last_active_at,protocol_version)
-      VALUES(?,?,?,?,?,?,?,?)`, handle, p.id, 0, "", now, now, now, String(protocolVersion || ""));
+    run(`INSERT INTO contexts(handle,server_id,root_id,label,created_at,updated_at,last_active_at,protocol_version,auth_kind,oauth_client_id,client_name,user_agent)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, handle, p.id, 0, "", now, now, now, String(protocolVersion || ""),
+      String(client.auth_kind || ""), String(client.oauth_client_id || ""), String(client.client_name || ""),
+      String(client.user_agent || "").slice(0, 512));
     return one("SELECT * FROM contexts WHERE handle=?", handle);
   }
   const contextExpired = context => !!context &&
@@ -3255,9 +3262,10 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     const bearer = /^Bearer\s+(.+)$/i.exec(authorization);
     if (bearer && p.oauth) {
       const hash = await sha256(bearer[1]);
-      const token = one(`SELECT token_hash FROM oauth_tokens
-        WHERE token_hash=? AND server_id=? AND expires_at>?`, hash, p.id, Date.now());
-      if (token) return { full: true, kind: "oauth" };
+      const token = one(`SELECT t.token_hash,t.client_id,COALESCE(c.name,'') client_name
+        FROM oauth_tokens t LEFT JOIN oauth_clients c ON c.client_id=t.client_id
+        WHERE t.token_hash=? AND t.server_id=? AND t.expires_at>?`, hash, p.id, Date.now());
+      if (token) return { full: true, kind: "oauth", clientId: token.client_id || "", clientName: token.client_name || "" };
     }
     const basic = /^Basic\s+(.+)$/i.exec(authorization);
     if (basic && p.basic_enabled) {
@@ -3266,10 +3274,10 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
           username = colon < 0 ? decoded : decoded.slice(0, colon), password = colon < 0 ? "" : decoded.slice(colon + 1),
           expected = openSecret(p.basic_secret_enc);
         if (expected && safeEqual(username, p.basic_username) && safeEqual(password, expected))
-          return { full: true, kind: "basic" };
+          return { full: true, kind: "basic", clientId: "", clientName: "Basic client" };
       } catch {}
     }
-    return { full: false, kind: "anonymous" };
+    return { full: false, kind: "anonymous", clientId: "", clientName: "" };
   }
   function authChallenge(p) {
     const schemes = [];
@@ -3772,7 +3780,12 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
           let toolResult;
           if (x.params.name === "create_context") {
             delete toolArgs.context_handle;
-            const record = createContext(p, observedProtocol);
+            const record = createContext(p, observedProtocol, {
+              auth_kind: auth.kind,
+              oauth_client_id: auth.clientId || "",
+              client_name: auth.clientName || "",
+              user_agent: req.headers.get("user-agent") || "",
+            });
             const selection = { context: record, root: selectedContextRoot(p, record) };
             toolResult = await callTool(
               p, x.params.name, toolArgs,
@@ -3870,10 +3883,14 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
 
   const rootsProjection = serverId => all("SELECT * FROM roots WHERE server_id=? ORDER BY id", serverId);
 
-  const contextProjection = (serverId, roots = rootsProjection(serverId)) => all(`SELECT c.id,c.handle,c.label,c.root_id,c.created_at,c.updated_at,c.last_active_at,c.protocol_version,
-      (SELECT COUNT(*) FROM logs l WHERE l.context_id=c.id) tool_calls
-    FROM contexts c WHERE c.server_id=? AND c.handle LIKE 'ctx_%'
-    ORDER BY c.last_active_at DESC,c.created_at DESC LIMIT 500`, serverId).map(context => {
+  const contextProjection = (serverId, roots = rootsProjection(serverId), oauthClientId = "") => {
+    const oauthFilter = String(oauthClientId || "");
+    const rows = all(`SELECT c.id,c.handle,c.label,c.root_id,c.created_at,c.updated_at,c.last_active_at,c.protocol_version,c.auth_kind,c.oauth_client_id,c.client_name,c.user_agent,
+        (SELECT COUNT(*) FROM logs l WHERE l.context_id=c.id) tool_calls
+      FROM contexts c WHERE c.server_id=? AND c.handle LIKE 'ctx_%' ${oauthFilter ? "AND c.oauth_client_id=?" : ""}
+      ORDER BY c.last_active_at DESC,c.created_at DESC LIMIT 500`,
+      ...(oauthFilter ? [serverId, oauthFilter] : [serverId]));
+    return rows.map(context => {
       const selected = Number(context.root_id || 0);
       const root = selected ? roots.find(item => item.id === selected && item.enabled) : null;
       return {
@@ -3885,7 +3902,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
         display_label: `#${context.id}`,
         expired: contextExpired(context),
         expires_at: Number(context.last_active_at || context.created_at || 0) + CONTEXT_TTL_MS,
-        effective_root: root?.name || "mrmcp.js folder",
+        effective_root: root?.name || "Program folder",
         effective_root_path: root?.path || APP_DIR,
         root_id: root?.id || 0,
         fallback_root: !root,
@@ -3893,10 +3910,12 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
           .map(item => ({ id: item.id, name: item.name, selected: item.id === root?.id })),
       };
     });
+  };
 
   const oauthProjection = () => all(`SELECT c.*,
       (SELECT COUNT(*) FROM oauth_tokens t WHERE t.client_id=c.client_id) token_count,
-      (SELECT COUNT(*) FROM oauth_refresh_tokens r WHERE r.client_id=c.client_id) refresh_token_count
+      (SELECT COUNT(*) FROM oauth_refresh_tokens r WHERE r.client_id=c.client_id) refresh_token_count,
+      (SELECT COUNT(*) FROM contexts x WHERE x.oauth_client_id=c.client_id) session_count
       FROM oauth_clients c ORDER BY c.created_at DESC`);
 
   const serverProjection = p => {
@@ -3924,7 +3943,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
   // The UI asks for only the active section. Database projections are evaluated lazily so
   // inactive pages do not query their tables during Eta -> Morphlex rerenders.
   const state = (section = "all") => {
-    const valid = new Set(["all", "dashboard", "sessions", "roots", "commands", "logs", "debug", "oauth", "settings"]);
+    const valid = new Set(["all", "dashboard", "sessions", "logs", "roots", "commands", "debug", "oauth", "settings", "help"]);
     section = valid.has(section) ? section : "dashboard";
     const p = serverConfig();
     if (!p) throw new Error("MrMCP server configuration is missing");
@@ -3936,7 +3955,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     }
     if (["all", "sessions", "logs"].includes(section)) {
       roots ||= rootsProjection(p.id);
-      result.context_values = contextProjection(p.id, roots);
+      result.context_values = contextProjection(p.id, roots, section === "sessions" ? uiState.sessions.oauthClientId : "");
     }
     if (["all", "dashboard"].includes(section)) {
       result.server = serverProjection(p);
@@ -4004,35 +4023,42 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     if (mcpListenError) setCfg("tls_last_error", [
       getCfg("tls_last_error", ""), mcpListenError,
     ].filter(Boolean).join("\n"));
-    emitUiChange(["dashboard", "settings", "tls", "endpoints"], "listeners");
+    emitUiChange(["dashboard", "settings", "help", "tls", "endpoints"], "listeners");
   }
 
   const eta = new Eta({ tags: ["<?", "?>"], autoEscape: true, cache: true });
   const fragmentTemplates = {
-    sidebar: `<? const current=it.data?.state?.currentSection||"dashboard",items=[["dashboard","🏠","Dashboard"],["sessions","💬","Sessions"],["roots","📁","Roots"],["commands","🧰","Commands"],["logs","📜","Tool calls"],["debug","🐞","HTTP debug"],["oauth","🔐","OAuth clients"],["settings","⚙️","Settings"]]; items.forEach(([id,icon,label])=>{ ?><button data-page="<?= id ?>" class="<?= current===id?'nav-active':'' ?>"<?= current===id?' aria-current=page':'' ?>><span class=menu-icon><?= icon ?></span><?= label ?></button><? }) ?>`,
+    sidebar: `<? const current=it.data?.state?.currentSection||"dashboard",items=[["dashboard","🏠","Dashboard"],["oauth","🔐","OAuth clients"],["sessions","💬","Sessions"],["logs","📜","Tool calls"],["roots","📁","Roots"],["commands","🧰","Commands"],["debug","🐞","HTTP debug"],["settings","⚙️","Settings"],["help","❓","Help"]]; items.forEach(([id,icon,label])=>{ ?><button data-page="<?= id ?>" class="<?= current===id?'nav-active':'' ?>"<?= current===id?' aria-current=page':'' ?>><span class=menu-icon><?= icon ?></span><?= label ?></button><? }) ?>`,
     view: `<? const s=it.data?.state||{},section=s.currentSection||"dashboard",settings=s.settings||{}; ?>
 <? if(section==="dashboard"){ ?><section id=dashboard class=page><div class=row><h2 class=grow>🏠 Dashboard</h2><span class=muted>One server · one endpoint · explicit context capabilities</span></div><div id=cards class=grid></div><div class=dashboard-grid><div><h3>🌐 Server</h3><div id=endpoints></div></div><div><h3>🔒 TLS and connectivity</h3><div id=tlsStatus></div></div></div></section>
-<? } else if(section==="sessions"){ ?><section id=sessions class=page><div class=row><h2 class=grow>💬 Sessions</h2><span class=muted>Live updates</span></div><p class=muted>Each session is a persistent MCP context with one current root. The same root may be shared by multiple sessions, and changing this selection affects new tool calls immediately.</p><div id=contextList></div></section>
-<? } else if(section==="roots"){ ?><section id=roots class=page><div class=row><h2 class=grow>📁 Roots</h2><button class=primary data-action=new-root>➕ Add root</button></div><p class=muted>Register a logical name and an existing directory path. Tool paths are relative to the root selected for the supplied <code>context_handle</code> value. Values without an explicit selection use the folder containing <code>mrmcp.js</code>.</p><div id=rootList></div></section>
-<? } else if(section==="commands"){ const c=s.commands||{}; ?><section id=commands class=page><div class=row><h2 class=grow>🧰 Extra commands</h2><button data-action=download-all-commands>⬇️ Download all</button><button class=primary data-action=new-command>➕ Register command</button></div><p class=muted>Metadata is stored in <code>commands.yaml</code> beside <code>mrmcp.js</code>. Executable files directly in <code>.mrmcp/bin</code> also appear automatically.</p><div class=row><input id=commandQuery class=grow placeholder="Search name, path or description…" value="<?= c.query||'' ?>"><label class=small><input id=commandIncludeMissing type=checkbox<?= c.includeMissing!==false?' checked':'' ?>> show unavailable</label><select id=commandPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(c.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-commands>🔎 Search</button></div><div id=commandList></div></section>
+<? } else if(section==="sessions"){ ?><section id=sessions class=page><div class=row><h2 class=grow>💬 Sessions</h2><span class=muted>Live updates</span></div><p class=muted>Each session is a persistent MCP context with one current root. The same root may be shared by multiple sessions, and changing this selection affects new tool calls immediately.</p><? if(s.sessions?.oauthClientId){ ?><div class=row><span class=muted>OAuth filter</span><code><?= s.sessions.oauthClientId ?></code><button class=small data-action=clear-session-oauth>✕ Clear</button></div><? } ?><div class=card><b>Client continuity</b><p class=muted>MCP does not reliably expose the ChatGPT model or thinking level. Client name, authentication type and User-Agent are best-effort metadata captured when the context is created. Changing model or thinking level in the same ChatGPT conversation may cause ChatGPT to create a new MCP context, so reuse of the same Session is not guaranteed.</p></div><div id=contextList></div></section>
+<? } else if(section==="roots"){ ?><section id=roots class=page><div class=row><h2 class=grow>📁 Roots</h2><button class=primary data-action=new-root>➕ Add root</button></div><p class=muted>Register a logical name and an existing directory path. Tool paths are relative to the root selected for the supplied <code>context_handle</code> value. Values without an explicit selection use the program folder.</p><div id=rootList></div></section>
+<? } else if(section==="commands"){ const c=s.commands||{}; ?><section id=commands class=page><div class=row><h2 class=grow>🧰 Extra commands</h2><button data-action=download-all-commands>⬇️ Download all</button><button class=primary data-action=new-command>➕ Register command</button></div><p class=muted>Metadata is stored in <code>commands.yaml</code> in the program folder. Executable files directly in <code>.mrmcp/bin</code> also appear automatically.</p><div class=row><input id=commandQuery class=grow placeholder="Search name, path or description…" value="<?= c.query||'' ?>"><label class=small><input id=commandIncludeMissing type=checkbox<?= c.includeMissing!==false?' checked':'' ?>> show unavailable</label><select id=commandPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(c.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-commands>🔎 Search</button></div><div id=commandList></div></section>
 <? } else if(section==="logs"){ const l=s.logs||{}; ?><section id=logs class=page><h2>📜 MCP tool calls</h2><p class=muted>Click a row to inspect input/output JSON. Active calls and linked managed processes can be terminated from the Actions column.</p><div class=row><input id=logQuery class=grow placeholder="Search input, output, stderr, errors…" value="<?= l.query||'' ?>"><select id=logContext><option value="">All sessions</option><? (s.contextValues||[]).forEach(v=>{ ?><option value="<?= v.pk ?>"<?= String(l.context||"")===String(v.pk)?" selected":"" ?>>#<?= v.pk ?></option><? }) ?></select><select id=logStatus><option value="">All states</option><? ['completed','failed','running'].forEach(v=>{ ?><option<?= l.status===v?' selected':'' ?>><?= v ?></option><? }) ?></select><select id=logPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(l.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select></div><? if(l.selfTest){ ?><div id=logSelfTest class=card><div class=row><h3 class=grow>🧪 MCP self-test</h3><button class=small data-action=copy-detail data-target=logDetail>📋 Copy JSON</button><button class=small data-action=close-self-test>✕ Close</button></div><pre id=logDetail><?= it.pretty(l.selfTest) ?></pre></div><? } ?><div id=logList></div></section>
 <? } else if(section==="debug"){ const d=s.debug||{}; ?><section id=debug class=page><div class=row><h2 class=grow>🐞 HTTP debug log</h2><label class=small style="margin:0"><input id=debugHttpLog type=checkbox<?= s.debug?.enabled?" checked":"" ?>> enabled</label><button data-action=save-debug-settings>✅ Apply</button><button class=danger data-action=clear-debug>🗑️ Clear</button></div><p class=muted>Disabled by default. Authorization, cookies, tokens, codes and secrets are redacted when enabled. Click a row to open or close its JSON directly below it.</p><div class=row><input id=debugQuery class=grow placeholder="Search URL, headers, body or errors…" value="<?= d.query||'' ?>"><select id=debugMethod><option value="">All methods</option><? ['GET','POST','OPTIONS'].forEach(v=>{ ?><option<?= d.method===v?' selected':'' ?>><?= v ?></option><? }) ?></select><input id=debugStatus type=number placeholder="Status" value="<?= d.status||'' ?>"><button data-action=load-debug>🔎 Search</button></div><div id=debugList></div></section>
 <? } else if(section==="oauth"){ ?><section id=oauth class=page><h2>🔐 OAuth clients</h2><div id=oauthList></div></section>
-<? } else if(section==="settings"){ ?><section id=settings class=page><h2>⚙️ Settings</h2><div class=grid><div class=card><h3>🌐 Fixed listeners</h3><p><b>HTTP</b> <code>0.0.0.0:80</code> · ACME HTTP-01 only</p><p><b>HTTPS</b> <code>0.0.0.0:443</code> · MCP, OAuth and metadata</p><p><b>GUI</b> <code>http://127.0.0.1:${GUI_PORT}</code> · embedded WebView / browser</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><label>Public base URL override</label><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><label>Public IPv4 lookup URLs (one per line)</label><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><label>Automatic DNS suffix</label><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><label>ACME directory URL</label><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card><h3>🔒 Certificate</h3><label>Let's Encrypt email</label><input id=tlsEmail type=email value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / request certificate</button></div><p class=muted>A valid certificate already present in .mrmcp is reused. Requests occur only when renewal is due and backoff permits them.</p></div><div class=card><h3>🖥️ Process environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><p class=muted>When disabled, the child PATH contains only <code>.mrmcp/bin</code>. Other environment variables remain available.</p></div></div><p><button class=primary data-action=save-settings>💾 Save settings</button></p><pre id=settingsInfo></pre></section><? } ?>`,
+<? } else if(section==="settings"){ ?><section id=settings class=page><h2>⚙️ Settings</h2><div class=grid><div class=card><h3>🌐 Fixed listeners</h3><p><b>HTTP</b> <code>0.0.0.0:80</code> · ACME HTTP-01 only</p><p><b>HTTPS</b> <code>0.0.0.0:443</code> · MCP, OAuth and metadata</p><p><b>GUI</b> <code>http://127.0.0.1:${GUI_PORT}</code> · embedded WebView / browser</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><label>Public base URL override</label><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><label>Public IPv4 lookup URLs (one per line)</label><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><label>Automatic DNS suffix</label><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><label>ACME directory URL</label><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card><h3>🔒 Certificate</h3><label>Let's Encrypt email</label><input id=tlsEmail type=email value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / request certificate</button></div><p class=muted>A valid certificate already present in .mrmcp is reused. Requests occur only when renewal is due and backoff permits them.</p></div><div class=card><h3>🖥️ Process environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><p class=muted>When disabled, the child PATH contains only <code>.mrmcp/bin</code>. Other environment variables remain available.</p></div></div><p><button class=primary data-action=save-settings>💾 Save settings</button></p></section>
+<? } else if(section==="help"){ ?><section id=help class=page><h2>❓ Help</h2><div class=card><h3>Connect ChatGPT Web</h3><ol><li>Make sure the Dashboard shows a trusted HTTPS certificate. ChatGPT needs a remote HTTPS MCP endpoint; use <code><?= settings.external_base_url ? settings.external_base_url + "/mcp" : "https://your-host/mcp" ?></code>.</li><li>In ChatGPT Web, enable Developer mode. In managed workspaces the current path is <b>Workspace settings → Permissions &amp; Roles → Connected Data Developer mode / Create custom MCP connectors</b>. Authorized users may also find the toggle under <b>Settings → Apps → Advanced Settings</b>.</li><li>Create a custom app from <b>Workspace settings → Apps → Create</b> or <b>Settings → Apps → Create</b>, enter the MrMCP endpoint, choose the offered authentication method, then select <b>Scan Tools</b>.</li><li>If OAuth is enabled in MrMCP, complete the authorization prompt. After the tool scan completes, create the app and select it from a new ChatGPT conversation.</li></ol></div><div class=card><h3>Authentication</h3><p>For ChatGPT, OAuth is the preferred MrMCP setup because ChatGPT can discover the authorization metadata, complete consent, and keep refresh-token connectivity. MrMCP also supports Basic authentication for MCP clients that offer it. Authentication grants access to the server; the <code>context_handle</code> selects persistent context state after authentication.</p></div><div class=card><h3>Write access</h3><p>MrMCP does not maintain a separate read/write allowlist: every authenticated client receives every published tool. ChatGPT controls whether write/modify actions are usable through the app's permissions and action controls. As of this build, OpenAI documents full MCP write/modify support for Business, Enterprise and Edu; Pro custom MCP access is limited to read/fetch, and availability may change. Test write tools in Developer mode first. Where available, use <b>Workspace settings → Apps → Configure Actions / Action control</b> to enable the required actions. ChatGPT may still ask for confirmation before a write.</p></div><div class=card><h3>Using MrMCP in a chat</h3><ol><li>Start a new chat and select the MrMCP app from the tools/apps menu.</li><li>On first use, ChatGPT should call <code>create_context</code>; later calls should reuse the returned <code>context_handle</code>.</li><li>Choose the working root for that Session in the MrMCP <b>Sessions</b> page.</li><li>If you change ChatGPT model or thinking level, the MCP context may be recreated even inside the same conversation. Check the Sessions page if continuity matters.</li></ol><p class=muted>ChatGPT UI labels and plan availability can change. Current OpenAI references: <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt" target=_blank rel=noopener>Developer mode and MCP apps in ChatGPT</a> · <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt" target=_blank rel=noopener>Apps in ChatGPT</a>.</p></div></section><? } ?>`,
     dialogs: `<? const dialog=it.data?.state?.dialog; ?><? if(dialog?.kind==="root"){ const r=dialog.data||{}; ?><dialog id=rootDialog data-managed-dialog=root><form id=rootForm><input id=rid type=hidden value="<?= r.id||'' ?>"><h2>📁 Root</h2><label>Logical name</label><input id=rname required value="<?= r.name||'' ?>"><label>Absolute directory path</label><input id=rpath required placeholder="C:\\projects\\my-root or /srv/my-root" value="<?= r.path||'' ?>"><label><input id=renabled type=checkbox<?= r.enabled!==false?' checked':'' ?>> Enabled</label><p class=row><button class=primary type=submit>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog?.kind==="command"){ const c=dialog.data||{}; ?><dialog id=commandDialog data-managed-dialog=command><form id=commandForm><input id=coldName type=hidden value="<?= c.registered?c.name:'' ?>"><h2>🧰 Command catalog entry</h2><label>Logical name</label><input id=cname pattern="[A-Za-z0-9_.+-]+" required value="<?= c.name||'' ?>"><label>Path below .mrmcp/bin</label><input id=cpath placeholder="Optional; defaults to logical name; Windows suffix optional" value="<?= c.path||'' ?>"><label>Description for the agent</label><textarea id=cdescription placeholder="Optional: what it does and when the agent should use it."><?= c.description||'' ?></textarea><label>Download URL</label><input id=cdownloadUrl type=url placeholder="https://example.com/tool" value="<?= c.download_url||'' ?>"><label>Documentation URL</label><input id=cdocumentationUrl type=url placeholder="https://example.com/docs" value="<?= c.documentation_url||'' ?>"><p class=row><button class=primary type=submit>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog?.kind==="confirm"){ ?><dialog id=confirmDialog data-managed-dialog=confirm><h2>⚠️ <?= dialog.title||"Confirm action" ?></h2><p><?= dialog.message||"Continue?" ?></p><p class=row><button class="primary danger" data-action=confirm-dialog>✓ Confirm</button><button data-action=close-dialog>✕ Cancel</button></p></dialog><? } else if(dialog?.kind==="message"){ ?><dialog id=messageDialog data-managed-dialog=message><h2><?= dialog.title||"MrMCP" ?></h2><pre><?= dialog.message||"" ?></pre><p><button class=primary data-action=close-dialog>✓ Close</button></p></dialog><? } ?>`,
     status: `<? const d=it.data||{},s=d.settings||{}; ?><span class=<?= d.live === "connected" ? "ok" : (d.live === "reconnecting" ? "pending" : "failed") ?>><?= d.live === "connected" ? "🟢 live" : (d.live === "reconnecting" ? "🟡 reconnecting" : "🔴 offline") ?></span><span>v<?= d.version||"" ?> · /mcp · HTTP:80 ACME <?= s.mcp_http_active?"on":"off" ?> · HTTPS:443 <?= s.mcp_https_active?(s.tls_active_kind||"active"):"off" ?></span>`,
     cards: `<? const icons={sessions:"💬",roots:"📁",tool_calls:"📜",failed_calls:"⚠️",http_requests:"🌐"}; Object.entries(it.data || {}).forEach(([key,value]) => { ?><div class=card><div class=muted><?= icons[key]||"•" ?> <?= key.replaceAll("_", " ") ?></div><strong style="font-size:24px"><?= value ?></strong></div><? }) ?>`,
     tls: `<? const t=it.data||{}, problem=!t.tls_active_trusted||!!t.tls_last_error||!!t.mcp_listen_error; ?><div class="card <?= problem ? "tls-alert" : "tls-good" ?>"><div class=row><h3 class=grow>🔒 TLS / Let's Encrypt</h3><b class="<?= t.tls_active_trusted ? "ok" : "failed" ?>"><?= t.tls_active_trusted ? "trusted" : (t.tls_active ? "fallback active" : "offline") ?></b></div><div class=grid><div><span class=muted>HTTPS listener</span><br><b><?= t.mcp_https_active ? "0.0.0.0:443 active" : "not listening" ?></b></div><div><span class=muted>Active certificate</span><br><b><?= t.tls_active_kind || "none" ?> · <?= t.tls_active_valid ? "valid" : "invalid" ?></b></div><div><span class=muted>Expires</span><br><b><?= it.dt(t.tls_active_expires) || "unknown" ?></b></div><div><span class=muted>Last ACME request</span><br><b><?= it.dt(t.tls_last_request_at) || "never recorded" ?></b></div><div><span class=muted>Last ACME result</span><br><b class="<?= t.tls_last_request_valid ? "ok" : (t.tls_last_request_status === "error" ? "failed" : "pending") ?>"><? if (t.tls_last_request_status) { ?><?= t.tls_last_request_status ?> · certificate <?= t.tls_last_request_valid ? "valid" : "not valid" ?><? } else { ?>not recorded<? } ?></b></div><div><span class=muted>Last valid certificate</span><br><b><?= it.dt(t.tls_last_issued_at) || "not recorded" ?></b></div><div><span class=muted>Renewal due</span><br><b><?= it.dt(t.tls_renewal_due_at) || "as soon as allowed" ?></b></div><div><span class=muted>Rate-limit reset</span><br><b><?= it.dt(t.tls_rate_limit_reset_at) || "none" ?></b></div><div><span class=muted>Next ACME attempt</span><br><b><?= it.dt(t.tls_next_attempt_at) || "not scheduled" ?></b></div></div><? if (t.tls_last_error || t.mcp_listen_error) { ?><pre class=tls-error><?= t.tls_last_error || t.mcp_listen_error ?></pre><? } ?><? if (!t.tls_active_trusted) { ?><p class=failed><b>Public clients such as ChatGPT will reject the self-signed fallback until Let's Encrypt succeeds.</b></p><? } ?></div>`,
     urls: `<? (it.data || []).forEach(x => { if (!x?.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?><? if (x.note) { ?> <span class=muted><?= x.note ?></span><? } ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?>`,
     roots: `<? const rows=it.data||[]; ?><? if(!rows.length){ ?><p class=muted>No roots registered.</p><? } else { ?><table><tr><th>Name</th><th>Path</th><th>State</th><th></th></tr><? rows.forEach(r => { ?><tr><td><code><?= r.name ?></code></td><td><code><?= r.path ?></code></td><td><?= r.enabled ? "✅ enabled" : "⏸️ disabled" ?></td><td class=nowrap><button data-action=edit-root data-id="<?= r.id ?>">✏️ Edit</button> <button class=danger data-action=delete-root data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></table><? } ?>`,
-    context: `<? const d=it.data||{},values=d.values||[]; ?><? if (!values.length) { ?><p class=muted>No sessions have been issued yet.</p><? } else { ?><table><tr><th>ID</th><th>Context</th><th>State / protocol</th><th>Current root</th><th>Activity</th><th>Tool calls</th><th></th></tr><? values.forEach(v=>{ ?><tr><td class=idcell>#<?= v.pk ?></td><td class=context-id><code><?= v.context_handle ?></code></td><td class=nowrap><b class="<?= v.expired ? 'failed' : 'ok' ?>"><?= v.expired ? "⌛ expired" : "🟢 active" ?></b><br><code><?= v.protocol_version||"unknown" ?></code></td><td><select data-action=context-root data-id="<?= v.pk ?>"><option value="0"<?= v.fallback_root?" selected":"" ?>>Default root</option><? (v.available_roots||[]).forEach(r=>{ ?><option value="<?= r.id ?>"<?= r.selected?" selected":"" ?>><?= r.name ?></option><? }) ?></select><div class=muted><?= v.effective_root_path ?></div></td><td class=context-dates><div><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></div><div><span class=muted>Updated</span> <?= it.logdt(v.updated_at) ?></div><div><span class=muted>Active</span> <?= it.logdt(v.last_active_at) ?></div><div><span class=muted>Expires</span> <?= it.logdt(v.expires_at) ?></div></td><td><?= v.tool_calls||0 ?></td><td><button class=danger data-action=delete-context data-id="<?= v.pk ?>">🗑️ Delete</button></td></tr><? }) ?></table><? } ?>`,
+    context: `<? const d=it.data||{},values=d.values||[]; ?><? if (!values.length) { ?><p class=muted>No sessions have been issued yet.</p><? } else { ?><table><tr><th>ID</th><th>Context</th><th>Client / auth</th><th>State / protocol</th><th>Current root</th><th>Activity</th><th>Tool calls</th><th></th></tr><? values.forEach(v=>{ const ua=String(v.user_agent||""); ?><tr><td class=idcell>#<?= v.pk ?></td><td class=context-id><code><?= v.context_handle ?></code></td><td><b><?= v.client_name||"Unknown client" ?></b><br><span class=muted><?= v.auth_kind||"unknown auth" ?></span><? if(ua){ ?><div class=muted title="<?= ua ?>"><?= ua.slice(0,72) ?><?= ua.length>72?"…":"" ?></div><? } ?></td><td class=nowrap><b class="<?= v.expired ? 'failed' : 'ok' ?>"><?= v.expired ? "⌛ expired" : "🟢 active" ?></b><br><code><?= v.protocol_version||"unknown" ?></code></td><td><select data-action=context-root data-id="<?= v.pk ?>"><option value="0"<?= v.fallback_root?" selected":"" ?>>Default root</option><? (v.available_roots||[]).forEach(r=>{ ?><option value="<?= r.id ?>"<?= r.selected?" selected":"" ?>><?= r.name ?></option><? }) ?></select><div class=muted><?= v.effective_root_path ?></div></td><td class=context-dates><div><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></div><div><span class=muted>Updated</span> <?= it.logdt(v.updated_at) ?></div><div><span class=muted>Active</span> <?= it.logdt(v.last_active_at) ?></div><div><span class=muted>Expires</span> <?= it.logdt(v.expires_at) ?></div></td><td class=nowrap><?= v.tool_calls||0 ?> <button class=small data-action=session-tool-calls data-id="<?= v.pk ?>">View calls</button></td><td><button class=danger data-action=delete-context data-id="<?= v.pk ?>">🗑️ Delete</button></td></tr><? }) ?></table><? } ?>`,
     commands: `<? const d=it.data || {}, rows=d.commands || []; ?><div class=muted><?= d.total || 0 ?> command<?= d.total === 1 ? "" : "s" ?> · page <?= d.page || 1 ?>/<?= d.pages || 1 ?> · config <code><?= d.config_file || "" ?></code></div><table><tr><th>Name</th><th>Relative path</th><th>Description</th><th>Links</th><th>Source</th><th>State</th><th></th></tr><? rows.forEach(c => { ?><tr><td><code><?= c.name ?></code></td><td><code><?= c.path ?></code></td><td><?= c.description || "—" ?></td><td><? if (c.documentation_url) { ?><a href="<?= c.documentation_url ?>" target=_blank rel=noopener>📖 Docs</a><? } else { ?>—<? } ?></td><td><?= c.source ?></td><td class="<?= c.present && c.executable ? "ok" : "failed" ?>"><?= c.present ? (c.executable ? "✅ available" : "⚠️ not executable") : "❌ missing" ?></td><td class=nowrap><button data-action=edit-command data-name="<?= c.name ?>" data-path="<?= c.path ?>">✏️ Edit</button><? if (c.registered && c.download_url) { ?> <button data-action=download-command data-name="<?= c.name ?>">⬇️ Download</button><? } ?><? if (c.registered) { ?> <button class=danger data-action=delete-command data-name="<?= c.name ?>">🗑️ Delete</button><? } ?></td></tr><? }) ?></table><div class=row><button data-action=commands-prev<?= d.page <= 1 ? " disabled" : "" ?>>Previous</button><button data-action=commands-next<?= d.has_more ? "" : " disabled" ?>>Next</button></div>`,
-    oauth: `<table><tr><th>Client</th><th>ID</th><th>Access</th><th>Refresh</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td><?= c.name ?></td><td><code><?= c.client_id ?></code></td><td><?= c.token_count ?></td><td><?= c.refresh_token_count ?></td><td><button class=danger data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
+    oauth: `<table><tr><th>Client</th><th>ID</th><th>Sessions</th><th>Access</th><th>Refresh</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td><?= c.name ?></td><td><code><?= c.client_id ?></code></td><td class=nowrap><?= c.session_count||0 ?> <button class=small data-action=oauth-sessions data-id="<?= c.client_id ?>">View sessions</button></td><td><?= c.token_count ?></td><td><?= c.refresh_token_count ?></td><td><button class=danger data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> available tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,
     logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",running:"⏳",received:"📥"}; ?><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool call pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr><? rows.forEach(l => { ?><tr data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=idcell><?= l.context_id ? "#"+l.context_id : "—" ?></td><td><code><?= l.tool ?></code></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Force</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail; ?><tr class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>MCP tool call #<?= l.id ?></b><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy full row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><section class=json-detail><div class=row><b class=grow>MCP result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div></td></tr><? } }) ?></table>`,
     debug: `<? const d=it.data||{}; if (!d.enabled) { ?><p class=muted>HTTP debug logging is disabled.</p><? } else { ?><table><tr><th>ID</th><th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>Remote</th><th>Error</th></tr><? (d.rows || []).forEach(r => { ?><tr data-action=select-debug data-id="<?= r.id ?>" title="Click to expand"><td class=idcell>#<?= r.id ?></td><td class=nowrap><?= it.logdt(r.ts) ?></td><td><b><?= r.method ?></b></td><td><code><?= r.path ?></code></td><td class="<?= r.status >= 400 ? "failed" : "ok" ?>"><?= r.status ?></td><td><?= r.duration_ms ?>ms</td><td><?= r.remote_addr ?></td><td><?= r.error_preview ?></td></tr><? if(String(d.openRowId||"")===String(r.id)&&d.openDetail){ ?><tr class=detail-row data-detail-kind=http data-detail-id="<?= r.id ?>"><td colspan=8><div class=detail-panel><div class=row><b class=grow>HTTP request #<?= r.id ?></b><button class=small data-action=copy-detail data-target="http-json-<?= r.id ?>">📋 Copy JSON</button><button class=small data-action=close-row-detail data-kind=http>✕ Close</button></div><pre id="http-json-<?= r.id ?>"><?= it.pretty(d.openDetail) ?></pre></div></td></tr><? } }) ?></table><? } ?>`,
   };
-  const fragmentDate = value => value ? new Date(value).toLocaleString() : "";
+  const fragmentDate = value => {
+    if (!value) return "";
+    const date = new Date(value), now = new Date();
+    if (!Number.isFinite(date.getTime())) return "";
+    const today = date.getFullYear() === now.getFullYear() && date.getMonth() === now.getMonth() && date.getDate() === now.getDate();
+    return today ? date.toLocaleTimeString() : date.toLocaleString();
+  };
   const fragmentRelativeAge = value => {
     if (!value) return "";
     const timestamp = new Date(value).getTime();
@@ -4103,9 +4129,6 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     const projected = { ...settings, ...draft };
     if (typeof projected.public_ip_urls === "string") projected.public_ip_urls = projected.public_ip_urls.split(/\r?\n/);
     return projected;
-  }
-  function uiSettingsInfo(settings) {
-    return `GUI: ${settings.gui_url}\nHTTP: 0.0.0.0:80 (ACME only) ${settings.mcp_http_active ? "active" : "failed"}\nHTTPS: 0.0.0.0:443 (MCP) ${settings.mcp_https_active ? `active with ${settings.tls_active_kind}` : "failed"}\nPublic: ${settings.external_base_url || "not available"}\nCertificate: ${settings.tls_active_valid ? "valid" : "invalid"} / ${settings.tls_active_trusted ? "trusted" : "not trusted"}\nExpires: ${settings.tls_active_expires || "none"}\nNext ACME attempt: ${settings.tls_next_attempt_at ? new Date(settings.tls_next_attempt_at).toLocaleString() : "not scheduled"}\nDatabase: ${settings.database}\nData: ${settings.data_dir}\nExtra command directory: ${settings.bin_directory}\nSystem PATH in child processes: ${settings.inherit_system_path ? "included" : "excluded"}`;
   }
   async function buildUiRenderModel() {
     const section = UI_SECTIONS.has(uiState.currentSection) ? uiState.currentSection : "dashboard";
@@ -4185,8 +4208,6 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       view = fillUiMount(view, "debugList", await renderEtaFragment("debug", model.debugData || {}));
     } else if (section === "oauth") {
       view = fillUiMount(view, "oauthList", await renderEtaFragment("oauth", projection.oauth_clients || []));
-    } else if (section === "settings") {
-      view = fillUiMount(view, "settingsInfo", htmlEscape(uiSettingsInfo(viewState.settings)));
     }
     const [sidebar, status, dialogs] = await Promise.all([
       renderEtaFragment("sidebar", { state: viewState }),
@@ -4302,6 +4323,22 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       case "delete-context":
         uiConfirm("Delete session", "Delete this persistent MCP context? Running processes are not terminated.", "delete-context", { id: data.id });
         return;
+      case "session-tool-calls":
+        uiState.currentSection = "logs";
+        uiState.logs.context = String(Number(data.id) || "");
+        uiState.logs.query = "";
+        uiState.logs.status = "";
+        uiState.logs.page = 1;
+        uiState.logs.openRowId = "";
+        uiState.logs.selfTest = null;
+        break;
+      case "oauth-sessions":
+        uiState.currentSection = "sessions";
+        uiState.sessions.oauthClientId = String(data.id || "");
+        break;
+      case "clear-session-oauth":
+        uiState.sessions.oauthClientId = "";
+        break;
       case "new-command":
         uiState.dialog = { kind: "command", data: { name: "", path: "", description: "", download_url: "", documentation_url: "", registered: false } };
         break;

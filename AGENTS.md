@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.48 consists of exactly five root files:
+MrMCP 0.10.50 consists of exactly five root files:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `morphlex.js` — DOM morphing engine. Eta performs server-side templating; Morphlex does not template.
@@ -34,7 +34,7 @@ The repository is in development. There is no backward compatibility.
 6. Never accept legacy `opaque_` values, `server_opaque` arguments or transport-derived session identifiers.
 7. Tell developers to delete `.mrmcp/mrmcp.sqlite` after incompatible schema changes.
 8. A clean schema must create no named `default` root.
-9. `contexts.id` is the numeric administrative primary key; `contexts.handle` remains the unique opaque bearer capability. Tool-call and process rows retain both `context_id` and `context_handle` snapshots.
+9. `contexts.id` is the numeric administrative primary key; `contexts.handle` remains the unique opaque bearer capability. Tool-call and process rows retain both `context_id` and `context_handle` snapshots. Context rows may also retain observational creation-client metadata (`auth_kind`, OAuth client id/name and User-Agent); that metadata never owns or authorizes the context.
 
 ## MCP 2026-07-28 and explicit context capabilities
 
@@ -61,7 +61,7 @@ Application state uses an explicit bearer capability:
 
 Authentication gates access to the server. After authentication, possession of a valid `context_handle` selects the context. Do not bind contexts, managed processes or JavaScript kernels to an OAuth client, Basic credential, owner key or transport identity.
 
-The GUI label **Sessions** is operator terminology only. Never describe `context_handle` as a protocol or transport session.
+The GUI label **Sessions** is operator terminology only. Never describe `context_handle` as a protocol or transport session. Session client metadata is best-effort observational information captured at context creation; do not infer a model, reasoning/thinking level or client ownership from it. A ChatGPT model or thinking-level change may result in a new context even inside the same chat.
 
 ## Authentication and authorization
 
@@ -97,13 +97,14 @@ JavaScript kernels are lazy and keyed by `(server_id, context_handle, root_id)`.
 Keep these sections:
 
 - Dashboard;
+- OAuth clients;
 - Sessions;
+- Tool calls;
 - Roots;
 - Commands;
-- Tool calls;
 - HTTP debug;
-- OAuth clients;
-- Settings.
+- Settings;
+- Help.
 
 Do not reintroduce Projects, Active calls, Custom tools or Approvals pages. Use emoji sparingly on navigation, headings, principal actions, destructive actions and state summaries; do not decorate technical values or every cell.
 
@@ -148,6 +149,7 @@ Deno owns one ephemeral `uiState` object containing at least:
 
 - `currentSection` and per-section scroll positions;
 - focus/selection metadata;
+- the optional Sessions OAuth-client filter;
 - command filters and pagination;
 - Tool-call query, Session-PK/status filters, pagination, self-test output and expanded log primary key;
 - HTTP-debug filters and expanded row primary key;
@@ -189,13 +191,14 @@ Do not add interval polling, refresh timers, auto-refresh controls, manual refre
 Eta selects the active section from Deno `uiState.currentSection`. `buildUiRenderModel()` may query only the current section’s data:
 
 - Dashboard: endpoint summary and aggregates.
-- Sessions: contexts and their single current root.
+- Sessions: contexts and their single current root, optionally filtered by stored OAuth client id.
 - Roots: roots only.
 - Commands: command catalog page only.
 - Tool calls: context filter values, paginated rows and at most one selected detail row.
 - HTTP debug: setting, filtered rows and at most one selected detail row.
-- OAuth: OAuth clients only.
+- OAuth: OAuth clients plus the count of contexts created through each client.
 - Settings: runtime settings only.
+- Help: static operator guidance plus the already-available settings projection; no section-specific database query.
 
 Inactive sections must neither render nor query their tables. Sidebar selection, expanded rows, dialogs, confirmations and drafts are all Eta output derived from Deno state.
 
@@ -260,7 +263,7 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 
 1. Syntax-check `mrmcp.js` as an ES module.
 2. Extract and syntax-check the embedded browser module and JavaScript worker.
-3. Compile/render every Eta fragment with representative data, including all eight sections and every dialog kind.
+3. Compile/render every Eta fragment with representative data, including all nine sections and every dialog kind.
 4. Verify sidebar input travels over WebSocket, changes Deno `uiState.currentSection`, queues a render and produces SSE HTML.
 5. Verify the browser bundle contains no application-state object, business logic or administrative JSON fetches.
 6. Verify expanded Tool-call and HTTP rows survive relevant backend renders by database primary key.
@@ -283,5 +286,7 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 23. Confirm `glob`, `grep` and `replace` implement every documented traversal, exclusion, encoding, size-limit and expected-count argument without shell, `uv` or Python helpers.
 24. Confirm no Tauri, Rust, Neutralinojs, npm project or CLI files exist.
 25. Confirm Session rows, Tool-call rows and the Tool-call Session filter use `contexts.id` / `logs.context_id`, while MCP requests still use the opaque handle.
-26. Confirm the archive contains exactly the five root project files.
-27. Run the desktop WebView on a machine with Deno and platform dependencies.
+26. Confirm OAuth client rows count `contexts.oauth_client_id` matches and their View sessions action opens Sessions with that client filter; clearing the filter restores all Sessions.
+27. Confirm current-day GUI timestamps omit the calendar date while preserving time and any relative-age suffix.
+28. Confirm the archive contains exactly the five root project files.
+29. Run the desktop WebView on a machine with Deno and platform dependencies.

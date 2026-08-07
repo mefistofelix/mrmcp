@@ -1,4 +1,4 @@
-# MrMCP 0.10.48
+# MrMCP 0.10.50
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -69,11 +69,13 @@ Successful tool results repeat only the bearer capability as common metadata:
 
 A missing, invalid or expired handle returns `isError: true` with an `error` message explaining that `create_context` must be called. No replacement handle is minted automatically. Contexts expire after 30 days without activity.
 
-The handle itself selects the context after authentication. MrMCP does not bind contexts, processes or JavaScript kernels to the OAuth client or Basic credential that created them. Any authenticated client possessing a valid handle can use that context.
+The handle itself selects the context after authentication. MrMCP does not bind contexts, processes or JavaScript kernels to the OAuth client or Basic credential that created them. Any authenticated client possessing a valid handle can use that context. The context row records best-effort metadata about the client that created it (authentication kind, OAuth client id/name when available, and User-Agent) for operator visibility only; those fields are not authorization or ownership controls.
 
 ### Why the GUI says “Sessions”
 
 The administration interface labels contexts **Sessions** because that is convenient for operators. Each row is identified in the GUI by a short numeric primary key; the long `ctx_...` bearer capability remains internal to MCP calls. This is only a GUI term. MrMCP does not implement protocol sessions and does not use `Mcp-Session-Id`.
+
+The Sessions table also shows best-effort creation-client metadata. MCP does not reliably expose the ChatGPT model or thinking/reasoning level, so MrMCP does not invent those values. Changing model or thinking level in the same ChatGPT conversation may cause ChatGPT to create another MCP context, so the same GUI Session is not guaranteed to persist across such changes.
 
 ## Authentication and tool access
 
@@ -96,7 +98,7 @@ Development builds use one exact current SQLite schema and no compatibility laye
 - There are no migrations, `ALTER TABLE` upgrades, backfills, aliases, old-key imports or legacy identifier acceptance.
 - After an incompatible development change, stop MrMCP and delete `.mrmcp/mrmcp.sqlite`.
 
-The current schema gives every context a numeric administrative primary key in `contexts.id` while retaining a unique opaque `context_handle` for MCP calls. Tool-call and process rows store both the numeric `context_id` snapshot used by the GUI and the opaque handle used by the protocol. A context stores exactly one current `root_id`; root id `0` denotes the directory containing `mrmcp.js`.
+The current schema gives every context a numeric administrative primary key in `contexts.id` while retaining a unique opaque `context_handle` for MCP calls. Tool-call and process rows store both the numeric `context_id` snapshot used by the GUI and the opaque handle used by the protocol. Contexts additionally store the creation authentication kind, OAuth client id/name when available, and User-Agent as observational GUI metadata. A context stores exactly one current `root_id`; root id `0` denotes the program directory.
 
 ## Roots and filesystem isolation
 
@@ -180,13 +182,14 @@ Preferred editing order:
 The interface contains:
 
 - Dashboard;
+- OAuth clients;
 - Sessions;
+- Tool calls;
 - Roots;
 - Commands;
-- Tool calls;
 - HTTP debug;
-- OAuth clients;
-- Settings.
+- Settings;
+- Help.
 
 Projects, Active calls, Custom tools and Approvals are intentionally absent. The header and window title use **🧩 MrMCP**. Emoji are limited to navigation, headings, principal actions, destructive actions and compact states.
 
@@ -198,6 +201,7 @@ The backend keeps one ephemeral `uiState` object containing:
 
 - the current section and per-section scroll positions;
 - focus and selection information needed after a morph;
+- the optional OAuth-client filter on Sessions;
 - command search, page, page size and availability filter;
 - Tool-call query, Session-PK/status filters, numbered page and expanded database primary key;
 - HTTP-debug filters and expanded database primary key;
@@ -220,6 +224,10 @@ Rendering is queued rather than performed synchronously inside the triggering op
 Eta chooses the active section with a conditional. `buildUiRenderModel()` queries only the data required by that section, then Eta renders the sidebar, active section, dialogs and section-specific rows. Inactive sections are neither rendered nor queried. Expanded Tool-call and HTTP rows are identified by their unique database primary key and are reconstructed by Eta after relevant backend events.
 
 Native confirmation and alert state is not kept in the browser. Confirmations, errors and forms are represented in Deno `uiState` and rendered as ordinary Eta dialogs. The browser may perform a local clipboard write because that operation carries no application or graphical state.
+
+### Help
+
+The Help page documents the current ChatGPT Web setup flow for a custom MCP app: enabling Developer mode, entering the remote HTTPS `/mcp` endpoint, authenticating (OAuth is the preferred ChatGPT path), scanning tools, understanding MrMCP's authenticated full-tool access model, and configuring write/modify action controls where the ChatGPT plan/workspace exposes them. As of this build, OpenAI documents full MCP write/modify support for Business, Enterprise and Edu, while Pro custom MCP access is limited to read/fetch; the Help page notes that availability can change. It also warns that model or thinking-level changes may result in a fresh MCP context.
 
 ### Tool-call log
 
@@ -244,6 +252,20 @@ MrMCP uses fixed public listeners:
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
 ## Development changelog
+
+### 0.10.50
+
+- Moved OAuth clients directly below Dashboard in the sidebar.
+- Added a Session count to each OAuth client row and a **View sessions** action that opens Sessions filtered by that OAuth `client_id`; the filter remains visible until cleared.
+- Changed GUI date formatting so timestamps from the current local day show only the time, while older/future dates keep their calendar date and existing relative-age suffixes remain unchanged.
+
+### 0.10.49
+
+- Added best-effort creation-client metadata to Sessions: authentication kind, OAuth client id/name when available, and User-Agent. Model and thinking/reasoning level are intentionally not inferred because MCP does not reliably expose them.
+- Added a Sessions continuity notice explaining that changing ChatGPT model or thinking level may create a new MCP context even inside the same conversation.
+- Added a Help section with ChatGPT Web Developer-mode, custom MCP app, OAuth, tool-scan and write-action setup guidance.
+- Moved Tool calls directly below Sessions in the sidebar and retained the one-click per-Session filtered Tool-call view.
+- Advanced the clean SQLite schema to version 4; delete `.mrmcp/mrmcp.sqlite` before restarting this development build.
 
 ### 0.10.48
 
