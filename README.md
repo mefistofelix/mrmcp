@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.53
+# MrMCP 0.10.54
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -11,7 +11,7 @@ The desktop window uses `jsr:@webview/webview@0.9.0`, imported directly by Deno.
 ## Project files
 
 - `mrmcp.js` — backend, MCP endpoint, SQLite schema, administration UI and desktop launcher.
-- `commands.yaml` — metadata for optional executables in `.mrmcp/bin`.
+- `commands.yaml` — editable extra-command catalog. Source mode reads this root file directly; standalone builds embed it as the first-run template and materialize it beside `mrmcp.exe` only when no physical `commands.yaml` exists.
 - `README.md` — user and operator documentation.
 - `AGENTS.md` — implementation invariants and release checks.
 - `assets/` — static WebView/build assets: `morphlex.js`, SVG/PNG branding, Windows ICO and administration screenshot.
@@ -38,7 +38,13 @@ deno run -A mrmcp.js --backend
 
 The administration interface is served at `http://127.0.0.1:7332/`. Desktop mode starts the backend as a Deno child process, waits for `MRMCP_READY`, opens the authenticated loopback URL in the WebView and terminates the child when the window closes. The initial window size is 1180×760.
 
-The authenticated GUI serves `assets/` uniformly under `/assets/`. With `deno run`, those files come directly from the repository `assets/` directory. With the project's Deno 2.9.4 build, `deno compile --include assets` embeds the same directory in Deno's virtual filesystem, so the WebView uses identical `/assets/...` URLs in source and standalone builds.
+The authenticated GUI serves `assets/` uniformly under `/assets/`. With `deno run`, those files come directly from the repository `assets/` directory. Standalone builds embed that directory with `deno compile --include assets`, so the WebView uses identical `/assets/...` URLs in source and standalone builds. `commands.yaml` is not a WebView asset: compile it separately with `--include commands.yaml`; on first standalone backend startup, MrMCP copies the embedded template beside the executable only if no editable physical `commands.yaml` exists there.
+
+Windows standalone build:
+
+```powershell
+deno compile -A --unstable-ffi --include assets --include commands.yaml --icon assets/mrmcp.ico --output mrmcp.exe mrmcp.js
+```
 
 ## MCP 2026-07-28 and stateless operation
 
@@ -263,6 +269,13 @@ MrMCP uses fixed public listeners:
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
 ## Development changelog
+
+### 0.10.54
+
+- Began versioning the root `commands.yaml` catalog instead of leaving it hidden by the root ignore rule.
+- Kept `commands.yaml` outside `assets/`: source mode edits the root file directly, while standalone builds embed it separately with `--include commands.yaml` only as a first-run template.
+- On standalone backend startup, materialize the embedded `commands.yaml` beside the executable only when that physical file is absent; existing user edits are never overwritten.
+- No database schema change; schema version remains 4.
 
 ### 0.10.53
 

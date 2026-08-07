@@ -1,0 +1,94 @@
+commands:
+  - logical_name: ast-grep
+    description: "AST-based structural code search, linting and rewriting CLI for syntax-aware queries and transformations."
+    download_url: https://github.com/ast-grep/ast-grep/releases/latest/download/app-x86_64-pc-windows-msvc.zip
+    documentation_url: https://ast-grep.github.io/guide/
+  - logical_name: deno
+    description: "Secure JavaScript, TypeScript and WebAssembly runtime with built-in tooling; prefer it over Node.js or Bun whenever the required workflow is supported."
+    download_url: https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip
+    documentation_url: https://docs.deno.com/runtime/
+  - logical_name: cymbal
+    description: "Language-agnostic code navigation CLI backed by tree-sitter and a local SQLite index for symbols, references, impact analysis and agent-oriented repository exploration."
+    download_url: https://github.com/1broseidon/cymbal/releases/download/v0.14.0/cymbal_v0.14.0_windows_x86_64.zip
+    documentation_url: https://github.com/1broseidon/cymbal
+  - logical_name: gh
+    description: "Official GitHub CLI for repositories, issues, pull requests, releases, Actions and authenticated GitHub API operations."
+    download_url: https://github.com/cli/cli/releases/download/v2.97.0/gh_2.97.0_windows_amd64.zip
+    documentation_url: https://cli.github.com/manual/
+  - logical_name: goshx
+    description: "Portable pure-Go Bash-compatible shell with integrated core utilities and JSON execution mode for agents and automation."
+    download_url: https://github.com/mefistofelix/goshx/releases/latest/download/goshx.exe
+    documentation_url: https://github.com/mefistofelix/goshx
+  - logical_name: hx
+    description: "Single-binary tool for copying, downloading and extracting local paths, HTTP resources, repositories, images, packages and archives."
+    download_url: https://github.com/mefistofelix/hx/releases/latest/download/hx.exe
+    documentation_url: https://github.com/mefistofelix/hx
+  - logical_name: jj
+    description: "Jujutsu distributed version-control CLI with a Git-compatible backend and operation-log-based workflow."
+    download_url: https://github.com/jj-vcs/jj/releases/download/v0.43.0/jj-v0.43.0-x86_64-pc-windows-msvc.zip
+    documentation_url: https://jj-vcs.github.io/jj/latest/
+  - logical_name: jq
+    description: "Command-line JSON processor for filtering, transforming, querying and generating structured data."
+    download_url: https://github.com/jqlang/jq/releases/latest/download/jq-windows-amd64.exe
+    documentation_url: https://jqlang.org/manual/
+  - logical_name: osqueryi
+    description: "Interactive osquery shell for querying operating-system state and telemetry through SQL tables."
+    download_url: https://github.com/osquery/osquery/releases/download/5.22.1/osquery-5.22.1.windows_x86_64.zip
+    documentation_url: https://osquery.readthedocs.io/en/stable/
+  - logical_name: rclone
+    description: "CLI for copying, synchronizing, mounting and managing files across local storage and cloud providers."
+    download_url: https://downloads.rclone.org/rclone-current-windows-amd64.zip
+    documentation_url: https://rclone.org/docs/
+  - logical_name: rg
+    description: "Ripgrep recursive regex search CLI, optimized for fast code and text search while respecting ignore files."
+    download_url: https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip
+    documentation_url: https://github.com/BurntSushi/ripgrep/blob/master/GUIDE.md
+  - logical_name: uv
+    description: |-
+      Preferred standalone Python runner and environment manager. Use it for ad-hoc Python, script files, tools, projects, interpreter management and automatic dependency resolution; it is not only a package manager. Invoke the catalog logical name directly through exec.program.
+
+      Exact MrMCP tool-call forms:
+      - Existing file: {"program":"uv","args":["run","script.py"]}
+      - Python supplied directly in the call: {"program":"uv","args":["run","-"],"stdin":"<complete Python source>"}
+
+      The final "-" tells uv to treat exec.stdin as a Python script. Do not wrap this in PowerShell, cmd, Bash or a shell here-document, and do not create a temporary .py file solely to execute short source supplied by the agent.
+
+      uv supports PEP 723 inline script metadata. Put this block at the beginning of the Python source to declare packages; uv resolves them and creates an isolated environment automatically:
+      # /// script
+      # dependencies = [
+      #   "requests<3",
+      #   "rich",
+      # ]
+      # ///
+
+      Matplotlib example producing an image and returning it through the same exec call:
+      {"program":"uv","args":["run","-"],"stdin":"# /// script\n# dependencies = [\"matplotlib\"]\n# ///\n\nimport matplotlib.pyplot as plt\n\nx = [1, 2, 3, 4]\ny = [1, 4, 9, 16]\nplt.plot(x, y, marker=\"o\")\nplt.title(\"Example chart\")\nplt.xlabel(\"x\")\nplt.ylabel(\"y\")\nplt.tight_layout()\nplt.savefig(\"chart.png\", dpi=160, bbox_inches=\"tight\")\n","return_files":["chart.png"]}
+
+      When Python creates an image, chart, PDF or other user-facing file, set exec.return_files to the generated paths so MrMCP returns them as MCP content; do not manually Base64-encode or read binary outputs as text.
+    download_url: https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip
+    documentation_url: https://docs.astral.sh/uv/
+  - logical_name: sqlite3
+    description: "Official SQLite command-line shell for opening, querying, importing, exporting and administering SQLite databases."
+    download_url: https://www.sqlite.org/2026/sqlite-tools-win-x64-3530400.zip
+    documentation_url: https://www.sqlite.org/cli.html
+  - logical_name: duckdb
+    description: "DuckDB command-line shell for interactive analytical SQL over local databases, files and common data formats."
+    download_url: https://github.com/duckdb/duckdb/releases/latest/download/duckdb_cli-windows-amd64.zip
+    documentation_url: https://duckdb.org/docs/stable/clients/cli/overview
+  - logical_name: handle
+    path: handle64
+    description: "Microsoft Sysinternals CLI for finding which Windows processes hold files, directories and other object handles open."
+    download_url: https://download.sysinternals.com/files/Handle.zip
+    documentation_url: https://learn.microsoft.com/en-us/sysinternals/downloads/handle
+  - logical_name: d2
+    description: "Modern standalone diagram scripting CLI written in Go. Prefer it for architecture, software, network and system diagrams when D2 syntax is suitable; invoke it directly with exec program d2, for example: d2 diagram.d2 diagram.svg. After rendering, call publish_file on diagram.svg to request the sandboxed MCP App preview. The executable is expected to already exist as .mrmcp/bin/d2 or d2.exe; this catalog entry intentionally has no download URL."
+    documentation_url: https://d2lang.com/tour/intro/
+  - logical_name: mermaid
+    path: arielc
+    description: "Preferred native Mermaid renderer for diagrams and chart-like Mermaid formats. Rust standalone CLI with no Node.js, browser or Puppeteer dependency; render .mmd input to SVG using exec program mermaid, for example: mermaid -i diagram.mmd -o diagram.svg, then call publish_file on diagram.svg to request the sandboxed MCP App preview. Supports Mermaid flowcharts, sequence/class/state/ER/C4 diagrams, mind maps, timelines, Gantt, pie, XY charts, Sankey, radar and other supported Mermaid types."
+    download_url: https://github.com/rinfimate/ariel-rs-cli/releases/download/v0.2.0/arielc-windows-x86_64.zip
+    documentation_url: https://github.com/rinfimate/ariel-rs-cli
+  - logical_name: screenshot-cmd
+    description: "Preferred MrMCP screenshot executable on Windows. Use it through exec instead of PowerShell screen-capture workarounds and write a PNG inside the selected workspace. Use exec.return_files for standard MCP attachment delivery, or call publish_file afterward with return_mode link or both to request the sandboxed MCP App image preview."
+    download_url: https://storage.googleapis.com/google-code-archive-downloads/v2/code.google.com/screenshot-cmd/screenshot-cmd.exe
+    documentation_url: https://superuser.com/questions/75614/take-a-screenshot-from-command-line-in-windows

@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.53 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
+MrMCP 0.10.54 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -21,6 +21,7 @@ const SELF = new URL(import.meta.url);
 const MODULE_DIR = dirname(fileURLToPath(SELF));
 const ASSETS_DIR = join(MODULE_DIR, "assets");
 const APP_DIR = Deno.build.standalone ? dirname(Deno.execPath()) : MODULE_DIR;
+const COMMANDS_TEMPLATE_PATH = join(MODULE_DIR, "commands.yaml");
 const COMMANDS_PATH = join(APP_DIR, "commands.yaml");
 const cliValue = name => { const index = Deno.args.indexOf(name); return index >= 0 ? String(Deno.args[index + 1] || "") : ""; };
 const GUI_PORT = 7332;
@@ -40,7 +41,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.53";
+const VERSION = "0.10.54";
 const DB_SCHEMA_VERSION = 4;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -271,6 +272,15 @@ const JS_KERNEL_SOURCE = jsKernelWorkerSource.toString().match(/\/\*([\s\S]*)\*\
 
 // Backend lifecycle, persistence and network services.
 async function backend() {
+  if (Deno.build.standalone) {
+    try { await Deno.lstat(COMMANDS_PATH); }
+    catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+      const source = await Deno.readTextFile(COMMANDS_TEMPLATE_PATH);
+      try { await Deno.writeTextFile(COMMANDS_PATH, source, { createNew: true }); }
+      catch (writeError) { if (!(writeError instanceof Deno.errors.AlreadyExists)) throw writeError; }
+    }
+  }
   const DATA = join(APP_DIR, ".mrmcp");
   const TLS_DATA = DATA;
   const DB_PATH = join(DATA, "mrmcp.sqlite");

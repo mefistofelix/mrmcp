@@ -2,10 +2,10 @@
 
 ## Current release and files
 
-MrMCP 0.10.53 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.54 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
-- `commands.yaml` — extra-command catalog.
+- `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
 - `README.md` — complete user/operator behavior and development changelog.
 - `AGENTS.md` — implementation invariants and release checks.
 - `assets/` — all static WebView/build assets, including `morphlex.js`, `mrmcp-logo.svg`, `mrmcp-logo.png`, `mrmcp.ico` and `mrmcp-screenshot.png`; do not duplicate them in the repository root.
@@ -20,7 +20,8 @@ Use only the direct Deno import `jsr:@webview/webview@0.9.0`.
 - Desktop mode starts the backend as a Deno child process, waits for `MRMCP_READY`, opens the authenticated GUI URL and stops the child when the WebView closes.
 - The initial desktop size is 1180×760.
 - Do not add a native tray or drag-and-drop bridge unless explicitly requested.
-- Keep WebView/static resources in `assets/` and serve them only through authenticated `/assets/...` routes. Source mode reads the directory from disk; with the project's Deno 2.9.4 build, standalone builds must embed it with `deno compile --include assets` so the same paths resolve from Deno's virtual filesystem.
+- Keep WebView/static resources in `assets/` and serve them only through authenticated `/assets/...` routes. Source mode reads the directory from disk; standalone builds embed it with `deno compile --include assets` so the same paths resolve from Deno's virtual filesystem.
+- Keep `commands.yaml` in the repository root, not `assets/`. Source mode reads/writes that physical file directly. Standalone builds must additionally compile with `--include commands.yaml`; treat the embedded copy only as a first-run template and materialize it beside the executable if the physical file is absent. Never overwrite an existing user-edited `commands.yaml` from the VFS template.
 - Keep root records conventional: logical name, absolute path, enabled state, edit and delete. Session-to-root assignment belongs on the Roots page through server-routed drag/drop; do not put a root selector back on Sessions. The Roots assignment view labels the left column **Roots** and the right column **Sessions / No root assigned**, and Session items show creation and last-access timestamps.
 
 ## Database: clean schema only
@@ -293,7 +294,8 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 27. Confirm current-day GUI timestamps omit the calendar date while preserving time and any relative-age suffix.
 28. Confirm the Roots page groups Sessions by `root_id`, labels the right-hand root-id-0 group **Sessions / No root assigned**, shows creation and last-access timestamps on Session items, accepts native drag/drop to named roots or root id `0`, routes the assignment through Deno, and the Sessions page has no root selector.
 29. Confirm browser drag handling only transports the numeric Session PK/target root and performs no imperative visible DOM mutation.
-30. Confirm the archive contains exactly the four root project files plus the versioned `assets/` directory, with Morphlex and all branding/static files there and no duplicate assets in the root.
-31. Verify `trash_paths` creates one `.trash/<action_id>/` plus sibling `.json`, supports explicit paths/directories and globs, collapses nested selections, and leaves no partial trash action after rollback.
-32. Verify `untrash_action` preflights the complete action and either restores every path or restores none; confirm both trash tools have `destructiveHint: false` and no permanent filesystem-delete tool is published.
-33. Run the desktop WebView on a machine with Deno and platform dependencies.
+30. Confirm the archive contains exactly the four root project files plus the versioned `assets/` directory, with Morphlex and all branding/static files there and no duplicate assets in the root; `commands.yaml` remains a root configuration file, not an asset.
+31. Confirm standalone builds include both `assets/` and root `commands.yaml`, and that first standalone startup materializes `commands.yaml` beside the executable only when absent without overwriting an existing file.
+32. Verify `trash_paths` creates one `.trash/<action_id>/` plus sibling `.json`, supports explicit paths/directories and globs, collapses nested selections, and leaves no partial trash action after rollback.
+33. Verify `untrash_action` preflights the complete action and either restores every path or restores none; confirm both trash tools have `destructiveHint: false` and no permanent filesystem-delete tool is published.
+34. Run the desktop WebView on a machine with Deno and platform dependencies.
