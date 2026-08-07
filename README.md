@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.57
+# MrMCP 0.10.58
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -114,7 +114,7 @@ The current schema gives every context a numeric administrative primary key in `
 
 ## Roots and filesystem isolation
 
-The Roots page lets the operator register named absolute directories and assign one current root to each Session. It is split into **📁 Roots** on the left and **💬 Sessions** with **No root assigned** on the right. Each named-root card contains its current Session assignments, and every Session item shows its creation time and last access.
+The Roots page lets the operator register named directories and assign one current root to each Session. Root paths may be absolute or relative; MrMCP stores the entered value unchanged, and resolves relative roots against the program folder only when the Root is actually used. The page is split into **📁 Roots** on the left and **💬 Sessions** with **No root assigned** on the right. Each named-root card contains its current Session assignments, and every Session item shows its creation time, last activity and Tool Calls count. The Default-root card explains that unassigned Sessions use the program folder without printing that folder's absolute path.
 
 - Drag a Session from the right-hand Sessions column into a named root to assign it.
 - Drag a Session from a named root back to the right-hand Sessions column to remove its named-root association; root id `0` is stored immediately.
@@ -278,6 +278,15 @@ MrMCP uses fixed public listeners:
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
 ## Development changelog
+
+### 0.10.58
+
+- Fixed Roots Session cards so Created and Last Activity timestamps are preserved from the projection and rendered correctly.
+- Added each Session's Tool Calls count to Roots assignment cards.
+- Removed the redundant absolute program-folder path from the Default-root card; the existing explanatory text is sufficient.
+- Root paths may now be absolute or relative. The exact entered string is stored in SQLite; relative roots are resolved against the program folder only at runtime when filesystem/process operations need an absolute path.
+- Root path existence/type validation is now a live red warning beside the field and does not block saving an otherwise valid Root. Command path warnings use the same inline style and keep the dialog open instead of replacing it with a generic Error dialog.
+- No database schema change; schema version remains 4.
 
 ### 0.10.57
 

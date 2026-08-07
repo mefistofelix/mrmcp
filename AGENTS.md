@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.57 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.58 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
@@ -23,7 +23,7 @@ Use only the direct Deno import `jsr:@webview/webview@0.9.0`.
 - Do not add a native tray or drag-and-drop bridge unless explicitly requested.
 - Keep WebView/static resources in `assets/` and serve them only through authenticated `/assets/...` routes. Source mode reads the directory from disk; standalone builds embed it with `deno compile --include assets` so the same paths resolve from Deno's virtual filesystem.
 - Keep `commands.yaml` in the repository root, not `assets/`. Source mode reads/writes that physical file directly. Standalone builds must additionally compile with `--include commands.yaml`; treat the embedded copy only as a first-run template and materialize it beside the executable if the physical file is absent. Never overwrite an existing user-edited `commands.yaml` from the VFS template.
-- Keep root records conventional: logical name, absolute path, enabled state, edit and delete. Session-to-root assignment belongs on the Roots page through server-routed drag/drop; do not put a root selector back on Sessions. The Roots assignment view labels the left column **Roots** and the right column **Sessions / No root assigned**, and Session items show creation and last-access timestamps.
+- Keep root records conventional: logical name, user-entered path, enabled state, edit and delete. Root paths may be absolute or relative; store the entered path string unchanged in SQLite and resolve relative values against `APP_DIR` only when an operation actually needs an absolute root. Session-to-root assignment belongs on the Roots page through server-routed drag/drop; do not put a root selector back on Sessions. The Roots assignment view labels the left column **Roots** and the right column **Sessions / No root assigned**. Session items show creation time, last activity and Tool Calls count. The Default-root card explains that it uses the program folder but does not print the absolute program-folder path.
 
 ## Database: clean schema only
 
@@ -82,7 +82,7 @@ The GUI maintains named roots. A root may be assigned to many contexts, while ea
 
 - Root id `0` is the fallback directory containing `mrmcp.js`.
 - New contexts start on root id `0`.
-- Root assignment is managed only in the Roots GUI. Sessions shows the current root label/path read-only.
+- Root assignment is managed only in the Roots GUI. Sessions shows the current root label/path read-only. Named-root paths shown in administrative UI remain in their stored form; `context_info` and actual filesystem/process execution resolve them to absolute paths only when needed.
 - The public MCP tool is `context_info`, which returns the absolute current root and nullable `agent_guidance_path`; the path itself expresses whether guidance is present.
 - `context_info` checks only the selected root's `AGENTS.md`, then `agents.md`; it returns an absolute path and never scans parent or child directories.
 - Tool/server descriptions must direct the agent to call `context_info` after `create_context` and root changes, then read and follow `agent_guidance_path` when non-null.
@@ -299,7 +299,7 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 25. Confirm Session rows, Tool-call rows and the Tool-call Session filter use `contexts.id` / `logs.context_id`, while MCP requests still use the opaque handle.
 26. Confirm OAuth client rows count `contexts.oauth_client_id` matches and their View sessions action opens Sessions with that client filter; clearing the filter restores all Sessions.
 27. Confirm current-day GUI timestamps omit the calendar date while preserving time and any relative-age suffix.
-28. Confirm the Roots page groups Sessions by `root_id`, labels the right-hand root-id-0 group **Sessions / No root assigned**, shows creation and last-access timestamps on Session items, accepts native drag/drop to named roots or root id `0`, routes the assignment through Deno, and the Sessions page has no root selector.
+28. Confirm the Roots page groups Sessions by `root_id`, labels the right-hand root-id-0 group **Sessions / No root assigned**, shows creation time, last activity and Tool Calls count on Session items, omits the absolute program-folder path from the Default-root card, accepts native drag/drop to named roots or root id `0`, routes the assignment through Deno, and the Sessions page has no root selector. Confirm named-root paths preserve the exact stored absolute/relative string in the GUI while runtime operations resolve relative values against `APP_DIR`.
 29. Confirm browser drag handling only transports the numeric Session PK/target root and performs no imperative visible DOM mutation.
 30. Confirm the archive contains exactly the four root project files plus the versioned `assets/` directory, with Morphlex and all branding/static files there and no duplicate assets in the root; `commands.yaml` remains a root configuration file, not an asset.
 31. Confirm standalone builds include both `assets/` and root `commands.yaml`, and that first standalone startup materializes `commands.yaml` beside the executable only when absent without overwriting an existing file.
@@ -311,4 +311,5 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 37. Verify Tool Call pagination/table/compact rows/detail rows use stable ids keyed by log database primary key and a live insert does not replace unrelated existing rows during Morphlex reconciliation.
 38. Verify visible GUI headings, action buttons and dialog titles use consistent Title Case while ordinary field labels/body prose remain sentence case.
 39. Confirm the Windows standalone build uses `--no-terminal` and its PE subsystem is GUI/Windows rather than console, while source-mode `deno run` remains terminal-attached.
-40. Run the desktop WebView on a machine with Deno and platform dependencies.
+40. Verify Root path existence/type checks render as live inline warnings without blocking save, and Command path validation errors remain inline without closing the dialog.
+41. Run the desktop WebView on a machine with Deno and platform dependencies.
