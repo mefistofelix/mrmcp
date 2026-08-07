@@ -4,7 +4,17 @@
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
-![MrMCP administration interface](./assets/mrmcp-screenshot.png)
+### Tool Calls
+
+Expanded process calls show a terminal-style command and combined output above the raw MCP input/result JSON, while the table keeps live status, duration and Session context visible.
+
+![MrMCP Tool Calls view](./assets/mrmcp-screenshot1.png)
+
+### Roots
+
+Named roots and unassigned Sessions are managed in one drag-and-drop view, with activity, status and Tool Calls counts visible on each Session.
+
+![MrMCP Roots and Sessions view](./assets/mrmcp-screenshot2.png)
 
 The desktop window uses `jsr:@webview/webview@0.9.0`, imported directly by Deno. The project has no Node.js application, npm install, CLI scaffold, Rust, Tauri or Neutralinojs runtime.
 
@@ -14,7 +24,7 @@ The desktop window uses `jsr:@webview/webview@0.9.0`, imported directly by Deno.
 - `commands.yaml` — editable extra-command catalog. Source mode reads this root file directly; standalone builds embed it as the first-run template and materialize it beside `mrmcp.exe` only when no physical `commands.yaml` exists.
 - `README.md` — user and operator documentation.
 - `AGENTS.md` — implementation invariants and release checks.
-- `assets/` — static WebView/build assets: `morphlex.js`, SVG/PNG branding, Windows ICO and administration screenshot.
+- `assets/` — static WebView/build assets: `morphlex.js`, SVG/PNG branding, Windows ICO and administration screenshots.
 
 ## Requirements and startup
 
@@ -339,7 +349,7 @@ The Settings and Dashboard pages display listener state, active certificate, val
 - Moved GUI/browser resources into a single versioned `assets/` directory: Morphlex, SVG/PNG branding, the multi-resolution Windows ICO and the administration screenshot.
 - Added authenticated `/assets/...` static serving that reads the same paths from disk under `deno run` and from Deno's virtual filesystem when `assets/` is embedded with `--include assets`.
 - Removed the inline brand SVG/data URL from `mrmcp.js`; the GUI header and favicon now reference `assets/mrmcp-logo.svg`, while the native window title remains **🧩 MrMCP**.
-- Moved the README screenshot reference to `assets/mrmcp-screenshot.png` and kept the screenshot separate from the logo asset.
+- Moved README screenshots into `assets/` and kept them separate from the logo assets.
 - Recompiled the Windows executable with `--include assets --icon assets/mrmcp.ico`.
 - No database schema change; schema version remains 4.
 

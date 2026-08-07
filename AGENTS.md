@@ -8,7 +8,7 @@ MrMCP 0.10.59 consists of four root project files plus one versioned asset direc
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
 - `README.md` — complete user/operator behavior and development changelog.
 - `AGENTS.md` — implementation invariants and release checks.
-- `assets/` — all static WebView/build assets, including `morphlex.js`, `mrmcp-logo.svg`, `mrmcp-logo.png`, `mrmcp.ico` and `mrmcp-screenshot.png`; do not duplicate them in the repository root.
+- `assets/` — all static WebView/build assets, including `morphlex.js`, `mrmcp-logo.svg`, `mrmcp-logo.png`, `mrmcp.ico` and the numbered administration screenshots; do not duplicate them in the repository root.
 
 The only public MCP endpoint is `/mcp`. The administration UI is loopback-only at `127.0.0.1:7332`.
 
