@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.62
+# MrMCP 0.10.63
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -291,6 +291,11 @@ MrMCP uses fixed public listeners:
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
 ## Development changelog
+
+### 0.10.63
+
+- On Windows, managed `exec` / `exec_start` child processes now use `node:child_process.spawn(..., { windowsHide: true })` so console executables do not briefly create a visible console window or steal focus from the MrMCP WebView.
+- Adapted Node child stdin/stdout/stderr to Web Streams internally, preserving the existing process polling, combined output, stdin, timeout and cancellation behavior; non-Windows execution continues to use `Deno.Command`.
 
 ### 0.10.62
 

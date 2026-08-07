@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.62 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.63 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
@@ -231,6 +231,7 @@ The system-PATH setting is enabled by default.
 - ON: prepend `.mrmcp/bin` to the supplied or inherited `PATH`.
 - OFF: use only `.mrmcp/bin` in the child `PATH`.
 - Use `ComSpec` on Windows and `SHELL` or `/bin/sh` on Unix.
+- On Windows, spawn managed `exec` / `exec_start` children through `node:child_process.spawn` with `windowsHide: true` and adapt Node stdio streams to the existing Web Stream process pipeline. Do not regress to a spawn path that flashes a console window or steals WebView focus. Non-Windows managed processes may continue to use `Deno.Command`.
 - Keep managed process access scoped to the exact `context_handle`; retain the root and cwd snapshot captured at process start.
 - `query_tool_calls` is read-only and scoped to the exact `context_handle`. It returns only calls that reached MrMCP and excludes its own currently running log row. Keep `limit` bounded to 1–50 with default 10; `tool` and `status` are exact filters, `query` is a case-insensitive literal substring search across the complete stored log row, and `before_id` is the stable backward-pagination cursor. Filters are combinable. Use it to distinguish server-side execution from upstream/client-wrapper rejection; never claim it can reveal a wrapper policy reason that was not sent to MrMCP.
 
@@ -328,7 +329,7 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 31. Confirm standalone builds include both `assets/` and root `commands.yaml`, and that first standalone startup materializes `commands.yaml` beside the executable only when absent without overwriting an existing file.
 32. Verify `trash_paths` creates one `.mrmcp/trash/<action_id>/` plus sibling `.json` inside the selected Root, never creates top-level `.trash`, excludes `.mrmcp` metadata from explicit/glob selections, supports files/directories and globs, collapses nested selections, and leaves no partial trash action after rollback.
 33. Verify `untrash_action` preflights the complete action and either restores every path or restores none; confirm both trash tools have `destructiveHint: false` and no permanent filesystem-delete tool is published.
-34. Verify `exec`/`exec_start` schemas describe argv as verbatim ordered arguments, expose combined `output` by default, and add individual stdout/stderr only when `separate_streams: true` is requested; verify `exec_poll` advances `output_offset` correctly.
+34. Verify `exec`/`exec_start` schemas describe argv as verbatim ordered arguments, expose combined `output` by default, and add individual stdout/stderr only when `separate_streams: true` is requested; verify `exec_poll` advances `output_offset` correctly. On Windows, verify managed children use `node:child_process.spawn(..., { windowsHide: true })` while preserving stdin/stdout/stderr and process status semantics.
 35. Verify `query_tool_calls` returns only prior rows for the supplied `context_handle`, excludes its own current row, enforces limit 1–50/default 10, combines exact tool/status filters with literal full-record text search and `before_id` backward pagination, and makes no claim about upstream requests that never reached MrMCP.
 36. Verify process-like Tool Call rows render command/cwd/combined output above MCP JSON, prefer live process output when available, enqueue process-output chunks through the normal coalesced render path, and render no terminal block for non-process tools.
 37. Verify Tool Call pagination/table/compact rows/detail rows use stable ids keyed by log database primary key and a live insert does not replace unrelated existing rows during Morphlex reconciliation.

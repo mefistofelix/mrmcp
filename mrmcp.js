@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.62 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
+MrMCP 0.10.63 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -9,7 +9,8 @@ GUI library: jsr:@webview/webview@0.9.0, imported directly by Deno.
 import { DatabaseSync } from "node:sqlite";
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { createBrotliCompress, createGzip, inflateRawSync } from "node:zlib";
-import { Readable } from "node:stream";
+import { Readable, Writable } from "node:stream";
+import { spawn as nodeSpawn } from "node:child_process";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isIP } from "node:net";
@@ -41,7 +42,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.62";
+const VERSION = "0.10.63";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CONTEXT_HANDLE_INPUT_DESCRIPTION = "Required opaque capability returned by create_context. Pass the exact value unchanged; never invent, modify, shorten, derive or substitute it.";
@@ -2857,6 +2858,36 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     rec.signal = signal;
     return true;
   }
+  function spawnManagedChild(program, options) {
+    if (Deno.build.os !== "windows") return new Deno.Command(program, options).spawn();
+    const child = nodeSpawn(program, options.args || [], {
+      cwd: options.cwd,
+      env: options.env,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let settled = false;
+    const status = new Promise((resolve, reject) => {
+      child.once("error", error => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      });
+      child.once("close", (code, signal) => {
+        if (settled) return;
+        settled = true;
+        resolve({ success: code === 0, code: code ?? -1, signal: signal || null });
+      });
+    });
+    return {
+      pid: child.pid,
+      stdin: Writable.toWeb(child.stdin),
+      stdout: Readable.toWeb(child.stdout),
+      stderr: Readable.toWeb(child.stderr),
+      status,
+      kill(signal) { return child.kill(signal); },
+    };
+  }
   async function startManagedProcess(p, args, background, execution = {}) {
     const target = await resolveWorkspacePath(execution.selection, args.cwd || ".");
     const defaultTimeout = background ? 0 : 120000;
@@ -2886,10 +2917,10 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       ? BIN_DIR + (Deno.build.os === "windows" ? ";" : ":") + inheritedPath
       : BIN_DIR;
     processEnv.MRMCP_BIN = BIN_DIR;
-    const child = new Deno.Command(spec.program, {
+    const child = spawnManagedChild(spec.program, {
       args: spec.argv, cwd: target.path, env: processEnv, clearEnv: true,
       stdin: "piped", stdout: "piped", stderr: "piped",
-    }).spawn();
+    });
     const rec = {
       id: `proc_${randomToken(18)}`, pid: child.pid, child, log_id: Number(execution.logId || 0),
       server_id: p.id, server_name: "mcp", context_id: target.context.id, context_handle: target.context.handle,
