@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.60
+# MrMCP 0.10.61
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -112,13 +112,12 @@ The only public MCP endpoint is `/mcp`. OAuth protected-resource metadata is exp
 
 ## Database policy
 
-Development builds use one exact current SQLite schema and no compatibility layer.
+SQLite is treated directly as persistent application state; MrMCP does not maintain a database schema version or gate startup on `PRAGMA user_version`.
 
 - The database is `.mrmcp/mrmcp.sqlite` beside the application.
-- `PRAGMA user_version` must exactly equal `DB_SCHEMA_VERSION`.
-- A non-empty database with another version is rejected before schema changes.
-- There are no migrations, `ALTER TABLE` upgrades, backfills, aliases, old-key imports or legacy identifier acceptance.
-- After an incompatible development change, stop MrMCP and delete `.mrmcp/mrmcp.sqlite`.
+- Startup ensures current tables and indexes with `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`, so additive structures become available automatically on an existing database.
+- There are no `ALTER TABLE` migrations, backfills, aliases, old-key imports or legacy identifier acceptance.
+- Startup still verifies the columns that current code actually requires. If an existing table has an incompatible shape, stop MrMCP and recreate `.mrmcp/mrmcp.sqlite` rather than adding compatibility code.
 
 The current schema gives every context a numeric administrative primary key in `contexts.id` while retaining a unique opaque `context_handle` for MCP calls. Tool-call and process rows store both the numeric `context_id` snapshot used by the GUI and the opaque handle used by the protocol. Contexts additionally store the creation authentication kind, OAuth client id/name when available, and User-Agent as observational GUI metadata. A context stores exactly one current `root_id`; root id `0` denotes the program directory.
 
@@ -155,9 +154,11 @@ Filesystem and text:
 - `read_file`, `read_files`, `write_file`, `write_files`;
 - `glob`, `grep`, `edit`, `replace`;
 - `file_info`, `create_directory`, `copy_path`, `move_path`, `trash_paths`, `untrash_action`;
-- `publish_file`.
+- `publish_file`, `publish_html`.
 
 `publish_file` is the single supported file-presentation path for ChatGPT. After a file has been created, call `publish_file` with its path instead of reading it as Base64 or trying to manufacture an inline/image/resource-link response. MrMCP creates a temporary HTTPS URL in the tool's structured result and attaches its MCP App widget. The widget renders `image/*` files with an ordinary HTML `<img src="...">`; PDFs, archives, databases and other MIME types get a compact **Open File** action. Raw MCP `resource_link` and inline-Base64 preview modes are intentionally not exposed because the working ChatGPT presentation path is the attached widget. `exec` therefore does not have `return_files` shortcuts: create the output with `exec`, then call `publish_file` explicitly.
+
+`publish_html` is the generic interactive-presentation path. The agent supplies a complete HTML document plus an optional title/height; MrMCP stores it in the `published_html` SQLite table and returns a persistent unguessable HTTPS URL, so the resource continues to work after a server restart. Its attached MCP App loads that URL inside a second iframe sandboxed with scripts, forms, modals and popup links enabled but without `allow-same-origin`, keeping the generated document isolated from the MCP App and ChatGPT host DOM; origin-dependent storage/cookie APIs may consequently be unavailable. Self-contained HTML/CSS/JavaScript is the portable choice. Remote images, fonts, scripts/modules, `fetch`/WebSocket calls and other network dependencies can depend on the current host's CSP/browser behavior and normal CORS rules, so agents should not assume external networking is portable. The entire MCP request, including the HTML string and JSON envelope, remains subject to MrMCP's current 2 MiB request-body limit.
 
 Commands and persistent execution:
 
@@ -291,6 +292,13 @@ The Settings and Dashboard pages display listener state, active certificate, val
 
 ## Development changelog
 
+### 0.10.61
+
+- Added `publish_html` for agent-generated interactive HTML/CSS/JavaScript, presented through its own MCP App widget and nested sandboxed iframe.
+- Persisted published HTML in SQLite with an unguessable `/published-html/html_...` URL, so previously published content survives MrMCP restarts.
+- Kept the nested document isolated by omitting `allow-same-origin`; scripts, forms, modals and popup links are available, while external network resources remain host/browser/CORS dependent and self-contained HTML is the portable default.
+- Removed database schema versioning entirely: there is no `DB_SCHEMA_VERSION` or `PRAGMA user_version` startup gate. Additive tables/indexes are ensured with `IF NOT EXISTS`, while genuinely incompatible existing table shapes still fail on the actual required columns.
+
 ### 0.10.60
 
 - Made the attached MCP App/Smart App widget the single supported `publish_file` presentation path in ChatGPT.
@@ -298,7 +306,7 @@ The Settings and Dashboard pages display listener state, active certificate, val
 - Updated the widget to render image MIME types through a normal HTML `<img src=uri>` and non-image files through an **Open File** action.
 - Removed `exec.return_files*`; commands create files and `publish_file` presents them, so agents have one unambiguous delivery workflow.
 - Bumped the widget resource URI to `ui://mrmcp/file-preview-v4.html` to avoid stale cached widget HTML.
-- No database schema change; schema version remains 4.
+- No SQLite schema change.
 
 ### 0.10.59
 
@@ -307,7 +315,7 @@ The Settings and Dashboard pages display listener state, active certificate, val
 - Marked invalid named-root paths red in both Roots and Sessions, with the validation reason available as a tooltip.
 - Simplified Roots drag/drop Session items: the first line now contains only Session id/client, while Created, Last Activity, Status and `Tool Calls: N` share one compact metadata row; generic OAuth text was removed.
 - Moved reversible trash storage under each Root's reserved `.mrmcp/trash/` metadata directory instead of a top-level `.trash/` directory.
-- No database schema change; schema version remains 4.
+- No SQLite schema change.
 
 ### 0.10.58
 
@@ -316,13 +324,13 @@ The Settings and Dashboard pages display listener state, active certificate, val
 - Removed the redundant absolute program-folder path from the Default-root card; the existing explanatory text is sufficient.
 - Root paths may now be absolute or relative. The exact entered string is stored in SQLite; relative roots are resolved against the program folder only at runtime when filesystem/process operations need an absolute path.
 - Root path existence/type validation is now a live red warning beside the field and does not block saving an otherwise valid Root. Command path warnings use the same inline style and keep the dialog open instead of replacing it with a generic Error dialog.
-- No database schema change; schema version remains 4.
+- No SQLite schema change.
 
 ### 0.10.57
 
 - Compiled the Windows standalone executable with Deno `--no-terminal`, so launching `mrmcp.exe` opens only the WebView and does not create a companion console window.
 - Kept source-mode `deno run` unchanged so development and backend diagnostics can still use a normal terminal.
-- No database schema change; schema version remains 4.
+- No SQLite schema change.
 
 ### 0.10.56
 
@@ -330,7 +338,7 @@ The Settings and Dashboard pages display listener state, active certificate, val
 - Made process `output` the default terminal-like stream, combining stdout and stderr in observed arrival order; `separate_streams: true` optionally adds the individual streams, and `exec_poll` supports a combined `output_offset`.
 - Restricted Tool Call terminal rendering to process-like results and changed the terminal block to the combined output stream above MCP JSON.
 - Normalized GUI page headings, action buttons and dialog titles to consistent Title Case, including **Tool Calls** and **HTTP Log**.
-- Kept the existing clean database schema at version 4.
+- No SQLite schema change.
 
 ### 0.10.55
 
@@ -338,14 +346,14 @@ The Settings and Dashboard pages display listener state, active certificate, val
 - Clarified process output schemas so `stdout` and `stderr` are explicitly diagnostic outputs that should be read together with status and exit code.
 - Added a terminal-style block above MCP JSON in expanded `exec`, `exec_start` and `exec_poll` Tool Call rows, showing command, cwd, stdout and stderr; live in-memory process output is preferred when available.
 - Added stable DOM ids for Tool Call pagination, table, compact rows and expanded detail rows so Morphlex keys existing rows by database primary key instead of rematching them by table position during live inserts.
-- No database schema change; schema version remains 4.
+- No SQLite schema change.
 
 ### 0.10.54
 
 - Began versioning the root `commands.yaml` catalog instead of leaving it hidden by the root ignore rule.
 - Kept `commands.yaml` outside `assets/`: source mode edits the root file directly, while standalone builds embed it separately with `--include commands.yaml` only as a first-run template.
 - On standalone backend startup, materialize the embedded `commands.yaml` beside the executable only when that physical file is absent; existing user edits are never overwritten.
-- No database schema change; schema version remains 4.
+- No SQLite schema change.
 
 ### 0.10.53
 
@@ -353,7 +361,7 @@ The Settings and Dashboard pages display listener state, active certificate, val
 - Added `untrash_action(action_id)` with all-or-nothing restore semantics and rollback on a mid-restore failure.
 - Kept trash actions intentionally simple: no hashes or redundant integrity metadata; MrMCP assumes `.mrmcp/trash` is managed only by MrMCP while retaining the preflight needed for transactional restore.
 - `trash_paths` and `untrash_action` are not annotated as destructive because they move data reversibly; removed the permanent `delete_path` tool so filesystem removal is trash-only.
-- No database schema change; schema version remains 4.
+- No SQLite schema change.
 
 ### 0.10.52
 
@@ -362,7 +370,7 @@ The Settings and Dashboard pages display listener state, active certificate, val
 - Removed the inline brand SVG/data URL from `mrmcp.js`; the GUI header and favicon now reference `assets/mrmcp-logo.svg`, while the native window title remains **🧩 MrMCP**.
 - Moved README screenshots into `assets/` and kept them separate from the logo assets.
 - Recompiled the Windows executable with `--include assets --icon assets/mrmcp.ico`.
-- No database schema change; schema version remains 4.
+- No SQLite schema change.
 
 ### 0.10.51
 
@@ -370,7 +378,7 @@ The Settings and Dashboard pages display listener state, active certificate, val
 - Added bidirectional drag-and-drop assignment between the Default root and named roots, plus direct root-to-root reassignment; Deno remains authoritative and the browser transports only the Session PK and target root id.
 - Removed the root selector from Sessions; the current root label and path remain visible there as read-only information.
 - Updated the sidebar labels/order to **Clients**, **Sessions**, **Roots**, **Tool Calls**, **Commands**, **HTTP Log** and compacted the Commands table actions vertically.
-- No database schema change; schema version remains 4.
+- No SQLite schema change.
 
 ### 0.10.50
 
@@ -384,7 +392,7 @@ The Settings and Dashboard pages display listener state, active certificate, val
 - Added a Sessions continuity notice explaining that changing ChatGPT model or thinking level may create a new MCP context even inside the same conversation.
 - Added a Help section with ChatGPT Web Developer-mode, custom MCP app, OAuth, tool-scan and write-action setup guidance.
 - Moved Tool calls directly below Sessions in the sidebar and retained the one-click per-Session filtered Tool-call view.
-- Advanced the clean SQLite schema to version 4; delete `.mrmcp/mrmcp.sqlite` before restarting this development build.
+- Updated the clean SQLite table shape for creation-client metadata; incompatible development databases needed to be recreated.
 
 ### 0.10.48
 
@@ -393,7 +401,7 @@ The Settings and Dashboard pages display listener state, active certificate, val
 - Changed the Sessions table, Tool-call Session column and Session filter to show the numeric PK instead of the long handle or generic `context` label.
 - Renamed the root-id-0 selector option to **Default root**.
 - Removed the Tool-call Search button; text, Session, status and page-size filter changes now refresh automatically through the existing Deno-owned render pipeline.
-- Advanced the clean SQLite schema to version 3.
+- Updated the clean SQLite table shape for numeric Session and Tool-call identifiers.
 
 ### 0.10.47
 
@@ -421,7 +429,7 @@ The Settings and Dashboard pages display listener state, active certificate, val
 - Scoped lazy persistent JavaScript kernels by context and root.
 - Replaced `list_files`, `search_files`, `edit_file`, `edit_files` and `replace_files` with `glob`, `grep`, `edit` and `replace`.
 - Fixed multi-edit semantics: ordered edits for the same file are now applied to one in-memory document and all files are committed atomically with rollback.
-- Added root snapshots to tool-call and process logs and moved the clean SQLite schema to version 2.
+- Added root snapshots to tool-call and process logs and updated the corresponding clean SQLite table shapes.
 
 ### 0.10.43
 

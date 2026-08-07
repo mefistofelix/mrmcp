@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.60 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.61 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
@@ -25,17 +25,17 @@ Use only the direct Deno import `jsr:@webview/webview@0.9.0`.
 - Keep `commands.yaml` in the repository root, not `assets/`. Source mode reads/writes that physical file directly. Standalone builds must additionally compile with `--include commands.yaml`; treat the embedded copy only as a first-run template and materialize it beside the executable if the physical file is absent. Never overwrite an existing user-edited `commands.yaml` from the VFS template.
 - Keep root records conventional: logical name, user-entered path, enabled state, edit and delete. Root paths may be absolute or relative; store the entered path string unchanged in SQLite and resolve relative values against `APP_DIR` only when an operation actually needs an absolute root. Validate Root/Command path existence/type on blur, never on every input keystroke. Invalid named-root paths must render red wherever that Root path is shown administratively. Session-to-root assignment belongs on the Roots page through server-routed drag/drop; do not put a root selector back on Sessions. The Roots assignment view labels the left column **Roots** and the right column **Sessions / No root assigned**. Session drag items keep Session id/client on the first line and Created, Last Activity, Status and `Tool Calls: N` together underneath; do not repeat generic OAuth/auth-kind text there. The Default-root card explains that it uses the program folder but does not print the absolute program-folder path.
 
-## Database: clean schema only
+## Database: direct current schema, no versioning
 
-The repository is in development. There is no backward compatibility.
+The repository is in development. There is no backward-compatibility layer and there is no database schema-version concept.
 
-1. Maintain one exact startup schema and one `DB_SCHEMA_VERSION`.
-2. Reject a non-empty database whose `PRAGMA user_version` differs.
+1. Do not introduce `DB_SCHEMA_VERSION`, `PRAGMA user_version` checks or any equivalent version gate.
+2. Ensure current tables and indexes directly at startup with `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`; additive structures must become available automatically on an existing database.
 3. Never add `ALTER TABLE`, migration code, backfills or old-column detection.
-4. Never import legacy configuration keys or identifiers.
-5. Never retain an old table or column only for compatibility.
-6. Never accept legacy `opaque_` values, `server_opaque` arguments or transport-derived session identifiers.
-7. Tell developers to delete `.mrmcp/mrmcp.sqlite` after incompatible schema changes.
+4. Keep required-column checks tied to structures the current code actually needs; if an existing table has an incompatible shape, fail on that shape and tell developers to recreate `.mrmcp/mrmcp.sqlite`.
+5. Never import legacy configuration keys or identifiers.
+6. Never retain an old table or column only for compatibility.
+7. Never accept legacy `opaque_` values, `server_opaque` arguments or transport-derived session identifiers.
 8. A clean schema must create no named `default` root.
 9. `contexts.id` is the numeric administrative primary key; `contexts.handle` remains the unique opaque bearer capability. Tool-call and process rows retain both `context_id` and `context_handle` snapshots. Context rows may also retain observational creation-client metadata (`auth_kind`, OAuth client id/name and User-Agent); that metadata never owns or authorizes the context.
 
@@ -234,7 +234,7 @@ The system-PATH setting is enabled by default.
 - Keep managed process access scoped to the exact `context_handle`; retain the root and cwd snapshot captured at process start.
 - `recent_tool_calls` is read-only and scoped to the exact `context_handle`. It returns only calls that reached MrMCP and excludes its own currently running log row. Use it to distinguish server-side execution from upstream/client-wrapper rejection; never claim it can reveal a wrapper policy reason that was not sent to MrMCP.
 
-## Published files and MCP App widget
+## Published files/HTML and MCP App widgets
 
 `publish_file` is the only supported path for presenting generated/existing files to ChatGPT users. Keep the contract deliberately singular:
 
@@ -246,7 +246,16 @@ The system-PATH setting is enabled by default.
 - do not add `exec.return_files*` shortcuts: a command creates a file, then the agent explicitly calls `publish_file` so the correct widget is attached to the correct tool result;
 - tool descriptions must tell agents to call `publish_file` directly rather than reading binary files, Base64-encoding them or constructing alternate preview payloads.
 
-The widget resource URI is versioned when its HTML/behavior changes so clients do not reuse stale cached widget markup.
+`publish_html` is the generic agent-generated UI path:
+
+- persist every published document in the `published_html` SQLite table with a random unguessable id, title, HTML, requested height, context handle and creation time; it must survive server restarts;
+- return a persistent HTTPS `/published-html/<id>` URL in `structuredContent.uri` and attach the dedicated versioned `HTML_PREVIEW_UI_URI` MCP App template;
+- the outer MCP App declares the MrMCP public origin in `frameDomains` and loads the persisted document in a nested iframe;
+- the nested iframe may allow scripts, forms, modals and popup links, but must never add `allow-same-origin`; generated HTML must not gain access to the MCP App or host DOM;
+- do not impose a MrMCP CSP on the persisted HTML response. Self-contained HTML/CSS/JavaScript is the portable default; external resources/network calls remain host/browser/CSP/CORS dependent and tool descriptions must say so explicitly rather than treating the current ChatGPT “CSP disabled” state as a contract;
+- the normal MCP request-body limit bounds the HTML input; do not add a separate alternate transport unless there is a concrete need.
+
+Both widget resource URIs are versioned when their HTML/behavior changes so clients do not reuse stale cached widget markup.
 
 ## Text-editing tools
 
@@ -295,7 +304,7 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 7. Verify `buildUiRenderModel()` queries only the active section.
 8. Verify input events update Deno drafts before unrelated backend renders.
 9. Verify the render queue coalesces bursts, never renders concurrently and performs a follow-up pass when dirtied during rendering.
-10. Build an empty SQLite database and verify `PRAGMA user_version` and the exact schema.
+10. Build/open SQLite state and verify current required tables/indexes are ensured without any `DB_SCHEMA_VERSION`/`PRAGMA user_version` gate; additive tables must appear on an existing compatible database.
 11. Confirm no migrations, `ALTER TABLE`, legacy identifiers or old configuration imports exist.
 12. Confirm only MCP `2026-07-28` is advertised and no transport-session headers are used.
 13. Confirm missing/valid/invalid/expired context-handle paths do or do not execute exactly as documented.
@@ -328,4 +337,5 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 40. Verify Root/Command path existence/type checks run on blur rather than per keystroke, render inline warnings without blocking Root save, preserve the next focused control through the render, and keep Command path validation errors inline without closing the dialog.
 41. Verify every managed Root/Command/Confirm/Message dialog is opened solely by Eta-rendered `open` state plus CSS overlay, with no browser `showModal()`/`show()`/imperative close path; Escape only sends a Deno close intent.
 42. Verify `publish_file` exposes no return-mode selector, Base64 image payload or MCP `resource_link`; its structured result contains the temporary HTTPS `uri`, its tool descriptor points to the versioned MCP App widget, and the widget reads `structuredContent.uri`, uses `<img>` for images and an Open File link for other MIME types. Confirm `exec` exposes no `return_files*` shortcut.
+43. Verify `publish_html` persists rows in `published_html`, returns a persistent unguessable HTTPS URI, remains fetchable after closing/reopening the SQLite connection/server, points to the dedicated MCP App widget, and renders through a nested iframe whose sandbox allows scripts/forms/modals/popups but never `allow-same-origin`. Confirm the outer widget declares the MrMCP origin in `frameDomains` and the tool description states that external networking is host/browser/CSP/CORS dependent.
 43. Run the desktop WebView on a machine with Deno and platform dependencies.

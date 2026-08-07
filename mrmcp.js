@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.60 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
+MrMCP 0.10.61 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -31,7 +31,7 @@ const BASE_TOOLS = [
   "create_context", "context_info", "read_file", "read_files", "write_file", "write_files",
   "edit", "replace", "glob", "grep",
   "file_info", "create_directory", "copy_path", "move_path", "trash_paths", "untrash_action",
-  "publish_file", "list_commands", "recent_tool_calls", "exec", "exec_start", "exec_poll", "exec_write", "exec_kill", "exec_list",
+  "publish_file", "publish_html", "list_commands", "recent_tool_calls", "exec", "exec_start", "exec_poll", "exec_write", "exec_kill", "exec_list",
   "js", "js_add_node_module_dir", "js_reset",
 ];
 const READ_TOOLS = new Set([
@@ -41,8 +41,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.60";
-const DB_SCHEMA_VERSION = 4;
+const VERSION = "0.10.61";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CONTEXT_HANDLE_INPUT_DESCRIPTION = "Required opaque capability returned by create_context. Pass the exact value unchanged; never invent, modify, shorten, derive or substitute it.";
@@ -51,6 +50,7 @@ const CONTEXT_HANDLE_RULE = "Requires the exact context_handle returned by creat
 const MCP_UI_EXTENSION = "io.modelcontextprotocol/ui";
 const MCP_UI_MIME_TYPE = "text/html;profile=mcp-app";
 const FILE_PREVIEW_UI_URI = "ui://mrmcp/file-preview-v4.html";
+const HTML_PREVIEW_UI_URI = "ui://mrmcp/html-preview-v1.html";
 const enc = new TextEncoder(), dec = new TextDecoder();
 
 const stringResponse = (body, status, type, headers = {}) => {
@@ -416,14 +416,6 @@ async function backend() {
     if (/\bmetrics\b/.test(statement)) scopes.add("dashboard");
     return [...scopes];
   }
-  const existingSchemaVersion = Number(db.prepare("PRAGMA user_version").get()?.user_version || 0);
-  const existingUserTables = Number(db.prepare(
-    "SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-  ).get()?.count || 0);
-  if (existingUserTables && existingSchemaVersion !== DB_SCHEMA_VERSION) throw new Error(
-    `Unsupported .mrmcp/mrmcp.sqlite schema ${existingSchemaVersion}. ` +
-    `MrMCP development builds do not migrate databases. Delete .mrmcp/mrmcp.sqlite and restart.`,
-  );
   db.exec(`
     PRAGMA journal_mode=WAL;
     PRAGMA foreign_keys=ON;
@@ -579,6 +571,17 @@ async function backend() {
       error TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS process_runs_time ON process_runs(started_at DESC);
+    CREATE TABLE IF NOT EXISTS published_html(
+      id TEXT PRIMARY KEY,
+      server_id INTEGER NOT NULL,
+      context_handle TEXT NOT NULL DEFAULT '',
+      title TEXT NOT NULL DEFAULT '',
+      html TEXT NOT NULL,
+      height INTEGER NOT NULL DEFAULT 600,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY(server_id) REFERENCES server_config(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS published_html_time ON published_html(created_at DESC);
     CREATE TABLE IF NOT EXISTS metrics(
       name TEXT PRIMARY KEY,
       value INTEGER NOT NULL DEFAULT 0
@@ -604,6 +607,7 @@ async function backend() {
     process_runs: ["context_id", "context_handle", "root_id", "root_name", "root_path", "stdout_tail", "stderr_tail"],
     logs: ["id", "server_name", "tool", "status", "input_json", "context_id", "context_handle", "root_id", "root_name", "root_path"],
     oauth_refresh_tokens: ["token_hash", "client_id", "server_id", "resource", "scope", "last_used_at"],
+    published_html: ["id", "server_id", "context_handle", "title", "html", "height", "created_at"],
   };
   const schemaErrors = [];
   for (const [table, columns] of Object.entries(requiredSchema)) {
@@ -614,7 +618,6 @@ async function backend() {
   if (schemaErrors.length) throw new Error(
     `Invalid clean database schema (${schemaErrors.join(", ")}). Delete .mrmcp/mrmcp.sqlite and restart.`,
   );
-  db.exec(`PRAGMA user_version=${DB_SCHEMA_VERSION}`);
   let fts = true;
   try {
     db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS logs_fts USING fts5(
@@ -914,6 +917,172 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
 </body>
 </html>`;
   }
+  const htmlPreviewUiMeta = () => ({
+    ui: {
+      prefersBorder: false,
+      csp: { frameDomains: [publicOrigin()] },
+    },
+  });
+  const htmlPreviewResource = () => ({
+    uri: HTML_PREVIEW_UI_URI,
+    name: "mrmcp_html_preview",
+    title: "MrMCP HTML preview",
+    description: "Sandboxed MCP App used by publish_html. It loads the persisted HTML URL returned in structuredContent inside a nested sandboxed iframe.",
+    mimeType: MCP_UI_MIME_TYPE,
+    _meta: htmlPreviewUiMeta(),
+  });
+  function htmlPreviewAppHtml() {
+    return String.raw`<!doctype html>
+<html lang="en" data-mode="inline">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MrMCP HTML preview</title>
+<style>
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+html, body, main { margin: 0; width: 100%; min-width: 0; background: transparent; }
+#bar { display: none; align-items: center; gap: 8px; min-height: 34px; padding: 4px 6px; font: 13px/1.2 system-ui, sans-serif; }
+#title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .75; }
+#fullscreen { width: 30px; height: 28px; padding: 0; border: 1px solid #ffffff33; border-radius: 7px; color: inherit; background: transparent; cursor: pointer; }
+#frame { display: none; width: 100%; min-height: 120px; border: 0; background: transparent; }
+#error { display: none; padding: 10px; color: var(--color-text-danger, #b42318); font: 14px/1.4 system-ui, sans-serif; overflow-wrap: anywhere; }
+html[data-mode="fullscreen"], html[data-mode="fullscreen"] body, html[data-mode="fullscreen"] main { height: 100%; overflow: hidden; }
+html[data-mode="fullscreen"] main { display: flex; flex-direction: column; }
+html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-height: 0; }
+</style>
+</head>
+<body>
+<main>
+  <div id="bar"><div id="title"></div><button id="fullscreen" type="button" title="Fullscreen" aria-label="Fullscreen" hidden>⛶</button></div>
+  <iframe id="frame" title="Published HTML" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox" allow="fullscreen" referrerpolicy="no-referrer"></iframe>
+  <div id="error" role="alert"></div>
+</main>
+<script>
+(function () {
+  'use strict';
+  var root = document.documentElement;
+  var bar = document.getElementById('bar');
+  var title = document.getElementById('title');
+  var frame = document.getElementById('frame');
+  var fullscreen = document.getElementById('fullscreen');
+  var error = document.getElementById('error');
+  var pending = new Map();
+  var nextId = 1;
+  var currentMode = 'inline';
+  var fullscreenAvailable = false;
+
+  function post(message) { window.parent.postMessage(message, '*'); }
+  function notify(method, params) { post({ jsonrpc: '2.0', method: method, params: params || {} }); }
+  function request(method, params, timeoutMs) {
+    var id = nextId++;
+    post({ jsonrpc: '2.0', id: id, method: method, params: params || {} });
+    return new Promise(function (resolve, reject) {
+      var timer = timeoutMs ? setTimeout(function () {
+        pending.delete(id);
+        reject(new Error(method + ' timeout'));
+      }, timeoutMs) : 0;
+      pending.set(id, {
+        resolve: function (value) { if (timer) clearTimeout(timer); resolve(value); },
+        reject: function (reason) { if (timer) clearTimeout(timer); reject(reason); }
+      });
+    });
+  }
+  function array(value) { return Array.isArray(value) ? value : []; }
+  function showError(text) {
+    error.textContent = text || '';
+    error.style.display = text ? 'block' : 'none';
+  }
+  function setMode(mode) {
+    currentMode = mode === 'fullscreen' ? 'fullscreen' : 'inline';
+    root.dataset.mode = currentMode;
+    fullscreen.title = currentMode === 'fullscreen' ? 'Exit fullscreen' : 'Fullscreen';
+    fullscreen.setAttribute('aria-label', fullscreen.title);
+  }
+  function applyHostContext(context) {
+    context = context || {};
+    if (context.theme) root.style.colorScheme = context.theme;
+    if (context.displayMode) setMode(context.displayMode);
+    fullscreenAvailable = array(context.availableDisplayModes).indexOf('fullscreen') >= 0;
+    fullscreen.hidden = !fullscreenAvailable;
+  }
+  function render(result) {
+    result = result || {};
+    var structured = result.structuredContent && typeof result.structuredContent === 'object'
+      ? result.structuredContent : result;
+    var uri = typeof structured.uri === 'string' ? structured.uri : '';
+    var label = String(structured.title || 'Interactive HTML');
+    var height = Math.max(120, Math.min(Number(structured.height || 600), 2000));
+    showError('');
+    frame.style.display = 'none';
+    bar.style.display = 'none';
+    frame.removeAttribute('src');
+    if (!uri) {
+      showError('publish_html did not provide the persisted HTML URL required by this widget.');
+      return;
+    }
+    title.textContent = label;
+    frame.title = label;
+    frame.style.height = height + 'px';
+    frame.src = uri;
+    bar.style.display = 'flex';
+    frame.style.display = 'block';
+  }
+  function toggleFullscreen() {
+    if (!fullscreenAvailable) return;
+    var requested = currentMode === 'fullscreen' ? 'inline' : 'fullscreen';
+    fullscreen.disabled = true;
+    request('ui/request-display-mode', { mode: requested }, 3000).then(function (result) {
+      setMode(result && result.mode ? result.mode : requested);
+    }).catch(function () {}).finally(function () { fullscreen.disabled = false; });
+  }
+
+  fullscreen.addEventListener('click', toggleFullscreen);
+  frame.addEventListener('load', function () { showError(''); });
+  window.addEventListener('message', function (event) {
+    if (event.source !== window.parent) return;
+    var message = event.data;
+    if (!message || message.jsonrpc !== '2.0') return;
+    if (message.id !== undefined && pending.has(message.id)) {
+      var item = pending.get(message.id);
+      pending.delete(message.id);
+      if (message.error) item.reject(message.error); else item.resolve(message.result);
+      return;
+    }
+    if (message.method === 'ui/notifications/tool-result') render(message.params);
+    if (message.method === 'ui/notifications/host-context-changed') applyHostContext(message.params);
+  }, { passive: true });
+
+  var openai = typeof window !== 'undefined' ? window.openai : undefined;
+  if (openai && openai.toolOutput) render(openai.toolOutput);
+
+  request('ui/initialize', {
+    protocolVersion: '2026-01-26',
+    appInfo: { name: 'mrmcp-html-preview', version: '1.0.0' },
+    appCapabilities: { availableDisplayModes: ['inline', 'fullscreen'] }
+  }, 3000).then(function (result) {
+    applyHostContext(result && result.hostContext);
+    notify('ui/notifications/initialized', {});
+    if (openai && openai.toolOutput) render(openai.toolOutput);
+  }).catch(function () {
+    if (openai && openai.toolOutput) render(openai.toolOutput);
+  });
+
+  if (typeof ResizeObserver === 'function') {
+    var lastWidth = 0, lastHeight = 0;
+    new ResizeObserver(function () {
+      var width = Math.ceil(document.documentElement.scrollWidth);
+      var height = Math.ceil(document.documentElement.scrollHeight);
+      if (width === lastWidth && height === lastHeight) return;
+      lastWidth = width; lastHeight = height;
+      notify('ui/notifications/size-changed', { width: width, height: height });
+    }).observe(document.documentElement);
+  }
+})();
+</script>
+</body>
+</html>`;
+  }
   const MIME_OVERRIDES = new Map([
     [".mmd", "text/plain"], [".d2", "text/plain"],
     [".sqlite", "application/vnd.sqlite3"], [".db", "application/octet-stream"],
@@ -949,6 +1118,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     return Number.isFinite(seconds) ? Math.max(30, Math.min(seconds, 604800)) : 86400;
   };
   const downloadUrl = (token, filename) => `${publicBase()}/download/${token}/${encodeURIComponent(filename)}`;
+  const publishedHtmlUrl = id => `${publicBase()}/published-html/${encodeURIComponent(id)}`;
   async function cleanupDownloadRecord(token, record, removeFile = false) {
     if (downloadTokens.get(token) === record) downloadTokens.delete(token);
     if (removeFile && record?.delete_after) await Deno.remove(record.path).catch(() => {});
@@ -989,6 +1159,23 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     const disposition = mode === "inline" ? "inline" : "attachment";
     return `${disposition}; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
   };
+  function publishedHtmlResponse(req, u) {
+    const match = u.pathname.match(/^\/published-html\/(html_[A-Za-z0-9_-]{24,})$/);
+    if (!match || !["GET", "HEAD"].includes(req.method))
+      return text("Not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
+    const record = one("SELECT html FROM published_html WHERE id=?", match[1]);
+    if (!record) return text("Not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
+    const headers = {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store, max-age=0",
+      "x-content-type-options": "nosniff",
+      "cross-origin-resource-policy": "cross-origin",
+      "referrer-policy": "no-referrer",
+    };
+    return req.method === "HEAD"
+      ? new Response(null, { status: 200, headers })
+      : new Response(record.html, { status: 200, headers });
+  }
   async function downloadResponse(req, u) {
     const match = u.pathname.match(/^\/download\/([A-Za-z0-9_-]{40,})\/([^/]+)$/);
     if (!match || !["GET", "HEAD"].includes(req.method))
@@ -2224,6 +2411,15 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
           ...contextInput,
         }, required: ["path"] },
       ],
+      publish_html: [
+        "Render arbitrary interactive HTML through MrMCP's attached MCP App widget. The HTML is persisted in SQLite and remains available after MrMCP restarts; the widget loads its persistent HTTPS URL inside a nested sandboxed iframe that allows scripts, forms, modals and popup links but deliberately omits allow-same-origin, so the document cannot access the MCP App or host DOM and origin-dependent storage/cookie APIs may be unavailable. Prefer self-contained HTML/CSS/JavaScript for portable results. Remote images, fonts, scripts, modules, fetch/WebSocket calls and other network dependencies may work when the current host/browser permits them, but are host/CSP dependent and normal browser CORS still applies, so do not assume they are portable. The whole MCP request, including HTML and JSON, is limited by MrMCP's 2 MiB request-body limit.",
+        { properties: {
+          html: { type: "string", minLength: 1 },
+          title: { type: "string", default: "Interactive HTML", maxLength: 200 },
+          height: { type: "integer", minimum: 120, maximum: 2000, default: 600 },
+          ...contextInput,
+        }, required: ["html"] },
+      ],
       list_commands: [
         "Discover installed extra commands by name or purpose. Every returned logical_name is directly callable as exec.program without PATH probes.",
         { properties: {
@@ -2336,6 +2532,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       trash_paths: outputSchema({ action_id: { type: "string" }, trash_path: { type: "string" }, manifest_path: { type: "string" }, paths: stringArray }),
       untrash_action: outputSchema({ action_id: { type: "string" }, paths: stringArray }),
       publish_file: outputSchema({ path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" }, size: { type: "integer" }, uri: { type: "string", description: "Temporary HTTPS URL consumed by the attached MCP App widget." }, expires_at: { type: "string" }, one_time: { type: "boolean" } }),
+      publish_html: outputSchema({ id: { type: "string" }, title: { type: "string" }, uri: { type: "string", description: "Persistent HTTPS URL loaded by the attached MCP App widget." }, height: { type: "integer" }, created_at: { type: "string" } }),
       list_commands: outputSchema({ query: { type: "string" }, page: { type: "integer" }, page_size: { type: "integer" }, total: { type: "integer" }, pages: { type: "integer" }, has_more: { type: "boolean" }, bin_directory: { type: "string" }, config_file: { type: "string" }, path_precedence: { type: "string" }, invocation: { type: "object", additionalProperties: true }, commands: objectArray }),
       recent_tool_calls: outputSchema({ calls: objectArray }),
       exec: outputSchema(processProperties),
@@ -2355,7 +2552,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       create_context: "Create context", context_info: "Context info", read_file: "Read", read_files: "Read batch",
       write_file: "Write", write_files: "Write batch", edit: "Edit", replace: "Replace",
       glob: "Glob", grep: "Grep", trash_paths: "Trash paths", untrash_action: "Restore trash action",
-      publish_file: "Publish File", list_commands: "Command Catalog", recent_tool_calls: "Recent Tool Calls",
+      publish_file: "Publish File", publish_html: "Publish HTML", list_commands: "Command Catalog", recent_tool_calls: "Recent Tool Calls",
       exec: "Run Command", exec_start: "Start Command", exec_poll: "Process Output", exec_write: "Write Stdin",
       exec_kill: "Terminate Process", exec_list: "List Processes", js: "JavaScript Kernel",
       js_add_node_module_dir: "Add Module Directory", js_reset: "Reset JavaScript Kernel",
@@ -2364,7 +2561,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       readOnlyHint: READ_TOOLS.has(name) || name === "publish_file",
       destructiveHint: ["write_file", "write_files", "edit", "replace", "move_path", "exec", "exec_start", "exec_write", "exec_kill", "js", "js_add_node_module_dir", "js_reset"].includes(name),
       idempotentHint: (READ_TOOLS.has(name) && name !== "publish_file") || ["write_file", "write_files", "edit", "create_directory", "js_reset"].includes(name),
-      openWorldHint: name.startsWith("exec") || name === "js" || name === "publish_file",
+      openWorldHint: name.startsWith("exec") || name === "js" || name === "publish_file" || name === "publish_html",
     });
     const schema = value => ({
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -2386,6 +2583,9 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
         ...(name === "publish_file" ? { _meta: {
           ui: { resourceUri: FILE_PREVIEW_UI_URI }, "openai/outputTemplate": FILE_PREVIEW_UI_URI,
           "openai/toolInvocation/invoking": "Preparing file preview…", "openai/toolInvocation/invoked": "File preview ready.",
+        } } : name === "publish_html" ? { _meta: {
+          ui: { resourceUri: HTML_PREVIEW_UI_URI }, "openai/outputTemplate": HTML_PREVIEW_UI_URI,
+          "openai/toolInvocation/invoking": "Rendering HTML…", "openai/toolInvocation/invoked": "HTML ready.",
         } } : {}),
       };
     });
@@ -2424,6 +2624,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       const expectedOutputs = {
         context_info: ["cwd", "agent_guidance_path"],
         recent_tool_calls: ["calls"],
+        publish_html: ["id", "title", "uri", "height", "created_at"],
         glob: ["files", "truncated"],
         grep: ["scanned_files", "matched_files", "results", "truncated"],
         replace: ["scanned_files", "total_replacements", "files"],
@@ -2442,6 +2643,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       glob: ["exclude", "include_hidden", "include_dependencies", "limit"],
       grep: ["exclude", "regex", "case_sensitive", "include_hidden", "include_dependencies", "max_file_bytes", "encoding", "context_before", "context_after", "output_mode", "max_results"],
       replace: ["exclude", "regex", "case_sensitive", "include_hidden", "include_dependencies", "max_file_bytes", "expected_replacements", "dry_run", "max_files"],
+      publish_html: ["html", "title", "height"],
     };
     for (const key of expectedInputs[tool.name] || [])
       if (!tool.inputSchema.properties?.[key]) errors.push(`inputSchema missing property ${key}`);
@@ -2453,16 +2655,28 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       name: tool.name,
       errors: validateToolDescriptor(tool),
     })).filter(x => x.errors.length);
-    const resource = filePreviewResource();
+    const fileResource = filePreviewResource(), htmlResource = htmlPreviewResource();
     const publishTool = tools.find(tool => tool.name === "publish_file");
+    const publishHtmlTool = tools.find(tool => tool.name === "publish_html");
     const uiErrors = [];
-    if (resource.uri !== FILE_PREVIEW_UI_URI) uiErrors.push("unexpected UI resource URI");
-    if (resource.mimeType !== MCP_UI_MIME_TYPE) uiErrors.push("unexpected UI resource MIME type");
-    if (!filePreviewAppHtml().includes("ui/notifications/tool-result")) uiErrors.push("UI bridge listener missing");
-    if (filePreviewAppHtml().includes("base64") || filePreviewAppHtml().includes("data:")) uiErrors.push("UI must not embed Base64/data URLs");
-    if (!filePreviewAppHtml().includes("structured.uri")) uiErrors.push("UI structuredContent URL handling missing");
+    if (fileResource.uri !== FILE_PREVIEW_UI_URI || htmlResource.uri !== HTML_PREVIEW_UI_URI)
+      uiErrors.push("unexpected UI resource URI");
+    if (fileResource.mimeType !== MCP_UI_MIME_TYPE || htmlResource.mimeType !== MCP_UI_MIME_TYPE)
+      uiErrors.push("unexpected UI resource MIME type");
+    if (!filePreviewAppHtml().includes("ui/notifications/tool-result") || !htmlPreviewAppHtml().includes("ui/notifications/tool-result"))
+      uiErrors.push("UI bridge listener missing");
+    if (filePreviewAppHtml().includes("base64") || filePreviewAppHtml().includes("data:"))
+      uiErrors.push("file UI must not embed Base64/data URLs");
+    if (!filePreviewAppHtml().includes("structured.uri") || !htmlPreviewAppHtml().includes("structured.uri"))
+      uiErrors.push("UI structuredContent URL handling missing");
+    if (!htmlPreviewAppHtml().includes("sandbox=\"allow-scripts") || htmlPreviewAppHtml().includes("allow-same-origin"))
+      uiErrors.push("publish_html nested iframe sandbox is invalid");
+    if (!htmlPreviewUiMeta().ui?.csp?.frameDomains?.includes(publicOrigin()))
+      uiErrors.push("publish_html frameDomains metadata missing public origin");
     if (publishTool?._meta?.ui?.resourceUri !== FILE_PREVIEW_UI_URI) uiErrors.push("publish_file UI metadata missing");
-    if (publishTool?._meta?.["openai/outputTemplate"] !== FILE_PREVIEW_UI_URI) uiErrors.push("ChatGPT output-template alias missing");
+    if (publishTool?._meta?.["openai/outputTemplate"] !== FILE_PREVIEW_UI_URI) uiErrors.push("publish_file output-template alias missing");
+    if (publishHtmlTool?._meta?.ui?.resourceUri !== HTML_PREVIEW_UI_URI) uiErrors.push("publish_html UI metadata missing");
+    if (publishHtmlTool?._meta?.["openai/outputTemplate"] !== HTML_PREVIEW_UI_URI) uiErrors.push("publish_html output-template alias missing");
     return {
       ok: tools.length > 0 && invalid.length === 0 && uiErrors.length === 0,
       endpoint: "/mcp",
@@ -2490,12 +2704,12 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
         ttlMs: 300000,
         cacheScope: "private",
       },
-      resources_list_result: { resources: [resource] },
+      resources_list_result: { resources: [fileResource, htmlResource] },
       resources_read_result: {
-        contents: [{
-          uri: FILE_PREVIEW_UI_URI, mimeType: MCP_UI_MIME_TYPE,
-          text: filePreviewAppHtml(), _meta: filePreviewUiMeta(),
-        }],
+        contents: [
+          { uri: FILE_PREVIEW_UI_URI, mimeType: MCP_UI_MIME_TYPE, text: filePreviewAppHtml(), _meta: filePreviewUiMeta() },
+          { uri: HTML_PREVIEW_UI_URI, mimeType: MCP_UI_MIME_TYPE, text: htmlPreviewAppHtml(), _meta: htmlPreviewUiMeta() },
+        ],
       },
     };
   }
@@ -3229,6 +3443,16 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       });
       return { path: target.display, ...result };
     }
+    if (name === "publish_html") {
+      const html = String(args.html ?? "");
+      if (!html.trim()) throw new Error("html must not be empty");
+      const title = String(args.title || "Interactive HTML").trim().slice(0, 200) || "Interactive HTML";
+      const height = Math.max(120, Math.min(Number(args.height || 600), 2000));
+      const id = `html_${randomToken(24)}`, createdAt = Date.now();
+      run(`INSERT INTO published_html(id,server_id,context_handle,title,html,height,created_at)
+        VALUES(?,?,?,?,?,?,?)`, id, p.id, args.context_handle, title, html, height, createdAt);
+      return { id, title, uri: publishedHtmlUrl(id), height, created_at: new Date(createdAt).toISOString() };
+    }
     if (name === "list_commands") return await commandCatalog({ ...args, admin: false, include_missing: false });
     if (name === "recent_tool_calls") {
       const limit = Math.max(1, Math.min(Number(args.limit || 10), 50));
@@ -3307,18 +3531,20 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     return processView(record, args);
   }
 
-  function redactTemporaryDownloadUrls(value) {
+  function redactPublishedCapabilityUrls(value) {
     if (typeof value === "string")
-      return value.replace(/\/download\/[A-Za-z0-9_-]{40,}\//g, "/download/[REDACTED]/");
-    if (Array.isArray(value)) return value.map(redactTemporaryDownloadUrls);
+      return value
+        .replace(/\/download\/[A-Za-z0-9_-]{40,}\//g, "/download/[REDACTED]/")
+        .replace(/\/published-html\/html_[A-Za-z0-9_-]{24,}/g, "/published-html/[REDACTED]");
+    if (Array.isArray(value)) return value.map(redactPublishedCapabilityUrls);
     if (value && typeof value === "object") return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [key, redactTemporaryDownloadUrls(item)]),
+      Object.entries(value).map(([key, item]) => [key, redactPublishedCapabilityUrls(item)]),
     );
     return value;
   }
   function toolResultForLog(value) {
     if (Array.isArray(value)) return value.map(toolResultForLog);
-    if (!value || typeof value !== "object") return redactTemporaryDownloadUrls(value);
+    if (!value || typeof value !== "object") return redactPublishedCapabilityUrls(value);
     const type = String(value.type || "");
     return Object.fromEntries(Object.entries(value).map(([key, item]) => {
       if (typeof item === "string" && ((type === "image" && key === "data") || key === "blob"))
@@ -3367,7 +3593,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       updateLog(id, { status: "running" });
       const result = await executeTool(p, name, args, executionState);
       const publicResult = result && typeof result === "object" ? result : { value: result };
-      const publicLogResult = redactTemporaryDownloadUrls(publicResult);
+      const publicLogResult = redactPublishedCapabilityUrls(publicResult);
       const stdout = typeof publicLogResult.output === "string" ? publicLogResult.output
         : typeof publicLogResult.stdout === "string" ? publicLogResult.stdout
         : JSON.stringify(publicLogResult, null, 2);
@@ -3492,6 +3718,8 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     if (u.pathname.startsWith("/download/")) {
       const parts = u.pathname.split("/");
       u.pathname = `/download/[REDACTED]/${parts.at(-1) || "file"}`;
+    } else if (u.pathname.startsWith("/published-html/")) {
+      u.pathname = "/published-html/[REDACTED]";
     }
     for (const key of [...u.searchParams.keys()]) if (sensitiveKey(key)) u.searchParams.set(key, "[REDACTED]");
     return u.pathname + u.search;
@@ -3516,7 +3744,9 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     const remoteHost = info?.remoteAddr?.hostname || "";
     if (!allowRequest(remoteHost)) return json({ error: "Too many requests" }, 429, { "retry-after": "60" });
     const debugEnabled = getCfg("debug_http_log", "0") === "1";
-    const downloadRequest = new URL(req.url).pathname.startsWith("/download/");
+    const requestPath = new URL(req.url).pathname;
+    const downloadRequest = requestPath.startsWith("/download/");
+    const publishedHtmlRequest = requestPath.startsWith("/published-html/");
     const started = Date.now(), requestCopy = debugEnabled ? req.clone() : null;
     let response, error = "";
     try { response = await mcpHandler(req, info, transport); }
@@ -3528,7 +3758,8 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       let requestBody = "", responseBody = "";
       try {
         requestBody = await debugBody(requestCopy);
-        responseBody = downloadRequest ? "[binary download body omitted]" : await debugBody(response.clone());
+        responseBody = downloadRequest ? "[binary download body omitted]"
+          : publishedHtmlRequest ? "[published HTML body omitted]" : await debugBody(response.clone());
       } catch (e) { error += (error ? "\n" : "") + "Debug capture error: " + String(e?.stack || e); }
       const remote = info?.remoteAddr
         ? `${info.remoteAddr.hostname || ""}${info.remoteAddr.port != null ? ":" + info.remoteAddr.port : ""}` : "";
@@ -3609,6 +3840,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
   async function mcpHandler(req, info, transport = "http") {
     const u = new URL(req.url);
     if (u.pathname.startsWith("/download/")) return await downloadResponse(req, u);
+    if (u.pathname.startsWith("/published-html/")) return publishedHtmlResponse(req, u);
     if (u.pathname === "/.well-known/oauth-authorization-server" ||
         u.pathname === "/.well-known/openid-configuration") {
       return json({
@@ -3868,6 +4100,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
         "Use read_file/read_files, glob, grep, edit and replace directly for file inspection, discovery, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. " +
         "Use list_commands before other command-line work and invoke returned logical_name values directly through exec.program without PATH probes. " +
         "Command execution tools return one combined output stream by default; exec, exec_start, exec_poll and custom commands accept separate_streams when individual stdout/stderr are needed. Use recent_tool_calls to confirm which calls actually reached this MrMCP Session; requests blocked upstream before dispatch are absent. " +
+        "Use publish_file to present existing files through its MCP App widget, and publish_html when an interactive self-contained HTML/CSS/JavaScript visualization is more appropriate. " +
         "Every authenticated client can invoke every published tool; context_handle is the bearer capability selecting persistent context state."
       : "The MrMCP endpoint is reachable, but anonymous access exposes no tools. Authenticate with OAuth or Basic authentication.";
 
@@ -3895,7 +4128,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
           cacheScope: "private", _meta: serverInfoMeta,
         };
       } else if (x.method === "resources/list") {
-        const resources = fullAccess ? [filePreviewResource()] : [];
+        const resources = fullAccess ? [filePreviewResource(), htmlPreviewResource()] : [];
         r.result = {
           resultType: "complete", resources, ttlMs: 300000,
           cacheScope: "private", _meta: serverInfoMeta,
@@ -3904,21 +4137,22 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
         if (!fullAccess) {
           r.error = { code: -32001, message: "Authentication required for resource access" };
           responseStatus = 403;
-        } else if (String(x.params?.uri || "") !== FILE_PREVIEW_UI_URI) {
-          r.error = { code: -32002, message: `Resource not found: ${String(x.params?.uri || "")}` };
-          responseStatus = 200;
         } else {
-          const resourceResult = {
-            contents: [{
-              uri: FILE_PREVIEW_UI_URI,
-              mimeType: MCP_UI_MIME_TYPE,
-              text: filePreviewAppHtml(),
-              _meta: filePreviewUiMeta(),
-            }],
-          };
-          r.result = modernRequest
-            ? { resultType: "complete", ...resourceResult, _meta: serverInfoMeta }
-            : resourceResult;
+          const resourceUri = String(x.params?.uri || "");
+          const resource = resourceUri === FILE_PREVIEW_UI_URI
+            ? { uri: FILE_PREVIEW_UI_URI, text: filePreviewAppHtml(), _meta: filePreviewUiMeta() }
+            : resourceUri === HTML_PREVIEW_UI_URI
+            ? { uri: HTML_PREVIEW_UI_URI, text: htmlPreviewAppHtml(), _meta: htmlPreviewUiMeta() }
+            : null;
+          if (!resource) {
+            r.error = { code: -32002, message: `Resource not found: ${resourceUri}` };
+            responseStatus = 200;
+          } else {
+            const resourceResult = { contents: [{ ...resource, mimeType: MCP_UI_MIME_TYPE }] };
+            r.result = modernRequest
+              ? { resultType: "complete", ...resourceResult, _meta: serverInfoMeta }
+              : resourceResult;
+          }
         }
       } else if (x.method === "tools/call") {
         if (!fullAccess) {
