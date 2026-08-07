@@ -1,4 +1,4 @@
-# MrMCP 0.10.47
+# MrMCP 0.10.48
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -73,7 +73,7 @@ The handle itself selects the context after authentication. MrMCP does not bind 
 
 ### Why the GUI says “Sessions”
 
-The administration interface labels contexts **Sessions** because that is convenient for operators. This is only a GUI term. MrMCP does not implement protocol sessions and does not use `Mcp-Session-Id`.
+The administration interface labels contexts **Sessions** because that is convenient for operators. Each row is identified in the GUI by a short numeric primary key; the long `ctx_...` bearer capability remains internal to MCP calls. This is only a GUI term. MrMCP does not implement protocol sessions and does not use `Mcp-Session-Id`.
 
 ## Authentication and tool access
 
@@ -96,7 +96,7 @@ Development builds use one exact current SQLite schema and no compatibility laye
 - There are no migrations, `ALTER TABLE` upgrades, backfills, aliases, old-key imports or legacy identifier acceptance.
 - After an incompatible development change, stop MrMCP and delete `.mrmcp/mrmcp.sqlite`.
 
-The current schema uses `server_config`, `roots`, `contexts`, `logs.context_handle` and `process_runs.context_handle`. A context stores exactly one current `root_id`; root id `0` denotes the directory containing `mrmcp.js`.
+The current schema gives every context a numeric administrative primary key in `contexts.id` while retaining a unique opaque `context_handle` for MCP calls. Tool-call and process rows store both the numeric `context_id` snapshot used by the GUI and the opaque handle used by the protocol. A context stores exactly one current `root_id`; root id `0` denotes the directory containing `mrmcp.js`.
 
 ## Roots and filesystem isolation
 
@@ -199,7 +199,7 @@ The backend keeps one ephemeral `uiState` object containing:
 - the current section and per-section scroll positions;
 - focus and selection information needed after a morph;
 - command search, page, page size and availability filter;
-- Tool-call filters, numbered page and expanded database primary key;
+- Tool-call query, Session-PK/status filters, numbered page and expanded database primary key;
 - HTTP-debug filters and expanded database primary key;
 - active dialog, confirmation or message;
 - in-progress Root, Command and Settings drafts;
@@ -225,8 +225,8 @@ Native confirmation and alert state is not kept in the browser. Confirmations, e
 
 The Tool calls page supports:
 
-- filter by GUI session and status;
-- full-text query;
+- filter by numeric GUI Session PK and status;
+- automatically apply the full-text query and every filter change without a Search button;
 - numbered pagination above the table;
 - complete timestamps with compact relative ages;
 - compact rows without inline input/output JSON;
@@ -244,6 +244,15 @@ MrMCP uses fixed public listeners:
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
 ## Development changelog
+
+### 0.10.48
+
+- Added a numeric primary key to every GUI Session while preserving the opaque `ctx_...` capability for MCP protocol calls.
+- Stored the Session PK on Tool-call and process rows so logs keep a stable short identifier even after a Session is deleted.
+- Changed the Sessions table, Tool-call Session column and Session filter to show the numeric PK instead of the long handle or generic `context` label.
+- Renamed the root-id-0 selector option to **Default root**.
+- Removed the Tool-call Search button; text, Session, status and page-size filter changes now refresh automatically through the existing Deno-owned render pipeline.
+- Advanced the clean SQLite schema to version 3.
 
 ### 0.10.47
 

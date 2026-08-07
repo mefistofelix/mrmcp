@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.47 consists of exactly five root files:
+MrMCP 0.10.48 consists of exactly five root files:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `morphlex.js` — DOM morphing engine. Eta performs server-side templating; Morphlex does not template.
@@ -34,6 +34,7 @@ The repository is in development. There is no backward compatibility.
 6. Never accept legacy `opaque_` values, `server_opaque` arguments or transport-derived session identifiers.
 7. Tell developers to delete `.mrmcp/mrmcp.sqlite` after incompatible schema changes.
 8. A clean schema must create no named `default` root.
+9. `contexts.id` is the numeric administrative primary key; `contexts.handle` remains the unique opaque bearer capability. Tool-call and process rows retain both `context_id` and `context_handle` snapshots.
 
 ## MCP 2026-07-28 and explicit context capabilities
 
@@ -148,7 +149,7 @@ Deno owns one ephemeral `uiState` object containing at least:
 - `currentSection` and per-section scroll positions;
 - focus/selection metadata;
 - command filters and pagination;
-- Tool-call filters, pagination, self-test output and expanded log primary key;
+- Tool-call query, Session-PK/status filters, pagination, self-test output and expanded log primary key;
 - HTTP-debug filters and expanded row primary key;
 - Root, Command and Settings drafts;
 - active confirmation/message/form dialog;
@@ -204,7 +205,8 @@ Root, Command, Settings, confirmation and message state belongs to Deno. Input e
 
 ## Tool-call UI
 
-- Filter by operator Session and status.
+- Display and filter by the numeric operator Session primary key, never the long `context_handle` or generic context label.
+- Apply text, Session, status and page-size filter changes automatically through Deno-owned state; do not add a Tool-call Search button or a second refresh path.
 - Use numbered pagination above the table.
 - Keep input/output JSON out of compact rows.
 - Render details only for the selected primary key.
@@ -270,7 +272,7 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 12. Confirm only MCP `2026-07-28` is advertised and no transport-session headers are used.
 13. Confirm missing/valid/invalid/expired context-handle paths do or do not execute exactly as documented.
 14. Confirm no approval, `allow_re`, `deny_re` or tool-enable policy remains.
-15. Confirm no UI polling interval, auto-refresh control or manual refresh path exists.
+15. Confirm no UI polling interval, auto-refresh control or manual refresh path exists; Tool-call filters must update through the single Deno render queue.
 16. Confirm backend log, context, root, process, debug, OAuth, settings and TLS mutations enter the same Deno render queue.
 17. Confirm every visible open/close/select/navigation transition is represented in Deno `uiState` and is produced by Eta, not by an imperative browser DOM mutation.
 18. Confirm expanded-row state uses database primary keys and remains correct when pagination or new rows change table order.
@@ -280,5 +282,6 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 22. Confirm every built-in tool exposes a strict tool-specific output schema layered on the common context envelope.
 23. Confirm `glob`, `grep` and `replace` implement every documented traversal, exclusion, encoding, size-limit and expected-count argument without shell, `uv` or Python helpers.
 24. Confirm no Tauri, Rust, Neutralinojs, npm project or CLI files exist.
-25. Confirm the archive contains exactly the five root project files.
-26. Run the desktop WebView on a machine with Deno and platform dependencies.
+25. Confirm Session rows, Tool-call rows and the Tool-call Session filter use `contexts.id` / `logs.context_id`, while MCP requests still use the opaque handle.
+26. Confirm the archive contains exactly the five root project files.
+27. Run the desktop WebView on a machine with Deno and platform dependencies.

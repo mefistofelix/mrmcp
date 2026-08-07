@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.47 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
+MrMCP 0.10.48 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -39,8 +39,8 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.47";
-const DB_SCHEMA_VERSION = 2;
+const VERSION = "0.10.48";
+const DB_SCHEMA_VERSION = 3;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CONTEXT_HANDLE_INPUT_DESCRIPTION = "Required opaque capability returned by create_context. Pass the exact value unchanged; never invent, modify, shorten, derive or substitute it.";
@@ -281,7 +281,7 @@ async function backend() {
     logs: { page: 1, query: "", context: "", status: "", pageSize: 25, openRowId: "", selfTest: null },
     debug: { query: "", method: "", status: "", openRowId: "" },
   };
-  let uiRenderTimer = null, uiRenderRunning = false, uiRenderQueued = false;
+  let uiRenderTimer = null, uiLogFilterTimer = null, uiRenderRunning = false, uiRenderQueued = false;
   let uiInputChain = Promise.resolve(), uiInputDepth = 0;
   const normalizedUiScopes = scopes => [...new Set((Array.isArray(scopes) ? scopes : [scopes])
     .map(String).map(value => value.trim()).filter(Boolean))];
@@ -432,6 +432,7 @@ async function backend() {
       error TEXT NOT NULL DEFAULT '',
       result_json TEXT NOT NULL DEFAULT '',
       duration_ms INTEGER,
+      context_id INTEGER NOT NULL DEFAULT 0,
       context_handle TEXT NOT NULL DEFAULT '',
       root_id INTEGER NOT NULL DEFAULT 0,
       root_name TEXT NOT NULL DEFAULT '',
@@ -441,6 +442,7 @@ async function backend() {
     CREATE INDEX IF NOT EXISTS logs_server ON logs(server_name,started_at DESC);
     CREATE INDEX IF NOT EXISTS logs_tool ON logs(tool,started_at DESC);
     CREATE INDEX IF NOT EXISTS logs_context ON logs(context_handle,started_at DESC);
+    CREATE INDEX IF NOT EXISTS logs_context_id ON logs(context_id,started_at DESC);
     CREATE TABLE IF NOT EXISTS debug_logs(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts INTEGER NOT NULL,
@@ -504,7 +506,8 @@ async function backend() {
       FOREIGN KEY(server_id) REFERENCES server_config(id) ON DELETE CASCADE
     );
     CREATE TABLE IF NOT EXISTS contexts(
-      handle TEXT PRIMARY KEY,
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      handle TEXT NOT NULL UNIQUE,
       server_id INTEGER NOT NULL,
       root_id INTEGER NOT NULL DEFAULT 0,
       label TEXT NOT NULL DEFAULT '',
@@ -522,6 +525,7 @@ async function backend() {
       pid INTEGER,
       server_id INTEGER NOT NULL,
       server_name TEXT NOT NULL,
+      context_id INTEGER NOT NULL DEFAULT 0,
       context_handle TEXT NOT NULL DEFAULT '',
       root_id INTEGER NOT NULL DEFAULT 0,
       root_name TEXT NOT NULL DEFAULT '',
@@ -560,9 +564,9 @@ async function backend() {
   const requiredSchema = {
     server_config: ["oauth", "basic_enabled", "basic_username", "basic_secret_enc"],
     roots: ["server_id", "name", "path", "enabled"],
-    contexts: ["handle", "server_id", "root_id", "created_at", "updated_at", "last_active_at", "protocol_version"],
-    process_runs: ["context_handle", "root_id", "root_name", "root_path", "stdout_tail", "stderr_tail"],
-    logs: ["id", "server_name", "tool", "status", "input_json", "context_handle", "root_id", "root_name", "root_path"],
+    contexts: ["id", "handle", "server_id", "root_id", "created_at", "updated_at", "last_active_at", "protocol_version"],
+    process_runs: ["context_id", "context_handle", "root_id", "root_name", "root_path", "stdout_tail", "stderr_tail"],
+    logs: ["id", "server_name", "tool", "status", "input_json", "context_id", "context_handle", "root_id", "root_name", "root_path"],
     oauth_refresh_tokens: ["token_hash", "client_id", "server_id", "resource", "scope", "last_used_at"],
   };
   const schemaErrors = [];
@@ -1665,13 +1669,19 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       String(handle), p.id,
     ) : null;
   }
+  function contextById(p, id) {
+    return Number(id) ? one(
+      "SELECT * FROM contexts WHERE id=? AND server_id=?",
+      Number(id), p.id,
+    ) : null;
+  }
   function createContext(p, protocolVersion = "") {
     let handle;
     do handle = `ctx_${randomToken(24)}`;
     while (one("SELECT 1 FROM contexts WHERE handle=?", handle));
     const now = Date.now();
     run(`INSERT INTO contexts(handle,server_id,root_id,label,created_at,updated_at,last_active_at,protocol_version)
-      VALUES(?,?,?,?,?,?,?,?)`, handle, p.id, 0, "context", now, now, now, String(protocolVersion || ""));
+      VALUES(?,?,?,?,?,?,?,?)`, handle, p.id, 0, "", now, now, now, String(protocolVersion || ""));
     return one("SELECT * FROM contexts WHERE handle=?", handle);
   }
   const contextExpired = context => !!context &&
@@ -1705,9 +1715,10 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
   function contextSnapshot(p, context) {
     const roots = serverRoots(p), root = selectedContextRoot(p, context);
     return {
-      id: context.handle,
+      id: context.id,
+      pk: context.id,
       context_handle: context.handle,
-      label: context.label || context.handle,
+      label: context.label || `#${context.id}`,
       expired: contextExpired(context),
       protocol_version: context.protocol_version || "unknown",
       root_id: root.id,
@@ -2458,9 +2469,10 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
   }
 
   function beginLog(p, tool, args, contextHandle = "", root = null) {
+    const contextId = Number(contextByHandle(p, contextHandle)?.id || 0);
     const inserted = run(`INSERT INTO logs(started_at,server_id,server_name,tool,status,input_json,
-      context_handle,root_id,root_name,root_path) VALUES(?,?,?,?,'received',?,?,?,?,?)`,
-      Date.now(), p.id, "mcp", tool, JSON.stringify(args), String(contextHandle || ""),
+      context_id,context_handle,root_id,root_name,root_path) VALUES(?,?,?,?,'received',?,?,?,?,?,?)`,
+      Date.now(), p.id, "mcp", tool, JSON.stringify(args), contextId, String(contextHandle || ""),
       Number(root?.id || 0), String(root?.name || ""), String(root?.path || ""));
     return Number(inserted.lastInsertRowid);
   }
@@ -2612,7 +2624,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     }).spawn();
     const rec = {
       id: `proc_${randomToken(18)}`, pid: child.pid, child, log_id: Number(execution.logId || 0),
-      server_id: p.id, server_name: "mcp", context_handle: target.context.handle,
+      server_id: p.id, server_name: "mcp", context_id: target.context.id, context_handle: target.context.handle,
       root_id: target.root.id, root_path: target.root.path, root_name: target.root.name,
       display: spec.display, command_json: JSON.stringify({
         program: spec.program, args: spec.argv, shell: spec.shell,
@@ -2625,9 +2637,9 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     };
     processes.set(rec.id, rec);
     execution.setCancel?.(signal => terminateProcess(rec, signal), { process_id: rec.id, kind: "process" });
-    run(`INSERT INTO process_runs(id,pid,server_id,server_name,context_handle,root_id,root_name,root_path,
-      command_json,cwd,status,started_at,timeout_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      rec.id, rec.pid, p.id, "mcp", rec.context_handle, rec.root_id, rec.root_name, rec.root_path,
+    run(`INSERT INTO process_runs(id,pid,server_id,server_name,context_id,context_handle,root_id,root_name,root_path,
+      command_json,cwd,status,started_at,timeout_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      rec.id, rec.pid, p.id, "mcp", rec.context_id, rec.context_handle, rec.root_id, rec.root_name, rec.root_path,
       rec.command_json, rec.cwd_display, rec.status, rec.started_at, timeout);
     const stdoutPump = pumpProcess(child.stdout, rec, "stdout"), stderrPump = pumpProcess(child.stderr, rec, "stderr");
     rec.done = child.status.then(async status => {
@@ -3858,17 +3870,19 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
 
   const rootsProjection = serverId => all("SELECT * FROM roots WHERE server_id=? ORDER BY id", serverId);
 
-  const contextProjection = (serverId, roots = rootsProjection(serverId)) => all(`SELECT c.handle,c.label,c.root_id,c.created_at,c.updated_at,c.last_active_at,c.protocol_version,
-      (SELECT COUNT(*) FROM logs l WHERE l.context_handle=c.handle) tool_calls
+  const contextProjection = (serverId, roots = rootsProjection(serverId)) => all(`SELECT c.id,c.handle,c.label,c.root_id,c.created_at,c.updated_at,c.last_active_at,c.protocol_version,
+      (SELECT COUNT(*) FROM logs l WHERE l.context_id=c.id) tool_calls
     FROM contexts c WHERE c.server_id=? AND c.handle LIKE 'ctx_%'
     ORDER BY c.last_active_at DESC,c.created_at DESC LIMIT 500`, serverId).map(context => {
       const selected = Number(context.root_id || 0);
       const root = selected ? roots.find(item => item.id === selected && item.enabled) : null;
       return {
         ...context,
-        id: context.handle,
+        id: context.id,
+        pk: context.id,
+        context_handle: context.handle,
         kind: "context_handle",
-        display_label: context.handle,
+        display_label: `#${context.id}`,
         expired: contextExpired(context),
         expires_at: Number(context.last_active_at || context.created_at || 0) + CONTEXT_TTL_MS,
         effective_root: root?.name || "mrmcp.js folder",
@@ -4001,7 +4015,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
 <? } else if(section==="sessions"){ ?><section id=sessions class=page><div class=row><h2 class=grow>💬 Sessions</h2><span class=muted>Live updates</span></div><p class=muted>Each session is a persistent MCP context with one current root. The same root may be shared by multiple sessions, and changing this selection affects new tool calls immediately.</p><div id=contextList></div></section>
 <? } else if(section==="roots"){ ?><section id=roots class=page><div class=row><h2 class=grow>📁 Roots</h2><button class=primary data-action=new-root>➕ Add root</button></div><p class=muted>Register a logical name and an existing directory path. Tool paths are relative to the root selected for the supplied <code>context_handle</code> value. Values without an explicit selection use the folder containing <code>mrmcp.js</code>.</p><div id=rootList></div></section>
 <? } else if(section==="commands"){ const c=s.commands||{}; ?><section id=commands class=page><div class=row><h2 class=grow>🧰 Extra commands</h2><button data-action=download-all-commands>⬇️ Download all</button><button class=primary data-action=new-command>➕ Register command</button></div><p class=muted>Metadata is stored in <code>commands.yaml</code> beside <code>mrmcp.js</code>. Executable files directly in <code>.mrmcp/bin</code> also appear automatically.</p><div class=row><input id=commandQuery class=grow placeholder="Search name, path or description…" value="<?= c.query||'' ?>"><label class=small><input id=commandIncludeMissing type=checkbox<?= c.includeMissing!==false?' checked':'' ?>> show unavailable</label><select id=commandPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(c.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-commands>🔎 Search</button></div><div id=commandList></div></section>
-<? } else if(section==="logs"){ const l=s.logs||{}; ?><section id=logs class=page><h2>📜 MCP tool calls</h2><p class=muted>Click a row to inspect input/output JSON. Active calls and linked managed processes can be terminated from the Actions column.</p><div class=row><input id=logQuery class=grow placeholder="Search input, output, stderr, errors…" value="<?= l.query||'' ?>"><select id=logContext><option value="">All sessions</option><? (s.contextValues||[]).forEach(v=>{ ?><option value="<?= v.id ?>"<?= l.context===v.id?" selected":"" ?>><?= v.display_label||v.id ?></option><? }) ?></select><select id=logStatus><option value="">All states</option><? ['completed','failed','running'].forEach(v=>{ ?><option<?= l.status===v?' selected':'' ?>><?= v ?></option><? }) ?></select><select id=logPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(l.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-logs>🔎 Search</button></div><? if(l.selfTest){ ?><div id=logSelfTest class=card><div class=row><h3 class=grow>🧪 MCP self-test</h3><button class=small data-action=copy-detail data-target=logDetail>📋 Copy JSON</button><button class=small data-action=close-self-test>✕ Close</button></div><pre id=logDetail><?= it.pretty(l.selfTest) ?></pre></div><? } ?><div id=logList></div></section>
+<? } else if(section==="logs"){ const l=s.logs||{}; ?><section id=logs class=page><h2>📜 MCP tool calls</h2><p class=muted>Click a row to inspect input/output JSON. Active calls and linked managed processes can be terminated from the Actions column.</p><div class=row><input id=logQuery class=grow placeholder="Search input, output, stderr, errors…" value="<?= l.query||'' ?>"><select id=logContext><option value="">All sessions</option><? (s.contextValues||[]).forEach(v=>{ ?><option value="<?= v.pk ?>"<?= String(l.context||"")===String(v.pk)?" selected":"" ?>>#<?= v.pk ?></option><? }) ?></select><select id=logStatus><option value="">All states</option><? ['completed','failed','running'].forEach(v=>{ ?><option<?= l.status===v?' selected':'' ?>><?= v ?></option><? }) ?></select><select id=logPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(l.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select></div><? if(l.selfTest){ ?><div id=logSelfTest class=card><div class=row><h3 class=grow>🧪 MCP self-test</h3><button class=small data-action=copy-detail data-target=logDetail>📋 Copy JSON</button><button class=small data-action=close-self-test>✕ Close</button></div><pre id=logDetail><?= it.pretty(l.selfTest) ?></pre></div><? } ?><div id=logList></div></section>
 <? } else if(section==="debug"){ const d=s.debug||{}; ?><section id=debug class=page><div class=row><h2 class=grow>🐞 HTTP debug log</h2><label class=small style="margin:0"><input id=debugHttpLog type=checkbox<?= s.debug?.enabled?" checked":"" ?>> enabled</label><button data-action=save-debug-settings>✅ Apply</button><button class=danger data-action=clear-debug>🗑️ Clear</button></div><p class=muted>Disabled by default. Authorization, cookies, tokens, codes and secrets are redacted when enabled. Click a row to open or close its JSON directly below it.</p><div class=row><input id=debugQuery class=grow placeholder="Search URL, headers, body or errors…" value="<?= d.query||'' ?>"><select id=debugMethod><option value="">All methods</option><? ['GET','POST','OPTIONS'].forEach(v=>{ ?><option<?= d.method===v?' selected':'' ?>><?= v ?></option><? }) ?></select><input id=debugStatus type=number placeholder="Status" value="<?= d.status||'' ?>"><button data-action=load-debug>🔎 Search</button></div><div id=debugList></div></section>
 <? } else if(section==="oauth"){ ?><section id=oauth class=page><h2>🔐 OAuth clients</h2><div id=oauthList></div></section>
 <? } else if(section==="settings"){ ?><section id=settings class=page><h2>⚙️ Settings</h2><div class=grid><div class=card><h3>🌐 Fixed listeners</h3><p><b>HTTP</b> <code>0.0.0.0:80</code> · ACME HTTP-01 only</p><p><b>HTTPS</b> <code>0.0.0.0:443</code> · MCP, OAuth and metadata</p><p><b>GUI</b> <code>http://127.0.0.1:${GUI_PORT}</code> · embedded WebView / browser</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><label>Public base URL override</label><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><label>Public IPv4 lookup URLs (one per line)</label><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><label>Automatic DNS suffix</label><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><label>ACME directory URL</label><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card><h3>🔒 Certificate</h3><label>Let's Encrypt email</label><input id=tlsEmail type=email value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / request certificate</button></div><p class=muted>A valid certificate already present in .mrmcp is reused. Requests occur only when renewal is due and backoff permits them.</p></div><div class=card><h3>🖥️ Process environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><p class=muted>When disabled, the child PATH contains only <code>.mrmcp/bin</code>. Other environment variables remain available.</p></div></div><p><button class=primary data-action=save-settings>💾 Save settings</button></p><pre id=settingsInfo></pre></section><? } ?>`,
@@ -4011,11 +4025,11 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     tls: `<? const t=it.data||{}, problem=!t.tls_active_trusted||!!t.tls_last_error||!!t.mcp_listen_error; ?><div class="card <?= problem ? "tls-alert" : "tls-good" ?>"><div class=row><h3 class=grow>🔒 TLS / Let's Encrypt</h3><b class="<?= t.tls_active_trusted ? "ok" : "failed" ?>"><?= t.tls_active_trusted ? "trusted" : (t.tls_active ? "fallback active" : "offline") ?></b></div><div class=grid><div><span class=muted>HTTPS listener</span><br><b><?= t.mcp_https_active ? "0.0.0.0:443 active" : "not listening" ?></b></div><div><span class=muted>Active certificate</span><br><b><?= t.tls_active_kind || "none" ?> · <?= t.tls_active_valid ? "valid" : "invalid" ?></b></div><div><span class=muted>Expires</span><br><b><?= it.dt(t.tls_active_expires) || "unknown" ?></b></div><div><span class=muted>Last ACME request</span><br><b><?= it.dt(t.tls_last_request_at) || "never recorded" ?></b></div><div><span class=muted>Last ACME result</span><br><b class="<?= t.tls_last_request_valid ? "ok" : (t.tls_last_request_status === "error" ? "failed" : "pending") ?>"><? if (t.tls_last_request_status) { ?><?= t.tls_last_request_status ?> · certificate <?= t.tls_last_request_valid ? "valid" : "not valid" ?><? } else { ?>not recorded<? } ?></b></div><div><span class=muted>Last valid certificate</span><br><b><?= it.dt(t.tls_last_issued_at) || "not recorded" ?></b></div><div><span class=muted>Renewal due</span><br><b><?= it.dt(t.tls_renewal_due_at) || "as soon as allowed" ?></b></div><div><span class=muted>Rate-limit reset</span><br><b><?= it.dt(t.tls_rate_limit_reset_at) || "none" ?></b></div><div><span class=muted>Next ACME attempt</span><br><b><?= it.dt(t.tls_next_attempt_at) || "not scheduled" ?></b></div></div><? if (t.tls_last_error || t.mcp_listen_error) { ?><pre class=tls-error><?= t.tls_last_error || t.mcp_listen_error ?></pre><? } ?><? if (!t.tls_active_trusted) { ?><p class=failed><b>Public clients such as ChatGPT will reject the self-signed fallback until Let's Encrypt succeeds.</b></p><? } ?></div>`,
     urls: `<? (it.data || []).forEach(x => { if (!x?.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?><? if (x.note) { ?> <span class=muted><?= x.note ?></span><? } ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?>`,
     roots: `<? const rows=it.data||[]; ?><? if(!rows.length){ ?><p class=muted>No roots registered.</p><? } else { ?><table><tr><th>Name</th><th>Path</th><th>State</th><th></th></tr><? rows.forEach(r => { ?><tr><td><code><?= r.name ?></code></td><td><code><?= r.path ?></code></td><td><?= r.enabled ? "✅ enabled" : "⏸️ disabled" ?></td><td class=nowrap><button data-action=edit-root data-id="<?= r.id ?>">✏️ Edit</button> <button class=danger data-action=delete-root data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></table><? } ?>`,
-    context: `<? const d=it.data||{},values=d.values||[]; ?><? if (!values.length) { ?><p class=muted>No sessions have been issued yet.</p><? } else { ?><table><tr><th>Session handle</th><th>State / protocol</th><th>Current root</th><th>Activity</th><th>Tool calls</th><th></th></tr><? values.forEach(v=>{ ?><tr><td><code class=context-id><?= v.id ?></code></td><td class=nowrap><b class="<?= v.expired ? 'failed' : 'ok' ?>"><?= v.expired ? "⌛ expired" : "🟢 active" ?></b><br><code><?= v.protocol_version||"unknown" ?></code></td><td><select data-action=context-root data-id="<?= v.id ?>"><option value="0"<?= v.fallback_root?" selected":"" ?>>Fallback: mrmcp.js folder</option><? (v.available_roots||[]).forEach(r=>{ ?><option value="<?= r.id ?>"<?= r.selected?" selected":"" ?>><?= r.name ?></option><? }) ?></select><div class=muted><?= v.effective_root_path ?></div></td><td class=context-dates><div><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></div><div><span class=muted>Updated</span> <?= it.logdt(v.updated_at) ?></div><div><span class=muted>Active</span> <?= it.logdt(v.last_active_at) ?></div><div><span class=muted>Expires</span> <?= it.logdt(v.expires_at) ?></div></td><td><?= v.tool_calls||0 ?></td><td><button class=danger data-action=delete-context data-id="<?= v.id ?>">🗑️ Delete</button></td></tr><? }) ?></table><? } ?>`,
+    context: `<? const d=it.data||{},values=d.values||[]; ?><? if (!values.length) { ?><p class=muted>No sessions have been issued yet.</p><? } else { ?><table><tr><th>PK</th><th>State / protocol</th><th>Current root</th><th>Activity</th><th>Tool calls</th><th></th></tr><? values.forEach(v=>{ ?><tr><td class=idcell>#<?= v.pk ?></td><td class=nowrap><b class="<?= v.expired ? 'failed' : 'ok' ?>"><?= v.expired ? "⌛ expired" : "🟢 active" ?></b><br><code><?= v.protocol_version||"unknown" ?></code></td><td><select data-action=context-root data-id="<?= v.pk ?>"><option value="0"<?= v.fallback_root?" selected":"" ?>>Default root</option><? (v.available_roots||[]).forEach(r=>{ ?><option value="<?= r.id ?>"<?= r.selected?" selected":"" ?>><?= r.name ?></option><? }) ?></select><div class=muted><?= v.effective_root_path ?></div></td><td class=context-dates><div><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></div><div><span class=muted>Updated</span> <?= it.logdt(v.updated_at) ?></div><div><span class=muted>Active</span> <?= it.logdt(v.last_active_at) ?></div><div><span class=muted>Expires</span> <?= it.logdt(v.expires_at) ?></div></td><td><?= v.tool_calls||0 ?></td><td><button class=danger data-action=delete-context data-id="<?= v.pk ?>">🗑️ Delete</button></td></tr><? }) ?></table><? } ?>`,
     commands: `<? const d=it.data || {}, rows=d.commands || []; ?><div class=muted><?= d.total || 0 ?> command<?= d.total === 1 ? "" : "s" ?> · page <?= d.page || 1 ?>/<?= d.pages || 1 ?> · config <code><?= d.config_file || "" ?></code></div><table><tr><th>Name</th><th>Relative path</th><th>Description</th><th>Links</th><th>Source</th><th>State</th><th></th></tr><? rows.forEach(c => { ?><tr><td><code><?= c.name ?></code></td><td><code><?= c.path ?></code></td><td><?= c.description || "—" ?></td><td><? if (c.documentation_url) { ?><a href="<?= c.documentation_url ?>" target=_blank rel=noopener>📖 Docs</a><? } else { ?>—<? } ?></td><td><?= c.source ?></td><td class="<?= c.present && c.executable ? "ok" : "failed" ?>"><?= c.present ? (c.executable ? "✅ available" : "⚠️ not executable") : "❌ missing" ?></td><td class=nowrap><button data-action=edit-command data-name="<?= c.name ?>" data-path="<?= c.path ?>">✏️ Edit</button><? if (c.registered && c.download_url) { ?> <button data-action=download-command data-name="<?= c.name ?>">⬇️ Download</button><? } ?><? if (c.registered) { ?> <button class=danger data-action=delete-command data-name="<?= c.name ?>">🗑️ Delete</button><? } ?></td></tr><? }) ?></table><div class=row><button data-action=commands-prev<?= d.page <= 1 ? " disabled" : "" ?>>Previous</button><button data-action=commands-next<?= d.has_more ? "" : " disabled" ?>>Next</button></div>`,
     oauth: `<table><tr><th>Client</th><th>ID</th><th>Access</th><th>Refresh</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td><?= c.name ?></td><td><code><?= c.client_id ?></code></td><td><?= c.token_count ?></td><td><?= c.refresh_token_count ?></td><td><button class=danger data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> available tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,
-    logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",running:"⏳",received:"📥"}; ?><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool call pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr><? rows.forEach(l => { ?><tr data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td><code class=context-id><?= l.context_label ?></code></td><td><code><?= l.tool ?></code></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Force</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail; ?><tr class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>MCP tool call #<?= l.id ?></b><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy full row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><section class=json-detail><div class=row><b class=grow>MCP result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div></td></tr><? } }) ?></table>`,
+    logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",running:"⏳",received:"📥"}; ?><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool call pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr><? rows.forEach(l => { ?><tr data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=idcell><?= l.context_id ? "#"+l.context_id : "—" ?></td><td><code><?= l.tool ?></code></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Force</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail; ?><tr class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>MCP tool call #<?= l.id ?></b><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy full row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><section class=json-detail><div class=row><b class=grow>MCP result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div></td></tr><? } }) ?></table>`,
     debug: `<? const d=it.data||{}; if (!d.enabled) { ?><p class=muted>HTTP debug logging is disabled.</p><? } else { ?><table><tr><th>ID</th><th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>Remote</th><th>Error</th></tr><? (d.rows || []).forEach(r => { ?><tr data-action=select-debug data-id="<?= r.id ?>" title="Click to expand"><td class=idcell>#<?= r.id ?></td><td class=nowrap><?= it.logdt(r.ts) ?></td><td><b><?= r.method ?></b></td><td><code><?= r.path ?></code></td><td class="<?= r.status >= 400 ? "failed" : "ok" ?>"><?= r.status ?></td><td><?= r.duration_ms ?>ms</td><td><?= r.remote_addr ?></td><td><?= r.error_preview ?></td></tr><? if(String(d.openRowId||"")===String(r.id)&&d.openDetail){ ?><tr class=detail-row data-detail-kind=http data-detail-id="<?= r.id ?>"><td colspan=8><div class=detail-panel><div class=row><b class=grow>HTTP request #<?= r.id ?></b><button class=small data-action=copy-detail data-target="http-json-<?= r.id ?>">📋 Copy JSON</button><button class=small data-action=close-row-detail data-kind=http>✕ Close</button></div><pre id="http-json-<?= r.id ?>"><?= it.pretty(d.openDetail) ?></pre></div></td></tr><? } }) ?></table><? } ?>`,
   };
   const fragmentDate = value => value ? new Date(value).toLocaleString() : "";
@@ -4250,7 +4264,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
         await uiInternalApi("/api/roots/delete", { method: "POST", body: { id: Number(data.id) } });
         break;
       case "delete-context":
-        await uiInternalApi("/api/context/delete", { method: "POST", body: { handle: String(data.id || "") } });
+        await uiInternalApi("/api/context/delete", { method: "POST", body: { id: Number(data.id) } });
         break;
       case "delete-command":
         await uiInternalApi("/api/commands/delete", { method: "POST", body: { name: String(data.name || "") } });
@@ -4344,9 +4358,6 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
         if (data.kind === "tool") uiState.logs.openRowId = "";
         else uiState.debug.openRowId = "";
         break;
-      case "load-logs":
-        uiState.logs.page = 1;
-        break;
       case "logs-page":
         uiState.logs.page = Math.max(1, Number(data.logPage) || 1);
         break;
@@ -4434,12 +4445,26 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
           return;
         case "focus":
           return;
-        case "input":
-          uiUpdateDraft(String(event.id || ""), event.value, event.checked);
+        case "input": {
+          const id = String(event.id || "");
+          uiUpdateDraft(id, event.value, event.checked);
+          if (id === "logQuery") {
+            uiState.logs.page = 1;
+            if (uiLogFilterTimer) clearTimeout(uiLogFilterTimer);
+            uiLogFilterTimer = setTimeout(() => {
+              uiLogFilterTimer = null;
+              queueUiRender("input:logQuery", 0);
+            }, 220);
+          }
           return;
+        }
         case "change": {
           const id = String(event.id || "");
           uiUpdateDraft(id, event.value, event.checked);
+          if (["logContext", "logStatus", "logPageSize"].includes(id) && uiLogFilterTimer) {
+            clearTimeout(uiLogFilterTimer);
+            uiLogFilterTimer = null;
+          }
           if (id === "logContext") { uiState.logs.context = String(event.value || ""); uiState.logs.page = 1; }
           else if (id === "logStatus") { uiState.logs.status = String(event.value || ""); uiState.logs.page = 1; }
           else if (id === "logPageSize") { uiState.logs.pageSize = Number(event.value) || 25; uiState.logs.page = 1; }
@@ -4448,13 +4473,16 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
           else if (id === "commandPageSize") { uiState.commands.pageSize = Number(event.value) || 25; uiState.commands.page = 1; }
           else if (id === "commandIncludeMissing") { uiState.commands.includeMissing = !!event.checked; uiState.commands.page = 1; }
           else if (event.dataset?.action === "context-root")
-            await uiInternalApi("/api/context/select", { method: "POST", body: { handle: event.dataset.id, root_id: Number(event.value) || 0 } });
+            await uiInternalApi("/api/context/select", { method: "POST", body: { id: Number(event.dataset.id), root_id: Number(event.value) || 0 } });
           queueUiRender(`change:${id}`);
           return;
         }
         case "enter":
-          if (event.id === "logQuery") uiState.logs.page = 1;
-          else if (event.id === "commandQuery") uiState.commands.page = 1;
+          if (event.id === "logQuery") {
+            uiState.logs.page = 1;
+            if (uiLogFilterTimer) clearTimeout(uiLogFilterTimer);
+            uiLogFilterTimer = null;
+          } else if (event.id === "commandQuery") uiState.commands.page = 1;
           queueUiRender(`enter:${event.id}`);
           return;
         case "submit": {
@@ -4565,17 +4593,16 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       return json({ ok: true });
     }
     if (u.pathname === "/api/context/select" && req.method === "POST") {
-      const x = await bodyJson(req), p = serverConfig(), context = contextByHandle(p, String(x.handle || ""));
+      const x = await bodyJson(req), p = serverConfig(), context = contextById(p, Number(x.id));
       if (!context) return json({ error: "Context not found" }, 404);
       return json({ ok: true, context: selectContextRoot(p, context, Number(x.root_id) || 0) });
     }
     if (u.pathname === "/api/context/delete" && req.method === "POST") {
-      const x = await bodyJson(req), p = serverConfig(), handle = String(x.handle || ""),
-        context = contextByHandle(p, handle);
+      const x = await bodyJson(req), p = serverConfig(), context = contextById(p, Number(x.id));
       if (!context) return json({ error: "Context not found" }, 404);
-      run("DELETE FROM contexts WHERE handle=?", handle);
+      run("DELETE FROM contexts WHERE id=?", context.id);
       for (const key of [...jsKernels.keys()])
-        if (key.startsWith(`${p.id}:${handle}:`)) destroyJsKernel(key, "context deleted");
+        if (key.startsWith(`${p.id}:${context.handle}:`)) destroyJsKernel(key, "context deleted");
       return json({ ok: true });
     }
     if (u.pathname === "/api/processes" && req.method === "GET") {
@@ -4740,7 +4767,8 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       return json({ ok: true });
     }
     if (u.pathname === "/api/logs" && req.method === "GET") {
-      const q = (u.searchParams.get("q") || "").trim(), context = u.searchParams.get("context") || "";
+      const q = (u.searchParams.get("q") || "").trim();
+      const contextId = Math.max(0, Number(u.searchParams.get("context")) || 0);
       const status = u.searchParams.get("status") || "";
       const page = Math.max(1, Number(u.searchParams.get("page")) || 1);
       const pageSize = Math.max(10, Math.min(Number(u.searchParams.get("page_size")) || 25, 100));
@@ -4749,35 +4777,32 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       if (q && fts) {
         try {
           total = one(`SELECT COUNT(*) n FROM logs_fts f JOIN logs l ON l.id=CAST(f.log_id AS INTEGER)
-            WHERE logs_fts MATCH ? AND (?='' OR l.context_handle=?) AND (?='' OR l.status=?)`,
-            q, context, context, status, status)?.n || 0;
-          rows = all(`SELECT l.id,l.started_at,l.completed_at,l.context_handle,l.tool,l.status,l.duration_ms
+            WHERE logs_fts MATCH ? AND (?=0 OR l.context_id=?) AND (?='' OR l.status=?)`,
+            q, contextId, contextId, status, status)?.n || 0;
+          rows = all(`SELECT l.id,l.started_at,l.completed_at,l.context_id,l.tool,l.status,l.duration_ms
             FROM logs_fts f JOIN logs l ON l.id=CAST(f.log_id AS INTEGER)
-            WHERE logs_fts MATCH ? AND (?='' OR l.context_handle=?) AND (?='' OR l.status=?)
+            WHERE logs_fts MATCH ? AND (?=0 OR l.context_id=?) AND (?='' OR l.status=?)
             ORDER BY l.started_at DESC LIMIT ? OFFSET ?`,
-            q, context, context, status, status, pageSize, offset);
+            q, contextId, contextId, status, status, pageSize, offset);
         } catch {}
       }
       if (!rows) {
         const like = `%${q}%`;
-        total = one(`SELECT COUNT(*) n FROM logs WHERE (?='' OR context_handle=?) AND (?='' OR status=?)
-          AND (?='' OR context_handle||tool||input_json||result_json||resolved_json||stdout||stderr||error LIKE ?)`,
-          context, context, status, status, q, like)?.n || 0;
-        rows = all(`SELECT id,started_at,completed_at,context_handle,tool,status,duration_ms FROM logs
-          WHERE (?='' OR context_handle=?) AND (?='' OR status=?)
-          AND (?='' OR context_handle||tool||input_json||result_json||resolved_json||stdout||stderr||error LIKE ?)
+        total = one(`SELECT COUNT(*) n FROM logs WHERE (?=0 OR context_id=?) AND (?='' OR status=?)
+          AND (?='' OR CAST(context_id AS TEXT)||context_handle||tool||input_json||result_json||resolved_json||stdout||stderr||error LIKE ?)`,
+          contextId, contextId, status, status, q, like)?.n || 0;
+        rows = all(`SELECT id,started_at,completed_at,context_id,tool,status,duration_ms FROM logs
+          WHERE (?=0 OR context_id=?) AND (?='' OR status=?)
+          AND (?='' OR CAST(context_id AS TEXT)||context_handle||tool||input_json||result_json||resolved_json||stdout||stderr||error LIKE ?)
           ORDER BY started_at DESC LIMIT ? OFFSET ?`,
-          context, context, status, status, q, like, pageSize, offset);
+          contextId, contextId, status, status, q, like, pageSize, offset);
       }
-      const contextLabels = new Map(all("SELECT handle,label FROM contexts")
-        .map(item => [item.handle, item.label || item.handle]));
       const processByLog = new Map([...processes.values()]
         .filter(record => record.log_id && ["starting", "running"].includes(record.status))
         .map(record => [record.log_id, record]));
       rows = rows.map(row => {
         const process = processByLog.get(row.id), control = activeCallControls.get(row.id);
-        return { ...row, context_label: contextLabels.get(row.context_handle) || row.context_handle || "unassigned",
-          killable: !!process || !!control?.cancel,
+        return { ...row, killable: !!process || !!control?.cancel,
           process_id: process?.id || control?.process_id || "" };
       });
       return json({ rows, page, page_size: pageSize, total,
@@ -4798,7 +4823,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     const lm = u.pathname.match(/^\/api\/logs\/(\d+)$/);
     if (lm && req.method === "GET") return json(
       one(`SELECT id,started_at,completed_at,server_id,server_name,tool,status,input_json,resolved_json,
-        stdout,stderr,error,result_json,duration_ms,context_handle FROM logs WHERE id=?`, Number(lm[1])) || { error: "Not found" }
+        stdout,stderr,error,result_json,duration_ms,context_id,context_handle FROM logs WHERE id=?`, Number(lm[1])) || { error: "Not found" }
     );
     if (u.pathname === "/api/logs/delete" && req.method === "POST") {
       const x = await bodyJson(req);
@@ -5020,6 +5045,7 @@ connectRenderStream();
     if (renewalTimer) clearInterval(renewalTimer);
     if (processCleanupTimer) clearInterval(processCleanupTimer);
     if (downloadCleanupTimer) clearInterval(downloadCleanupTimer);
+    if (uiLogFilterTimer) clearTimeout(uiLogFilterTimer);
     for (const key of [...jsKernels.keys()]) destroyJsKernel(key, "server shutdown");
     await Promise.allSettled(
       [...processes.values()]
