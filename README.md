@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.59
+# MrMCP 0.10.60
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -157,6 +157,8 @@ Filesystem and text:
 - `file_info`, `create_directory`, `copy_path`, `move_path`, `trash_paths`, `untrash_action`;
 - `publish_file`.
 
+`publish_file` is the single supported file-presentation path for ChatGPT. After a file has been created, call `publish_file` with its path instead of reading it as Base64 or trying to manufacture an inline/image/resource-link response. MrMCP creates a temporary HTTPS URL in the tool's structured result and attaches its MCP App widget. The widget renders `image/*` files with an ordinary HTML `<img src="...">`; PDFs, archives, databases and other MIME types get a compact **Open File** action. Raw MCP `resource_link` and inline-Base64 preview modes are intentionally not exposed because the working ChatGPT presentation path is the attached widget. `exec` therefore does not have `return_files` shortcuts: create the output with `exec`, then call `publish_file` explicitly.
+
 Commands and persistent execution:
 
 - `list_commands`;
@@ -288,6 +290,15 @@ MrMCP uses fixed public listeners:
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
 ## Development changelog
+
+### 0.10.60
+
+- Made the attached MCP App/Smart App widget the single supported `publish_file` presentation path in ChatGPT.
+- Removed `return_mode=inline|link|both`, Base64 image payloads and raw MCP `resource_link` output from `publish_file`; the tool now returns one temporary HTTPS `uri` in `structuredContent` for the widget to consume.
+- Updated the widget to render image MIME types through a normal HTML `<img src=uri>` and non-image files through an **Open File** action.
+- Removed `exec.return_files*`; commands create files and `publish_file` presents them, so agents have one unambiguous delivery workflow.
+- Bumped the widget resource URI to `ui://mrmcp/file-preview-v4.html` to avoid stale cached widget HTML.
+- No database schema change; schema version remains 4.
 
 ### 0.10.59
 

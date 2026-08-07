@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.59 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
+MrMCP 0.10.60 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -41,7 +41,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.59";
+const VERSION = "0.10.60";
 const DB_SCHEMA_VERSION = 4;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -50,7 +50,7 @@ const CONTEXT_HANDLE_OUTPUT_DESCRIPTION = "Opaque capability identifying a persi
 const CONTEXT_HANDLE_RULE = "Requires the exact context_handle returned by create_context.";
 const MCP_UI_EXTENSION = "io.modelcontextprotocol/ui";
 const MCP_UI_MIME_TYPE = "text/html;profile=mcp-app";
-const FILE_PREVIEW_UI_URI = "ui://mrmcp/image-preview-v3.html";
+const FILE_PREVIEW_UI_URI = "ui://mrmcp/file-preview-v4.html";
 const enc = new TextEncoder(), dec = new TextDecoder();
 
 const stringResponse = (body, status, type, headers = {}) => {
@@ -76,7 +76,6 @@ const sha256 = async value => b64url(new Uint8Array(
 ));
 const parseJson = (s, fallback) => { try { return JSON.parse(s); } catch { return fallback; } };
 const MAX_REQUEST_BODY = 2 * 1024 * 1024;
-const MAX_INLINE_IMAGE_BYTES = 8 * 1024 * 1024;
 async function bodyText(req, max = MAX_REQUEST_BODY) {
   const declared = Number(req.headers.get("content-length") || 0);
   if (declared > max) throw new Error("Request body too large");
@@ -713,7 +712,7 @@ async function backend() {
     uri: FILE_PREVIEW_UI_URI,
     name: "mrmcp_file_preview",
     title: "MrMCP file preview",
-    description: "Minimal sandboxed MCP App that displays an image directly from the HTTPS resource_link returned by publish_file.",
+    description: "Sandboxed MCP App used by publish_file. It reads the temporary HTTPS URL from structuredContent, renders image files with a normal img element, and offers an Open File action for other MIME types.",
     mimeType: MCP_UI_MIME_TYPE,
     _meta: filePreviewUiMeta(),
   });
@@ -723,32 +722,43 @@ async function backend() {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MrMCP image preview</title>
+<title>MrMCP file preview</title>
 <style>
 :root { color-scheme: light dark; }
 * { box-sizing: border-box; }
 html, body, main { margin: 0; width: 100%; min-width: 0; background: transparent; }
-#stage { position: relative; display: none; width: 100%; place-items: center; overflow: hidden; }
+#imageStage { position: relative; display: none; width: 100%; place-items: center; overflow: hidden; }
 #image { display: block; width: 100%; height: auto; object-fit: contain; }
 #actions { position: absolute; top: 8px; right: 8px; display: flex; gap: 6px; opacity: .25; transition: opacity .15s; }
-#stage:hover #actions, #actions:focus-within { opacity: 1; }
+#imageStage:hover #actions, #actions:focus-within { opacity: 1; }
 #actions button, #actions a { display: grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 1px solid #ffffff55; border-radius: 8px; color: white; background: #000b; font: 20px/1 system-ui, sans-serif; text-decoration: none; cursor: pointer; }
 #actions [hidden] { display: none; }
+#fileStage { display: none; align-items: center; gap: 12px; padding: 14px; border: 1px solid #ffffff22; border-radius: 10px; font: 14px/1.35 system-ui, sans-serif; }
+#fileIcon { font-size: 28px; }
+#fileInfo { flex: 1; min-width: 0; }
+#fileName { font-weight: 650; overflow-wrap: anywhere; }
+#fileMeta { margin-top: 3px; opacity: .65; font-size: 12px; }
+#fileOpen { padding: 7px 10px; border: 1px solid #ffffff33; border-radius: 8px; color: inherit; text-decoration: none; white-space: nowrap; }
 #error { display: none; padding: 10px; color: var(--color-text-danger, #b42318); font: 14px/1.4 system-ui, sans-serif; overflow-wrap: anywhere; }
 html[data-mode="fullscreen"], html[data-mode="fullscreen"] body, html[data-mode="fullscreen"] main { height: 100%; overflow: hidden; }
-html[data-mode="fullscreen"] #stage { display: grid; height: 100%; }
+html[data-mode="fullscreen"] #imageStage { display: grid; height: 100%; }
 html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
 @media (hover: none) { #actions { opacity: 1; } }
 </style>
 </head>
 <body>
 <main>
-  <div id="stage">
+  <div id="imageStage">
     <img id="image" alt="Published image">
     <div id="actions">
       <button id="fullscreen" type="button" title="Fullscreen" aria-label="Fullscreen" hidden>⛶</button>
-      <a id="open" target="_blank" rel="noopener noreferrer" title="Open original" aria-label="Open original">↗</a>
+      <a id="imageOpen" target="_blank" rel="noopener noreferrer" title="Open original" aria-label="Open original">↗</a>
     </div>
+  </div>
+  <div id="fileStage">
+    <div id="fileIcon">📄</div>
+    <div id="fileInfo"><div id="fileName"></div><div id="fileMeta"></div></div>
+    <a id="fileOpen" target="_blank" rel="noopener noreferrer">Open File ↗</a>
   </div>
   <div id="error" role="alert"></div>
 </main>
@@ -756,15 +766,20 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
 (function () {
   'use strict';
   var root = document.documentElement;
-  var stage = document.getElementById('stage');
+  var imageStage = document.getElementById('imageStage');
+  var fileStage = document.getElementById('fileStage');
   var image = document.getElementById('image');
-  var open = document.getElementById('open');
+  var imageOpen = document.getElementById('imageOpen');
+  var fileName = document.getElementById('fileName');
+  var fileMeta = document.getElementById('fileMeta');
+  var fileOpen = document.getElementById('fileOpen');
   var fullscreen = document.getElementById('fullscreen');
   var error = document.getElementById('error');
   var pending = new Map();
   var nextId = 1;
   var currentMode = 'inline';
   var fullscreenAvailable = false;
+  var currentIsImage = false;
 
   function post(message) { window.parent.postMessage(message, '*'); }
   function notify(method, params) { post({ jsonrpc: '2.0', method: method, params: params || {} }); }
@@ -783,11 +798,6 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     });
   }
   function array(value) { return Array.isArray(value) ? value : []; }
-  function resourceLink(result) {
-    return array(result && result.content).find(function (item) {
-      return item && item.type === 'resource_link' && typeof item.uri === 'string';
-    });
-  }
   function showError(text) {
     error.textContent = text || '';
     error.style.display = text ? 'block' : 'none';
@@ -803,34 +813,48 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     if (context.theme) root.style.colorScheme = context.theme;
     if (context.displayMode) setMode(context.displayMode);
     fullscreenAvailable = array(context.availableDisplayModes).indexOf('fullscreen') >= 0;
-    fullscreen.hidden = !fullscreenAvailable;
+    fullscreen.hidden = !fullscreenAvailable || !currentIsImage;
+  }
+  function formatSize(value) {
+    var size = Number(value || 0);
+    if (!size) return '';
+    if (size < 1024) return size + ' B';
+    if (size < 1048576) return (size / 1024).toFixed(1) + ' KB';
+    return (size / 1048576).toFixed(1) + ' MB';
   }
   function render(result) {
     result = result || {};
     var structured = result.structuredContent && typeof result.structuredContent === 'object'
       ? result.structuredContent : result;
-    var link = resourceLink(result);
-    var uri = (link && link.uri) || (typeof structured.uri === 'string' ? structured.uri : '');
-    var mime = String((link && link.mimeType) || structured.mime_type || '').toLowerCase();
-    var filename = String((link && (link.title || link.name)) || structured.filename || 'Published image');
+    var uri = typeof structured.uri === 'string' ? structured.uri : '';
+    var mime = String(structured.mime_type || '').toLowerCase();
+    var filename = String(structured.filename || 'Published file');
+    currentIsImage = mime.indexOf('image/') === 0;
+    imageStage.style.display = 'none';
+    fileStage.style.display = 'none';
+    image.removeAttribute('src');
     showError('');
     if (!uri) {
-      stage.style.display = 'none';
-      showError('This preview requires publish_file with return_mode link or both.');
+      showError('publish_file did not provide the temporary HTTPS URL required by this widget.');
       return;
     }
-    if (mime && mime.indexOf('image/') !== 0) {
-      stage.style.display = 'none';
-      showError('This minimal preview displays image resource links only.');
+    if (currentIsImage) {
+      image.alt = filename;
+      imageOpen.href = uri;
+      image.src = uri;
+      imageStage.style.display = 'grid';
+      fullscreen.hidden = !fullscreenAvailable;
       return;
     }
-    image.alt = filename;
-    open.href = uri;
-    image.src = uri;
-    stage.style.display = 'grid';
+    if (currentMode === 'fullscreen') setMode('inline');
+    fullscreen.hidden = true;
+    fileName.textContent = filename;
+    fileMeta.textContent = [mime || 'file', formatSize(structured.size)].filter(Boolean).join(' · ');
+    fileOpen.href = uri;
+    fileStage.style.display = 'flex';
   }
   function toggleFullscreen() {
-    if (!fullscreenAvailable) return;
+    if (!fullscreenAvailable || !currentIsImage) return;
     var requested = currentMode === 'fullscreen' ? 'inline' : 'fullscreen';
     fullscreen.disabled = true;
     request('ui/request-display-mode', { mode: requested }, 3000).then(function (result) {
@@ -842,8 +866,8 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
   image.addEventListener('dblclick', toggleFullscreen);
   image.addEventListener('load', function () { showError(''); });
   image.addEventListener('error', function () {
-    stage.style.display = 'none';
-    showError('Unable to load the published image resource. The temporary URL may have expired; publish the file again.');
+    imageStage.style.display = 'none';
+    showError('Unable to load the published image. The temporary URL may have expired; call publish_file again.');
   });
 
   window.addEventListener('message', function (event) {
@@ -865,7 +889,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
 
   request('ui/initialize', {
     protocolVersion: '2026-01-26',
-    appInfo: { name: 'mrmcp-image-preview', version: '1.2.0' },
+    appInfo: { name: 'mrmcp-file-preview', version: '1.3.0' },
     appCapabilities: { availableDisplayModes: ['inline', 'fullscreen'] }
   }, 3000).then(function (result) {
     applyHostContext(result && result.hostContext);
@@ -903,10 +927,6 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     mediaContentType(String(mimeType || "").trim()) ||
     mediaContentType(extname(String(filename || "")).toLowerCase()) ||
     String(mimeType || "application/octet-stream");
-  const isRasterImageMime = mimeType => {
-    const essence = mimeEssence(mimeType);
-    return essence.startsWith("image/") && essence !== "image/svg+xml";
-  };
   const isInlinePreviewMime = mimeType => {
     const essence = mimeEssence(mimeType);
     return essence.startsWith("image/") || essence.startsWith("text/") ||
@@ -950,95 +970,18 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     const mimeType = String(options.mime_type || inferredMimeType(filename)).trim() || "application/octet-stream";
     if (/[^\x20-\x7e]/.test(mimeType) || !/^[^\s\/]+\/[^\s]+$/.test(mimeType))
       throw new Error("Invalid MIME type");
-    const returnMode = String(options.return_mode || "link").trim().toLowerCase();
-    if (!["inline", "link", "both"].includes(returnMode))
-      throw new Error("return_mode must be inline, link, or both");
-    const rasterImage = isRasterImageMime(mimeType);
-    if (returnMode === "inline" && !rasterImage)
-      throw new Error("return_mode=inline is supported only for non-SVG raster images");
-    if (returnMode === "inline" && stat.size > MAX_INLINE_IMAGE_BYTES)
-      throw new Error(`Image exceeds the ${MAX_INLINE_IMAGE_BYTES} byte inline limit; use return_mode=link or both`);
-
-    const wantsInline = returnMode !== "link" && rasterImage && stat.size <= MAX_INLINE_IMAGE_BYTES;
-    const wantsLink = returnMode !== "inline";
-    const content = [];
-    if (wantsInline) {
-      const inlineData = Buffer.from(await Deno.readFile(realPath)).toString("base64");
-      content.push({ type: "image", data: inlineData, mimeType });
-    }
-
-    let uri, expiresAt, record;
-    if (wantsLink) {
-      const token = randomToken(32);
-      expiresAt = Date.now() + boundedExpirySeconds(options.expires_in) * 1000;
-      record = {
-        path: realPath, allowed_root: allowedRoot, filename, mime_type: mimeType, size: stat.size,
-        expires_at: expiresAt, one_time: options.one_time === true, delete_after: options.delete_after === true,
-      };
-      downloadTokens.set(token, record);
-      uri = downloadUrl(token, filename);
-      content.push({
-        type: "resource_link", uri, name: filename, title: filename,
-        description: String(options.description || `${mimeEssence(mimeType).startsWith("image/") ? "Image preview" : "Published file"}: ${filename}`),
-        mimeType, size: stat.size,
-        annotations: { audience: ["user"], priority: 1 },
-      });
-    }
-
-    const inlineOmittedReason = returnMode === "both" && !wantsInline
-      ? (!rasterImage ? "File MIME type is not an inline raster image" : `Image exceeds the ${MAX_INLINE_IMAGE_BYTES} byte inline limit`)
-      : undefined;
-    return {
-      mcp_content: content, filename, mime_type: mimeType, size: stat.size,
-      return_mode: returnMode, inline: wantsInline, linked: wantsLink,
-      ...(uri ? {
-        uri,
-        markdown: mimeEssence(mimeType).startsWith("image/") ? `![${filename}](${uri})` : `[Download ${filename}](${uri})`,
-        expires_at: new Date(expiresAt).toISOString(), one_time: record.one_time,
-      } : {}),
-      ...(inlineOmittedReason ? { inline_omitted_reason: inlineOmittedReason } : {}),
+    const token = randomToken(32);
+    const expiresAt = Date.now() + boundedExpirySeconds(options.expires_in) * 1000;
+    const record = {
+      path: realPath, allowed_root: allowedRoot, filename, mime_type: mimeType, size: stat.size,
+      expires_at: expiresAt, one_time: options.one_time === true, delete_after: options.delete_after === true,
     };
-  }
-  async function processReturnFiles(rec, args) {
-    const requested = args.return_files;
-    if (!Array.isArray(requested) || !requested.length || rec.status !== "completed") return null;
-    const root = await Deno.realPath(rec.root_path);
-    const prepared = [], seen = new Set();
-    for (const raw of requested) {
-      const value = String(raw || "").trim();
-      if (!value) throw new Error("return_files entries must be non-empty paths");
-      const candidate = isAbsolute(value) ? resolve(value) : resolve(rec.cwd, value);
-      const realPath = await Deno.realPath(candidate).catch(() => null);
-      if (!realPath) throw new Error(`Returned file does not exist: ${value}`);
-      if (!within(root, realPath)) throw new Error(`Returned file resolves outside the selected context root: ${value}`);
-      const stat = await Deno.stat(realPath);
-      if (!stat.isFile) throw new Error(`Returned path is not a regular file: ${value}`);
-      const key = Deno.build.os === "windows" ? realPath.toLowerCase() : realPath;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      prepared.push({
-        path: realPath, stat,
-        display: relative(root, realPath).split(sep).join("/") || basename(realPath),
-      });
-    }
-    let inlineBudget = MAX_INLINE_IMAGE_BYTES;
-    const mcpContent = [], files = [];
-    for (const entry of prepared) {
-      const mimeType = inferredMimeType(entry.path);
-      const mayInline = args.return_files_inline !== false && isRasterImageMime(mimeType) &&
-        entry.stat.size <= inlineBudget;
-      const result = await publishPath(entry.path, {
-        filename: basename(entry.path), mime_type: mimeType,
-        expires_in: args.return_files_expires_in, one_time: args.return_files_one_time,
-        return_mode: mayInline ? "both" : "link", allowed_root: root,
-        description: `Output file created by ${rec.display}`,
-      });
-      if (result.inline) inlineBudget -= result.size;
-      mcpContent.push(...result.mcp_content);
-      const { mcp_content: _content, ...metadata } = result;
-      files.push({ path: entry.display, ...metadata });
-    }
-    return { mcp_content: mcpContent, returned_files: files };
+    downloadTokens.set(token, record);
+    return {
+      filename, mime_type: mimeType, size: stat.size,
+      uri: downloadUrl(token, filename),
+      expires_at: new Date(expiresAt).toISOString(), one_time: record.one_time,
+    };
   }
 
   const contentDisposition = (filename, mode = "attachment") => {
@@ -2273,12 +2216,11 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
         { properties: { action_id: { type: "string" }, ...contextInput }, required: ["action_id"] },
       ],
       publish_file: [
-        "Publish an existing file from the current root. Use this for generated images, PDFs, archives, databases and other binary outputs; never read or Base64-encode binary files manually.",
+        "Present an existing file to the user through MrMCP's attached MCP App widget. This is the supported ChatGPT presentation path: MrMCP puts a temporary HTTPS URL in structuredContent and the widget renders image/* through an HTML img element or shows an Open File action for other MIME types. Do not read/Base64-encode the file and do not try to construct inline or resource_link preview modes; simply call publish_file after creating the file.",
         { properties: {
           path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" },
           expires_in: { type: "integer", minimum: 30, maximum: 604800, default: 86400 },
           one_time: { type: "boolean", default: false },
-          return_mode: { type: "string", enum: ["inline", "link", "both"], default: "link" },
           ...contextInput,
         }, required: ["path"] },
       ],
@@ -2300,10 +2242,6 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
         { oneOf: [{ required: ["program"] }, { required: ["shell_command"] }], properties: {
           ...execInput,
           timeout_ms: { type: "integer", minimum: 1, maximum: 3600000, default: 120000 },
-          return_files: { type: "array", minItems: 1, maxItems: 16, items: { type: "string" } },
-          return_files_expires_in: { type: "integer", minimum: 30, maximum: 604800, default: 86400 },
-          return_files_one_time: { type: "boolean", default: false },
-          return_files_inline: { type: "boolean", default: true },
         } },
       ],
       exec_start: [
@@ -2372,7 +2310,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       stderr: { type: "string", description: "Separate standard error, returned only when separate_streams=true. Some successful CLIs legitimately write progress or diagnostics here." },
       stderr_from: { type: "integer" }, stderr_next: { type: "integer" },
       stderr_truncated_before: { anyOf: [{ type: "integer" }, { type: "null" }] },
-      stdin_open: { type: "boolean" }, success: { type: "boolean" }, returned_files: objectArray,
+      stdin_open: { type: "boolean" }, success: { type: "boolean" },
     };
     const outputSchemas = {
       create_context: outputSchema(),
@@ -2397,7 +2335,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       move_path: outputSchema({ from: { type: "string" }, to: { type: "string" } }),
       trash_paths: outputSchema({ action_id: { type: "string" }, trash_path: { type: "string" }, manifest_path: { type: "string" }, paths: stringArray }),
       untrash_action: outputSchema({ action_id: { type: "string" }, paths: stringArray }),
-      publish_file: outputSchema({ path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" }, size: { type: "integer" }, return_mode: { type: "string" }, inline: { type: "boolean" }, linked: { type: "boolean" }, uri: { type: "string" }, markdown: { type: "string" }, expires_at: { type: "string" }, one_time: { type: "boolean" }, inline_omitted_reason: { type: "string" } }),
+      publish_file: outputSchema({ path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" }, size: { type: "integer" }, uri: { type: "string", description: "Temporary HTTPS URL consumed by the attached MCP App widget." }, expires_at: { type: "string" }, one_time: { type: "boolean" } }),
       list_commands: outputSchema({ query: { type: "string" }, page: { type: "integer" }, page_size: { type: "integer" }, total: { type: "integer" }, pages: { type: "integer" }, has_more: { type: "boolean" }, bin_directory: { type: "string" }, config_file: { type: "string" }, path_precedence: { type: "string" }, invocation: { type: "object", additionalProperties: true }, commands: objectArray }),
       recent_tool_calls: outputSchema({ calls: objectArray }),
       exec: outputSchema(processProperties),
@@ -2522,7 +2460,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     if (resource.mimeType !== MCP_UI_MIME_TYPE) uiErrors.push("unexpected UI resource MIME type");
     if (!filePreviewAppHtml().includes("ui/notifications/tool-result")) uiErrors.push("UI bridge listener missing");
     if (filePreviewAppHtml().includes("base64") || filePreviewAppHtml().includes("data:")) uiErrors.push("UI must not embed Base64/data URLs");
-    if (!filePreviewAppHtml().includes("resource_link")) uiErrors.push("UI resource-link handling missing");
+    if (!filePreviewAppHtml().includes("structured.uri")) uiErrors.push("UI structuredContent URL handling missing");
     if (publishTool?._meta?.ui?.resourceUri !== FILE_PREVIEW_UI_URI) uiErrors.push("publish_file UI metadata missing");
     if (publishTool?._meta?.["openai/outputTemplate"] !== FILE_PREVIEW_UI_URI) uiErrors.push("ChatGPT output-template alias missing");
     return {
@@ -3287,7 +3225,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       const result = await publishPath(target.path, {
         filename: args.filename || basename(target.path), mime_type: args.mime_type,
         expires_in: args.expires_in, one_time: args.one_time,
-        return_mode: args.return_mode || "link", allowed_root: target.root.path,
+        allowed_root: target.root.path,
       });
       return { path: target.display, ...result };
     }
@@ -3336,8 +3274,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       const record = await startManagedProcess(p, args, name === "exec_start", execution);
       if (name === "exec_start") return processView(record, args);
       await record.done;
-      const view = processView(record, args), returned = await processReturnFiles(record, args);
-      return returned ? { ...view, returned_files: returned.returned_files, mcp_content: returned.mcp_content } : view;
+      return processView(record, args);
     }
     if (name === "exec_poll") return await pollManagedProcess(ownedProcess(args.process_id, args.context_handle), args);
     if (name === "exec_write") {
@@ -3429,7 +3366,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       if (!serverTools(p, true).some(tool => tool.name === name)) throw new Error("Unknown tool");
       updateLog(id, { status: "running" });
       const result = await executeTool(p, name, args, executionState);
-      const { mcp_content: mcpContent, ...publicResult } = result && typeof result === "object" ? result : { value: result };
+      const publicResult = result && typeof result === "object" ? result : { value: result };
       const publicLogResult = redactTemporaryDownloadUrls(publicResult);
       const stdout = typeof publicLogResult.output === "string" ? publicLogResult.output
         : typeof publicLogResult.stdout === "string" ? publicLogResult.stdout
@@ -3443,10 +3380,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
         : JSON.stringify(structuredContent, null, 2);
       const max = 1024 * 1024, rendered = full.length > max
         ? full.slice(0, max) + `\n\n[truncated; full output in log ${id}]` : full;
-      const content = Array.isArray(mcpContent)
-        ? [...mcpContent, { type: "text", text: rendered }]
-        : [{ type: "text", text: rendered }];
-      const toolResult = { content, structuredContent, isError: status !== "completed" };
+      const toolResult = { content: [{ type: "text", text: rendered }], structuredContent, isError: status !== "completed" };
       updateLog(id, {
         completed_at: Date.now(), duration_ms: Date.now() - started, status,
         resolved_json: JSON.stringify(publicLogResult), stdout, stderr,

@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.59 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.60 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
@@ -234,6 +234,20 @@ The system-PATH setting is enabled by default.
 - Keep managed process access scoped to the exact `context_handle`; retain the root and cwd snapshot captured at process start.
 - `recent_tool_calls` is read-only and scoped to the exact `context_handle`. It returns only calls that reached MrMCP and excludes its own currently running log row. Use it to distinguish server-side execution from upstream/client-wrapper rejection; never claim it can reveal a wrapper policy reason that was not sent to MrMCP.
 
+## Published files and MCP App widget
+
+`publish_file` is the only supported path for presenting generated/existing files to ChatGPT users. Keep the contract deliberately singular:
+
+- the tool creates one temporary HTTPS download URL and returns it as `structuredContent.uri`;
+- the `publish_file` descriptor attaches the MCP App/Smart App output template;
+- the widget reads `structuredContent.uri` directly; it must not depend on MCP `resource_link` content;
+- image MIME types are displayed by the widget with a normal HTML `<img src="...">`; non-image MIME types get an **Open File** action;
+- do not emit Base64 image content and do not reintroduce `return_mode=inline|link|both`;
+- do not add `exec.return_files*` shortcuts: a command creates a file, then the agent explicitly calls `publish_file` so the correct widget is attached to the correct tool result;
+- tool descriptions must tell agents to call `publish_file` directly rather than reading binary files, Base64-encoding them or constructing alternate preview payloads.
+
+The widget resource URI is versioned when its HTML/behavior changes so clients do not reuse stale cached widget markup.
+
 ## Text-editing tools
 
 Support UTF-8, UTF-16LE, UTF-16BE, Windows-1252 and Latin-1, including BOM and `LF`/`CRLF`/`CR` controls.
@@ -313,4 +327,5 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 39. Confirm the Windows standalone build uses `--no-terminal` and its PE subsystem is GUI/Windows rather than console, while source-mode `deno run` remains terminal-attached.
 40. Verify Root/Command path existence/type checks run on blur rather than per keystroke, render inline warnings without blocking Root save, preserve the next focused control through the render, and keep Command path validation errors inline without closing the dialog.
 41. Verify every managed Root/Command/Confirm/Message dialog is opened solely by Eta-rendered `open` state plus CSS overlay, with no browser `showModal()`/`show()`/imperative close path; Escape only sends a Deno close intent.
-42. Run the desktop WebView on a machine with Deno and platform dependencies.
+42. Verify `publish_file` exposes no return-mode selector, Base64 image payload or MCP `resource_link`; its structured result contains the temporary HTTPS `uri`, its tool descriptor points to the versioned MCP App widget, and the widget reads `structuredContent.uri`, uses `<img>` for images and an Open File link for other MIME types. Confirm `exec` exposes no `return_files*` shortcut.
+43. Run the desktop WebView on a machine with Deno and platform dependencies.
