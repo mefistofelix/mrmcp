@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.43 consists of exactly five root files:
+MrMCP 0.10.46 consists of exactly five root files:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `morphlex.js` — DOM morphing engine. Eta performs server-side templating; Morphlex does not template.
@@ -31,11 +31,11 @@ The repository is in development. There is no backward compatibility.
 3. Never add `ALTER TABLE`, migration code, backfills or old-column detection.
 4. Never import legacy configuration keys or identifiers.
 5. Never retain an old table or column only for compatibility.
-6. Never accept old `ctx_` values or transport-derived session identifiers.
+6. Never accept legacy `opaque_` values, `server_opaque` arguments or transport-derived session identifiers.
 7. Tell developers to delete `.mrmcp/mrmcp.sqlite` after incompatible schema changes.
 8. A clean schema must create no named `default` root.
 
-## MCP 2026-07-28 and explicit opaque state
+## MCP 2026-07-28 and explicit context capabilities
 
 Only protocol `2026-07-28` is advertised and accepted.
 
@@ -47,31 +47,49 @@ The protocol is stateless and sessionless at the transport layer:
 - do not send, consume or infer identity from `Mcp-Session-Id` or vendor session headers;
 - every request must be understandable without a previous transport handshake.
 
-Application state follows the explicit-handle pattern recommended by the MCP maintainers:
+Application state uses an explicit bearer capability:
 
-- every tool input schema contains the same optional `server_opaque` property and description;
-- every output schema requires `server_opaque`, `server_opaque_status`, `retry_required` and `message`;
-- missing value: issue one, do not execute, request a retry;
-- valid value: execute and repeat it byte-for-byte;
-- unknown, foreign or expired value: do not execute and do not mint a replacement automatically;
-- values are owned by the authenticated client and expire after 30 days without activity.
+- `create_context` is the only tool without a `context_handle` input and creates a globally unique `ctx_...` value;
+- every other base and custom tool requires the same `context_handle` property;
+- every output schema requires only `context_handle`, `context_status` and `operation_executed` in the common envelope;
+- every built-in tool must add an explicit tool-specific output schema and use `additionalProperties: false`; never regress to one permissive generic result schema;
+- recovery responses additionally provide `retry_required`, `recovery_tool` and `message` and set `isError: true`;
+- missing, invalid or expired handles never execute the requested operation and never mint a replacement automatically;
+- valid handles execute and are repeated byte-for-byte in the result;
+- contexts expire after 30 days without activity.
 
-The GUI label **Sessions** is operator terminology only. Never describe `server_opaque` as a protocol or transport session in tool schemas or MCP responses.
+Authentication gates access to the server. After authentication, possession of a valid `context_handle` selects the context. Do not bind contexts, managed processes or JavaScript kernels to an OAuth client, Basic credential, owner key or transport identity.
+
+The GUI label **Sessions** is operator terminology only. Never describe `context_handle` as a protocol or transport session.
 
 ## Authentication and authorization
 
-Authentication is the only tool-access decision.
+Authentication is the only server-access decision.
 
 - Authenticated clients receive all published tools.
 - Anonymous clients receive none.
 - Do not implement tool approvals, allow/deny regular expressions, enable lists, execution switches or per-tool policy rules.
 - OAuth consent remains only to authorize the OAuth client.
+- `context_handle` is a bearer capability shared by any authenticated client that possesses it.
 
-## Roots
+## Roots and current working directory
 
-A valid opaque value may select one named root. New values start without a named root. Without a selection, resolve paths relative to the directory containing `mrmcp.js`.
+The GUI maintains named roots. A root may be assigned to many contexts, while each context stores exactly one current `root_id`.
 
-All relative paths and child-process working directories must remain inside the effective root. Do not create a global default-root setting or a named default root.
+- Root id `0` is the fallback directory containing `mrmcp.js`.
+- New contexts start on root id `0`.
+- Root assignment is managed only in the Sessions/Roots GUI.
+- The public MCP tool is `context_info`, which returns the absolute current root, `agent_guidance_present`, and nullable `agent_guidance_path`.
+- `context_info` checks only the selected root's `AGENTS.md`, then `agents.md`; it returns an absolute path and never scans parent or child directories.
+- Tool/server descriptions must direct the agent to call `context_info` after `create_context` and root changes, then read and follow `agent_guidance_path` when non-null.
+- Changing a context root is unrestricted and affects new calls immediately.
+- Existing background and interactive processes continue with their original working directory.
+- Disabling or deleting a root moves associated contexts to root id `0` without terminating processes.
+- Resolve the context and root once at the start of each call and use that fixed selection for the whole operation.
+
+All relative paths and new child-process working directories must remain inside the selected root.
+
+JavaScript kernels are lazy and keyed by `(server_id, context_handle, root_id)`. Switching roots selects or creates the matching kernel; switching back restores its previous state. Never share a kernel between different contexts.
 
 ## GUI architecture
 
@@ -170,10 +188,10 @@ Do not add interval polling, refresh timers, auto-refresh controls, manual refre
 Eta selects the active section from Deno `uiState.currentSection`. `buildUiRenderModel()` may query only the current section’s data:
 
 - Dashboard: endpoint summary and aggregates.
-- Sessions: opaque values and roots.
+- Sessions: contexts and their single current root.
 - Roots: roots only.
 - Commands: command catalog page only.
-- Tool calls: opaque filter values, paginated rows and at most one selected detail row.
+- Tool calls: context filter values, paginated rows and at most one selected detail row.
 - HTTP debug: setting, filtered rows and at most one selected detail row.
 - OAuth: OAuth clients only.
 - Settings: runtime settings only.
@@ -200,7 +218,7 @@ The system-PATH setting is enabled by default.
 - ON: prepend `.mrmcp/bin` to the supplied or inherited `PATH`.
 - OFF: use only `.mrmcp/bin` in the child `PATH`.
 - Use `ComSpec` on Windows and `SHELL` or `/bin/sh` on Unix.
-- Keep managed process state scoped to the valid opaque value.
+- Keep managed process access scoped to the exact `context_handle`; retain the root and cwd snapshot captured at process start.
 
 ## Text-editing tools
 
@@ -208,10 +226,17 @@ Support UTF-8, UTF-16LE, UTF-16BE, Windows-1252 and Latin-1, including BOM and `
 
 Prefer:
 
-1. `edit_file` / `edit_files` for exact edits;
-2. `replace_files` for repeated literal or regex changes;
-3. `write_file` / `write_files` for complete content;
-4. `js` / `exec` only for transformations that require programmatic parsing.
+1. `glob` and `grep` for discovery and search;
+2. `edit` for ordered exact edits per file and atomic changes across files;
+3. `replace` for repeated literal or regex changes across a glob;
+4. `write_file` / `write_files` for complete content;
+5. `js` / `exec` only for parsing, computation or transformations that cannot be expressed by the structured tools.
+
+Do not invoke shell commands, `uv` or Python to list, search, inspect, edit or replace files when the structured MrMCP tools cover the operation. Tool descriptions and `server/discover` instructions must reinforce this precedence.
+
+`glob` must support exclusions plus explicit hidden/dependency traversal. `grep` must additionally support literal/regex matching, case sensitivity, context lines, encoding, file-size limits and content/file/count modes. `replace` must support the same traversal controls, preview mode, atomic rollback and an optional exact `expected_replacements` total.
+
+`edit` must read each file once, apply its edit list sequentially to the evolving in-memory text, validate each `expected_occurrences`, write each file once, and roll back all files if any write fails. Duplicate file entries are invalid.
 
 Preserve source encoding, BOM and line endings unless conversion is explicitly requested.
 
@@ -220,7 +245,7 @@ Preserve source encoding, BOM and line endings unless conversion is explicitly r
 README must describe current behavior, not only past changes. It must include:
 
 - startup and files;
-- protocol rationale and explicit opaque lifecycle;
+- protocol rationale and explicit context capability lifecycle;
 - the distinction between GUI Sessions and protocol sessions;
 - authentication and database policy;
 - roots, commands, processes, text encoding and TLS;
@@ -243,14 +268,17 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 10. Build an empty SQLite database and verify `PRAGMA user_version` and the exact schema.
 11. Confirm no migrations, `ALTER TABLE`, legacy identifiers or old configuration imports exist.
 12. Confirm only MCP `2026-07-28` is advertised and no transport-session headers are used.
-13. Confirm missing/valid/invalid/expired opaque paths do or do not execute exactly as documented.
+13. Confirm missing/valid/invalid/expired context-handle paths do or do not execute exactly as documented.
 14. Confirm no approval, `allow_re`, `deny_re` or tool-enable policy remains.
 15. Confirm no UI polling interval, auto-refresh control or manual refresh path exists.
-16. Confirm backend log, opaque, root, process, debug, OAuth, settings and TLS mutations enter the same Deno render queue.
+16. Confirm backend log, context, root, process, debug, OAuth, settings and TLS mutations enter the same Deno render queue.
 17. Confirm every visible open/close/select/navigation transition is represented in Deno `uiState` and is produced by Eta, not by an imperative browser DOM mutation.
 18. Confirm expanded-row state uses database primary keys and remains correct when pagination or new rows change table order.
 19. Confirm inactive sections perform no section-specific database queries during a render.
 20. Confirm the WebView only sends normalized input envelopes, receives SSE renders, invokes Morphlex and restores Deno-supplied focus/scroll metadata.
-21. Confirm no Tauri, Rust, Neutralinojs, npm project or CLI files exist.
-22. Confirm the archive contains exactly the five root project files.
-23. Run the desktop WebView on a machine with Deno and platform dependencies.
+21. Confirm `context_info` returns the current absolute root and the root-level `AGENTS.md` / `agents.md` path when present, and returns `null` when absent.
+22. Confirm every built-in tool exposes a strict tool-specific output schema layered on the common context envelope.
+23. Confirm `glob`, `grep` and `replace` implement every documented traversal, exclusion, encoding, size-limit and expected-count argument without shell, `uv` or Python helpers.
+24. Confirm no Tauri, Rust, Neutralinojs, npm project or CLI files exist.
+25. Confirm the archive contains exactly the five root project files.
+26. Run the desktop WebView on a machine with Deno and platform dependencies.

@@ -1,6 +1,6 @@
-# MrMCP 0.10.43
+# MrMCP 0.10.46
 
-MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit server-issued opaque values for application state.
+MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
 ![MrMCP administration interface](./mrmcp-screenshot.png)
 
@@ -48,42 +48,43 @@ References:
 - [SEP-2567 — Sessionless MCP via Explicit State Handles](https://modelcontextprotocol.io/seps/2567-sessionless-mcp)
 - [SEP-2575 — Make MCP Stateless](https://modelcontextprotocol.io/seps/2575-stateless-mcp)
 
-MrMCP implements that application-level pattern through the optional `server_opaque` property present in every tool input schema. It is not a transport session identifier.
+MrMCP implements that application-level pattern with an explicit `create_context` tool and a required `context_handle` argument on every other tool. The handle is an opaque bearer capability, not a transport session identifier.
 
-### Bootstrap and reuse
+### Create and reuse a context
 
-1. The first tool call omits `server_opaque`.
-2. MrMCP creates an `opaque_...` value, does **not** execute the requested operation, returns the value and sets `retry_required: true`.
-3. The client repeats the same call with that exact value.
-4. A valid value executes the operation and is repeated unchanged in the result.
-5. An unknown, foreign or expired value never executes the requested operation and never causes an automatic replacement to be minted.
-6. A response may explicitly instruct the client to omit the invalid value once to obtain a new one.
+1. Call `create_context` without `context_handle`.
+2. MrMCP creates and returns a globally unique, unguessable `ctx_...` value.
+3. Call `context_info` with that handle before repository work.
+4. `context_info` returns the current absolute root and, when present, the root-level `AGENTS.md` or `agents.md` path to read and follow.
+5. Pass the exact handle unchanged in `context_handle` on every later MrMCP tool call. Call `context_info` again after the operator changes the Session root.
+6. A missing, unknown or expired handle does not execute the requested operation and does not mint a replacement automatically. Recover with `create_context`, then repeat the requested call.
 
-Every tool result repeats the state envelope:
+Successful tool results contain the compact state envelope:
 
 ```json
 {
-  "server_opaque": "opaque_...",
-  "server_opaque_status": "active",
-  "retry_required": false,
-  "message": "..."
+  "context_handle": "ctx_...",
+  "context_status": "active",
+  "operation_executed": true
 }
 ```
 
-Possible statuses are `active`, `invalid` and `expired`. Values are scoped to the authenticated client and expire after 30 days without activity.
+Recovery responses additionally set `isError: true`, `operation_executed: false`, `retry_required: true`, `recovery_tool: "create_context"` and a recovery message. Possible statuses are `active`, `invalid` and `expired`. Contexts expire after 30 days without activity.
+
+The handle itself selects the context after authentication. MrMCP does not bind contexts, processes or JavaScript kernels to the OAuth client or Basic credential that created them. Any authenticated client possessing a valid handle can use that context.
 
 ### Why the GUI says “Sessions”
 
-The administration interface labels these values **Sessions** because that is convenient for an operator grouping calls, roots, process state and logs. This is only a GUI term. MrMCP does not implement protocol sessions, does not use `Mcp-Session-Id`, and does not derive identity from client transport headers.
+The administration interface labels contexts **Sessions** because that is convenient for operators. This is only a GUI term. MrMCP does not implement protocol sessions and does not use `Mcp-Session-Id`.
 
 ## Authentication and tool access
 
-Authentication is the only server-side tool-access boundary.
+Authentication controls access to MrMCP; `context_handle` selects persistent state after authentication.
 
 - Authenticated OAuth or Basic clients receive every published built-in and custom tool.
 - Anonymous clients receive no tools and cannot execute operations.
 - There are no tool approvals, enable lists, execution switches, `allow_re`, `deny_re` or user-defined per-tool policies.
-- OAuth consent remains because it authorizes the client itself, not an individual tool call.
+- OAuth consent authorizes the client itself, not an individual tool call.
 
 The only public MCP endpoint is `/mcp`. OAuth protected-resource metadata is exposed for that single resource.
 
@@ -97,35 +98,54 @@ Development builds use one exact current SQLite schema and no compatibility laye
 - There are no migrations, `ALTER TABLE` upgrades, backfills, aliases, old-key imports or legacy identifier acceptance.
 - After an incompatible development change, stop MrMCP and delete `.mrmcp/mrmcp.sqlite`.
 
-The current schema uses `server_config`, `roots`, `server_opaques`, `logs.server_opaque` and `process_runs.server_opaque` directly. A clean database creates no named `default` root.
+The current schema uses `server_config`, `roots`, `contexts`, `logs.context_handle` and `process_runs.context_handle`. A context stores exactly one current `root_id`; root id `0` denotes the directory containing `mrmcp.js`.
 
 ## Roots and filesystem isolation
 
-Each valid opaque value may select one named root. If none is selected, its effective root is the directory containing `mrmcp.js`.
+The Roots page lets the operator register named absolute directories and assign one current root to each Session.
 
-The Roots page provides conventional management only:
+- A root may be assigned to any number of contexts.
+- Every context always has exactly one effective root.
+- A new context starts on the fallback root beside `mrmcp.js`.
+- Changing a Session's root affects new tool calls immediately.
+- Existing background or interactive processes continue in the directory where they started.
+- Disabling or deleting a root moves currently associated contexts to the fallback root without terminating processes.
 
-- logical name;
-- existing absolute directory path;
-- enabled state;
-- edit and delete.
+The public `context_info` tool returns the absolute root directory currently assigned to the supplied context plus `agent_guidance_present` and a nullable absolute `agent_guidance_path`. MrMCP checks only the root-level `AGENTS.md`, then `agents.md`; it does not scan parent or child directories. When the path is present, the agent must read and follow that file before modifying the repository. Root identifiers, available roots and other administrative metadata are not exposed through MCP tools.
 
-There is no drag-and-drop or drop diagnostics. Relative paths and child-process working directories must remain within the effective root.
+All relative paths and new child-process working directories must remain inside the root captured at the start of the tool call.
 
 ## Built-in tools
 
-MrMCP publishes tools for:
+Context and location:
 
-- workspace/root selection;
-- file and directory metadata;
-- listing and searching files;
-- UTF-aware reading, writing and exact/bulk editing;
-- creating, copying, moving and deleting paths;
-- publishing generated files;
-- discovering extra commands;
-- foreground and managed/background process execution;
-- polling, stdin writes, termination and process listing;
-- a persistent Deno JavaScript worker and module-directory registration.
+- `create_context`;
+- `context_info`.
+
+Filesystem and text:
+
+- `read_file`, `read_files`, `write_file`, `write_files`;
+- `glob`, `grep`, `edit`, `replace`;
+- `file_info`, `create_directory`, `copy_path`, `move_path`, `delete_path`;
+- `publish_file`.
+
+Commands and persistent execution:
+
+- `list_commands`;
+- `exec`, `exec_start`, `exec_poll`, `exec_write`, `exec_kill`, `exec_list`;
+- `js`, `js_add_node_module_dir`, `js_reset`.
+
+`edit` accepts multiple files and multiple ordered exact edits per file. Each file is read once, its edits are applied sequentially in memory, every expected occurrence count is validated, and all files are written atomically with rollback.
+
+`glob`, `grep` and `replace` are intended to remove the need for improvised `uv`, Python or shell scripts during ordinary repository work:
+
+- `glob` supports a start path, glob pattern, exclusions, hidden files, dependency directories and a result limit;
+- `grep` supports literal or regular-expression matching, case sensitivity, globs, exclusions, context lines, hidden/dependency traversal, encoding selection, file-size limits and `content`, `files_with_matches` or `count` output;
+- `replace` supports the same traversal controls, literal or regex replacements, preview mode, encoding/BOM/line-ending preservation, atomic rollback and an optional exact `expected_replacements` guard.
+
+Every built-in tool publishes a tool-specific output schema layered on the common `context_handle`, `context_status` and `operation_executed` envelope. Recovery-only fields remain optional so successful results stay compact.
+
+JavaScript kernels are created lazily and keyed by `(context_handle, root_id)`. Switching a Session to another root uses or creates that context-root kernel; switching back reuses its previous state. Different contexts never share JavaScript globals even when they use the same root.
 
 Custom commands are described in `commands.yaml` and resolve below `.mrmcp/bin`. Executables found directly in that directory are also discoverable.
 
@@ -152,10 +172,10 @@ Text tools support:
 
 Preferred editing order:
 
-1. `edit_file` / `edit_files` for exact replacements;
-2. `replace_files` for repeated literal or regular-expression replacements;
+1. `edit` for one or more ordered exact edits per file and atomic multi-file changes;
+2. `replace` for repeated literal or regular-expression replacements across files;
 3. `write_file` / `write_files` for complete content;
-4. `js` / `exec` only when the transformation genuinely requires parsing or programmatic logic.
+4. `js` / `exec` only when the transformation genuinely requires parsing, computation or other programmatic logic.
 
 ## Administration interface
 
@@ -227,6 +247,25 @@ The Settings and Dashboard pages display listener state, active certificate, val
 
 ## Development changelog
 
+### 0.10.46
+
+- Replaced `get_cwd` with `context_info`, which returns the current absolute root and the optional root-level `AGENTS.md` / `agents.md` guidance path.
+- Directed agents to call `context_info` after context creation and root changes, then read and follow `agent_guidance_path` when present.
+- Added explicit tool-specific output schemas instead of one permissive generic result schema.
+- Expanded `glob`, `grep` and `replace` with exclusions, hidden/dependency traversal, file-size and encoding controls; `replace` also gained an exact `expected_replacements` guard.
+- Updated tool descriptions and server instructions to prefer structured file tools and avoid shell, `uv` or Python for covered operations.
+
+### 0.10.45
+
+- Replaced `server_opaque` with the public bearer capability `context_handle` and added `create_context`.
+- Removed authenticated-client ownership from contexts, processes and JavaScript kernels; possession of a valid handle selects the context after authentication.
+- Replaced the MCP `workspace` tool with the minimal `get_cwd` tool. Root assignment remains exclusively in the Sessions/Roots administration UI.
+- Made each context reference exactly one current `root_id`, freely reassignable; a root may serve many contexts and existing processes are left untouched when the assignment changes.
+- Scoped lazy persistent JavaScript kernels by context and root.
+- Replaced `list_files`, `search_files`, `edit_file`, `edit_files` and `replace_files` with `glob`, `grep`, `edit` and `replace`.
+- Fixed multi-edit semantics: ordered edits for the same file are now applied to one in-memory document and all files are committed atomically with rollback.
+- Added root snapshots to tool-call and process logs and moved the clean SQLite schema to version 2.
+
 ### 0.10.43
 
 - Expanded `AGENTS.md` with the full UI-state design rationale and failure mode that motivated the architecture.
@@ -294,7 +333,7 @@ The Settings and Dashboard pages display listener state, active certificate, val
 ### 0.10.30–0.10.31
 
 - Replaced transport-derived session identity with explicit tool arguments for the stateless protocol.
-- Stabilized the final field name as `server_opaque` and removed “context” terminology from agent-facing schemas.
+- Stabilized the final field name as `context_handle` and removed “context” terminology from agent-facing schemas.
 
 ### 0.10.28
 
