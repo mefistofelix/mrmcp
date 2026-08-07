@@ -1,4 +1,4 @@
-# MrMCP 0.10.50
+# MrMCP 0.10.51
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -102,8 +102,13 @@ The current schema gives every context a numeric administrative primary key in `
 
 ## Roots and filesystem isolation
 
-The Roots page lets the operator register named absolute directories and assign one current root to each Session.
+The Roots page lets the operator register named absolute directories and assign one current root to each Session. It is split into **📁 Roots** on the left and **💬 Sessions** with **No root assigned** on the right. Each named-root card contains its current Session assignments, and every Session item shows its creation time and last access.
 
+- Drag a Session from the right-hand Sessions column into a named root to assign it.
+- Drag a Session from a named root back to the right-hand Sessions column to remove its named-root association; root id `0` is stored immediately.
+- Dragging directly between named roots reassigns the Session in one step.
+- Disabled roots remain visible for editing/deletion but cannot receive Sessions.
+- The Sessions page shows the current root name and path as read-only information; assignment is performed only from Roots.
 - A root may be assigned to any number of contexts.
 - Every context always has exactly one effective root.
 - A new context starts on the fallback root beside `mrmcp.js`.
@@ -182,12 +187,12 @@ Preferred editing order:
 The interface contains:
 
 - Dashboard;
-- OAuth clients;
+- Clients;
 - Sessions;
-- Tool calls;
 - Roots;
+- Tool Calls;
 - Commands;
-- HTTP debug;
+- Http Log;
 - Settings;
 - Help.
 
@@ -211,8 +216,8 @@ The backend keeps one ephemeral `uiState` object containing:
 
 The WebView does not keep an application-state object and does not query administrative JSON endpoints. Its responsibilities are deliberately narrow:
 
-1. delegate click, change, input, submit, focus, keyboard and scroll events;
-2. serialize those events and send them to Deno over `/api/ui-input` WebSocket;
+1. delegate click, change, input, submit, focus, keyboard, scroll and native drag/drop events;
+2. serialize those events and send them to Deno over `/api/ui-input` WebSocket; the drag data carries only the numeric Session PK and never mutates visible DOM state;
 3. receive complete server-rendered UI HTML over `/api/events` SSE;
 4. apply the HTML to `#app` with Morphlex;
 5. restore the scroll and focus values supplied by Deno.
@@ -223,7 +228,7 @@ Rendering is queued rather than performed synchronously inside the triggering op
 
 Eta chooses the active section with a conditional. `buildUiRenderModel()` queries only the data required by that section, then Eta renders the sidebar, active section, dialogs and section-specific rows. Inactive sections are neither rendered nor queried. Expanded Tool-call and HTTP rows are identified by their unique database primary key and are reconstructed by Eta after relevant backend events.
 
-Native confirmation and alert state is not kept in the browser. Confirmations, errors and forms are represented in Deno `uiState` and rendered as ordinary Eta dialogs. The browser may perform a local clipboard write because that operation carries no application or graphical state.
+Native confirmation and alert state is not kept in the browser. Confirmations, errors and forms are represented in Deno `uiState` and rendered as ordinary Eta dialogs. The browser may perform a local clipboard write and may use the native drag `DataTransfer` object transiently to carry a Session PK to a root drop target; neither operation carries persistent or graphical application state.
 
 ### Help
 
@@ -252,6 +257,14 @@ MrMCP uses fixed public listeners:
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
 ## Development changelog
+
+### 0.10.51
+
+- Centralized Session root assignment on the Roots page: **📁 Roots** appear on the left with their associated Sessions, while **💬 Sessions / No root assigned** appears on the right; Session items show creation and last-access timestamps.
+- Added bidirectional drag-and-drop assignment between the Default root and named roots, plus direct root-to-root reassignment; Deno remains authoritative and the browser transports only the Session PK and target root id.
+- Removed the root selector from Sessions; the current root label and path remain visible there as read-only information.
+- Updated the sidebar labels/order to **Clients**, **Sessions**, **Roots**, **Tool Calls**, **Commands**, **Http Log** and compacted the Commands table actions vertically.
+- No database schema change; schema version remains 4.
 
 ### 0.10.50
 

@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.50 consists of exactly five root files:
+MrMCP 0.10.51 consists of exactly five root files:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `morphlex.js` — DOM morphing engine. Eta performs server-side templating; Morphlex does not template.
@@ -20,7 +20,7 @@ Use only the direct Deno import `jsr:@webview/webview@0.9.0`.
 - Desktop mode starts the backend as a Deno child process, waits for `MRMCP_READY`, opens the authenticated GUI URL and stops the child when the WebView closes.
 - The initial desktop size is 1180×760.
 - Do not add a native tray or drag-and-drop bridge unless explicitly requested.
-- Keep Roots management conventional: logical name, absolute path, enabled state, edit and delete.
+- Keep root records conventional: logical name, absolute path, enabled state, edit and delete. Session-to-root assignment belongs on the Roots page through server-routed drag/drop; do not put a root selector back on Sessions. The Roots assignment view labels the left column **Roots** and the right column **Sessions / No root assigned**, and Session items show creation and last-access timestamps.
 
 ## Database: clean schema only
 
@@ -79,7 +79,7 @@ The GUI maintains named roots. A root may be assigned to many contexts, while ea
 
 - Root id `0` is the fallback directory containing `mrmcp.js`.
 - New contexts start on root id `0`.
-- Root assignment is managed only in the Sessions/Roots GUI.
+- Root assignment is managed only in the Roots GUI. Sessions shows the current root label/path read-only.
 - The public MCP tool is `context_info`, which returns the absolute current root and nullable `agent_guidance_path`; the path itself expresses whether guidance is present.
 - `context_info` checks only the selected root's `AGENTS.md`, then `agents.md`; it returns an absolute path and never scans parent or child directories.
 - Tool/server descriptions must direct the agent to call `context_info` after `create_context` and root changes, then read and follow `agent_guidance_path` when non-null.
@@ -97,12 +97,12 @@ JavaScript kernels are lazy and keyed by `(server_id, context_handle, root_id)`.
 Keep these sections:
 
 - Dashboard;
-- OAuth clients;
+- Clients;
 - Sessions;
-- Tool calls;
 - Roots;
+- Tool Calls;
 - Commands;
-- HTTP debug;
+- Http Log;
 - Settings;
 - Help.
 
@@ -169,7 +169,7 @@ The embedded browser has only transport and DOM-application responsibilities:
 4. morph the complete `#app` HTML using Morphlex;
 5. apply scroll/focus metadata sent by Deno.
 
-The browser must not call `/api/state`, `/api/render` or section-specific JSON endpoints. It must not execute database, filesystem, process, TLS, OAuth or command business logic. Local clipboard writes are allowed because they carry no persistent or graphical application state.
+The browser must not call `/api/state`, `/api/render` or section-specific JSON endpoints. It must not execute database, filesystem, process, TLS, OAuth or command business logic. Local clipboard writes are allowed because they carry no persistent or graphical application state. Native drag `DataTransfer` may transiently carry only a numeric Session PK to a server-rendered root drop target; it must not add/remove classes, move nodes, retain assignment state or otherwise alter visible UI locally.
 
 ### One backend input and render pipeline
 
@@ -191,8 +191,8 @@ Do not add interval polling, refresh timers, auto-refresh controls, manual refre
 Eta selects the active section from Deno `uiState.currentSection`. `buildUiRenderModel()` may query only the current section’s data:
 
 - Dashboard: endpoint summary and aggregates.
-- Sessions: contexts and their single current root, optionally filtered by stored OAuth client id.
-- Roots: roots only.
+- Sessions: contexts and their single current root, optionally filtered by stored OAuth client id; root information is read-only.
+- Roots: root records plus the minimal context rows required to group Sessions by current `root_id` and render the Default-root bucket.
 - Commands: command catalog page only.
 - Tool calls: context filter values, paginated rows and at most one selected detail row.
 - HTTP debug: setting, filtered rows and at most one selected detail row.
@@ -288,5 +288,7 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 25. Confirm Session rows, Tool-call rows and the Tool-call Session filter use `contexts.id` / `logs.context_id`, while MCP requests still use the opaque handle.
 26. Confirm OAuth client rows count `contexts.oauth_client_id` matches and their View sessions action opens Sessions with that client filter; clearing the filter restores all Sessions.
 27. Confirm current-day GUI timestamps omit the calendar date while preserving time and any relative-age suffix.
-28. Confirm the archive contains exactly the five root project files.
-29. Run the desktop WebView on a machine with Deno and platform dependencies.
+28. Confirm the Roots page groups Sessions by `root_id`, labels the right-hand root-id-0 group **Sessions / No root assigned**, shows creation and last-access timestamps on Session items, accepts native drag/drop to named roots or root id `0`, routes the assignment through Deno, and the Sessions page has no root selector.
+29. Confirm browser drag handling only transports the numeric Session PK/target root and performs no imperative visible DOM mutation.
+30. Confirm the archive contains exactly the five root project files.
+31. Run the desktop WebView on a machine with Deno and platform dependencies.
