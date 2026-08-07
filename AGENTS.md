@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.55 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.56 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
@@ -104,7 +104,7 @@ Keep these sections:
 - Roots;
 - Tool Calls;
 - Commands;
-- Http Log;
+- HTTP Log;
 - Settings;
 - Help.
 
@@ -213,7 +213,8 @@ Root, Command, Settings, confirmation and message state belongs to Deno. Input e
 - Display and filter by the numeric operator Session primary key, never the long `context_handle` or generic context label.
 - Apply text, Session, status and page-size filter changes automatically through Deno-owned state; do not add a Tool-call Search button or a second refresh path.
 - Give Tool Call pagination, the table, every compact row and every expanded detail row stable DOM ids derived from the log database primary key so Morphlex preserves row identity when new calls are inserted ahead of existing rows.
-- Expanded `exec`, `exec_start` and `exec_poll` rows show a terminal-style command/cwd/stdout/stderr block before the MCP input/result JSON; prefer live managed-process output when the linked process is still in memory.
+- Show terminal chrome only when the selected Tool Call has an actual process-like result (managed exec-family calls or custom commands carrying process command/output data); filesystem, search and control calls must not show an empty terminal section.
+- Process-like expanded rows show command/cwd plus the combined terminal `output` block before MCP input/result JSON; prefer live managed-process output when the linked process is still in memory. Every process-output chunk marks the Tool Calls scope dirty through the normal coalesced render queue; do not add polling. Separately requested stdout/stderr belong in MCP Result JSON, not duplicated in the terminal block.
 - Use numbered pagination above the table.
 - Keep input/output JSON out of compact rows.
 - Render details only for the selected primary key.
@@ -225,11 +226,12 @@ Root, Command, Settings, confirmation and message state belongs to Deno. Input e
 The system-PATH setting is enabled by default.
 
 - `exec` and `exec_start` must describe `args` as the exact ordered argv passed verbatim to the executable; agents should consult the command's `--help` rather than reinterpret uncertain option syntax.
-- Process result schemas must explicitly tell agents to inspect both `stdout` and `stderr` together with status/exit code when diagnosing what a command did; successful CLIs may legitimately write useful output to stderr.
+- `exec`, `exec_start`, `exec_poll` and custom-command result schemas expose one combined terminal-like `output` stream by default and tell agents to read it with status/exit code. Append stdout/stderr chunks in the order MrMCP observes them arriving from the two OS pipes. `separate_streams: true` optionally adds the individual streams; `exec_poll` uses `output_offset` for the combined stream and stream-specific offsets only when separation is requested. `exec_list` history remains combined-only.
 - ON: prepend `.mrmcp/bin` to the supplied or inherited `PATH`.
 - OFF: use only `.mrmcp/bin` in the child `PATH`.
 - Use `ComSpec` on Windows and `SHELL` or `/bin/sh` on Unix.
 - Keep managed process access scoped to the exact `context_handle`; retain the root and cwd snapshot captured at process start.
+- `recent_tool_calls` is read-only and scoped to the exact `context_handle`. It returns only calls that reached MrMCP and excludes its own currently running log row. Use it to distinguish server-side execution from upstream/client-wrapper rejection; never claim it can reveal a wrapper policy reason that was not sent to MrMCP.
 
 ## Text-editing tools
 
@@ -302,7 +304,9 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 31. Confirm standalone builds include both `assets/` and root `commands.yaml`, and that first standalone startup materializes `commands.yaml` beside the executable only when absent without overwriting an existing file.
 32. Verify `trash_paths` creates one `.trash/<action_id>/` plus sibling `.json`, supports explicit paths/directories and globs, collapses nested selections, and leaves no partial trash action after rollback.
 33. Verify `untrash_action` preflights the complete action and either restores every path or restores none; confirm both trash tools have `destructiveHint: false` and no permanent filesystem-delete tool is published.
-34. Verify `exec`/`exec_start` schemas describe argv as verbatim ordered arguments and describe stdout/stderr as diagnostic outputs to inspect together with status/exit code.
-35. Verify expanded `exec`, `exec_start` and `exec_poll` Tool Call rows render the terminal block above MCP JSON and prefer live process output when available.
-36. Verify Tool Call pagination/table/compact rows/detail rows use stable ids keyed by log database primary key and a live insert does not replace unrelated existing rows during Morphlex reconciliation.
-37. Run the desktop WebView on a machine with Deno and platform dependencies.
+34. Verify `exec`/`exec_start` schemas describe argv as verbatim ordered arguments, expose combined `output` by default, and add individual stdout/stderr only when `separate_streams: true` is requested; verify `exec_poll` advances `output_offset` correctly.
+35. Verify `recent_tool_calls` returns only prior rows for the supplied `context_handle`, excludes its own current row, and makes no claim about upstream requests that never reached MrMCP.
+36. Verify process-like Tool Call rows render command/cwd/combined output above MCP JSON, prefer live process output when available, enqueue process-output chunks through the normal coalesced render path, and render no terminal block for non-process tools.
+37. Verify Tool Call pagination/table/compact rows/detail rows use stable ids keyed by log database primary key and a live insert does not replace unrelated existing rows during Morphlex reconciliation.
+38. Verify visible GUI headings, action buttons and dialog titles use consistent Title Case while ordinary field labels/body prose remain sentence case.
+39. Run the desktop WebView on a machine with Deno and platform dependencies.

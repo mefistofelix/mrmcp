@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.55
+# MrMCP 0.10.56
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -135,7 +135,8 @@ All relative paths and new child-process working directories must remain inside 
 Context and location:
 
 - `create_context`;
-- `context_info`.
+- `context_info`;
+- `recent_tool_calls` — recent calls that actually reached MrMCP for the same `context_handle`, useful for distinguishing server-side failures from requests blocked before MCP dispatch.
 
 Filesystem and text:
 
@@ -151,6 +152,10 @@ Commands and persistent execution:
 - `js`, `js_add_node_module_dir`, `js_reset`.
 
 `edit` accepts multiple files and multiple ordered exact edits per file. Each file is read once, its edits are applied sequentially in memory, every expected occurrence count is validated, and all files are written atomically with rollback.
+
+Command execution tools (`exec`, `exec_start`, `exec_poll` and custom commands) return a terminal-like `output` stream by default. MrMCP appends chunks from stdout and stderr to that field in the order the two OS pipes are observed producing data, so the agent normally has one stream to read together with `status` and `exit_code`. Set `separate_streams: true` when the individual `stdout` and `stderr` streams are specifically useful; `exec_poll` uses `output_offset` for incremental reads of the combined stream. `exec_list` history exposes combined output only.
+
+`recent_tool_calls` reads only the supplied Session's `context_handle` history and excludes its own currently running call. It proves which requests reached MrMCP and shows their input, resolved result/output, status, timing and errors. A request rejected by a client/platform wrapper before MCP dispatch cannot be present, and MrMCP cannot expose an upstream reason code that was never delivered to the server.
 
 `trash_paths` is the removal path for files and directories. It accepts explicit root-relative `paths`, an optional root-relative `glob`, or both. Each call creates `.trash/<action_id>/` plus sibling metadata `.trash/<action_id>.json`; the action id is the local date/time to the second with `-2`, `-3`, ... added only on collision. Nested selections are collapsed so moving a selected directory does not separately move its children. `untrash_action(action_id)` restores the whole action or restores nothing: it preflights every original target first and rolls back any moves if a restore step fails. MrMCP intentionally exposes no permanent filesystem-delete tool; removal is reversible through trash actions.
 
@@ -204,7 +209,7 @@ The interface contains:
 - Roots;
 - Tool Calls;
 - Commands;
-- Http Log;
+- HTTP Log;
 - Settings;
 - Help.
 
@@ -248,14 +253,16 @@ The Help page documents the current ChatGPT Web setup flow for a custom MCP app:
 
 ### Tool-call log
 
-The Tool calls page supports:
+The Tool Calls page supports:
 
 - filter by numeric GUI Session PK and status;
 - automatically apply the full-text query and every filter change without a Search button;
 - numbered pagination above the table;
 - complete timestamps with compact relative ages;
 - compact rows without inline input/output JSON;
-- Eta-rendered expanded details;
+- Eta-rendered expanded details keyed by stable log database ids so Morphlex preserves row identity during live inserts;
+- a Terminal block above MCP JSON only when the call result is actually process-like; ordinary filesystem, search and control tools do not render terminal chrome;
+- terminal command/cwd plus the combined `output` stream, preferring live in-memory process output when available; process chunks enter the same coalesced Deno render queue so an expanded running call updates without polling; separately requested stdout/stderr remain available in MCP Result JSON;
 - Terminate and Force controls only when cancellation is real.
 
 ## TLS and connectivity
@@ -269,6 +276,14 @@ MrMCP uses fixed public listeners:
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
 ## Development changelog
+
+### 0.10.56
+
+- Added `recent_tool_calls`, scoped to the exact `context_handle`, so agents can inspect calls that actually reached MrMCP without querying SQLite; requests blocked upstream before MCP dispatch are necessarily absent.
+- Made process `output` the default terminal-like stream, combining stdout and stderr in observed arrival order; `separate_streams: true` optionally adds the individual streams, and `exec_poll` supports a combined `output_offset`.
+- Restricted Tool Call terminal rendering to process-like results and changed the terminal block to the combined output stream above MCP JSON.
+- Normalized GUI page headings, action buttons and dialog titles to consistent Title Case, including **Tool Calls** and **HTTP Log**.
+- Kept the existing clean database schema at version 4.
 
 ### 0.10.55
 
@@ -307,7 +322,7 @@ The Settings and Dashboard pages display listener state, active certificate, val
 - Centralized Session root assignment on the Roots page: **📁 Roots** appear on the left with their associated Sessions, while **💬 Sessions / No root assigned** appears on the right; Session items show creation and last-access timestamps.
 - Added bidirectional drag-and-drop assignment between the Default root and named roots, plus direct root-to-root reassignment; Deno remains authoritative and the browser transports only the Session PK and target root id.
 - Removed the root selector from Sessions; the current root label and path remain visible there as read-only information.
-- Updated the sidebar labels/order to **Clients**, **Sessions**, **Roots**, **Tool Calls**, **Commands**, **Http Log** and compacted the Commands table actions vertically.
+- Updated the sidebar labels/order to **Clients**, **Sessions**, **Roots**, **Tool Calls**, **Commands**, **HTTP Log** and compacted the Commands table actions vertically.
 - No database schema change; schema version remains 4.
 
 ### 0.10.50
