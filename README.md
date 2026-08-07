@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.61
+# MrMCP 0.10.62
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -147,7 +147,7 @@ Context and location:
 
 - `create_context`;
 - `context_info`;
-- `recent_tool_calls` — recent calls that actually reached MrMCP for the same `context_handle`, useful for distinguishing server-side failures from requests blocked before MCP dispatch.
+- `query_tool_calls` — query calls that actually reached MrMCP for the same `context_handle`, with exact tool/status filters, literal full-record text search, stable backward pagination and a bounded result limit.
 
 Filesystem and text:
 
@@ -170,7 +170,7 @@ Commands and persistent execution:
 
 Command execution tools (`exec`, `exec_start`, `exec_poll` and custom commands) return a terminal-like `output` stream by default. MrMCP appends chunks from stdout and stderr to that field in the order the two OS pipes are observed producing data, so the agent normally has one stream to read together with `status` and `exit_code`. Set `separate_streams: true` when the individual `stdout` and `stderr` streams are specifically useful; `exec_poll` uses `output_offset` for incremental reads of the combined stream. `exec_list` history exposes combined output only.
 
-`recent_tool_calls` reads only the supplied Session's `context_handle` history and excludes its own currently running call. It proves which requests reached MrMCP and shows their input, resolved result/output, status, timing and errors. A request rejected by a client/platform wrapper before MCP dispatch cannot be present, and MrMCP cannot expose an upstream reason code that was never delivered to the server.
+`query_tool_calls` reads only the supplied Session's `context_handle` history and excludes its own currently running call. `limit` defaults to 10 and is bounded to 1–50; `tool` and `status` are exact filters; `query` is a case-insensitive literal substring search across the complete stored log row; `before_id` returns only older stable log ids for backward pagination. Filters can be combined. The tool proves which requests reached MrMCP and shows their input, resolved result/output, status, timing and errors. A request rejected by a client/platform wrapper before MCP dispatch cannot be present, and MrMCP cannot expose an upstream reason code that was never delivered to the server.
 
 `trash_paths` is the removal path for files and directories. It accepts explicit root-relative `paths`, an optional root-relative `glob`, or both. Each call creates `.mrmcp/trash/<action_id>/` plus sibling metadata `.mrmcp/trash/<action_id>.json` inside the selected Root; the action id is the local date/time to the second with `-2`, `-3`, ... added only on collision. `.mrmcp` is reserved metadata and is excluded from trash selections/globs. Nested selections are collapsed so moving a selected directory does not separately move its children. `untrash_action(action_id)` restores the whole action or restores nothing: it preflights every original target first and rolls back any moves if a restore step fails. MrMCP intentionally exposes no permanent filesystem-delete tool; removal is reversible through trash actions.
 
@@ -228,7 +228,7 @@ The interface contains:
 - Settings;
 - Help.
 
-Projects, Active calls, Custom tools and Approvals are intentionally absent. The GUI header and favicon use the MrMCP balloon+folder brand mark; the native window title remains **🧩 MrMCP**. Emoji are limited to navigation, headings, principal actions, destructive actions and compact states.
+Projects, Active calls, Custom tools and Approvals are intentionally absent. The Dashboard also exposes reversible-removal activity directly from completed Tool Call logs: separate Trash and Untrash cards show the completed-operation count plus the latest completion time, `action_id` and absolute trash path. For Untrash the displayed trash path is historical because a successful restore removes that action directory. Failed attempts do not increment either counter. The GUI header and favicon use the MrMCP balloon+folder brand mark; the native window title remains **🧩 MrMCP**. Emoji are limited to navigation, headings, principal actions, destructive actions and compact states.
 
 ### Deno-owned event-driven rendering model
 
@@ -291,6 +291,13 @@ MrMCP uses fixed public listeners:
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
 ## Development changelog
+
+### 0.10.62
+
+- Renamed the current `recent_tool_calls` tool to `query_tool_calls` with no compatibility alias, matching its role as a filterable history query rather than only a recent-items fetch.
+- Kept `limit` at default 10 / maximum 50 and added combinable exact `tool`, exact `status`, case-insensitive literal `query` across the complete stored log record, and stable `before_id` backward pagination.
+- Added Dashboard Trash and Untrash activity cards derived from completed Tool Call logs, showing total completed operations plus the latest completion time, action/folder id and absolute trash path; the Untrash path is explicitly historical after restoration.
+- No SQLite schema change; the Dashboard derives this information from existing persistent Tool Call logs.
 
 ### 0.10.61
 

@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.61 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.62 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
@@ -193,7 +193,7 @@ Do not add interval polling, refresh timers, auto-refresh controls, manual refre
 
 Eta selects the active section from Deno `uiState.currentSection`. `buildUiRenderModel()` may query only the current section’s data:
 
-- Dashboard: endpoint summary and aggregates.
+- Dashboard: endpoint summary and aggregates, including Trash/Untrash activity derived from completed Tool Call logs.
 - Sessions: contexts and their single current root, optionally filtered by stored OAuth client id; root information is read-only.
 - Roots: root records plus the minimal context rows required to group Sessions by current `root_id` and render the Default-root bucket.
 - Commands: command catalog page only.
@@ -232,7 +232,7 @@ The system-PATH setting is enabled by default.
 - OFF: use only `.mrmcp/bin` in the child `PATH`.
 - Use `ComSpec` on Windows and `SHELL` or `/bin/sh` on Unix.
 - Keep managed process access scoped to the exact `context_handle`; retain the root and cwd snapshot captured at process start.
-- `recent_tool_calls` is read-only and scoped to the exact `context_handle`. It returns only calls that reached MrMCP and excludes its own currently running log row. Use it to distinguish server-side execution from upstream/client-wrapper rejection; never claim it can reveal a wrapper policy reason that was not sent to MrMCP.
+- `query_tool_calls` is read-only and scoped to the exact `context_handle`. It returns only calls that reached MrMCP and excludes its own currently running log row. Keep `limit` bounded to 1–50 with default 10; `tool` and `status` are exact filters, `query` is a case-insensitive literal substring search across the complete stored log row, and `before_id` is the stable backward-pagination cursor. Filters are combinable. Use it to distinguish server-side execution from upstream/client-wrapper rejection; never claim it can reveal a wrapper policy reason that was not sent to MrMCP.
 
 ## Published files/HTML and MCP App widgets
 
@@ -277,7 +277,7 @@ Do not invoke shell commands, `uv` or Python to list, search, inspect, edit or r
 
 Preserve source encoding, BOM and line endings unless conversion is explicitly requested.
 
-Filesystem removal is trash-only; do not reintroduce a permanent delete tool. `trash_paths` accepts explicit paths and/or one glob, supports files and directories, collapses nested selections, and moves each action under the selected Root's reserved `.mrmcp/trash/<action_id>/` with sibling `.mrmcp/trash/<action_id>.json`. Never create a top-level `.trash` directory. Exclude the entire `.mrmcp` metadata directory from explicit trash targets and trash globs. Action ids use local date/time to the second with an incrementing numeric suffix only on collision. The manifest stays minimal (`action_id`, creation time and original paths); do not add hashes or redundant integrity metadata. Assume `.mrmcp/trash` is managed by MrMCP, but keep the preflight required to guarantee `untrash_action` restores the entire action or nothing and rolls back any mid-restore moves. Neither `trash_paths` nor `untrash_action` is destructive; do not add them to `destructiveHint`.
+Filesystem removal is trash-only; do not reintroduce a permanent delete tool. `trash_paths` accepts explicit paths and/or one glob, supports files and directories, collapses nested selections, and moves each action under the selected Root's reserved `.mrmcp/trash/<action_id>/` with sibling `.mrmcp/trash/<action_id>.json`. Never create a top-level `.trash` directory. Exclude the entire `.mrmcp` metadata directory from explicit trash targets and trash globs. Action ids use local date/time to the second with an incrementing numeric suffix only on collision. The manifest stays minimal (`action_id`, creation time and original paths); do not add hashes or redundant integrity metadata. Assume `.mrmcp/trash` is managed by MrMCP, but keep the preflight required to guarantee `untrash_action` restores the entire action or nothing and rolls back any mid-restore moves. Neither `trash_paths` nor `untrash_action` is destructive; do not add them to `destructiveHint`. Dashboard Trash/Untrash counters and latest-action details must be derived from completed persistent Tool Call logs rather than duplicated into another table; failed attempts do not count, and a successful Untrash displays its reconstructed trash path as historical because the action directory has been removed.
 
 ## Documentation requirements
 
@@ -329,7 +329,7 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 32. Verify `trash_paths` creates one `.mrmcp/trash/<action_id>/` plus sibling `.json` inside the selected Root, never creates top-level `.trash`, excludes `.mrmcp` metadata from explicit/glob selections, supports files/directories and globs, collapses nested selections, and leaves no partial trash action after rollback.
 33. Verify `untrash_action` preflights the complete action and either restores every path or restores none; confirm both trash tools have `destructiveHint: false` and no permanent filesystem-delete tool is published.
 34. Verify `exec`/`exec_start` schemas describe argv as verbatim ordered arguments, expose combined `output` by default, and add individual stdout/stderr only when `separate_streams: true` is requested; verify `exec_poll` advances `output_offset` correctly.
-35. Verify `recent_tool_calls` returns only prior rows for the supplied `context_handle`, excludes its own current row, and makes no claim about upstream requests that never reached MrMCP.
+35. Verify `query_tool_calls` returns only prior rows for the supplied `context_handle`, excludes its own current row, enforces limit 1–50/default 10, combines exact tool/status filters with literal full-record text search and `before_id` backward pagination, and makes no claim about upstream requests that never reached MrMCP.
 36. Verify process-like Tool Call rows render command/cwd/combined output above MCP JSON, prefer live process output when available, enqueue process-output chunks through the normal coalesced render path, and render no terminal block for non-process tools.
 37. Verify Tool Call pagination/table/compact rows/detail rows use stable ids keyed by log database primary key and a live insert does not replace unrelated existing rows during Morphlex reconciliation.
 38. Verify visible GUI headings, action buttons and dialog titles use consistent Title Case while ordinary field labels/body prose remain sentence case.
@@ -338,4 +338,5 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 41. Verify every managed Root/Command/Confirm/Message dialog is opened solely by Eta-rendered `open` state plus CSS overlay, with no browser `showModal()`/`show()`/imperative close path; Escape only sends a Deno close intent.
 42. Verify `publish_file` exposes no return-mode selector, Base64 image payload or MCP `resource_link`; its structured result contains the temporary HTTPS `uri`, its tool descriptor points to the versioned MCP App widget, and the widget reads `structuredContent.uri`, uses `<img>` for images and an Open File link for other MIME types. Confirm `exec` exposes no `return_files*` shortcut.
 43. Verify `publish_html` persists rows in `published_html`, returns a persistent unguessable HTTPS URI, remains fetchable after closing/reopening the SQLite connection/server, points to the dedicated MCP App widget, and renders through a nested iframe whose sandbox allows scripts/forms/modals/popups but never `allow-same-origin`. Confirm the outer widget declares the MrMCP origin in `frameDomains` and the tool description states that external networking is host/browser/CSP/CORS dependent.
-43. Run the desktop WebView on a machine with Deno and platform dependencies.
+44. Verify the Dashboard derives completed Trash/Untrash counts and latest completion/action/path details from Tool Call logs, ignores failed attempts, uses the logged absolute root snapshot to build the trash path, and labels a successful Untrash path as historical.
+45. Run the desktop WebView on a machine with Deno and platform dependencies.
