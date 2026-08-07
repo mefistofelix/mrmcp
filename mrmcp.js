@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.51 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
+MrMCP 0.10.52 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -19,6 +19,7 @@ import { contentType as mediaContentType, typeByExtension } from "jsr:@std/media
 
 const SELF = new URL(import.meta.url);
 const MODULE_DIR = dirname(fileURLToPath(SELF));
+const ASSETS_DIR = join(MODULE_DIR, "assets");
 const APP_DIR = Deno.build.standalone ? dirname(Deno.execPath()) : MODULE_DIR;
 const COMMANDS_PATH = join(APP_DIR, "commands.yaml");
 const cliValue = name => { const index = Deno.args.indexOf(name); return index >= 0 ? String(Deno.args[index + 1] || "") : ""; };
@@ -39,7 +40,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.51";
+const VERSION = "0.10.52";
 const DB_SCHEMA_VERSION = 4;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -153,6 +154,27 @@ function compressHttpResponse(req, response) {
 const within = (root, path) => {
   const r = relative(root, path);
   return r === "" || (r !== ".." && !r.startsWith(".." + sep) && !isAbsolute(r));
+};
+const staticAssetResponse = async pathname => {
+  let requested;
+  try { requested = decodeURIComponent(String(pathname).slice("/assets/".length)); }
+  catch { return text("Bad request", 400); }
+  if (!requested || requested.includes("\0")) return text("Not found", 404);
+  const path = resolve(ASSETS_DIR, requested.replaceAll("/", sep));
+  if (!within(ASSETS_DIR, path)) return text("Not found", 404);
+  try {
+    const stat = await Deno.stat(path);
+    if (!stat.isFile) return text("Not found", 404);
+    const body = await Deno.readFile(path);
+    return new Response(body, { headers: {
+      "content-type": mediaContentType(extname(path).toLowerCase()) || "application/octet-stream",
+      "cache-control": "no-cache",
+      "x-content-type-options": "nosniff",
+    } });
+  } catch (error) {
+    if (error instanceof Deno.errors.NotFound) return text("Not found", 404);
+    throw error;
+  }
 };
 
 function jsKernelWorkerSource() {/*
@@ -306,7 +328,7 @@ async function backend() {
         const message = htmlEscape(String(error?.stack || error));
         const payload = JSON.stringify({
           revision: ++uiRevision,
-          html: `<div id="app" data-section="${htmlEscape(uiState.currentSection)}"><header><b>🧩 MrMCP</b></header><main style="margin-left:0"><div class="card tls-alert"><h2>UI render failed</h2><pre>${message}</pre></div></main></div>`,
+          html: `<div id="app" data-section="${htmlEscape(uiState.currentSection)}"><header><div class=brand><img class=brand-mark src="/assets/mrmcp-logo.svg" alt=""><b>MrMCP</b></div></header><main style="margin-left:0"><div class="card tls-alert"><h2>UI render failed</h2><pre>${message}</pre></div></main></div>`,
           section: uiState.currentSection,
           scroll: [0, 0], focus: null, ack: uiState.lastInputSequence,
           reason: "render-error", at: Date.now(),
@@ -4240,7 +4262,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     const banner = uiState.notice
       ? `<div id=errorBanner class=banner style="display:block">${htmlEscape(uiState.notice.message || "")}</div>`
       : `<div id=errorBanner class=banner></div>`;
-    return `<div id="app" data-section="${htmlEscape(section)}"><header><b>🧩 MrMCP</b><div id=uiStatus class=status>${status}</div></header>${banner}<aside><div id=sidebar>${sidebar}</div></aside><main><div id=mainView>${view}</div></main><div id=dialogHost>${dialogs}</div></div>`;
+    return `<div id="app" data-section="${htmlEscape(section)}"><header><div class=brand><img class=brand-mark src="/assets/mrmcp-logo.svg" alt=""><b>MrMCP</b></div><div id=uiStatus class=status>${status}</div></header>${banner}<aside><div id=sidebar>${sidebar}</div></aside><main><div id=mainView>${view}</div></main><div id=dialogHost>${dialogs}</div></div>`;
   }
 
   function uiMessage(title, message) {
@@ -4916,19 +4938,19 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     return json({ error: "Not found" }, 404);
   }
 
-  // Eta renders server-side only. Morphlex is vendored locally and served by this process.
+  // Eta renders server-side only. Browser assets are served from assets/ on disk or from Deno's compiled virtual filesystem.
   const UI_CSP = "default-src 'self';base-uri 'none';object-src 'none';frame-ancestors 'self' http://127.0.0.1:*;form-action 'self';style-src 'unsafe-inline';script-src 'self';connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:* ws://localhost:*;img-src 'self' data:";
   const UI_TEMPLATE = String.raw`<!doctype html><html><head><meta charset=utf-8>
 <meta name=mrmcp-csrf content="__MRMCP_CSRF__">
 <meta http-equiv="Content-Security-Policy" content="${UI_CSP}">
-<meta name=viewport content="width=device-width,initial-scale=1"><title>🧩 MrMCP</title><style>
-:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.status{margin-left:auto;color:#8b949e;display:flex;gap:8px;align-items:center}aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}aside button{display:block;width:100%;text-align:left;margin:3px 0;background:transparent;border:0}aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.banner{display:none;margin-left:170px;padding:9px 18px;background:#5a2020;color:#ffd7d7}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.small{padding:4px 8px;font-size:12px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.pending,.running{color:#ffd166}.tools{columns:3;min-width:500px}dialog{color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw)}dialog::backdrop{background:#0009}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 8px 10px;background:#111318}.detail-panel{border:1px solid #343944;border-radius:8px;background:#0d0f12;padding:10px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.menu-icon{display:inline-block;width:22px;text-align:center}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-dates{display:flex;gap:6px 14px;flex-wrap:wrap;margin-top:5px;font-size:12px}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout{grid-template-columns:1fr}.default-root-card{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){aside{width:130px}main,.banner{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
+<meta name=viewport content="width=device-width,initial-scale=1"><link rel=icon href="/assets/mrmcp-logo.svg"><title>MrMCP</title><style>
+:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:8px;align-items:center}aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}aside button{display:block;width:100%;text-align:left;margin:3px 0;background:transparent;border:0}aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.banner{display:none;margin-left:170px;padding:9px 18px;background:#5a2020;color:#ffd7d7}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.small{padding:4px 8px;font-size:12px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.pending,.running{color:#ffd166}.tools{columns:3;min-width:500px}dialog{color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw)}dialog::backdrop{background:#0009}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 8px 10px;background:#111318}.detail-panel{border:1px solid #343944;border-radius:8px;background:#0d0f12;padding:10px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.menu-icon{display:inline-block;width:22px;text-align:center}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-dates{display:flex;gap:6px 14px;flex-wrap:wrap;margin-top:5px;font-size:12px}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout{grid-template-columns:1fr}.default-root-card{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){aside{width:130px}main,.banner{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
 </style></head><body>
-<div id=app data-section=dashboard><header><b>🧩 MrMCP</b><div class=status><span class=pending>connecting…</span></div></header><main style="margin-left:0"><div class=card>Connecting to the MrMCP UI service…</div></main></div>
+<div id=app data-section=dashboard><header><div class=brand><img class=brand-mark src="/assets/mrmcp-logo.svg" alt=""><b>MrMCP</b></div><div class=status><span class=pending>connecting…</span></div></header><main style="margin-left:0"><div class=card>Connecting to the MrMCP UI service…</div></main></div>
 <script type=module src=/app.js></script></body></html>`;
 
   function browserAppSource() {/*
-import { morphInner } from "/morphlex.js";
+import { morphInner } from "/assets/morphlex.js";
 const app = document.getElementById("app");
 let socket = null, renderStream = null, reconnectTimer = null, scrollTimer = null;
 let sequence = 0, lastSentSequence = 0;
@@ -5095,15 +5117,10 @@ connectRenderStream();
     });
     if (!hasSession(req)) return text("Unauthorized", 401);
     if (u.pathname.startsWith("/api/")) return await guiApi(req, u);
+    if (u.pathname.startsWith("/assets/")) return await staticAssetResponse(u.pathname);
     if (u.pathname === "/app.js") return text(BROWSER_JS, 200, "text/javascript; charset=utf-8", {
       "cache-control": "no-store", "x-content-type-options": "nosniff",
     });
-    if (u.pathname === "/morphlex.js") {
-      const source = await Deno.readTextFile(join(MODULE_DIR, "morphlex.js"));
-      return text(source, 200, "text/javascript; charset=utf-8", {
-        "cache-control": "public, max-age=31536000, immutable", "x-content-type-options": "nosniff",
-      });
-    }
     if (u.pathname === "/" || u.pathname === "/index.html") return text(ui(), 200, "text/html; charset=utf-8", {
       "cache-control": "no-store",
       "content-security-policy": UI_CSP,

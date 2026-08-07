@@ -1,0 +1,14 @@
+<svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title">
+  <title id="title">MrMCP</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#12253b"/><stop offset="1" stop-color="#091623"/></linearGradient>
+    <linearGradient id="folderBack" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffc231"/><stop offset="1" stop-color="#e19607"/></linearGradient>
+    <linearGradient id="folderFront" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffd856"/><stop offset="1" stop-color="#ffbe28"/></linearGradient>
+  </defs>
+  <rect x="28" y="28" width="456" height="456" rx="78" fill="url(#bg)"/>
+  <path d="M139 96h212a43 43 0 0 1 43 43v132a43 43 0 0 1-43 43H235l-78 68 14-68h-32a43 43 0 0 1-43-43V139a43 43 0 0 1 43-43Z" fill="#f9fafc" stroke="#4c7fbe" stroke-width="14" stroke-linejoin="round"/>
+  <circle cx="171" cy="205" r="15" fill="#081b2b"/><circle cx="245" cy="205" r="15" fill="#081b2b"/><circle cx="319" cy="205" r="15" fill="#081b2b"/>
+  <path d="M291 240h64l34 34h43a12 12 0 0 1 12 12v56H279v-90a12 12 0 0 1 12-12Z" fill="url(#folderBack)" stroke="#b77400" stroke-width="11" stroke-linejoin="round"/>
+  <rect x="251" y="290" width="212" height="151" rx="28" fill="url(#folderFront)" stroke="#b77400" stroke-width="11"/>
+  <rect x="271" y="306" width="169" height="31" rx="14" fill="#fff" opacity=".25"/>
+</svg>

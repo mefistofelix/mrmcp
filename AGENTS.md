@@ -2,13 +2,13 @@
 
 ## Current release and files
 
-MrMCP 0.10.51 consists of exactly five root files:
+MrMCP 0.10.52 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
-- `morphlex.js` — DOM morphing engine. Eta performs server-side templating; Morphlex does not template.
 - `commands.yaml` — extra-command catalog.
 - `README.md` — complete user/operator behavior and development changelog.
 - `AGENTS.md` — implementation invariants and release checks.
+- `assets/` — all static WebView/build assets, including `morphlex.js`, `mrmcp-logo.svg`, `mrmcp-logo.png`, `mrmcp.ico` and `mrmcp-screenshot.png`; do not duplicate them in the repository root.
 
 The only public MCP endpoint is `/mcp`. The administration UI is loopback-only at `127.0.0.1:7332`.
 
@@ -20,6 +20,7 @@ Use only the direct Deno import `jsr:@webview/webview@0.9.0`.
 - Desktop mode starts the backend as a Deno child process, waits for `MRMCP_READY`, opens the authenticated GUI URL and stops the child when the WebView closes.
 - The initial desktop size is 1180×760.
 - Do not add a native tray or drag-and-drop bridge unless explicitly requested.
+- Keep WebView/static resources in `assets/` and serve them only through authenticated `/assets/...` routes. Source mode reads the directory from disk; with the project's Deno 2.9.4 build, standalone builds must embed it with `deno compile --include assets` so the same paths resolve from Deno's virtual filesystem.
 - Keep root records conventional: logical name, absolute path, enabled state, edit and delete. Session-to-root assignment belongs on the Roots page through server-routed drag/drop; do not put a root selector back on Sessions. The Roots assignment view labels the left column **Roots** and the right column **Sessions / No root assigned**, and Session items show creation and last-access timestamps.
 
 ## Database: clean schema only
@@ -290,5 +291,5 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 27. Confirm current-day GUI timestamps omit the calendar date while preserving time and any relative-age suffix.
 28. Confirm the Roots page groups Sessions by `root_id`, labels the right-hand root-id-0 group **Sessions / No root assigned**, shows creation and last-access timestamps on Session items, accepts native drag/drop to named roots or root id `0`, routes the assignment through Deno, and the Sessions page has no root selector.
 29. Confirm browser drag handling only transports the numeric Session PK/target root and performs no imperative visible DOM mutation.
-30. Confirm the archive contains exactly the five root project files.
+30. Confirm the archive contains exactly the four root project files plus the versioned `assets/` directory, with Morphlex and all branding/static files there and no duplicate assets in the root.
 31. Run the desktop WebView on a machine with Deno and platform dependencies.

@@ -1,18 +1,20 @@
-# MrMCP 0.10.51
+<p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
+
+# MrMCP 0.10.52
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
-![MrMCP administration interface](./mrmcp-screenshot.png)
+![MrMCP administration interface](./assets/mrmcp-screenshot.png)
 
 The desktop window uses `jsr:@webview/webview@0.9.0`, imported directly by Deno. The project has no Node.js application, npm install, CLI scaffold, Rust, Tauri or Neutralinojs runtime.
 
 ## Project files
 
 - `mrmcp.js` — backend, MCP endpoint, SQLite schema, administration UI and desktop launcher.
-- `morphlex.js` — DOM morphing engine used after Eta renders updated HTML.
 - `commands.yaml` — metadata for optional executables in `.mrmcp/bin`.
 - `README.md` — user and operator documentation.
 - `AGENTS.md` — implementation invariants and release checks.
+- `assets/` — static WebView/build assets: `morphlex.js`, SVG/PNG branding, Windows ICO and administration screenshot.
 
 ## Requirements and startup
 
@@ -35,6 +37,8 @@ deno run -A mrmcp.js --backend
 ```
 
 The administration interface is served at `http://127.0.0.1:7332/`. Desktop mode starts the backend as a Deno child process, waits for `MRMCP_READY`, opens the authenticated loopback URL in the WebView and terminates the child when the window closes. The initial window size is 1180×760.
+
+The authenticated GUI serves `assets/` uniformly under `/assets/`. With `deno run`, those files come directly from the repository `assets/` directory. With the project's Deno 2.9.4 build, `deno compile --include assets` embeds the same directory in Deno's virtual filesystem, so the WebView uses identical `/assets/...` URLs in source and standalone builds.
 
 ## MCP 2026-07-28 and stateless operation
 
@@ -196,7 +200,7 @@ The interface contains:
 - Settings;
 - Help.
 
-Projects, Active calls, Custom tools and Approvals are intentionally absent. The header and window title use **🧩 MrMCP**. Emoji are limited to navigation, headings, principal actions, destructive actions and compact states.
+Projects, Active calls, Custom tools and Approvals are intentionally absent. The GUI header and favicon use the MrMCP balloon+folder brand mark; the native window title remains **🧩 MrMCP**. Emoji are limited to navigation, headings, principal actions, destructive actions and compact states.
 
 ### Deno-owned event-driven rendering model
 
@@ -257,6 +261,15 @@ MrMCP uses fixed public listeners:
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
 ## Development changelog
+
+### 0.10.52
+
+- Moved GUI/browser resources into a single versioned `assets/` directory: Morphlex, SVG/PNG branding, the multi-resolution Windows ICO and the administration screenshot.
+- Added authenticated `/assets/...` static serving that reads the same paths from disk under `deno run` and from Deno's virtual filesystem when `assets/` is embedded with `--include assets`.
+- Removed the inline brand SVG/data URL from `mrmcp.js`; the GUI header and favicon now reference `assets/mrmcp-logo.svg`, while the native window title remains **🧩 MrMCP**.
+- Moved the README screenshot reference to `assets/mrmcp-screenshot.png` and kept the screenshot separate from the logo asset.
+- Recompiled the Windows executable with `--include assets --icon assets/mrmcp.ico`.
+- No database schema change; schema version remains 4.
 
 ### 0.10.51
 
