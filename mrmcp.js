@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.46 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
+MrMCP 0.10.47 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -39,7 +39,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.46";
+const VERSION = "0.10.47";
 const DB_SCHEMA_VERSION = 2;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -1678,14 +1678,14 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     Date.now() - Number(context.last_active_at || context.created_at || 0) > CONTEXT_TTL_MS;
   function resolveContext(p, suppliedHandle = "", protocolVersion = "") {
     const handle = String(suppliedHandle ?? "");
-    if (!handle) return { kind: "missing", record: null, supplied_handle: "", context_status: "invalid" };
-    if (handle.length > 256) return { kind: "invalid", record: null, supplied_handle: handle, context_status: "invalid" };
+    if (!handle) return { kind: "missing", record: null, supplied_handle: "" };
+    if (handle.length > 256) return { kind: "invalid", record: null, supplied_handle: handle };
     const context = contextByHandle(p, handle);
-    if (!context) return { kind: "invalid", record: null, supplied_handle: handle, context_status: "invalid" };
-    if (contextExpired(context)) return { kind: "expired", record: context, context_status: "expired" };
+    if (!context) return { kind: "invalid", record: null, supplied_handle: handle };
+    if (contextExpired(context)) return { kind: "expired", record: context, supplied_handle: handle };
     const now = Date.now(), observed = String(protocolVersion || context.protocol_version || "");
     run("UPDATE contexts SET last_active_at=?,protocol_version=? WHERE handle=?", now, observed, context.handle);
-    return { kind: "active", record: one("SELECT * FROM contexts WHERE handle=?", context.handle), context_status: "active" };
+    return { kind: "active", record: one("SELECT * FROM contexts WHERE handle=?", context.handle), supplied_handle: handle };
   }
   function getContextRecord(p, handle = "") {
     const context = contextByHandle(p, handle);
@@ -1708,7 +1708,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       id: context.handle,
       context_handle: context.handle,
       label: context.label || context.handle,
-      context_status: contextExpired(context) ? "expired" : "active",
+      expired: contextExpired(context),
       protocol_version: context.protocol_version || "unknown",
       root_id: root.id,
       effective_root: root.name,
@@ -1752,7 +1752,6 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     }
     return {
       cwd: selection.root.path,
-      agent_guidance_present: !!agentGuidancePath,
       agent_guidance_path: agentGuidancePath,
     };
   }
@@ -2253,19 +2252,13 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     const stringArray = { type: "array", items: { type: "string" } };
     const envelopeProperties = {
       context_handle: { type: "string", description: CONTEXT_HANDLE_OUTPUT_DESCRIPTION },
-      context_status: { type: "string", enum: ["active", "invalid", "expired"] },
-      operation_executed: { type: "boolean" },
-      retry_required: { type: "boolean" },
-      recovery_tool: { type: "string" },
-      message: { type: "string" },
-      execution_log_id: { type: "integer" },
       error: { type: "string" },
     };
     const outputSchema = (properties = {}) => ({
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       type: "object", additionalProperties: false,
       properties: { ...envelopeProperties, ...properties },
-      required: ["context_handle", "context_status", "operation_executed"],
+      required: ["context_handle"],
     });
     const textMetadata = {
       encoding: { type: "string" }, bom: { type: "boolean" }, line_endings: { type: "string" },
@@ -2284,7 +2277,6 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       create_context: outputSchema(),
       context_info: outputSchema({
         cwd: { type: "string", description: "Absolute path of the context's current root." },
-        agent_guidance_present: { type: "boolean" },
         agent_guidance_path: {
           ...nullableString,
           description: "Absolute root-level AGENTS.md or agents.md path. When non-null, read and follow it before modifying files under this context root.",
@@ -2295,14 +2287,14 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       write_file: outputSchema({ path: { type: "string" }, bytes: { type: "integer" }, sha256: { type: "string" }, ...textMetadata }),
       write_files: outputSchema({ files: objectArray }),
       edit: outputSchema({ files: objectArray, total_replacements: { type: "integer" } }),
-      replace: outputSchema({ dry_run: { type: "boolean" }, scanned_files: { type: "integer" }, changed_files: { type: "integer" }, total_replacements: { type: "integer" }, files: objectArray }),
-      glob: outputSchema({ files: stringArray, count: { type: "integer" }, truncated: { type: "boolean" } }),
-      grep: outputSchema({ output_mode: { type: "string" }, scanned_files: { type: "integer" }, matched_files: { type: "integer" }, result_count: { type: "integer" }, results: objectArray, truncated: { type: "boolean" } }),
+      replace: outputSchema({ dry_run: { type: "boolean" }, scanned_files: { type: "integer" }, total_replacements: { type: "integer" }, files: objectArray }),
+      glob: outputSchema({ files: stringArray, truncated: { type: "boolean" } }),
+      grep: outputSchema({ output_mode: { type: "string" }, scanned_files: { type: "integer" }, matched_files: { type: "integer" }, results: objectArray, truncated: { type: "boolean" } }),
       file_info: outputSchema({ path: { type: "string" }, name: { type: "string" }, is_file: { type: "boolean" }, is_directory: { type: "boolean" }, is_symlink: { type: "boolean" }, size: { type: "integer" }, modified_at: nullableString, created_at: nullableString }),
-      create_directory: outputSchema({ path: { type: "string" }, created: { type: "boolean" } }),
+      create_directory: outputSchema({ path: { type: "string" } }),
       copy_path: outputSchema({ from: { type: "string" }, to: { type: "string" } }),
       move_path: outputSchema({ from: { type: "string" }, to: { type: "string" } }),
-      delete_path: outputSchema({ path: { type: "string" }, deleted: { type: "boolean" } }),
+      delete_path: outputSchema({ path: { type: "string" } }),
       publish_file: outputSchema({ path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" }, size: { type: "integer" }, return_mode: { type: "string" }, inline: { type: "boolean" }, linked: { type: "boolean" }, uri: { type: "string" }, markdown: { type: "string" }, expires_at: { type: "string" }, one_time: { type: "boolean" }, inline_omitted_reason: { type: "string" } }),
       list_commands: outputSchema({ query: { type: "string" }, page: { type: "integer" }, page_size: { type: "integer" }, total: { type: "integer" }, pages: { type: "integer" }, has_more: { type: "boolean" }, bin_directory: { type: "string" }, config_file: { type: "string" }, path_precedence: { type: "string" }, invocation: { type: "object", additionalProperties: true }, commands: objectArray }),
       exec: outputSchema(processProperties),
@@ -2385,13 +2377,13 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     else {
       if (tool.outputSchema.type !== "object") errors.push("outputSchema.type must be object");
       if (tool.outputSchema.additionalProperties !== false) errors.push("outputSchema.additionalProperties must be false");
-      for (const key of ["context_handle", "context_status", "operation_executed"])
-        if (!tool.outputSchema.required?.includes(key)) errors.push(`outputSchema missing required ${key}`);
+      if (!tool.outputSchema.required?.includes("context_handle"))
+        errors.push("outputSchema missing required context_handle");
       const expectedOutputs = {
-        context_info: ["cwd", "agent_guidance_present", "agent_guidance_path"],
-        glob: ["files", "count", "truncated"],
-        grep: ["scanned_files", "matched_files", "result_count", "results", "truncated"],
-        replace: ["scanned_files", "changed_files", "total_replacements", "files"],
+        context_info: ["cwd", "agent_guidance_path"],
+        glob: ["files", "truncated"],
+        grep: ["scanned_files", "matched_files", "results", "truncated"],
+        replace: ["scanned_files", "total_replacements", "files"],
         edit: ["total_replacements", "files"],
       };
       for (const key of expectedOutputs[tool.name] || [])
@@ -2953,7 +2945,6 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       return {
         dry_run: dryRun,
         scanned_files: scannedFiles,
-        changed_files: changes.length,
         total_replacements: totalReplacements,
         files: changes.map(change => ({
           path: change.display, replacements: change.matches,
@@ -2971,7 +2962,6 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       const filtered = paths.filter(path => !excludedPath(path, args.exclude || []));
       return {
         files: filtered.slice(0, limit),
-        count: Math.min(filtered.length, limit),
         truncated: filtered.length > limit || paths.length >= 10000,
       };
     }
@@ -3030,7 +3020,6 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
         output_mode: mode,
         scanned_files: scannedFiles,
         matched_files: matchedFiles,
-        result_count: Math.min(results.length, max),
         results: results.slice(0, max),
         truncated,
       };
@@ -3043,7 +3032,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     }
     if (name === "create_directory") {
       const target = await resolvePath(args.path); await Deno.mkdir(target.path, { recursive: true });
-      return { path: target.display, created: true };
+      return { path: target.display };
     }
     if (name === "copy_path" || name === "move_path") {
       const from = await resolvePath(args.from), to = await resolvePath(args.to);
@@ -3062,7 +3051,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       const target = await resolvePath(args.path);
       if (resolve(target.path) === resolve(await Deno.realPath(target.root.path))) throw new Error("Cannot delete the current root");
       await Deno.remove(target.path, { recursive: !!args.recursive });
-      return { path: target.display, deleted: true };
+      return { path: target.display };
     }
     if (name === "publish_file") {
       const target = await resolvePath(args.path);
@@ -3154,11 +3143,8 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     }));
   }
 
-  function contextEnvelope(handle, status = "active", operationExecuted = true, extras = {}) {
-    return {
-      context_handle: String(handle || ""), context_status: status,
-      operation_executed: !!operationExecuted, ...extras,
-    };
+  function contextEnvelope(handle, extras = {}) {
+    return { context_handle: String(handle || ""), ...extras };
   }
   function contextControlMessage(kind) {
     if (kind === "missing") return "context_handle is required. Call create_context, then repeat this tool call with the exact value returned.";
@@ -3168,18 +3154,17 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
   }
   function contextControlToolResult(p, name, args, resolution) {
     const handle = resolution.record?.handle || resolution.supplied_handle || "";
-    const envelope = contextEnvelope(handle, resolution.context_status, false, {
-      retry_required: true, recovery_tool: "create_context", message: contextControlMessage(resolution.kind),
-    });
-    const id = beginLog(p, name, args, handle), structuredContent = { execution_log_id: id, ...envelope };
+    const error = contextControlMessage(resolution.kind);
+    const structuredContent = contextEnvelope(handle, { error });
+    const id = beginLog(p, name, args, handle);
     const toolResult = {
-      content: [{ type: "text", text: JSON.stringify(structuredContent, null, 2) }],
+      content: [{ type: "text", text: error }],
       structuredContent, isError: true,
     };
     updateLog(id, {
       completed_at: Date.now(), duration_ms: 0, status: "failed",
-      resolved_json: JSON.stringify(structuredContent), stdout: JSON.stringify(structuredContent, null, 2),
-      result_json: JSON.stringify(toolResultForLog(toolResult)), error: envelope.message,
+      resolved_json: JSON.stringify(structuredContent), stdout: error,
+      result_json: JSON.stringify(toolResultForLog(toolResult)), error,
     });
     indexLog(id);
     return toolResult;
@@ -3202,8 +3187,8 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       const stdout = typeof publicLogResult.stdout === "string" ? publicLogResult.stdout : JSON.stringify(publicLogResult, null, 2);
       const stderr = typeof publicLogResult.stderr === "string" ? publicLogResult.stderr : "";
       const status = publicResult.success === false ? "failed" : "completed";
-      const envelope = contextEnvelope(callInfo.contextHandle, "active", true);
-      const structuredContent = { execution_log_id: id, ...publicResult, ...envelope };
+      const envelope = contextEnvelope(callInfo.contextHandle);
+      const structuredContent = { ...publicResult, ...envelope };
       const full = typeof publicResult.content === "string"
         ? `${publicResult.content}\n\ncontext_handle: ${envelope.context_handle}`
         : JSON.stringify(structuredContent, null, 2);
@@ -3222,10 +3207,10 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       return toolResult;
     } catch (error) {
       const message = String(error?.stack || error);
-      const envelope = contextEnvelope(callInfo.contextHandle, "active", true);
-      const structuredContent = { execution_log_id: id, error: String(error?.message || error), ...envelope };
+      const envelope = contextEnvelope(callInfo.contextHandle);
+      const structuredContent = { error: String(error?.message || error), ...envelope };
       const toolResult = {
-        content: [{ type: "text", text: `${String(error?.message || error)}\nExecution log: ${id}\ncontext_handle: ${envelope.context_handle}` }],
+        content: [{ type: "text", text: `${String(error?.message || error)}\ncontext_handle: ${envelope.context_handle}` }],
         structuredContent, isError: true,
       };
       updateLog(id, {
@@ -3760,7 +3745,6 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
           );
           r.error = {
             code: -32001, message: "Authentication required for tool execution",
-            data: { execution_log_id: logId },
           };
           responseStatus = 403;
         } else if (!x.params?.name || typeof x.params.name !== "string") {
@@ -3770,7 +3754,6 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
           );
           r.error = {
             code: -32602, message: "tools/call requires params.name",
-            data: { execution_log_id: logId },
           };
         } else {
           const toolArgs = { ...(x.params?.arguments || {}) };
@@ -3886,7 +3869,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
         id: context.handle,
         kind: "context_handle",
         display_label: context.handle,
-        context_status: contextExpired(context) ? "expired" : "active",
+        expired: contextExpired(context),
         expires_at: Number(context.last_active_at || context.created_at || 0) + CONTEXT_TTL_MS,
         effective_root: root?.name || "mrmcp.js folder",
         effective_root_path: root?.path || APP_DIR,
@@ -4028,7 +4011,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     tls: `<? const t=it.data||{}, problem=!t.tls_active_trusted||!!t.tls_last_error||!!t.mcp_listen_error; ?><div class="card <?= problem ? "tls-alert" : "tls-good" ?>"><div class=row><h3 class=grow>🔒 TLS / Let's Encrypt</h3><b class="<?= t.tls_active_trusted ? "ok" : "failed" ?>"><?= t.tls_active_trusted ? "trusted" : (t.tls_active ? "fallback active" : "offline") ?></b></div><div class=grid><div><span class=muted>HTTPS listener</span><br><b><?= t.mcp_https_active ? "0.0.0.0:443 active" : "not listening" ?></b></div><div><span class=muted>Active certificate</span><br><b><?= t.tls_active_kind || "none" ?> · <?= t.tls_active_valid ? "valid" : "invalid" ?></b></div><div><span class=muted>Expires</span><br><b><?= it.dt(t.tls_active_expires) || "unknown" ?></b></div><div><span class=muted>Last ACME request</span><br><b><?= it.dt(t.tls_last_request_at) || "never recorded" ?></b></div><div><span class=muted>Last ACME result</span><br><b class="<?= t.tls_last_request_valid ? "ok" : (t.tls_last_request_status === "error" ? "failed" : "pending") ?>"><? if (t.tls_last_request_status) { ?><?= t.tls_last_request_status ?> · certificate <?= t.tls_last_request_valid ? "valid" : "not valid" ?><? } else { ?>not recorded<? } ?></b></div><div><span class=muted>Last valid certificate</span><br><b><?= it.dt(t.tls_last_issued_at) || "not recorded" ?></b></div><div><span class=muted>Renewal due</span><br><b><?= it.dt(t.tls_renewal_due_at) || "as soon as allowed" ?></b></div><div><span class=muted>Rate-limit reset</span><br><b><?= it.dt(t.tls_rate_limit_reset_at) || "none" ?></b></div><div><span class=muted>Next ACME attempt</span><br><b><?= it.dt(t.tls_next_attempt_at) || "not scheduled" ?></b></div></div><? if (t.tls_last_error || t.mcp_listen_error) { ?><pre class=tls-error><?= t.tls_last_error || t.mcp_listen_error ?></pre><? } ?><? if (!t.tls_active_trusted) { ?><p class=failed><b>Public clients such as ChatGPT will reject the self-signed fallback until Let's Encrypt succeeds.</b></p><? } ?></div>`,
     urls: `<? (it.data || []).forEach(x => { if (!x?.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?><? if (x.note) { ?> <span class=muted><?= x.note ?></span><? } ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?>`,
     roots: `<? const rows=it.data||[]; ?><? if(!rows.length){ ?><p class=muted>No roots registered.</p><? } else { ?><table><tr><th>Name</th><th>Path</th><th>State</th><th></th></tr><? rows.forEach(r => { ?><tr><td><code><?= r.name ?></code></td><td><code><?= r.path ?></code></td><td><?= r.enabled ? "✅ enabled" : "⏸️ disabled" ?></td><td class=nowrap><button data-action=edit-root data-id="<?= r.id ?>">✏️ Edit</button> <button class=danger data-action=delete-root data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></table><? } ?>`,
-    context: `<? const d=it.data||{},values=d.values||[]; ?><? if (!values.length) { ?><p class=muted>No sessions have been issued yet.</p><? } else { ?><table><tr><th>Session handle</th><th>State / protocol</th><th>Current root</th><th>Activity</th><th>Tool calls</th><th></th></tr><? values.forEach(v=>{ ?><tr><td><code class=context-id><?= v.id ?></code></td><td class=nowrap><b class="<?= v.context_status === 'active' ? 'ok' : 'failed' ?>"><?= v.context_status === "active" ? "🟢 active" : "⌛ expired" ?></b><br><code><?= v.protocol_version||"unknown" ?></code></td><td><select data-action=context-root data-id="<?= v.id ?>"><option value="0"<?= v.fallback_root?" selected":"" ?>>Fallback: mrmcp.js folder</option><? (v.available_roots||[]).forEach(r=>{ ?><option value="<?= r.id ?>"<?= r.selected?" selected":"" ?>><?= r.name ?></option><? }) ?></select><div class=muted><?= v.effective_root_path ?></div></td><td class=context-dates><div><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></div><div><span class=muted>Updated</span> <?= it.logdt(v.updated_at) ?></div><div><span class=muted>Active</span> <?= it.logdt(v.last_active_at) ?></div><div><span class=muted>Expires</span> <?= it.logdt(v.expires_at) ?></div></td><td><?= v.tool_calls||0 ?></td><td><button class=danger data-action=delete-context data-id="<?= v.id ?>">🗑️ Delete</button></td></tr><? }) ?></table><? } ?>`,
+    context: `<? const d=it.data||{},values=d.values||[]; ?><? if (!values.length) { ?><p class=muted>No sessions have been issued yet.</p><? } else { ?><table><tr><th>Session handle</th><th>State / protocol</th><th>Current root</th><th>Activity</th><th>Tool calls</th><th></th></tr><? values.forEach(v=>{ ?><tr><td><code class=context-id><?= v.id ?></code></td><td class=nowrap><b class="<?= v.expired ? 'failed' : 'ok' ?>"><?= v.expired ? "⌛ expired" : "🟢 active" ?></b><br><code><?= v.protocol_version||"unknown" ?></code></td><td><select data-action=context-root data-id="<?= v.id ?>"><option value="0"<?= v.fallback_root?" selected":"" ?>>Fallback: mrmcp.js folder</option><? (v.available_roots||[]).forEach(r=>{ ?><option value="<?= r.id ?>"<?= r.selected?" selected":"" ?>><?= r.name ?></option><? }) ?></select><div class=muted><?= v.effective_root_path ?></div></td><td class=context-dates><div><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></div><div><span class=muted>Updated</span> <?= it.logdt(v.updated_at) ?></div><div><span class=muted>Active</span> <?= it.logdt(v.last_active_at) ?></div><div><span class=muted>Expires</span> <?= it.logdt(v.expires_at) ?></div></td><td><?= v.tool_calls||0 ?></td><td><button class=danger data-action=delete-context data-id="<?= v.id ?>">🗑️ Delete</button></td></tr><? }) ?></table><? } ?>`,
     commands: `<? const d=it.data || {}, rows=d.commands || []; ?><div class=muted><?= d.total || 0 ?> command<?= d.total === 1 ? "" : "s" ?> · page <?= d.page || 1 ?>/<?= d.pages || 1 ?> · config <code><?= d.config_file || "" ?></code></div><table><tr><th>Name</th><th>Relative path</th><th>Description</th><th>Links</th><th>Source</th><th>State</th><th></th></tr><? rows.forEach(c => { ?><tr><td><code><?= c.name ?></code></td><td><code><?= c.path ?></code></td><td><?= c.description || "—" ?></td><td><? if (c.documentation_url) { ?><a href="<?= c.documentation_url ?>" target=_blank rel=noopener>📖 Docs</a><? } else { ?>—<? } ?></td><td><?= c.source ?></td><td class="<?= c.present && c.executable ? "ok" : "failed" ?>"><?= c.present ? (c.executable ? "✅ available" : "⚠️ not executable") : "❌ missing" ?></td><td class=nowrap><button data-action=edit-command data-name="<?= c.name ?>" data-path="<?= c.path ?>">✏️ Edit</button><? if (c.registered && c.download_url) { ?> <button data-action=download-command data-name="<?= c.name ?>">⬇️ Download</button><? } ?><? if (c.registered) { ?> <button class=danger data-action=delete-command data-name="<?= c.name ?>">🗑️ Delete</button><? } ?></td></tr><? }) ?></table><div class=row><button data-action=commands-prev<?= d.page <= 1 ? " disabled" : "" ?>>Previous</button><button data-action=commands-next<?= d.has_more ? "" : " disabled" ?>>Next</button></div>`,
     oauth: `<table><tr><th>Client</th><th>ID</th><th>Access</th><th>Refresh</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td><?= c.name ?></td><td><code><?= c.client_id ?></code></td><td><?= c.token_count ?></td><td><?= c.refresh_token_count ?></td><td><button class=danger data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> available tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,

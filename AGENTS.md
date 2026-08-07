@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.46 consists of exactly five root files:
+MrMCP 0.10.47 consists of exactly five root files:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `morphlex.js` — DOM morphing engine. Eta performs server-side templating; Morphlex does not template.
@@ -51,9 +51,9 @@ Application state uses an explicit bearer capability:
 
 - `create_context` is the only tool without a `context_handle` input and creates a globally unique `ctx_...` value;
 - every other base and custom tool requires the same `context_handle` property;
-- every output schema requires only `context_handle`, `context_status` and `operation_executed` in the common envelope;
+- every output schema requires only `context_handle` as common metadata;
 - every built-in tool must add an explicit tool-specific output schema and use `additionalProperties: false`; never regress to one permissive generic result schema;
-- recovery responses additionally provide `retry_required`, `recovery_tool` and `message` and set `isError: true`;
+- failed calls set `isError: true` and expose one human-readable `error` string; do not add duplicate status, execution, retry, recovery-tool or log-id fields;
 - missing, invalid or expired handles never execute the requested operation and never mint a replacement automatically;
 - valid handles execute and are repeated byte-for-byte in the result;
 - contexts expire after 30 days without activity.
@@ -79,7 +79,7 @@ The GUI maintains named roots. A root may be assigned to many contexts, while ea
 - Root id `0` is the fallback directory containing `mrmcp.js`.
 - New contexts start on root id `0`.
 - Root assignment is managed only in the Sessions/Roots GUI.
-- The public MCP tool is `context_info`, which returns the absolute current root, `agent_guidance_present`, and nullable `agent_guidance_path`.
+- The public MCP tool is `context_info`, which returns the absolute current root and nullable `agent_guidance_path`; the path itself expresses whether guidance is present.
 - `context_info` checks only the selected root's `AGENTS.md`, then `agents.md`; it returns an absolute path and never scans parent or child directories.
 - Tool/server descriptions must direct the agent to call `context_info` after `create_context` and root changes, then read and follow `agent_guidance_path` when non-null.
 - Changing a context root is unrestricted and affects new calls immediately.

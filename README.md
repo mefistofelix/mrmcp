@@ -1,4 +1,4 @@
-# MrMCP 0.10.46
+# MrMCP 0.10.47
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -59,17 +59,15 @@ MrMCP implements that application-level pattern with an explicit `create_context
 5. Pass the exact handle unchanged in `context_handle` on every later MrMCP tool call. Call `context_info` again after the operator changes the Session root.
 6. A missing, unknown or expired handle does not execute the requested operation and does not mint a replacement automatically. Recover with `create_context`, then repeat the requested call.
 
-Successful tool results contain the compact state envelope:
+Successful tool results repeat only the bearer capability as common metadata:
 
 ```json
 {
-  "context_handle": "ctx_...",
-  "context_status": "active",
-  "operation_executed": true
+  "context_handle": "ctx_..."
 }
 ```
 
-Recovery responses additionally set `isError: true`, `operation_executed: false`, `retry_required: true`, `recovery_tool: "create_context"` and a recovery message. Possible statuses are `active`, `invalid` and `expired`. Contexts expire after 30 days without activity.
+A missing, invalid or expired handle returns `isError: true` with an `error` message explaining that `create_context` must be called. No replacement handle is minted automatically. Contexts expire after 30 days without activity.
 
 The handle itself selects the context after authentication. MrMCP does not bind contexts, processes or JavaScript kernels to the OAuth client or Basic credential that created them. Any authenticated client possessing a valid handle can use that context.
 
@@ -111,7 +109,7 @@ The Roots page lets the operator register named absolute directories and assign 
 - Existing background or interactive processes continue in the directory where they started.
 - Disabling or deleting a root moves currently associated contexts to the fallback root without terminating processes.
 
-The public `context_info` tool returns the absolute root directory currently assigned to the supplied context plus `agent_guidance_present` and a nullable absolute `agent_guidance_path`. MrMCP checks only the root-level `AGENTS.md`, then `agents.md`; it does not scan parent or child directories. When the path is present, the agent must read and follow that file before modifying the repository. Root identifiers, available roots and other administrative metadata are not exposed through MCP tools.
+The public `context_info` tool returns the absolute root directory currently assigned to the supplied context plus a nullable absolute `agent_guidance_path`. A non-null path means guidance is present; no separate boolean is needed. MrMCP checks only the root-level `AGENTS.md`, then `agents.md`; it does not scan parent or child directories. When the path is present, the agent must read and follow that file before modifying the repository. Root identifiers, available roots and other administrative metadata are not exposed through MCP tools.
 
 All relative paths and new child-process working directories must remain inside the root captured at the start of the tool call.
 
@@ -143,7 +141,7 @@ Commands and persistent execution:
 - `grep` supports literal or regular-expression matching, case sensitivity, globs, exclusions, context lines, hidden/dependency traversal, encoding selection, file-size limits and `content`, `files_with_matches` or `count` output;
 - `replace` supports the same traversal controls, literal or regex replacements, preview mode, encoding/BOM/line-ending preservation, atomic rollback and an optional exact `expected_replacements` guard.
 
-Every built-in tool publishes a tool-specific output schema layered on the common `context_handle`, `context_status` and `operation_executed` envelope. Recovery-only fields remain optional so successful results stay compact.
+Every built-in tool publishes a strict tool-specific output schema. The only common field is `context_handle`; failed calls additionally use `isError: true` and an `error` string. Internal log identifiers and derived status flags are not exposed through tool results.
 
 JavaScript kernels are created lazily and keyed by `(context_handle, root_id)`. Switching a Session to another root uses or creates that context-root kernel; switching back reuses its previous state. Different contexts never share JavaScript globals even when they use the same root.
 
@@ -246,6 +244,15 @@ MrMCP uses fixed public listeners:
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
 ## Development changelog
+
+### 0.10.47
+
+- Reduced the public tool-result envelope to the required `context_handle` plus tool-specific fields.
+- Removed redundant `context_status`, `operation_executed`, `retry_required`, `recovery_tool` and recovery `message` fields; errors now use `isError: true` and one `error` string.
+- Removed public `execution_log_id` values while retaining complete internal administration logs.
+- Removed `agent_guidance_present`; a nullable `agent_guidance_path` now expresses both presence and location.
+- Replaced the internal GUI context status string with a direct `expired` boolean.
+- Removed constant success flags and array-length duplicates from `create_directory`, `delete_path`, `glob`, `grep` and `replace` results.
 
 ### 0.10.46
 
