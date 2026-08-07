@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.56
+# MrMCP 0.10.57
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -43,8 +43,10 @@ The authenticated GUI serves `assets/` uniformly under `/assets/`. With `deno ru
 Windows standalone build:
 
 ```powershell
-deno compile -A --unstable-ffi --include assets --include commands.yaml --icon assets/mrmcp.ico --output mrmcp.exe mrmcp.js
+deno compile -A --unstable-ffi --no-terminal --include assets --include commands.yaml --icon assets/mrmcp.ico --output mrmcp.exe mrmcp.js
 ```
+
+`--no-terminal` makes the Windows standalone executable a GUI application, so launching `mrmcp.exe` opens the WebView without an additional console window. Source-mode `deno run` remains a normal terminal process for development and diagnostics.
 
 ## MCP 2026-07-28 and stateless operation
 
@@ -276,6 +278,12 @@ MrMCP uses fixed public listeners:
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
 ## Development changelog
+
+### 0.10.57
+
+- Compiled the Windows standalone executable with Deno `--no-terminal`, so launching `mrmcp.exe` opens only the WebView and does not create a companion console window.
+- Kept source-mode `deno run` unchanged so development and backend diagnostics can still use a normal terminal.
+- No database schema change; schema version remains 4.
 
 ### 0.10.56
 

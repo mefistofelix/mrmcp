@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.56 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.57 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
@@ -19,6 +19,7 @@ Use only the direct Deno import `jsr:@webview/webview@0.9.0`.
 - Do not add Tauri, Rust, Neutralinojs, Node.js, npm, a CLI or a scaffold project.
 - Desktop mode starts the backend as a Deno child process, waits for `MRMCP_READY`, opens the authenticated GUI URL and stops the child when the WebView closes.
 - The initial desktop size is 1180×760.
+- Windows standalone builds must use `deno compile --no-terminal` so the compiled desktop application opens only the WebView and does not create a companion console window. Do not add runtime console-hiding code; source-mode `deno run` remains terminal-attached for development.
 - Do not add a native tray or drag-and-drop bridge unless explicitly requested.
 - Keep WebView/static resources in `assets/` and serve them only through authenticated `/assets/...` routes. Source mode reads the directory from disk; standalone builds embed it with `deno compile --include assets` so the same paths resolve from Deno's virtual filesystem.
 - Keep `commands.yaml` in the repository root, not `assets/`. Source mode reads/writes that physical file directly. Standalone builds must additionally compile with `--include commands.yaml`; treat the embedded copy only as a first-run template and materialize it beside the executable if the physical file is absent. Never overwrite an existing user-edited `commands.yaml` from the VFS template.
@@ -309,4 +310,5 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 36. Verify process-like Tool Call rows render command/cwd/combined output above MCP JSON, prefer live process output when available, enqueue process-output chunks through the normal coalesced render path, and render no terminal block for non-process tools.
 37. Verify Tool Call pagination/table/compact rows/detail rows use stable ids keyed by log database primary key and a live insert does not replace unrelated existing rows during Morphlex reconciliation.
 38. Verify visible GUI headings, action buttons and dialog titles use consistent Title Case while ordinary field labels/body prose remain sentence case.
-39. Run the desktop WebView on a machine with Deno and platform dependencies.
+39. Confirm the Windows standalone build uses `--no-terminal` and its PE subsystem is GUI/Windows rather than console, while source-mode `deno run` remains terminal-attached.
+40. Run the desktop WebView on a machine with Deno and platform dependencies.
