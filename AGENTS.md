@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.79 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.80 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
@@ -223,6 +223,8 @@ Root, Command, Settings, confirmation and message state belongs to Deno. Input e
 - Render details only for the selected primary key.
 - Show Terminate/Force controls only for genuinely cancellable work.
 - Display complete timestamps plus compact relative ages.
+- Keep `failed` and `invalid` semantically distinct. `failed` is red and represents an accepted call that failed during execution or an execution-level rejection; `invalid` is purple and represents a request that reached MrMCP but was rejected before tool execution by MCP protocol, tool-name, context or input-schema validation. The Tool Calls status filter and the compact header must expose `invalid`; the header count is clickable through the same Deno-owned navigation/filter path as running/failed.
+- Keep published tool input schemas strict. Never relax `additionalProperties`, required fields, types or bounds merely to observe bad clients. Mirror the published input schema server-side before execution so a client that dispatches an invalid call anyway is logged as `invalid` and not executed. Preserve the received input, exact validation message and the MCP/JSON-RPC result returned to that client where a response body exists.
 
 ## Processes and PATH
 
@@ -237,7 +239,7 @@ The system-PATH setting is enabled by default.
 - Managed termination must use the runtime child-process `kill()` API directly. Do not spawn `taskkill`, `kill`, `pkill` or another platform helper and do not claim portable recursive process-tree termination: Deno/Node core provides no cross-platform tree-kill API. `SIGTERM` and `SIGKILL` remain distinct requests on Unix; on Windows Node may terminate the direct child without Unix signal semantics. Parent exit must still release a foreground MCP response after the bounded output-drain path even when descendants retain inherited handles.
 - Explicit GUI/`exec_kill` termination uses `termination_source: "user"`; timeout and server-shutdown requests use `timeout` and `server`, while an externally observable termination uses `external`. Keep `requested_signal` distinct from the actually observed `signal`; do not invent an observed signal when Windows reports none.
 - Keep managed process access scoped to the exact `context_handle`; retain the root and cwd snapshot captured at process start.
-- `query_tool_calls` is read-only and scoped to the exact `context_handle`. It returns only calls that reached MrMCP and excludes its own currently running log row. Keep `limit` bounded to 1–50 with default 10; `tool` and `status` are exact filters, `query` is a case-insensitive literal substring search across the complete stored log row, and `before_id` is the stable backward-pagination cursor. Filters are combinable. Use it to distinguish server-side execution from upstream/client-wrapper rejection; never claim it can reveal a wrapper policy reason that was not sent to MrMCP.
+- `query_tool_calls` is read-only and scoped to the exact `context_handle`. It returns only calls that reached MrMCP and excludes its own currently running log row. Keep `limit` bounded to 1–50 with default 10; `tool` and `status` are exact filters including `invalid`, `query` is a case-insensitive literal substring search across the complete stored log row, and `before_id` is the stable backward-pagination cursor. Filters are combinable. Use it to distinguish server-side execution/validation from upstream/client-wrapper rejection; never claim it can reveal a wrapper policy reason that was not sent to MrMCP.
 
 ## Published files/HTML and MCP App widgets
 
@@ -296,7 +298,7 @@ README must describe current behavior, not only past changes. It must include:
 - the event-driven UI and ephemeral state model;
 - a development changelog, with reverted architecture experiments clearly marked as superseded.
 
-Update README, AGENTS, the source header and `VERSION` together for every release. The release commit itself must use the explicit Git commit message `release X.Y.Z` matching the version/tag being published; do not use a generic or unrelated commit message for a release.
+Update README, AGENTS, the source header and `VERSION` together for every release. The release commit itself must use the explicit Git commit message `release X.Y.Z` matching the version/tag being published; do not use a generic or unrelated commit message for a release. Invoke Git/GitHub CLI through MrMCP `exec` with `program` + `args`; never add a `shell` boolean/field, because it is not part of the tool schema. After creating the release tag, prefer one direct combined push with `git push origin main X.Y.Z`; this exact form is valid and verified. Split branch/tag pushes only when Git itself returns an execution error, not when a tool invocation was rejected before reaching MrMCP.
 
 ## Release checks
 
@@ -323,6 +325,7 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 21. Confirm `context_info` returns the current absolute root and the root-level `AGENTS.md` / `agents.md` path when present, and returns `null` when absent.
 22. Confirm every built-in tool exposes a strict tool-specific output schema layered on the common context envelope.
 23. Confirm `glob`, `grep` and `replace` implement every documented traversal, exclusion, encoding, size-limit and expected-count argument without shell, `uv` or Python helpers.
+24. Confirm published tool input schemas remain strict and unchanged by diagnostic logging; an invalid call that does reach `/mcp` must be rejected before execution, stored with status `invalid`, retain its input/error/result, render purple, and be reachable from both the Tool Calls status filter and the clickable header invalid count.
 24. Confirm no Tauri, Rust, Neutralinojs, npm project or CLI files exist.
 25. Confirm Session rows, Tool-call rows and the Tool-call Session filter use `contexts.id` / `logs.context_id`, while MCP requests still use the opaque handle.
 26. Confirm OAuth client rows count `contexts.oauth_client_id` matches and their View sessions action opens Sessions with that client filter; clearing the filter restores all Sessions.
