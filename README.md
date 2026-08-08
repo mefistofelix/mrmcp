@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.71
+# MrMCP 0.10.72
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -111,6 +111,8 @@ Authentication controls access to MrMCP; `context_handle` selects persistent sta
 - Anonymous clients receive no tools and cannot execute operations.
 - There are no tool approvals, enable lists, execution switches, `allow_re`, `deny_re` or user-defined per-tool policies.
 - OAuth consent authorizes the client itself, not an individual tool call.
+
+The public OAuth consent screen is generic for every compatible client and is rendered server-side with Eta. It centers the MrMCP logo and authorization decision, shows the requesting client, requested scope, MCP resource and registered return destination, and uses distinct green **Authorize Access** and red **Cancel** actions. Invalid or expired authorization requests use the same branded Eta layout. After approval or denial MrMCP follows the normal OAuth flow and redirects directly to the client's registered callback; there is no client-specific or intermediate success page.
 
 The only public MCP endpoint is `/mcp`. OAuth protected-resource metadata is exposed for that single resource.
 
@@ -234,7 +236,7 @@ The interface contains:
 - Settings;
 - Help.
 
-Projects, Active calls, Custom tools and Approvals are intentionally absent. The Dashboard also exposes reversible-removal activity directly from completed Tool Call logs: separate Trash and Untrash cards show the completed-operation count plus the latest completion time, `action_id` and absolute trash path. For Untrash the displayed trash path is historical because a successful restore removes that action directory. Failed attempts do not increment either counter. The GUI header and favicon use the MrMCP balloon+folder brand mark; the native window title remains **🧩 MrMCP**. Emoji are limited to navigation, headings, principal actions, destructive actions and compact states.
+Projects, Active calls, Custom tools and Approvals are intentionally absent. The Clients page shows OAuth client creation time, first/last Session creation, latest access-token issue and latest refresh-token use, each with the same full/current-day timestamp plus compact relative age used elsewhere in the GUI. The Dashboard also exposes reversible-removal activity directly from completed Tool Call logs: separate Trash and Untrash cards show the completed-operation count plus the latest completion time, `action_id` and absolute trash path. For Untrash the displayed trash path is historical because a successful restore removes that action directory. Failed attempts do not increment either counter. The GUI header and favicon use the MrMCP balloon+folder brand mark; the native window title remains **🧩 MrMCP**. Emoji are limited to navigation, headings, principal actions, destructive actions and compact states.
 
 ### Deno-owned event-driven rendering model
 
@@ -303,6 +305,14 @@ Settings also provides **Clear Operational Data**. It preserves authentication s
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### 0.10.72
+
+- Redesigned the generic OAuth consent screen around a centered MrMCP brand card with the public logo, clearer client/scope/resource/return-destination details and an explicit trust notice.
+- Made **Authorize Access** a green primary action and **Cancel** a red secondary/destructive action, without button emoji; kept the page client-agnostic and preserved the standard direct OAuth redirect to the registered client callback.
+- Moved the complete OAuth consent/error document to Eta using the same server-side Eta instance as the administration UI, with auto-escaped dynamic values and a matching branded invalid/expired-request state.
+- Expanded **OAuth Clients** with client creation, first/last Session creation, latest access-token issue and latest refresh-token use timestamps, including compact relative ages.
+- No SQLite schema change.
 
 ### 0.10.71
 

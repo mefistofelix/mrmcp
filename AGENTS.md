@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.71 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.72 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
@@ -75,6 +75,7 @@ Authentication is the only server-access decision.
 - Anonymous clients receive none.
 - Do not implement tool approvals, allow/deny regular expressions, enable lists, execution switches or per-tool policy rules.
 - OAuth consent remains only to authorize the OAuth client.
+- The public OAuth consent/error page must remain client-agnostic and server-rendered with the same Eta instance used by the administration UI. Dynamic client, scope, resource, redirect and hidden-form values go through Eta auto-escaping; do not rebuild the page with interpolated HTML strings or client-specific copy. Keep the centered MrMCP logo/branding, green **Authorize Access**, red **Cancel**, matching branded invalid/expired state, and the direct standards-compliant redirect to the registered client callback after the decision.
 - `context_handle` is a bearer capability shared by any authenticated client that possesses it.
 
 ## Roots and current working directory
@@ -200,7 +201,7 @@ Eta selects the active section from Deno `uiState.currentSection`. `buildUiRende
 - Commands: command catalog page only.
 - Tool calls: context filter values, paginated rows and at most one selected detail row.
 - HTTP debug: setting, filtered rows and at most one selected detail row.
-- OAuth: OAuth clients plus the count of contexts created through each client.
+- OAuth: OAuth clients plus context counts and lifecycle timestamps derived from existing client/token/context tables: client creation, first/last Session creation, latest access-token issue and latest refresh-token use.
 - Settings: runtime settings only.
 - Help: static operator guidance plus the already-available settings projection; no section-specific database query.
 
@@ -344,3 +345,4 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 43. Verify `publish_html` persists rows in `published_html`, returns a persistent unguessable HTTPS URI, remains fetchable after closing/reopening the SQLite connection/server, points to the dedicated MCP App widget, and renders through a nested iframe whose sandbox allows scripts/forms/modals/popups but never `allow-same-origin`. Confirm the outer widget declares the MrMCP origin in `frameDomains` and the tool description states that external networking is host/browser/CSP/CORS dependent.
 44. Verify the Dashboard Trash card derives its count and latest action/path from actual `.mrmcp/trash/<action_id>` directories across the program folder and every configured Root, so Empty Trash immediately produces zero with no stale path detail even when historical `trash_paths` Tool Call logs remain. Untrash count/details remain historical Tool Call activity and its path is labeled historical. Verify Settings Clear Operational Data and Dashboard Empty Trash use the shared Promise maintenance barrier: in-flight Tool Calls finish, new calls wait, maintenance runs, then waiting calls continue. Confirmation dialogs close immediately, no completion dialog appears, only the active action button shows spinner/live in-flight+waiting counts, and Dashboard Tool Calls In Flight tracks `activeCallControls.size` without browser polling.
 45. Run the desktop WebView on a machine with Deno and platform dependencies.
+46. Verify the public OAuth consent and invalid/expired-request pages render through the shared Eta instance with auto-escaped dynamic values, generic MrMCP branding, centered decision content, green **Authorize Access** and red **Cancel** buttons without button emoji, and no client-specific or intermediate success page. Confirm approve/deny still redirect directly to the registered OAuth callback with the standard code/error parameters.
