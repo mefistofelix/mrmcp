@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.63 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.64 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
@@ -215,7 +215,7 @@ Root, Command, Settings, confirmation and message state belongs to Deno. Input e
 - Apply text, Session, status and page-size filter changes automatically through Deno-owned state; do not add a Tool-call Search button or a second refresh path.
 - Give Tool Call pagination, the table, every compact row and every expanded detail row stable DOM ids derived from the log database primary key so Morphlex preserves row identity when new calls are inserted ahead of existing rows.
 - Show terminal chrome only when the selected Tool Call has an actual process-like result (managed exec-family calls or custom commands carrying process command/output data); filesystem, search and control calls must not show an empty terminal section.
-- Process-like expanded rows show command/cwd plus the combined terminal `output` block before MCP input/result JSON; prefer live managed-process output when the linked process is still in memory. Every process-output chunk marks the Tool Calls scope dirty through the normal coalesced render queue; do not add polling. Separately requested stdout/stderr belong in MCP Result JSON, not duplicated in the terminal block.
+- Process-like expanded rows show command/cwd, optional input `stdin` as a shell-style heredoc, then the combined terminal `output` block before MCP input/result JSON; label base64 stdin without decoding it for display, and prefer live managed-process output when the linked process is still in memory. Every process-output chunk marks the Tool Calls scope dirty through the normal coalesced render queue; do not add polling. Separately requested stdout/stderr belong in MCP Result JSON, not duplicated in the terminal block.
 - Use numbered pagination above the table.
 - Keep input/output JSON out of compact rows.
 - Render details only for the selected primary key.
@@ -331,7 +331,7 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 33. Verify `untrash_action` preflights the complete action and either restores every path or restores none; confirm both trash tools have `destructiveHint: false` and no permanent filesystem-delete tool is published.
 34. Verify `exec`/`exec_start` schemas describe argv as verbatim ordered arguments, expose combined `output` by default, and add individual stdout/stderr only when `separate_streams: true` is requested; verify `exec_poll` advances `output_offset` correctly. On Windows, verify managed children use `node:child_process.spawn(..., { windowsHide: true })` while preserving stdin/stdout/stderr and process status semantics.
 35. Verify `query_tool_calls` returns only prior rows for the supplied `context_handle`, excludes its own current row, enforces limit 1–50/default 10, combines exact tool/status filters with literal full-record text search and `before_id` backward pagination, and makes no claim about upstream requests that never reached MrMCP.
-36. Verify process-like Tool Call rows render command/cwd/combined output above MCP JSON, prefer live process output when available, enqueue process-output chunks through the normal coalesced render path, and render no terminal block for non-process tools.
+36. Verify process-like Tool Call rows render command/cwd, optional stdin heredoc and combined output above MCP JSON; base64 stdin must be labeled rather than display-decoded. Prefer live process output when available, enqueue process-output chunks through the normal coalesced render path, and render no terminal block for non-process tools.
 37. Verify Tool Call pagination/table/compact rows/detail rows use stable ids keyed by log database primary key and a live insert does not replace unrelated existing rows during Morphlex reconciliation.
 38. Verify visible GUI headings, action buttons and dialog titles use consistent Title Case while ordinary field labels/body prose remain sentence case.
 39. Confirm the Windows standalone build uses `--no-terminal` and its PE subsystem is GUI/Windows rather than console, while source-mode `deno run` remains terminal-attached.

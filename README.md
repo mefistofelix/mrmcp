@@ -1,12 +1,12 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.63
+# MrMCP 0.10.64
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
 ### Tool Calls
 
-Expanded process calls show a terminal-style command and combined output above the raw MCP input/result JSON, while the table keeps live status, duration and Session context visible.
+Expanded process calls show a terminal-style command, optional stdin and combined output above the raw MCP input/result JSON, while the table keeps live status, duration and Session context visible.
 
 ![MrMCP Tool Calls view](./assets/mrmcp-screenshot1.png)
 
@@ -277,7 +277,7 @@ The Tool Calls page supports:
 - compact rows without inline input/output JSON;
 - Eta-rendered expanded details keyed by stable log database ids so Morphlex preserves row identity during live inserts;
 - a Terminal block above MCP JSON only when the call result is actually process-like; ordinary filesystem, search and control tools do not render terminal chrome;
-- terminal command/cwd plus the combined `output` stream, preferring live in-memory process output when available; process chunks enter the same coalesced Deno render queue so an expanded running call updates without polling; separately requested stdout/stderr remain available in MCP Result JSON;
+- terminal command/cwd plus optional input `stdin` rendered as a shell-style heredoc and the combined `output` stream, preferring live in-memory process output when available; base64 stdin is labeled without decoding it for display; process chunks enter the same coalesced Deno render queue so an expanded running call updates without polling; separately requested stdout/stderr remain available in MCP Result JSON;
 - Terminate and Force controls only when cancellation is real.
 
 ## TLS and connectivity
@@ -291,6 +291,12 @@ MrMCP uses fixed public listeners:
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
 ## Development changelog
+
+### 0.10.64
+
+- Added process-call stdin to the expanded Tool Calls terminal view when `stdin` was supplied, rendered before output as a shell-style `<<'EOF' ... EOF` heredoc.
+- Preserve the logged stdin value exactly; base64 stdin is labeled as base64 rather than being decoded only for display.
+- No SQLite schema change.
 
 ### 0.10.63
 
