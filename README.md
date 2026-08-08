@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.81
+# MrMCP 0.10.82
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -278,7 +278,7 @@ The Help page documents the current ChatGPT Web setup flow for a custom MCP app:
 
 The Tool Calls page supports:
 
-- filter by numeric GUI Session PK and status;
+- filter by numeric GUI Session PK and status; the status dropdown uses the same semantic colors as Tool Call rows (`completed` green, `failed` red, `invalid` purple, `running` yellow), including the currently selected value;
 - automatically apply the full-text query and every filter change without a Search button;
 - numbered pagination above the table;
 - complete timestamps with compact relative ages;
@@ -305,6 +305,13 @@ Settings also provides **Clear Operational Data**. It preserves authentication s
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### 0.10.82
+
+- Colored every Tool Calls status-filter option with the same semantic status palette used by rows and the compact header: `completed` green, `failed` red, `invalid` purple and `running` yellow; the selected status keeps its semantic color after the Deno-owned rerender.
+- Changed the release workflow rule so Git release commits use a concise descriptive message containing the version and primary change instead of generic `release X.Y.Z` messages.
+- Reverified that the OAuth consent page remains the compact dark 52vw one-screen layout introduced in 0.10.81, with combined `vw` + `vh` typography and no desktop scrolling regression.
+- No SQLite schema change.
 
 ### 0.10.81
 
