@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.67
+# MrMCP 0.10.68
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -292,7 +292,20 @@ MrMCP uses fixed public listeners:
 
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
+Settings also provides **Clear Operational Data**. It preserves authentication state, Sessions/contexts, Roots, server settings and registered tools, while deleting Tool Calls/search index rows, managed-process history, HTTP debug logs and persisted `publish_html` documents, and resetting request metrics. The Dashboard Trash card also provides **Empty Trash**, which permanently removes the contents of `.mrmcp/trash` under the program folder and every configured Root without touching other root data.
+
+Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
+
 ## Development changelog
+
+### 0.10.68
+
+- Added Settings **Clear Operational Data**, preserving authentication, Sessions/contexts, Roots, server settings and registered tools while clearing Tool Calls/search rows, process history, HTTP debug logs, persisted HTML and request metrics.
+- Added Dashboard **Empty Trash**, permanently clearing managed `.mrmcp/trash` contents under the program folder and every configured Root after confirmation.
+- Both maintenance actions use a Promise barrier rather than an application queue: already in-flight Tool Calls finish, new Tool Calls wait, maintenance runs, then waiting calls continue. Managed processes detached from a completed `exec_start` call do not delay maintenance.
+- Maintenance confirmation dialogs close immediately after Confirm and never produce completion dialogs. Only the action button being executed shows a spinner with live `in flight` / `waiting` counts and then returns to its normal label.
+- Added a live Dashboard **Tool Calls In Flight** counter backed directly by current Deno runtime state; no browser polling or browser-owned countdown was introduced.
+- No SQLite schema change.
 
 ### 0.10.67
 
