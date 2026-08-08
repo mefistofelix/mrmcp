@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.80
+# MrMCP 0.10.81
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -112,7 +112,7 @@ Authentication controls access to MrMCP; `context_handle` selects persistent sta
 - There are no tool approvals, enable lists, execution switches, `allow_re`, `deny_re` or user-defined per-tool policies.
 - OAuth consent authorizes the client itself, not an individual tool call.
 
-The public OAuth consent screen is generic for every compatible client and is rendered server-side with Eta. It uses the same dark palette as the administration GUI and a compact centered card whose width, typography, logo, spacing and actions are sized from viewport-relative `vw`/`vh`/`vmin` units instead of fixed pixels, keeping the client, requested scope, MCP resource, registered return destination and both actions visible without scrolling in a normal desktop viewport. **Authorize Access** is green and **Cancel** is red; there is no extra trust-notice block. Invalid or expired authorization requests use the same branded Eta layout. After approval or denial MrMCP follows the normal OAuth flow and redirects directly to the client's registered callback; there is no client-specific or intermediate success page.
+The public OAuth consent screen is generic for every compatible client and is rendered server-side with Eta. It uses the same dark palette as the administration GUI and a compact centered card at roughly half the desktop viewport width. The card width is driven by `vw`, while typography combines `vw` and `vh` instead of using `vmin`, so a short landscape browser viewport cannot shrink otherwise readable text. Logo, spacing and actions remain viewport-relative; client, requested scope, MCP resource, registered return destination and both actions stay visible without scrolling in a normal desktop viewport. **Authorize Access** is green and **Cancel** is red; there is no extra trust-notice or redundant footer block. Invalid or expired authorization requests use the same branded Eta layout. After approval or denial MrMCP follows the normal OAuth flow and redirects directly to the client's registered callback; there is no client-specific or intermediate success page.
 
 The only public MCP endpoint is `/mcp`. OAuth protected-resource metadata is exposed for that single resource.
 
@@ -305,6 +305,13 @@ Settings also provides **Clear Operational Data**. It preserves authentication s
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### 0.10.81
+
+- Fixed the OAuth consent layout's landscape scaling bug: `vmin` was tied to the shorter viewport dimension and made typography too small, while the card width was unnecessarily capped by `72vh`.
+- Kept the dark centered one-screen design but made the card a true `52vw` desktop panel and sized text from combined `vw` + `vh` terms, producing substantially larger readable typography without bringing back vertical scrolling.
+- Increased the logo and metadata/action text proportionally, kept the four request details in one compact panel, and removed the redundant OAuth footer so the larger type still fits comfortably.
+- No SQLite schema change.
 
 ### 0.10.80
 
