@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.68
+# MrMCP 0.10.69
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -16,7 +16,7 @@ Named roots and unassigned Sessions are managed in one drag-and-drop view, with 
 
 ![MrMCP Roots and Sessions view](./assets/mrmcp-screenshot2.png)
 
-The desktop window uses `jsr:@webview/webview@0.9.0`, imported directly by Deno. The project has no Node.js application, npm install, CLI scaffold, Rust, Tauri or Neutralinojs runtime.
+The desktop window uses `jsr:@webview/webview@0.9.0`, imported directly by Deno. Desktop mode keeps one OS process: the WebView runs on the main thread while the backend runs in a Deno Worker/isolate in the same `mrmcp.exe`. The project has no Node.js application, npm install, CLI scaffold, Rust, Tauri or Neutralinojs runtime.
 
 ## Project files
 
@@ -46,7 +46,11 @@ Headless backend:
 deno run -A mrmcp.js --backend
 ```
 
-The administration interface is served at `http://127.0.0.1:7332/`. Desktop mode starts the backend as a Deno child process, waits for `MRMCP_READY`, opens the authenticated loopback URL in the WebView and terminates the child when the window closes. The initial window size is 1180×760.
+The administration interface normally starts at `http://127.0.0.1:7332/`. Desktop mode starts the backend in a Deno Worker in the same OS process, waits for a typed `ready` message, opens the authenticated loopback URL in the WebView, and on window close sends the Worker a graceful `shutdown` request before terminating the isolate as a bounded fallback. The initial window size is 1180×760.
+
+Listener ports are runtime-resolved without changing configuration. If GUI 7332, HTTP 80 or HTTPS 443 is already occupied, that listener retries at `base + 50` repeatedly until it binds (for example 7332→7382, 80→130, 443→493). The compact header groups version, live/fallback state and effective ports, recently active Sessions with `#id(total Tool Calls)`, and Tool Calls total/in-flight/error counts. Related values use semantic text colors: active green, in-flight yellow, errors red and totals/session counters blue-neutral. A Session is considered active when it has started a Tool Call within the last five minutes; at most the four most recently active Sessions are listed. ACME HTTP-01 is available only when the effective HTTP listener is still port 80; fallback instances may reuse existing certificates but cannot perform HTTP-01 issuance on the fallback HTTP port.
+
+Port fallback only resolves listener collisions; it does not isolate application data. Parallel MrMCP instances intended for testing should be run from separate program directories so each has its own `.mrmcp` data directory and editable `commands.yaml`.
 
 The authenticated GUI serves `assets/` uniformly under `/assets/`. With `deno run`, those files come directly from the repository `assets/` directory. Standalone builds embed that directory with `deno compile --include assets`, so the WebView uses identical `/assets/...` URLs in source and standalone builds. `commands.yaml` is not a WebView asset: compile it separately with `--include commands.yaml`; on first standalone backend startup, MrMCP copies the embedded template beside the executable only if no editable physical `commands.yaml` exists there.
 
@@ -168,7 +172,7 @@ Commands and persistent execution:
 
 `edit` accepts multiple files and multiple ordered exact edits per file. Each file is read once, its edits are applied sequentially in memory, every expected occurrence count is validated, and all files are written atomically with rollback.
 
-Command execution tools (`exec`, `exec_start`, `exec_poll` and custom commands) return a terminal-like `output` stream by default. MrMCP appends chunks from stdout and stderr to that field in the order the two OS pipes are observed producing data, so the agent normally has one stream to read together with `status` and `exit_code`. Set `separate_streams: true` when the individual `stdout` and `stderr` streams are specifically useful; `exec_poll` uses `output_offset` for incremental reads of the combined stream. `exec_list` history exposes combined output only.
+Command execution tools (`exec`, `exec_start`, `exec_poll` and custom commands) normalize process output before buffering or storage. ANSI/OSC/control sequences are removed, while standalone carriage-return progress updates become separate lines so intermediate states are preserved. MrMCP combines stdout and stderr in observed pipe-arrival order; set `separate_streams: true` when the individual streams are specifically useful. `exec_poll` offsets refer directly to the normalized stored stream. Tool Calls displays that same normalized output.
 
 Managed termination uses the child-process API supplied by Deno/Node directly; MrMCP does not launch `taskkill`, `kill`, `pkill` or another platform command. `Terminate` requests `SIGTERM` and `Force` requests `SIGKILL`. On Unix these are distinct signals; on Windows Node's child-process implementation terminates the managed child without providing Unix signal semantics, so the two controls may have the same practical effect. Core Deno/Node provides no portable recursive process-tree kill API, so MrMCP deliberately targets the managed child rather than claiming cross-platform descendant termination. Parent exit still completes the MCP call after a short output-drain window even if descendants inherited its pipes.
 
@@ -279,16 +283,18 @@ The Tool Calls page supports:
 - compact rows without inline input/output JSON;
 - Eta-rendered expanded details keyed by stable log database ids so Morphlex preserves row identity during live inserts;
 - a Terminal block above MCP JSON only when the call result is actually process-like; ordinary filesystem, search and control tools do not render terminal chrome;
-- terminal command/cwd plus optional input `stdin` rendered as a shell-style heredoc and the combined `output` stream, preferring live in-memory process output when available; base64 stdin is labeled without decoding it for display; process chunks enter the same coalesced Deno render queue so an expanded running call updates without polling; separately requested stdout/stderr remain available in MCP Result JSON;
+- terminal command/cwd plus optional input `stdin` in its own panel and the combined normalized `output` stream, preferring live in-memory process output when available; base64 stdin is labeled without decoding it for display; process chunks enter the same coalesced Deno render queue so an expanded running call updates without polling; separately requested stdout/stderr remain available in MCP Result JSON;
 - Terminate and Force controls only when cancellation is real.
 
 ## TLS and connectivity
 
-MrMCP uses fixed public listeners:
+MrMCP uses these base listener ports, with runtime `+50` fallback when a port is already occupied:
 
-- port 80 for ACME HTTP-01 challenges;
-- port 443 for MCP, OAuth and metadata;
-- loopback port 7332 for the administration UI.
+- HTTP 80 for ACME HTTP-01 challenges;
+- HTTPS 443 for MCP, OAuth and metadata;
+- loopback GUI 7332 for the administration UI.
+
+Fallback ports are runtime-only and never rewrite configuration. ACME HTTP-01 remains available only while the effective HTTP port is 80.
 
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
@@ -297,6 +303,15 @@ Settings also provides **Clear Operational Data**. It preserves authentication s
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### 0.10.69
+
+- Replaced the desktop backend child process with a named Deno Worker/isolate inside the same OS process. WebView close now sends a graceful Worker shutdown message and terminates the isolate only as a bounded fallback, eliminating the extra `mrmcp.exe` lifecycle.
+- Added runtime listener fallback in `+50` steps for GUI/HTTP/HTTPS without persisting fallback ports. The header turns warning-state when fallback is active and shows effective ports; ACME HTTP-01 is disabled unless effective HTTP remains port 80. Parallel isolated test instances should run from separate program directories.
+- Expanded the compact header with five-minute active Sessions, recent `#Session(total Tool Calls)` summaries, and Tool Calls total, in-flight and error counts. Related values are grouped and use semantic text colors without adding extra icon noise.
+- Process stdout/stderr is now terminal-normalized before buffering or storage. ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines, preserving intermediate progress states. No raw process-output copy or `raw_output` option remains.
+- Simplified explanatory GUI copy and standardized Tool Calls on the `🛠` icon across navigation, pages, cards and Session actions.
+- No SQLite schema change.
 
 ### 0.10.68
 
