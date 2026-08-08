@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.74 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
+MrMCP 0.10.75 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -43,7 +43,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.74";
+const VERSION = "0.10.75";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CONTEXT_HANDLE_INPUT_DESCRIPTION = "Required opaque capability returned by create_context. Pass the exact value unchanged; never invent, modify, shorten, derive or substitute it.";
