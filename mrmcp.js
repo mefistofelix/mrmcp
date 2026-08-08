@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.64 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
+MrMCP 0.10.65 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -42,7 +42,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.64";
+const VERSION = "0.10.65";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CONTEXT_HANDLE_INPUT_DESCRIPTION = "Required opaque capability returned by create_context. Pass the exact value unchanged; never invent, modify, shorten, derive or substitute it.";
@@ -2504,6 +2504,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       process_id: { type: "string" }, pid: { type: "integer" }, status: { type: "string" },
       command: {}, cwd: { type: "string" }, started_at: { type: "string" }, completed_at: nullableString,
       exit_code: { anyOf: [{ type: "integer" }, { type: "null" }] }, signal: nullableString,
+      requested_signal: nullableString, termination_source: nullableString,
       timed_out: { type: "boolean" },
       output: { type: "string", description: "Primary terminal-like process output. It combines stdout and stderr in the order MrMCP observes chunks arriving from the two OS pipes. Read this together with status and exit_code to understand what happened." },
       output_from: { type: "integer" }, output_next: { type: "integer" }, output_truncated_before: { anyOf: [{ type: "integer" }, { type: "null" }] },
@@ -2774,6 +2775,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
   }
   async function pumpProcess(stream, rec, key) {
     const reader = stream.getReader(), decoder = new TextDecoder();
+    rec.output_readers.add(reader);
     try {
       for (;;) {
         const { value, done } = await reader.read();
@@ -2782,8 +2784,22 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       }
       appendProcessOutput(rec, key, decoder.decode());
     } catch (e) {
-      rec.error ||= String(e?.message || e);
+      if (!rec.output_cancelled) rec.error ||= String(e?.message || e);
+    } finally {
+      rec.output_readers.delete(reader);
+      try { reader.releaseLock(); } catch {}
     }
+  }
+  async function settleProcessOutput(rec, pumps, graceMs = 250) {
+    const settled = Promise.allSettled(pumps);
+    if (await Promise.race([settled.then(() => true), sleep(graceMs).then(() => false)])) return false;
+    rec.output_cancelled = true;
+    if (rec.child.closeOutput) rec.child.closeOutput();
+    else await Promise.allSettled([...rec.output_readers].map(async reader => {
+      try { await reader.cancel(); } catch {}
+    }));
+    await settled;
+    return true;
   }
   function commandSpec(args) {
     const hasProgram = typeof args.program === "string" && args.program.length;
@@ -2821,7 +2837,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       cwd: rec.cwd_display, context_handle: rec.context_handle,
       started_at: new Date(rec.started_at).toISOString(),
       completed_at: rec.completed_at ? new Date(rec.completed_at).toISOString() : null,
-      exit_code: rec.exit_code, signal: rec.signal || null, timed_out: !!rec.timed_out,
+      exit_code: rec.exit_code, signal: rec.signal || null, requested_signal: rec.requested_signal || null,
+      termination_source: rec.termination_source || null, timed_out: !!rec.timed_out,
       output: combined.value, output_from: combined.from, output_next: combined.next,
       output_truncated_before: combined.truncated_before,
       stdin_open: !!rec.stdin_writer, error: rec.error || "",
@@ -2849,14 +2866,34 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
   }
   async function terminateProcess(rec, signal = "SIGTERM") {
     if (!rec || !["starting", "running"].includes(rec.status)) return false;
-    try { rec.child.kill(signal); }
-    catch {
-      if (Deno.build.os === "windows" && rec.pid) {
-        await new Deno.Command("taskkill", { args: ["/PID", String(rec.pid), "/T", "/F"], stdout: "null", stderr: "null" }).output().catch(() => {});
+    rec.requested_signal = signal;
+    rec.termination_source = "mrmcp";
+    if (Deno.build.os === "windows" && rec.pid) {
+      const taskkill = force => new Deno.Command("taskkill", {
+        args: ["/PID", String(rec.pid), "/T", ...(force ? ["/F"] : [])], stdout: "null", stderr: "null",
+      }).output().catch(() => null);
+      let result = await taskkill(signal === "SIGKILL");
+      if (!result?.success && signal === "SIGTERM") {
+        result = await taskkill(true);
+        if (result?.success) rec.signal = "SIGKILL";
       }
+      if (!result?.success) {
+        rec.requested_signal = "";
+        rec.termination_source = "";
+        return false;
+      }
+      rec.signal ||= signal;
+      return true;
     }
-    rec.signal = signal;
-    return true;
+    try {
+      if (rec.child.kill(signal) === false) throw new Error("Process termination was rejected");
+      rec.signal = signal;
+      return true;
+    } catch {
+      rec.requested_signal = "";
+      rec.termination_source = "";
+      return false;
+    }
   }
   function spawnManagedChild(program, options) {
     if (Deno.build.os !== "windows") return new Deno.Command(program, options).spawn();
@@ -2873,7 +2910,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         settled = true;
         reject(error);
       });
-      child.once("close", (code, signal) => {
+      child.once("exit", (code, signal) => {
         if (settled) return;
         settled = true;
         resolve({ success: code === 0, code: code ?? -1, signal: signal || null });
@@ -2886,6 +2923,12 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       stderr: Readable.toWeb(child.stderr),
       status,
       kill(signal) { return child.kill(signal); },
+      closeOutput() {
+        for (const stream of [child.stdout, child.stderr]) {
+          stream.on("error", () => {});
+          stream.destroy();
+        }
+      },
     };
   }
   async function startManagedProcess(p, args, background, execution = {}) {
@@ -2930,8 +2973,9 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         catalog_name: spec.catalog_name || null, system_path_inherited: includeSystemPath,
       }),
       cwd: target.path, cwd_display: target.display, status: "running", started_at: Date.now(), completed_at: null,
-      exit_code: null, signal: "", timed_out: false, error: "",
+      exit_code: null, signal: "", requested_signal: "", termination_source: "", timed_out: false, error: "",
       output: "", stdout: "", stderr: "", output_base: 0, stdout_base: 0, stderr_base: 0, updated_at: Date.now(),
+      output_readers: new Set(), output_cancelled: false,
       stdin_writer: child.stdin.getWriter(), timeout_timer: null, done: null,
     };
     processes.set(rec.id, rec);
@@ -2942,18 +2986,36 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       rec.command_json, rec.cwd_display, rec.status, rec.started_at, timeout);
     const stdoutPump = pumpProcess(child.stdout, rec, "stdout"), stderrPump = pumpProcess(child.stderr, rec, "stderr");
     rec.done = child.status.then(async status => {
-      await Promise.allSettled([stdoutPump, stderrPump]);
-      rec.completed_at = Date.now(); rec.exit_code = status.code; rec.signal ||= status.signal || "";
-      rec.status = rec.timed_out ? "timed_out" : status.success ? "completed" : rec.signal ? "killed" : "failed";
+      const outputInterrupted = await settleProcessOutput(rec, [stdoutPump, stderrPump]);
+      rec.completed_at = Date.now(); rec.exit_code = status.code;
+      const observedSignal = status.signal || "";
+      if (rec.timed_out) {
+        rec.termination_source = "mrmcp";
+        rec.signal ||= observedSignal || rec.requested_signal || "SIGKILL";
+        rec.status = "timed_out";
+      } else if (rec.requested_signal) {
+        rec.termination_source = "mrmcp";
+        rec.signal ||= observedSignal || rec.requested_signal;
+        rec.status = "killed";
+      } else if (observedSignal || (outputInterrupted && !status.success)) {
+        rec.termination_source = "external";
+        rec.signal ||= observedSignal;
+        rec.status = "killed";
+      } else {
+        rec.signal ||= observedSignal;
+        rec.status = status.success ? "completed" : "failed";
+      }
       if (rec.timeout_timer) clearTimeout(rec.timeout_timer);
       try { await rec.stdin_writer?.close(); } catch {}
       rec.stdin_writer = null;
       run(`UPDATE process_runs SET status=?,completed_at=?,exit_code=?,signal=?,stdout_tail=?,stderr_tail=?,error=? WHERE id=?`,
         rec.status, rec.completed_at, rec.exit_code, rec.signal, processTail(rec.output), processTail(rec.stderr), rec.error, rec.id);
+      emitUiChange(["logs"], "process-exit");
       return rec;
     }).catch(error => {
       rec.completed_at = Date.now(); rec.status = "failed"; rec.error = String(error?.stack || error);
       run("UPDATE process_runs SET status='failed',completed_at=?,error=? WHERE id=?", rec.completed_at, rec.error, rec.id);
+      emitUiChange(["logs"], "process-exit");
       return rec;
     });
     if (timeout > 0) rec.timeout_timer = setTimeout(() => {
@@ -4560,7 +4622,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     commands: `<? const d=it.data || {}, rows=d.commands || []; ?><div class=muted><?= d.total || 0 ?> command<?= d.total === 1 ? "" : "s" ?> · page <?= d.page || 1 ?>/<?= d.pages || 1 ?> · config <code><?= d.config_file || "" ?></code></div><table class=commands-table><tr><th>Name</th><th>Relative path</th><th class=command-description>Description</th><th>Links</th><th>Source</th><th>State</th><th class=command-action-cell></th></tr><? rows.forEach(c => { ?><tr><td><code><?= c.name ?></code></td><td><code><?= c.path ?></code></td><td class=command-description><?= c.description || "—" ?></td><td><? if (c.documentation_url) { ?><a href="<?= c.documentation_url ?>" target=_blank rel=noopener>📖 Docs</a><? } else { ?>—<? } ?></td><td><?= c.source ?></td><td class="<?= c.present && c.executable ? "ok" : "failed" ?>"><?= c.present ? (c.executable ? "✅ available" : "⚠️ not executable") : "❌ missing" ?></td><td class=command-action-cell><div class=command-actions><button data-action=edit-command data-name="<?= c.name ?>" data-path="<?= c.path ?>">✏️ Edit</button><? if (c.registered && c.download_url) { ?><button data-action=download-command data-name="<?= c.name ?>">⬇️ Download</button><? } ?><? if (c.registered) { ?><button class=danger data-action=delete-command data-name="<?= c.name ?>">🗑️ Delete</button><? } ?></div></td></tr><? }) ?></table><div class=row><button data-action=commands-prev<?= d.page <= 1 ? " disabled" : "" ?>>Previous</button><button data-action=commands-next<?= d.has_more ? "" : " disabled" ?>>Next</button></div>`,
     oauth: `<table><tr><th>Client</th><th>ID</th><th>Sessions</th><th>Access</th><th>Refresh</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td><?= c.name ?></td><td><code><?= c.client_id ?></code></td><td class=nowrap><?= c.session_count||0 ?> <button class=small data-action=oauth-sessions data-id="<?= c.client_id ?>">💬 View Sessions</button></td><td><?= c.token_count ?></td><td><?= c.refresh_token_count ?></td><td><button class=danger data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> Available Tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,
-    logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=idcell><?= l.context_id ? "#"+l.context_id : "—" ?></td><td><code><?= l.tool ?></code></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Force</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin_block!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin_block ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><section class=json-detail><div class=row><b class=grow>MCP Result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div></td></tr><? } }) ?></tbody></table>`,
+    logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=idcell><?= l.context_id ? "#"+l.context_id : "—" ?></td><td><code><?= l.tool ?></code></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Force</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : terminal.signal ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin_block!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin_block ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><section class=json-detail><div class=row><b class=grow>MCP Result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div></td></tr><? } }) ?></tbody></table>`,
     debug: `<? const d=it.data||{}; if (!d.enabled) { ?><p class=muted>HTTP debug logging is disabled.</p><? } else { ?><table><tr><th>ID</th><th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>Remote</th><th>Error</th></tr><? (d.rows || []).forEach(r => { ?><tr data-action=select-debug data-id="<?= r.id ?>" title="Click to expand"><td class=idcell>#<?= r.id ?></td><td class=nowrap><?= it.logdt(r.ts) ?></td><td><b><?= r.method ?></b></td><td><code><?= r.path ?></code></td><td class="<?= r.status >= 400 ? "failed" : "ok" ?>"><?= r.status ?></td><td><?= r.duration_ms ?>ms</td><td><?= r.remote_addr ?></td><td><?= r.error_preview ?></td></tr><? if(String(d.openRowId||"")===String(r.id)&&d.openDetail){ ?><tr class=detail-row data-detail-kind=http data-detail-id="<?= r.id ?>"><td colspan=8><div class=detail-panel><div class=row><b class=grow>HTTP Request #<?= r.id ?></b><button class=small data-action=copy-detail data-target="http-json-<?= r.id ?>">📋 Copy JSON</button><button class=small data-action=close-row-detail data-kind=http>✕ Close</button></div><pre id="http-json-<?= r.id ?>"><?= it.pretty(d.openDetail) ?></pre></div></td></tr><? } }) ?></table><? } ?>`,
   };
   const fragmentDate = value => {
@@ -4633,6 +4695,9 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       output: String(live?.output ?? resolved.output ?? log.stdout ?? ""),
       status: String(source.status || log.status || ""),
       exit_code: source.exit_code ?? null,
+      signal: String(source.signal || ""),
+      requested_signal: String(source.requested_signal || ""),
+      termination_source: String(source.termination_source || ""),
     };
   };
   const endpointRows = p => [

@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.64 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.65 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
@@ -329,9 +329,9 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 31. Confirm standalone builds include both `assets/` and root `commands.yaml`, and that first standalone startup materializes `commands.yaml` beside the executable only when absent without overwriting an existing file.
 32. Verify `trash_paths` creates one `.mrmcp/trash/<action_id>/` plus sibling `.json` inside the selected Root, never creates top-level `.trash`, excludes `.mrmcp` metadata from explicit/glob selections, supports files/directories and globs, collapses nested selections, and leaves no partial trash action after rollback.
 33. Verify `untrash_action` preflights the complete action and either restores every path or restores none; confirm both trash tools have `destructiveHint: false` and no permanent filesystem-delete tool is published.
-34. Verify `exec`/`exec_start` schemas describe argv as verbatim ordered arguments, expose combined `output` by default, and add individual stdout/stderr only when `separate_streams: true` is requested; verify `exec_poll` advances `output_offset` correctly. On Windows, verify managed children use `node:child_process.spawn(..., { windowsHide: true })` while preserving stdin/stdout/stderr and process status semantics.
+34. Verify `exec`/`exec_start` schemas describe argv as verbatim ordered arguments, expose combined `output` by default, and add individual stdout/stderr only when `separate_streams: true` is requested; verify `exec_poll` advances `output_offset` correctly. On Windows, verify managed children use `node:child_process.spawn(..., { windowsHide: true })`, completion observes the child `exit` rather than waiting indefinitely for inherited pipe closure, and managed termination stops the process tree (`taskkill /T`, escalating to `/T /F`; Force uses `/T /F` immediately).
 35. Verify `query_tool_calls` returns only prior rows for the supplied `context_handle`, excludes its own current row, enforces limit 1–50/default 10, combines exact tool/status filters with literal full-record text search and `before_id` backward pagination, and makes no claim about upstream requests that never reached MrMCP.
-36. Verify process-like Tool Call rows render command/cwd, optional stdin heredoc and combined output above MCP JSON; base64 stdin must be labeled rather than display-decoded. Prefer live process output when available, enqueue process-output chunks through the normal coalesced render path, and render no terminal block for non-process tools.
+36. Verify process-like Tool Call rows render command/cwd, optional stdin heredoc and combined output above MCP JSON; base64 stdin must be labeled rather than display-decoded. Prefer live process output when available, enqueue process-output chunks and process-exit changes through the normal coalesced render path, show observable termination origin/signal, and render no terminal block for non-process tools. A parent exit must complete the foreground client response even when descendants keep inherited stdout/stderr handles open; ordinary nonzero exits must not be mislabeled as external kills.
 37. Verify Tool Call pagination/table/compact rows/detail rows use stable ids keyed by log database primary key and a live insert does not replace unrelated existing rows during Morphlex reconciliation.
 38. Verify visible GUI headings, action buttons and dialog titles use consistent Title Case while ordinary field labels/body prose remain sentence case.
 39. Confirm the Windows standalone build uses `--no-terminal` and its PE subsystem is GUI/Windows rather than console, while source-mode `deno run` remains terminal-attached.

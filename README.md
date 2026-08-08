@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.64
+# MrMCP 0.10.65
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -291,6 +291,14 @@ MrMCP uses fixed public listeners:
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
 ## Development changelog
+
+### 0.10.65
+
+- Fixed Tool Calls **Terminate** / **Force** for managed processes. On Windows, Terminate first attempts `taskkill /T` and escalates to `/T /F` when required; Force uses `/T /F` immediately so the process tree is actually stopped rather than only the parent process.
+- Managed-process completion now observes the parent process `exit` instead of waiting indefinitely for Node's `close` event. Output is allowed a short drain period, then lingering inherited stdout/stderr pipes are detached so a foreground MCP tool call returns even when the parent was killed while descendants still hold the pipes open.
+- Process responses now expose `requested_signal` and `termination_source` (`mrmcp` or `external` when the origin is observable), and the expanded Tool Calls terminal shows the termination origin/signal. A normal Windows `exit 1` is not falsely classified as an external kill.
+- Process exit now queues a Tool Calls UI render so kill buttons/status disappear promptly after the process actually ends.
+- No SQLite schema change.
 
 ### 0.10.64
 
