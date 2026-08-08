@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.69
+# MrMCP 0.10.70
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -46,7 +46,7 @@ Headless backend:
 deno run -A mrmcp.js --backend
 ```
 
-The administration interface normally starts at `http://127.0.0.1:7332/`. Desktop mode starts the backend in a Deno Worker in the same OS process, waits for a typed `ready` message, opens the authenticated loopback URL in the WebView, and on window close sends the Worker a graceful `shutdown` request before terminating the isolate as a bounded fallback. The initial window size is 1180×760.
+The administration interface normally starts at `http://127.0.0.1:7332/`. Desktop mode starts the backend in a Deno Worker in the same OS process, waits for a typed `ready` message, opens the authenticated loopback URL in the WebView, and on window close sends the Worker a graceful `shutdown` request before terminating the isolate as a bounded fallback. Once shutdown completes, the desktop process exits immediately. The initial window size is 1180×760.
 
 Listener ports are runtime-resolved without changing configuration. If GUI 7332, HTTP 80 or HTTPS 443 is already occupied, that listener retries at `base + 50` repeatedly until it binds (for example 7332→7382, 80→130, 443→493). The compact header groups version, live/fallback state and effective ports, recently active Sessions with `#id(total Tool Calls)`, and Tool Calls total/in-flight/error counts. Related values use semantic text colors: active green, in-flight yellow, errors red and totals/session counters blue-neutral. A Session is considered active when it has started a Tool Call within the last five minutes; at most the four most recently active Sessions are listed. ACME HTTP-01 is available only when the effective HTTP listener is still port 80; fallback instances may reuse existing certificates but cannot perform HTTP-01 issuance on the fallback HTTP port.
 
@@ -298,11 +298,18 @@ Fallback ports are runtime-only and never rewrite configuration. ACME HTTP-01 re
 
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
-Settings also provides **Clear Operational Data**. It preserves authentication state, Sessions/contexts, Roots, server settings and registered tools, while deleting Tool Calls/search index rows, managed-process history, HTTP debug logs and persisted `publish_html` documents, and resetting request metrics. The Dashboard Trash card also provides **Empty Trash**, which permanently removes the contents of `.mrmcp/trash` under the program folder and every configured Root without touching other root data.
+Settings also provides **Clear Operational Data**. It preserves authentication state, Sessions/contexts, Roots, server settings and registered tools, while deleting Tool Calls/search index rows, managed-process history, HTTP debug logs and persisted `publish_html` documents, and resetting request metrics. The Dashboard Trash card shows the trash actions that currently exist on disk and provides **Empty Trash**, which permanently removes the contents of `.mrmcp/trash` under the program folder and every configured Root without touching other root data. Untrash remains historical activity.
 
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### 0.10.70
+
+- Fixed desktop shutdown so closing the WebView cannot leave `mrmcp.exe` resident after listeners stop: Worker readiness/shutdown timeouts are cancellable, graceful Worker shutdown is still awaited, and the desktop main entrypoint exits explicitly after cleanup.
+- Changed the Dashboard Trash card from historical `trash_paths` counts to the live `.mrmcp/trash` filesystem inventory, so **Empty Trash** immediately shows `0` and no stale action/path details. Untrash activity remains historical.
+- Tool Calls now uses the explicit emoji-presentation form `🛠️` throughout the GUI so Windows renders the icon consistently with the other colored emoji.
+- No SQLite schema change.
 
 ### 0.10.69
 
