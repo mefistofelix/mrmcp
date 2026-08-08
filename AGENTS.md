@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.75 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.76 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
@@ -75,7 +75,7 @@ Authentication is the only server-access decision.
 - Anonymous clients receive none.
 - Do not implement tool approvals, allow/deny regular expressions, enable lists, execution switches or per-tool policy rules.
 - OAuth consent remains only to authorize the OAuth client.
-- The public OAuth consent/error page must remain client-agnostic and server-rendered with the same Eta instance used by the administration UI. Dynamic client, scope, resource, redirect and hidden-form values go through Eta auto-escaping; do not rebuild the page with interpolated HTML strings or client-specific copy. Keep the centered MrMCP logo/branding, green **Authorize Access**, red **Cancel**, matching branded invalid/expired state, and the direct standards-compliant redirect to the registered client callback after the decision.
+- The public OAuth consent/error page must remain client-agnostic and server-rendered with the same Eta instance used by the administration UI. Dynamic client, scope, resource, redirect and hidden-form values go through Eta auto-escaping; do not rebuild the page with interpolated HTML strings or client-specific copy. Keep the centered compact MrMCP logo/branding, green **Authorize Access**, red **Cancel**, matching branded invalid/expired state, and the direct standards-compliant redirect to the registered client callback after the decision. Keep client/scope/resource/return details and both actions visible in a normal viewport without unnecessary scrolling; do not add a separate trust-notice block.
 - `context_handle` is a bearer capability shared by any authenticated client that possesses it.
 
 ## Roots and current working directory
