@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.73
+# MrMCP 0.10.74
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -48,7 +48,7 @@ deno run -A mrmcp.js --backend
 
 The administration interface normally starts at `http://127.0.0.1:7332/`. Desktop mode starts the backend in a Deno Worker in the same OS process, waits for a typed `ready` message, opens the authenticated loopback URL in the WebView, and on window close sends the Worker a graceful `shutdown` request before terminating the isolate as a bounded fallback. Once shutdown completes, the desktop process exits immediately. The initial window size is 1180×760.
 
-Listener ports are runtime-resolved without changing configuration. If GUI 7332, HTTP 80 or HTTPS 443 is already occupied, that listener retries at `base + 50` repeatedly until it binds (for example 7332→7382, 80→130, 443→493). The compact header groups version, live/fallback state and effective ports, recently active Sessions with `#id(total Tool Calls)`, and Tool Calls total/in-flight/error counts. Related values use semantic text colors: active green, in-flight yellow, errors red and totals/session counters blue-neutral. A Session is considered active when it has started a Tool Call within the last five minutes; at most the four most recently active Sessions are listed. ACME HTTP-01 is available only when the effective HTTP listener is still port 80; fallback instances may reuse existing certificates but cannot perform HTTP-01 issuance on the fallback HTTP port.
+Listener ports are runtime-resolved without changing configuration. If GUI 7332, HTTP 80 or HTTPS 443 is already occupied, that listener retries at `base + 50` repeatedly until it binds (for example 7332→7382, 80→130, 443→493). The compact header groups version, live/fallback state and effective ports in public-first order HTTP/HTTPS/GUI, recently active Sessions with `#id(total Tool Calls)`, and Tool Calls total/in-flight/error counts. Useful header values are server-routed shortcuts: ports open Settings, active opens all Sessions, a recent `#Session` opens that Session's Tool Calls, and in-flight/total/errors open Tool Calls filtered to running/all/failed. Every shortcut only sends a normalized input; Deno updates `uiState` and Eta renders the result through the normal SSE/Morphlex pipeline. Related values use semantic text colors: active green, in-flight yellow, errors red and totals/session counters blue-neutral. A Session is considered active when it has started a Tool Call within the last five minutes; at most the four most recently active Sessions are listed. ACME HTTP-01 is available only when the effective HTTP listener is still port 80; fallback instances may reuse existing certificates but cannot perform HTTP-01 issuance on the fallback HTTP port.
 
 Port fallback only resolves listener collisions; it does not isolate application data. Parallel MrMCP instances intended for testing should be run from separate program directories so each has its own `.mrmcp` data directory and editable `commands.yaml`.
 
@@ -305,6 +305,12 @@ Settings also provides **Clear Operational Data**. It preserves authentication s
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### 0.10.74
+
+- Reordered header listener ports to HTTP / HTTPS / GUI so public ports appear first.
+- Made useful header counters server-routed shortcuts: Settings, all Sessions, per-Session Tool Calls, and running/all/failed Tool Call views; filters remain exclusively Deno-owned `uiState` rendered through Eta.
+- No SQLite schema change.
 
 ### 0.10.73
 
