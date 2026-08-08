@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.65
+# MrMCP 0.10.66
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -170,6 +170,8 @@ Commands and persistent execution:
 
 Command execution tools (`exec`, `exec_start`, `exec_poll` and custom commands) return a terminal-like `output` stream by default. MrMCP appends chunks from stdout and stderr to that field in the order the two OS pipes are observed producing data, so the agent normally has one stream to read together with `status` and `exit_code`. Set `separate_streams: true` when the individual `stdout` and `stderr` streams are specifically useful; `exec_poll` uses `output_offset` for incremental reads of the combined stream. `exec_list` history exposes combined output only.
 
+Managed termination uses the child-process API supplied by Deno/Node directly; MrMCP does not launch `taskkill`, `kill`, `pkill` or another platform command. `Terminate` requests `SIGTERM` and `Force` requests `SIGKILL`. On Unix these are distinct signals; on Windows Node's child-process implementation terminates the managed child without providing Unix signal semantics, so the two controls may have the same practical effect. Core Deno/Node provides no portable recursive process-tree kill API, so MrMCP deliberately targets the managed child rather than claiming cross-platform descendant termination. Parent exit still completes the MCP call after a short output-drain window even if descendants inherited its pipes.
+
 `query_tool_calls` reads only the supplied Session's `context_handle` history and excludes its own currently running call. `limit` defaults to 10 and is bounded to 1–50; `tool` and `status` are exact filters; `query` is a case-insensitive literal substring search across the complete stored log row; `before_id` returns only older stable log ids for backward pagination. Filters can be combined. The tool proves which requests reached MrMCP and shows their input, resolved result/output, status, timing and errors. A request rejected by a client/platform wrapper before MCP dispatch cannot be present, and MrMCP cannot expose an upstream reason code that was never delivered to the server.
 
 `trash_paths` is the removal path for files and directories. It accepts explicit root-relative `paths`, an optional root-relative `glob`, or both. Each call creates `.mrmcp/trash/<action_id>/` plus sibling metadata `.mrmcp/trash/<action_id>.json` inside the selected Root; the action id is the local date/time to the second with `-2`, `-3`, ... added only on collision. `.mrmcp` is reserved metadata and is excluded from trash selections/globs. Nested selections are collapsed so moving a selected directory does not separately move its children. `untrash_action(action_id)` restores the whole action or restores nothing: it preflights every original target first and rolls back any moves if a restore step fails. MrMCP intentionally exposes no permanent filesystem-delete tool; removal is reversible through trash actions.
@@ -291,6 +293,14 @@ MrMCP uses fixed public listeners:
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
 ## Development changelog
+
+### 0.10.66
+
+- Removed Windows `taskkill` process-tree handling. Managed termination now uses only the existing Deno/Node child-process `kill()` API, with no spawned platform-specific helper command.
+- Renamed explicit operator/client termination origin from `termination_source: "mrmcp"` to `termination_source: "user"`; timeout and server-shutdown requests are tracked separately as `timeout` and `server`, while externally observed termination remains `external`.
+- Kept `signal` as the signal actually observed from the child runtime when available and `requested_signal` as the requested termination mode, avoiding fabricated Windows signal values.
+- Terminate/Force target the managed child only. There is no claim of portable recursive process-tree termination; foreground calls still return after parent exit even if descendant processes retain inherited output handles.
+- No SQLite schema change.
 
 ### 0.10.65
 
