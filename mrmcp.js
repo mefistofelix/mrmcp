@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.70 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
+MrMCP 0.10.71 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -43,7 +43,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.70";
+const VERSION = "0.10.71";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CONTEXT_HANDLE_INPUT_DESCRIPTION = "Required opaque capability returned by create_context. Pass the exact value unchanged; never invent, modify, shorten, derive or substitute it.";
@@ -820,6 +820,11 @@ async function backend() {
   };
   const serverConfig = () => one("SELECT * FROM server_config WHERE id=1");
   const mcpUrl = () => `${publicBase()}/mcp`;
+  const mcpIconUrl = () => `${publicBase()}/mrmcp-icon.png`;
+  const mcpServerInfo = () => ({
+    name: "MrMCP", version: VERSION,
+    icons: [{ src: mcpIconUrl(), mimeType: "image/png" }],
+  });
   const metadataUrl = () => `${publicBase()}/.well-known/oauth-protected-resource/mcp`;
   const serverCapabilities = fullAccess => fullAccess ? {
     tools: { listChanged: false },
@@ -2842,6 +2847,9 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     if (publishTool?._meta?.["openai/outputTemplate"] !== FILE_PREVIEW_UI_URI) uiErrors.push("publish_file output-template alias missing");
     if (publishHtmlTool?._meta?.ui?.resourceUri !== HTML_PREVIEW_UI_URI) uiErrors.push("publish_html UI metadata missing");
     if (publishHtmlTool?._meta?.["openai/outputTemplate"] !== HTML_PREVIEW_UI_URI) uiErrors.push("publish_html output-template alias missing");
+    const serverInfo = mcpServerInfo();
+    if (serverInfo.icons?.[0]?.src !== `${publicBase()}/mrmcp-icon.png` || serverInfo.icons?.[0]?.mimeType !== "image/png")
+      uiErrors.push("serverInfo public icon metadata missing");
     return {
       ok: tools.length > 0 && invalid.length === 0 && uiErrors.length === 0,
       endpoint: "/mcp",
@@ -2854,12 +2862,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         resultType: "complete",
         supportedVersions: MCP_PROTOCOLS,
         capabilities: serverCapabilities(true),
-        _meta: {
-          "io.modelcontextprotocol/serverInfo": {
-            name: "MrMCP",
-            version: VERSION,
-          },
-        },
+        _meta: { "io.modelcontextprotocol/serverInfo": serverInfo },
         ttlMs: 300000,
         cacheScope: "private",
       },
@@ -4154,6 +4157,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const u = new URL(req.url);
     if (u.pathname.startsWith("/download/")) return await downloadResponse(req, u);
     if (u.pathname.startsWith("/published-html/")) return publishedHtmlResponse(req, u);
+    if (transport === "https" && req.method === "GET" && u.pathname === "/mrmcp-icon.png")
+      return await staticAssetResponse("/assets/mrmcp-logo.png");
     if (u.pathname === "/.well-known/oauth-authorization-server" ||
         u.pathname === "/.well-known/openid-configuration") {
       return json({
@@ -4401,12 +4406,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       return new Response(null, { status: 202 });
     }
 
-    const serverInfoMeta = {
-      "io.modelcontextprotocol/serverInfo": {
-        name: "MrMCP",
-        version: VERSION,
-      },
-    };
+    const serverInfoMeta = { "io.modelcontextprotocol/serverInfo": mcpServerInfo() };
     const instructions = fullAccess
       ? "Call create_context once, then call context_info and pass the exact context_handle unchanged on every later tool call. " +
         "context_info returns the current absolute root and agent_guidance_path; when that path is non-null, read and follow the referenced AGENTS.md before repository work. Call context_info again after the operator changes the Session root. " +

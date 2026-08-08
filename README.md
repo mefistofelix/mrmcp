@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.70
+# MrMCP 0.10.71
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -52,7 +52,7 @@ Listener ports are runtime-resolved without changing configuration. If GUI 7332,
 
 Port fallback only resolves listener collisions; it does not isolate application data. Parallel MrMCP instances intended for testing should be run from separate program directories so each has its own `.mrmcp` data directory and editable `commands.yaml`.
 
-The authenticated GUI serves `assets/` uniformly under `/assets/`. With `deno run`, those files come directly from the repository `assets/` directory. Standalone builds embed that directory with `deno compile --include assets`, so the WebView uses identical `/assets/...` URLs in source and standalone builds. `commands.yaml` is not a WebView asset: compile it separately with `--include commands.yaml`; on first standalone backend startup, MrMCP copies the embedded template beside the executable only if no editable physical `commands.yaml` exists there.
+The authenticated GUI serves `assets/` uniformly under `/assets/`. MCP `serverInfo` also advertises the MrMCP PNG logo at `${publicBase()}/mrmcp-icon.png`; that exact read-only HTTPS path is intentionally public so clients can fetch the icon without credentials, while ordinary `/assets/...` routes stay authenticated. With `deno run`, assets come directly from the repository `assets/` directory. Standalone builds embed that directory with `deno compile --include assets`, so the WebView and public icon use the same versioned files. `commands.yaml` is not a WebView asset: compile it separately with `--include commands.yaml`; on first standalone backend startup, MrMCP copies the embedded template beside the executable only if no editable physical `commands.yaml` exists there.
 
 Windows standalone build:
 
@@ -303,6 +303,13 @@ Settings also provides **Clear Operational Data**. It preserves authentication s
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### 0.10.71
+
+- Advertised the MrMCP PNG logo through MCP `serverInfo.icons`, using the current public HTTPS base URL so compatible clients can display server branding.
+- Added unauthenticated read-only HTTPS `GET /mrmcp-icon.png`, backed by the versioned `assets/mrmcp-logo.png`; normal GUI `/assets/...` routes remain authenticated.
+- Centralized server name/version/icon metadata in one `mcpServerInfo()` projection used by `server/discover`, response `_meta` and the MCP self-test.
+- No SQLite schema change.
 
 ### 0.10.70
 
