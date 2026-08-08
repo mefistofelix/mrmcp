@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.78 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.79 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
@@ -296,7 +296,7 @@ README must describe current behavior, not only past changes. It must include:
 - the event-driven UI and ephemeral state model;
 - a development changelog, with reverted architecture experiments clearly marked as superseded.
 
-Update README, AGENTS, the source header and `VERSION` together for every release.
+Update README, AGENTS, the source header and `VERSION` together for every release. The release commit itself must use the explicit Git commit message `release X.Y.Z` matching the version/tag being published; do not use a generic or unrelated commit message for a release.
 
 ## Release checks
 
