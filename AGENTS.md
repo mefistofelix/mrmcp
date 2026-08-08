@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.66 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.67 consists of four root project files plus one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
