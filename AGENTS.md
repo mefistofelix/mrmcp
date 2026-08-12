@@ -2,28 +2,28 @@
 
 ## Current release and files
 
-MrMCP 0.10.83 consists of four root project files plus one versioned asset directory:
+MrMCP 0.10.84 consists of four root project files plus one versioned asset directory:
 
-- `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, loopback UI and WebView launcher.
+- `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, local Tauriless UI and desktop launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
 - `README.md` — complete user/operator behavior and development changelog.
 - `AGENTS.md` — implementation invariants and release checks.
 - `assets/` — all static WebView/build assets, including `morphlex.js`, `mrmcp-logo.svg`, `mrmcp-logo.png`, `mrmcp.ico` and the numbered administration screenshots; do not duplicate them in the repository root.
 
-The only public MCP protocol endpoint is `/mcp`. The public HTTPS listener also serves the read-only unauthenticated `/mrmcp-icon.png` branding asset referenced by MCP `serverInfo.icons`. The administration UI is loopback-only and starts from base port `127.0.0.1:7332`, using runtime `+50` fallback when that port is occupied.
+The only public MCP protocol endpoint is `/mcp`. The public HTTPS listener also serves the read-only unauthenticated `/mrmcp-icon.png` branding asset referenced by MCP `serverInfo.icons`. The administration UI is local-only through Tauriless' `tauri` asset protocol and opens no GUI network listener.
 
 ## Desktop shell
 
 Use only the direct Deno import `import { Tauriless } from "npm:@mefistofelix/tauriless";` for the desktop shell.
 
 - Do not add a hand-written FFI wrapper, vendored Tauriless native binaries, a Rust/Tauri scaffold, Neutralinojs, a Node.js application, npm project files or a CLI. Tauriless is consumed only as the normal npm JS library and owns its native binding internally.
-- Desktop mode is one OS process: Tauriless stays on the main OS thread and is drained by Deno every ~16 ms, while the backend runs in a named Deno Worker/isolate loaded from the same `mrmcp.js`. Readiness and shutdown use typed Worker messages (`ready`, `shutdown`, `stopped`), not stdout parsing or a child process. The desktop window is currently allowed to load the authenticated loopback GUI URL returned by the backend; a later asset-protocol integration may remove the loopback GUI listener/session/CSRF layer. Closing the Tauriless window requests graceful backend shutdown and then terminates the Worker only as a bounded fallback. Worker wait timeouts must clear their timers when readiness/shutdown wins; after desktop cleanup completes, the main entrypoint exits explicitly so FFI or other residual handles cannot keep `mrmcp.exe` resident.
+- Desktop mode is one OS process: Tauriless stays on the main OS thread and is drained by Deno every ~16 ms, while the backend runs in a named Deno Worker/isolate loaded from the same `mrmcp.js`. Readiness and shutdown use typed Worker messages (`ready`, `shutdown`, `stopped`), not stdout parsing or a child process. Tauriless serves the GUI through `asset-request` / `tauriless:asset-response` with inline `content`; the GUI has no loopback HTTP listener, login token, cookie, session or CSRF layer. Browser inputs use Tauri `plugin:event|emit`; Deno renders in the Worker, posts the render to the main thread, and the main thread delivers it with `plugin:event|emit_to`. Closing the Tauriless window requests graceful backend shutdown and then terminates the Worker only as a bounded fallback. Worker wait timeouts must clear their timers when readiness/shutdown wins; after desktop cleanup completes, the main entrypoint exits explicitly so FFI or other residual handles cannot keep `mrmcp.exe` resident.
 - The initial desktop size is 1180×760.
 - Windows standalone builds must use both `deno compile --no-terminal` and `--icon assets/mrmcp.ico` so the compiled desktop application opens only the WebView, has the MrMCP executable icon and does not create a companion console window. Never omit either flag from release builds. Do not add runtime console-hiding code; source-mode `deno run` remains terminal-attached for development.
-- Do not add a native tray or drag-and-drop bridge unless explicitly requested.
-- Keep WebView/static resources in `assets/`; normal `/assets/...` GUI routes remain authenticated. The only public branding exception is exact HTTPS `GET /mrmcp-icon.png`, backed by `assets/mrmcp-logo.png`, so MCP clients can fetch `serverInfo.icons` without credentials. Source mode reads assets from disk; standalone builds embed them with `deno compile --include assets` so the same files resolve from Deno's virtual filesystem.
+- Keep the native desktop integrations enabled: set the main window icon through `plugin:window|set_icon` using in-memory RGBA data; create one MrMCP tray icon whose menu contains only Quit; a left tray click toggles the main window visible/hidden and does not open the menu; a normal window close request hides the window instead of terminating MrMCP. Enable native window drag/drop: dropped directories are forwarded to the backend and automatically added as enabled Workspaces, dropped non-directories are ignored, and a path already represented by any Workspace is a no-op. Auto-created Workspace names start from the final directory name and use the first free `Name`, `Name #2`, `Name #3`, ... form. Workspace names are globally unique database keys through `UNIQUE(name)`. When a new remote Session is created in desktop mode, show one OS notification from the Tauriless main thread with the Session id and best available observed client label.
+- Keep WebView/static resources in `assets/`. The desktop GUI may inline the small CSS/JavaScript/logo payload into the Tauriless asset response; do not reintroduce GUI HTTP routes merely to serve them. The only public branding path is exact HTTPS `GET /mrmcp-icon.png`, backed by `assets/mrmcp-logo.png`, so MCP clients can fetch `serverInfo.icons` without credentials. Source mode reads assets from disk; standalone builds embed them with `deno compile --include assets` so the same files resolve from Deno's virtual filesystem.
 - Keep `commands.yaml` in the repository root, not `assets/`. Source mode reads/writes that physical file directly. Standalone builds must additionally compile with `--include commands.yaml`; treat the embedded copy only as a first-run template and materialize it beside the executable if the physical file is absent. Never overwrite an existing user-edited `commands.yaml` from the VFS template.
-- Keep root records conventional: logical name, user-entered path, enabled state, edit and delete. Root paths may be absolute or relative; store the entered path string unchanged in SQLite and resolve relative values against `APP_DIR` only when an operation actually needs an absolute root. Validate Root/Command path existence/type on blur, never on every input keystroke. Invalid named-root paths must render red wherever that Root path is shown administratively. Session-to-root assignment belongs on the Roots page through server-routed drag/drop; do not put a root selector back on Sessions. The Roots assignment view labels the left column **Roots** and the right column **Sessions / No root assigned**. Session drag items keep Session id/client on the first line and Created, Last Activity, Status and `Tool Calls: N` together underneath; do not repeat generic OAuth/auth-kind text there. The Default-root card explains that it uses the program folder but does not print the absolute program-folder path.
+- Keep Workspace records conventional: globally unique name, user-entered path, enabled state, edit and delete. The `roots` table remains the internal persistence name, but visible GUI and MCP terminology is always **Workspace**. Workspace paths may be absolute or relative; store the entered path string unchanged in SQLite and resolve relative values against `APP_DIR` only when an operation actually needs an absolute path. Validate Workspace and Command path existence/type on blur, never through browser-native validation UI. Field errors render inline beside the relevant field and disable Save; generic operational errors use a small Deno-owned on-screen balloon, never an error modal/alert popup. Session-to-Workspace reassignment belongs on the Workspaces page through server-routed drag/drop; do not put a Workspace selector back on Sessions. Session drag items keep Session id/client on the first line and Created, Last Activity, Status and `Tool Calls: N` together underneath; do not repeat generic OAuth/auth-kind text there.
 
 ## Database: direct current schema, no versioning
 
@@ -36,11 +36,11 @@ The repository is in development. There is no backward-compatibility layer and t
 5. Never import legacy configuration keys or identifiers.
 6. Never retain an old table or column only for compatibility.
 7. Never accept legacy `opaque_` values, `server_opaque` arguments or transport-derived session identifiers.
-8. A clean schema must create no named `default` root.
-9. `contexts.id` is the numeric administrative primary key; `contexts.handle` remains the unique opaque bearer capability. Tool-call and process rows retain both `context_id` and `context_handle` snapshots. Context rows may also retain observational creation-client metadata (`auth_kind`, OAuth client id/name and User-Agent); that metadata never owns or authorizes the context.
-10. Settings **Clear Operational Data** is a history/data cleanup, not a configuration reset: preserve `config`, `server_config`, `custom_tools`, all OAuth tables, `roots` and `contexts`; clear `logs` plus `logs_fts`, `process_runs`, `debug_logs` and `published_html`, reset metrics, and reset only the cleared log-table sequences. Dashboard **Empty Trash** permanently removes only the contents of `.mrmcp/trash` under the program folder and every configured Root. Both maintenance actions use one Promise barrier rather than an application queue: new Tool Calls wait, already in-flight Tool Calls finish, maintenance runs, then waiting Tool Calls continue. Managed processes already detached from a completed `exec_start` call do not count as in-flight Tool Calls. Maintenance dialogs are confirmation-only: after Confirm they close immediately and no completion dialog appears. Only the confirmed action button renders the spinner plus live in-flight/waiting counts from Deno-owned state, then returns to its normal label when maintenance finishes; the other maintenance button may be disabled but must keep its normal label. Dashboard always exposes the current `activeCallControls.size` as Tool Calls In Flight. Do not add browser polling or a browser-owned countdown. Clear Operational Data must not delete certificates, command files/catalog data, trash contents or other filesystem state; Empty Trash must not delete anything outside the managed trash directories.
+8. A clean schema must create no named `default` Workspace and `roots.name` must be globally unique with `UNIQUE(name)`, never `UNIQUE(server_id,name)`.
+9. `contexts.id` is the numeric administrative Session primary key; `contexts.handle` remains the unique opaque Session bearer capability. Tool-call and process rows retain both `context_id` and `context_handle` snapshots. Context rows may also retain observational creation-client metadata (`auth_kind`, OAuth client id/name and User-Agent); that metadata never owns or authorizes the Session.
+10. Settings **Clear Operational Data** is a history/data cleanup, not a configuration reset: preserve `config`, `server_config`, `custom_tools`, all OAuth tables, `roots` and `contexts`; clear `logs` plus `logs_fts`, `process_runs`, `debug_logs` and `published_html`, reset metrics, and reset only the cleared log-table sequences. Dashboard **Empty Trash** permanently removes only the contents of `.mrmcp/trash` under the program folder and every configured Workspace. Both maintenance actions use one Promise barrier rather than an application queue: new Tool Calls wait, already in-flight Tool Calls finish, maintenance runs, then waiting Tool Calls continue. Managed processes already detached from a completed `exec_start` call do not count as in-flight Tool Calls. Maintenance dialogs are confirmation-only: after Confirm they close immediately and no completion dialog appears. Only the confirmed action button renders the spinner plus live in-flight/waiting counts from Deno-owned state, then returns to its normal label when maintenance finishes; the other maintenance button may be disabled but must keep its normal label. Dashboard always exposes the current `activeCallControls.size` as Tool Calls In Flight. Do not add browser polling or a browser-owned countdown. Clear Operational Data must not delete certificates, command files/catalog data, trash contents or other filesystem state; Empty Trash must not delete anything outside the managed trash directories.
 
-## MCP 2026-07-28 and explicit context capabilities
+## MCP 2026-07-28 and explicit Session capabilities
 
 Only protocol `2026-07-28` is advertised and accepted.
 
@@ -52,20 +52,21 @@ The protocol is stateless and sessionless at the transport layer:
 - do not send, consume or infer identity from `Mcp-Session-Id` or vendor session headers;
 - every request must be understandable without a previous transport handshake.
 
-Application state uses an explicit bearer capability:
+Application state uses an explicit Session bearer capability:
 
-- `create_context` is the only tool without a `context_handle` input and creates a globally unique `ctx_...` value;
+- `open_workspace` is the only tool without a `context_handle` input; it requires the globally unique enabled Workspace `name`, creates a new Session already attached to that Workspace, and returns a globally unique `ctx_...` value;
+- `workspace_info` reports the Session's current Workspace name, absolute working directory and nullable Workspace-level `agent_guidance_path`;
 - every other base and custom tool requires the same `context_handle` property;
 - every output schema requires only `context_handle` as common metadata;
 - every built-in tool must add an explicit tool-specific output schema and use `additionalProperties: false`; never regress to one permissive generic result schema;
 - failed calls set `isError: true` and expose one human-readable `error` string; do not add duplicate status, execution, retry, recovery-tool or log-id fields;
 - missing, invalid or expired handles never execute the requested operation and never mint a replacement automatically;
 - valid handles execute and are repeated byte-for-byte in the result;
-- contexts expire after 30 days without activity.
+- Sessions expire after 30 days without activity.
 
-Authentication gates access to the server. After authentication, possession of a valid `context_handle` selects the context. Do not bind contexts, managed processes or JavaScript kernels to an OAuth client, Basic credential, owner key or transport identity.
+Authentication gates access to the server. After authentication, possession of a valid `context_handle` selects the Session and its current Workspace. Do not bind Sessions, managed processes or JavaScript kernels to an OAuth client, Basic credential, owner key or transport identity.
 
-The GUI label **Sessions** is operator terminology only. Never describe `context_handle` as a protocol or transport session. Session client metadata is best-effort observational information captured at context creation; do not infer a model, reasoning/thinking level or client ownership from it. A ChatGPT model or thinking-level change may result in a new context even inside the same chat.
+Never describe `context_handle` as a protocol or transport session identifier. Session client metadata is best-effort observational information captured when `open_workspace` creates the Session; do not infer a model, reasoning/thinking level or client ownership from it. A ChatGPT model or thinking-level change may result in a new Session even inside the same chat.
 
 ## Authentication and authorization
 
@@ -78,24 +79,23 @@ Authentication is the only server-access decision.
 - The public OAuth consent/error page must remain client-agnostic and server-rendered with the same Eta instance used by the administration UI. Dynamic client, scope, resource, redirect and hidden-form values go through Eta auto-escaping; do not rebuild the page with interpolated HTML strings or client-specific copy. Keep it as a compact centered one-screen card using the administration GUI dark palette, with compact client/scope/resource/return rows, green **Authorize Access**, red **Cancel**, matching branded invalid/expired state, and the direct standards-compliant redirect to the registered client callback after the decision. On desktop keep the panel around half the viewport width and size typography from a combination of `vw` and `vh`; do not derive primary consent typography from `vmin`, because a short landscape viewport makes it unacceptably small. Keep logo, spacing and actions viewport-relative, constrain the document to the viewport, and keep all details and both actions visible without scrolling in a normal desktop viewport. Do not add a separate trust-notice block or redundant footer.
 - `context_handle` is a bearer capability shared by any authenticated client that possesses it.
 
-## Roots and current working directory
+## Workspaces and current working directory
 
-The GUI maintains named roots. A root may be assigned to many contexts, while each context stores exactly one current `root_id`.
+The GUI maintains named Workspaces. Workspace names are globally unique; a Workspace may be assigned to many Sessions, while each Session stores exactly one current internal `root_id`.
 
-- Root id `0` is the fallback directory containing `mrmcp.js`.
-- New contexts start on root id `0`.
-- Root assignment is managed only in the Roots GUI. Sessions shows the current root label/path read-only. Named-root paths shown in administrative UI remain in their stored form; `context_info` and actual filesystem/process execution resolve them to absolute paths only when needed.
-- The public MCP tool is `context_info`, which returns the absolute current root and nullable `agent_guidance_path`; the path itself expresses whether guidance is present.
-- `context_info` checks only the selected root's `AGENTS.md`, then `agents.md`; it returns an absolute path and never scans parent or child directories.
-- Tool/server descriptions must direct the agent to call `context_info` after `create_context` and root changes, then read and follow `agent_guidance_path` when non-null.
-- Changing a context root is unrestricted and affects new calls immediately.
-- Existing background and interactive processes continue with their original working directory.
-- Disabling or deleting a root moves associated contexts to root id `0` without terminating processes.
-- Resolve the context and root once at the start of each call and use that fixed selection for the whole operation.
+- Internal Workspace id `0` is the program-folder fallback containing `mrmcp.js`; it is not a named Workspace accepted by `open_workspace`.
+- `open_workspace(name)` requires an enabled named Workspace and creates the new Session attached to it immediately.
+- Workspace reassignment is managed in the Workspaces GUI. Sessions shows the current Workspace name/path read-only. Stored relative paths are resolved against `APP_DIR` only when an operation needs an absolute path.
+- The public MCP tool is `workspace_info`, which returns `workspace_name`, absolute `cwd` and nullable `agent_guidance_path`.
+- `workspace_info` checks only the selected Workspace's `AGENTS.md`, then `agents.md`; it returns an absolute path and never scans parent or child directories.
+- Tool/server descriptions must direct the agent to call `workspace_info` after `open_workspace` and after an operator changes the Session Workspace, then read and follow `agent_guidance_path` when non-null.
+- Changing a Session Workspace affects new calls immediately. Existing background and interactive processes continue with their original working directory.
+- Disabling or deleting a Workspace moves associated Sessions to internal id `0` without terminating processes; such Sessions remain visible for operator reassignment but new Sessions cannot be opened into id `0` through `open_workspace`.
+- Resolve the Session and Workspace once at the start of each call and use that fixed selection for the whole operation.
 
-All relative paths and new child-process working directories must remain inside the selected root.
+All relative paths and new child-process working directories must remain inside the selected Workspace.
 
-JavaScript kernels are lazy and keyed by `(server_id, context_handle, root_id)`. Switching roots selects or creates the matching kernel; switching back restores its previous state. Never share a kernel between different contexts.
+JavaScript kernels are lazy and keyed internally by `(server_id, context_handle, root_id)`. Switching Workspaces selects or creates the matching kernel; switching back restores its previous state. Never share a kernel between different Sessions.
 
 ## GUI architecture
 
@@ -104,7 +104,7 @@ Keep these sections:
 - Dashboard;
 - Clients;
 - Sessions;
-- Roots;
+- Workspaces;
 - Tool Calls;
 - Commands;
 - HTTP Log;
@@ -135,10 +135,10 @@ The authoritative flow is always:
 3. Deno updates `uiState` where required and performs database, filesystem, process, TLS, OAuth or command work.
 4. Deno marks the UI dirty instead of rendering synchronously in the mutation path.
 5. The render scheduler coalesces/throttles bursts and asynchronously builds the active view with Eta.
-6. Deno sends the completed HTML plus restoration metadata over SSE.
+6. The backend Worker posts the completed HTML plus restoration metadata to the main thread, which emits it to the WebView over the Tauri event bus.
 7. The WebView applies that HTML through Morphlex and restores only the focus/scroll information supplied by Deno.
 
-The same path applies to non-user events. A new MCP tool call, a log row, process output/completion, a root change, OAuth mutation, certificate update or settings change must update backend state/data and enqueue the same render pipeline. There must not be a separate “automatic refresh” implementation.
+The same path applies to non-user events. A new MCP tool call, a log row, process output/completion, a Workspace change, OAuth mutation, certificate update or settings change must update backend state/data and enqueue the same render pipeline. There must not be a separate “automatic refresh” implementation.
 
 Eta is responsible for conditional UI composition. It selects the visible section from `uiState.currentSection` with ordinary conditionals and renders only that section. Data access must be lazy and section-scoped: the projection or helper for Tool calls queries Tool-call data only while Tool calls is active; HTTP-debug data is queried only while HTTP debug is active; the same rule applies to every section. Do not preload every page merely because a full `#app` HTML fragment will be sent.
 
@@ -158,8 +158,8 @@ Deno owns one ephemeral `uiState` object containing at least:
 - command filters and pagination;
 - Tool-call query, Session-PK/status filters, pagination, self-test output and expanded log primary key;
 - HTTP-debug filters and expanded row primary key;
-- Root, Command and Settings drafts;
-- active confirmation/message/form dialog;
+- Workspace, Command and Settings drafts plus inline field-validation state;
+- active confirmation/form dialog and non-modal notice balloon;
 - the last processed input sequence.
 
 Database primary keys identify expanded rows. Never use a row index or DOM position.
@@ -169,16 +169,16 @@ Database primary keys identify expanded rows. Never use a row index or DOM posit
 The embedded browser has only transport and DOM-application responsibilities:
 
 1. delegate user events;
-2. serialize them to `/api/ui-input` over WebSocket;
-3. receive `render` events from `/api/events` over SSE;
+2. serialize them and emit them through Tauri `plugin:event|emit`;
+3. receive render payloads through Tauri `plugin:event|listen` after the main thread sends them with `plugin:event|emit_to`;
 4. morph the complete `#app` HTML using Morphlex;
 5. apply scroll/focus metadata sent by Deno.
 
-The browser must not call `/api/state`, `/api/render` or section-specific JSON endpoints. It must not execute database, filesystem, process, TLS, OAuth or command business logic. Local clipboard writes are allowed because they carry no persistent or graphical application state. Native drag `DataTransfer` may transiently carry only a numeric Session PK to a server-rendered root drop target; it must not add/remove classes, move nodes, retain assignment state or otherwise alter visible UI locally.
+The browser must not call `/api/state`, `/api/render` or section-specific JSON endpoints. It must not execute database, filesystem, process, TLS, OAuth or command business logic. Local clipboard writes are allowed because they carry no persistent or graphical application state. Native drag `DataTransfer` may transiently carry only a numeric Session PK to a server-rendered Workspace drop target; it must not add/remove classes, move nodes, retain assignment state or otherwise alter visible UI locally.
 
 ### One backend input and render pipeline
 
-Deno processes WebView inputs sequentially. The dispatcher updates `uiState`, performs the requested backend action and queues a render when required. Backend-originated changes from MCP calls, logs, managed processes, Roots, OAuth, TLS, settings and commands enter the same queue through `emitUiChange`.
+Deno processes WebView inputs sequentially. The browser may coalesce rapid text-input drafts before crossing the Tauri event bridge, but action/change/blur/submit/navigation events must flush pending input first so the latest edit is never lost. The dispatcher updates `uiState`, performs the requested backend action and queues a render when required. Backend-originated changes from MCP calls, logs, managed processes, Workspaces, OAuth, TLS, settings and commands enter the same queue through `emitUiChange`.
 
 Rendering must not occur synchronously in mutation paths:
 
@@ -187,7 +187,7 @@ Rendering must not occur synchronously in mutation paths:
 - if another event arrives during rendering, perform one subsequent pass;
 - yield before expensive work;
 - use Eta asynchronous rendering when available;
-- broadcast the completed full `#app` HTML through SSE.
+- send the completed full `#app` HTML through the Worker → main-thread → Tauri event path.
 
 Do not add interval polling, refresh timers, auto-refresh controls, manual refresh paths or multiple independent render queues.
 
@@ -196,8 +196,8 @@ Do not add interval polling, refresh timers, auto-refresh controls, manual refre
 Eta selects the active section from Deno `uiState.currentSection`. `buildUiRenderModel()` may query only the current section’s data:
 
 - Dashboard: endpoint summary and aggregates, including Trash/Untrash activity derived from completed Tool Call logs.
-- Sessions: contexts and their single current root, optionally filtered by stored OAuth client id; root information is read-only.
-- Roots: root records plus the minimal context rows required to group Sessions by current `root_id` and render the Default-root bucket.
+- Sessions: Sessions and their single current Workspace, optionally filtered by stored OAuth client id; Workspace information is read-only.
+- Workspaces: Workspace records plus the minimal Session rows required to group Sessions by current internal `root_id` and render the program-folder fallback bucket.
 - Commands: command catalog page only.
 - Tool calls: context filter values, paginated rows and at most one selected detail row.
 - HTTP debug: setting, filtered rows and at most one selected detail row.
@@ -207,9 +207,9 @@ Eta selects the active section from Deno `uiState.currentSection`. `buildUiRende
 
 Inactive sections must neither render nor query their tables. Sidebar selection, expanded rows, dialogs, confirmations and drafts are all Eta output derived from Deno state.
 
-### Dialogs and drafts
+### Dialogs, validation and drafts
 
-Root, Command, Settings, confirmation and message state belongs to Deno. Input events update the corresponding server draft even when no immediate render is needed, so an unrelated MCP/SSE update cannot erase partially entered values. Root/Command path checks run only on blur; the blur event must carry the next focus target (or explicit null) so a validation render cannot steal focus. Confirmations and errors must be Eta-rendered dialogs, not browser `confirm()` or `alert()` calls. For every managed dialog kind, Eta owns open/closed state and renders the `open` attribute from `uiState.dialog`; never call `showModal()`/`show()` or close a dialog imperatively in browser JavaScript. Use server-rendered markup plus CSS overlay for modal presentation; Escape may only send a close intent back to Deno.
+Workspace, Command, Settings and confirmation state belongs to Deno. Input events update the corresponding server draft even when no immediate render is needed, so an unrelated MCP/render update cannot erase partially entered values. Workspace/Command path checks run on blur; synchronous name/URL/settings validation may update from coalesced input events. Never rely on browser-native `required`, `pattern`, URL/email validation bubbles, `alert()` or `confirm()` for application validation. Field-specific errors render as concise red text beside the field and disable the corresponding Save action until valid. Generic operational errors render as a small non-modal Deno-owned red notice balloon, never an error modal. Eta owns confirmation/form open state and renders the `open` attribute from `uiState.dialog`; never call `showModal()`/`show()` or close a dialog imperatively in browser JavaScript. Use server-rendered markup plus CSS overlay for confirmation/form presentation; Escape may only send a close intent back to Deno.
 
 ## Tool-call UI
 
@@ -238,7 +238,7 @@ The system-PATH setting is enabled by default.
 - On Windows, spawn managed `exec` / `exec_start` children through `node:child_process.spawn` with `windowsHide: true` and adapt Node stdio streams to the existing Web Stream process pipeline. Do not regress to a spawn path that flashes a console window or steals WebView focus. Non-Windows managed processes may continue to use `Deno.Command`.
 - Managed termination must use the runtime child-process `kill()` API directly. Do not spawn `taskkill`, `kill`, `pkill` or another platform helper and do not claim portable recursive process-tree termination: Deno/Node core provides no cross-platform tree-kill API. `SIGTERM` and `SIGKILL` remain distinct requests on Unix; on Windows Node may terminate the direct child without Unix signal semantics. Parent exit must still release a foreground MCP response after the bounded output-drain path even when descendants retain inherited handles.
 - Explicit GUI/`exec_kill` termination uses `termination_source: "user"`; timeout and server-shutdown requests use `timeout` and `server`, while an externally observable termination uses `external`. Keep `requested_signal` distinct from the actually observed `signal`; do not invent an observed signal when Windows reports none.
-- Keep managed process access scoped to the exact `context_handle`; retain the root and cwd snapshot captured at process start.
+- Keep managed process access scoped to the exact `context_handle`; retain the Workspace and cwd snapshot captured at process start.
 - `query_tool_calls` is read-only and scoped to the exact `context_handle`. It returns only calls that reached MrMCP and excludes its own currently running log row. Keep `limit` bounded to 1–50 with default 10; `tool` and `status` are exact filters including `invalid`, `query` is a case-insensitive literal substring search across the complete stored log row, and `before_id` is the stable backward-pagination cursor. Filters are combinable. Use it to distinguish server-side execution/validation from upstream/client-wrapper rejection; never claim it can reveal a wrapper policy reason that was not sent to MrMCP.
 
 ## Published files/HTML and MCP App widgets
@@ -284,7 +284,7 @@ Do not invoke shell commands, `uv` or Python to list, search, inspect, edit or r
 
 Preserve source encoding, BOM and line endings unless conversion is explicitly requested.
 
-Filesystem removal is trash-only; do not reintroduce a permanent delete tool. `trash_paths` accepts explicit paths and/or one glob, supports files and directories, collapses nested selections, and moves each action under the selected Root's reserved `.mrmcp/trash/<action_id>/` with sibling `.mrmcp/trash/<action_id>.json`. Never create a top-level `.trash` directory. Exclude the entire `.mrmcp` metadata directory from explicit trash targets and trash globs. Action ids use local date/time to the second with an incrementing numeric suffix only on collision. The manifest stays minimal (`action_id`, creation time and original paths); do not add hashes or redundant integrity metadata. Assume `.mrmcp/trash` is managed by MrMCP, but keep the preflight required to guarantee `untrash_action` restores the entire action or nothing and rolls back any mid-restore moves. Neither `trash_paths` nor `untrash_action` is destructive; do not add them to `destructiveHint`. Dashboard Trash/Untrash counters and latest-action details must be derived from completed persistent Tool Call logs rather than duplicated into another table; failed attempts do not count, and a successful Untrash displays its reconstructed trash path as historical because the action directory has been removed.
+Filesystem removal is trash-only; do not reintroduce a permanent delete tool. `trash_paths` accepts explicit paths and/or one glob, supports files and directories, collapses nested selections, and moves each action under the selected Workspace's reserved `.mrmcp/trash/<action_id>/` with sibling `.mrmcp/trash/<action_id>.json`. Never create a top-level `.trash` directory. Exclude the entire `.mrmcp` metadata directory from explicit trash targets and trash globs. Action ids use local date/time to the second with an incrementing numeric suffix only on collision. The manifest stays minimal (`action_id`, creation time and original paths); do not add hashes or redundant integrity metadata. Assume `.mrmcp/trash` is managed by MrMCP, but keep the preflight required to guarantee `untrash_action` restores the entire action or nothing and rolls back any mid-restore moves. Neither `trash_paths` nor `untrash_action` is destructive; do not add them to `destructiveHint`. Dashboard Trash/Untrash counters and latest-action details must be derived from completed persistent Tool Call logs rather than duplicated into another table; failed attempts do not count, and a successful Untrash displays its reconstructed trash path as historical because the action directory has been removed.
 
 ## Documentation requirements
 
@@ -294,7 +294,7 @@ README must describe current behavior, not only past changes. It must include:
 - protocol rationale and explicit context capability lifecycle;
 - the distinction between GUI Sessions and protocol sessions;
 - authentication and database policy;
-- roots, commands, processes, text encoding and TLS;
+- Workspaces, commands, processes, text encoding and TLS;
 - the event-driven UI and ephemeral state model;
 - a development changelog, with reverted architecture experiments clearly marked as superseded.
 
@@ -305,7 +305,7 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 1. Syntax-check `mrmcp.js` as an ES module.
 2. Extract and syntax-check the embedded browser module and JavaScript worker.
 3. Compile/render every Eta fragment with representative data, including all nine sections and every dialog kind.
-4. Verify sidebar input travels over WebSocket, changes Deno `uiState.currentSection`, queues a render and produces SSE HTML.
+4. Verify sidebar input travels through `plugin:event|emit` to Tauriless, reaches the backend Worker, changes Deno `uiState.currentSection`, queues a render, and returns through `plugin:event|emit_to`.
 5. Verify the browser bundle contains no application-state object, business logic or administrative JSON fetches.
 6. Verify expanded Tool-call and HTTP rows survive relevant backend renders by database primary key.
 7. Verify `buildUiRenderModel()` queries only the active section.
@@ -317,12 +317,12 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 13. Confirm missing/valid/invalid/expired context-handle paths do or do not execute exactly as documented.
 14. Confirm no approval, `allow_re`, `deny_re` or tool-enable policy remains.
 15. Confirm no UI polling interval, auto-refresh control or manual refresh path exists; Tool-call filters must update through the single Deno render queue.
-16. Confirm backend log, context, root, process, debug, OAuth, settings and TLS mutations enter the same Deno render queue.
+16. Confirm backend log, Session, Workspace, process, debug, OAuth, settings and TLS mutations enter the same Deno render queue.
 17. Confirm every visible open/close/select/navigation transition is represented in Deno `uiState` and is produced by Eta, not by an imperative browser DOM mutation.
 18. Confirm expanded-row state uses database primary keys and remains correct when pagination or new rows change table order.
 19. Confirm inactive sections perform no section-specific database queries during a render.
-20. Confirm the WebView only sends normalized input envelopes (including blur with the next focus target), receives SSE renders, invokes Morphlex and restores Deno-supplied focus/scroll metadata.
-21. Confirm `context_info` returns the current absolute root and the root-level `AGENTS.md` / `agents.md` path when present, and returns `null` when absent.
+20. Confirm the WebView only sends normalized input envelopes through Tauri events (including blur with the next focus target), receives Tauri render events, invokes Morphlex and restores Deno-supplied focus/scroll metadata.
+21. Confirm `open_workspace` requires a globally unique enabled Workspace `name`, creates a new Session already attached to it and does not accept `context_handle`; confirm `workspace_info` returns `workspace_name`, absolute `cwd` and the Workspace-level `AGENTS.md` / `agents.md` path when present, with `agent_guidance_path: null` when absent.
 22. Confirm every built-in tool exposes a strict tool-specific output schema layered on the common context envelope.
 23. Confirm `glob`, `grep` and `replace` implement every documented traversal, exclusion, encoding, size-limit and expected-count argument without shell, `uv` or Python helpers.
 24. Confirm published tool input schemas remain strict and unchanged by diagnostic logging; an invalid call that does reach `/mcp` must be rejected before execution, stored with status `invalid`, retain its input/error/result, render purple, and be reachable from both the Tool Calls status filter and the clickable header invalid count. Confirm the status dropdown renders completed/failed/invalid/running in green/red/purple/yellow respectively and keeps the selected value in that semantic color.
@@ -330,22 +330,22 @@ Update README, AGENTS, the source header and `VERSION` together for every releas
 26. Confirm Session rows, Tool-call rows and the Tool-call Session filter use `contexts.id` / `logs.context_id`, while MCP requests still use the opaque handle.
 27. Confirm OAuth client rows count `contexts.oauth_client_id` matches and their View sessions action opens Sessions with that client filter; clearing the filter restores all Sessions.
 28. Confirm current-day GUI timestamps omit the calendar date while preserving time and any relative-age suffix.
-29. Confirm the Roots page groups Sessions by `root_id`, labels the right-hand root-id-0 group **Sessions / No root assigned**, renders Session id/client alone on the first drag-item line and Created, Last Activity, Status and `Tool Calls: N` together underneath without generic OAuth/auth-kind text, omits the absolute program-folder path from the Default-root card, accepts native drag/drop to named roots or root id `0`, routes the assignment through Deno, and the Sessions page has no root selector. Confirm named-root paths preserve the exact stored absolute/relative string in the GUI while runtime operations resolve relative values against `APP_DIR`, and invalid named-root paths render red in both Roots and Sessions.
-30. Confirm browser drag handling only transports the numeric Session PK/target root and performs no imperative visible DOM mutation.
+29. Confirm the Workspaces page groups Sessions by internal `root_id`, renders Session id/client alone on the first drag-item line and Created, Last Activity, Status and `Tool Calls: N` together underneath without generic OAuth/auth-kind text, routes Session reassignment through Deno, and the Sessions page has no Workspace selector. Confirm Workspace paths preserve the exact stored absolute/relative string in the GUI while runtime operations resolve relative values against `APP_DIR`. Confirm `roots.name` has global `UNIQUE(name)`, rename/create collisions render inline beside the name field and disable Save, and native OS directory drops add enabled Workspaces automatically, ignore files/non-directories, no-op when the effective path already exists, and choose the first free globally unique name `Name`, `Name #2`, `Name #3`, ... .
+30. Confirm browser drag handling only transports the numeric Session PK/target Workspace id and performs no imperative visible DOM mutation.
 31. Confirm the archive contains exactly the four root project files plus the versioned `assets/` directory, with Morphlex and all branding/static files there and no duplicate assets in the root; `commands.yaml` remains a root configuration file, not an asset.
-32. Confirm standalone builds include both `assets/` and root `commands.yaml`, and that first standalone startup materializes `commands.yaml` beside the executable only when absent without overwriting an existing file. Confirm MCP `serverInfo` always contains the public HTTPS `${publicBase()}/mrmcp-icon.png` PNG icon and that exact path is fetchable without authentication only on the HTTPS listener; ordinary `/assets/...` routes remain authenticated.
-33. Verify `trash_paths` creates one `.mrmcp/trash/<action_id>/` plus sibling `.json` inside the selected Root, never creates top-level `.trash`, excludes `.mrmcp` metadata from explicit/glob selections, supports files/directories and globs, collapses nested selections, and leaves no partial trash action after rollback.
+32. Confirm standalone builds include both `assets/` and root `commands.yaml`, and that first standalone startup materializes `commands.yaml` beside the executable only when absent without overwriting an existing file. Confirm MCP `serverInfo` always contains the public HTTPS `${publicBase()}/mrmcp-icon.png` PNG icon and that exact path is fetchable without authentication only on the HTTPS listener. Confirm the desktop GUI exposes no `/assets/...` HTTP routes and receives its local asset content only through Tauriless.
+33. Verify `trash_paths` creates one `.mrmcp/trash/<action_id>/` plus sibling `.json` inside the selected Workspace, never creates top-level `.trash`, excludes `.mrmcp` metadata from explicit/glob selections, supports files/directories and globs, collapses nested selections, and leaves no partial trash action after rollback.
 34. Verify `untrash_action` preflights the complete action and either restores every path or restores none; confirm both trash tools have `destructiveHint: false` and no permanent filesystem-delete tool is published.
 35. Verify `exec`/`exec_start` schemas describe argv as verbatim ordered arguments, expose combined normalized `output`, and add individual stdout/stderr only when `separate_streams: true` is requested. Normalization happens before buffering/storage, removes ANSI/OSC/control sequences without erasing prior progress states, and converts standalone `\r` to a line break. There is no raw-output option or retained raw process-output copy; `exec_poll` offsets advance directly over the normalized stream. On Windows, verify managed children use `node:child_process.spawn(..., { windowsHide: true })`, completion observes the child `exit` rather than waiting indefinitely for inherited pipe closure, and termination uses only the managed child runtime `kill()` API with no `taskkill`/platform helper or false process-tree guarantee.
 36. Verify `query_tool_calls` returns only prior rows for the supplied `context_handle`, excludes its own current row, enforces limit 1–50/default 10, combines exact tool/status filters with literal full-record text search and `before_id` backward pagination, and makes no claim about upstream requests that never reached MrMCP.
 37. Verify process-like Tool Call rows render command/cwd, optional raw stdin panel and normalized combined output above MCP JSON; base64 stdin must be labeled rather than display-decoded. Prefer live process output when available, enqueue process-output chunks and process-exit changes through the normal coalesced render path, show observable termination origin/requested/observed signal, and render no terminal block for non-process tools. Explicit GUI/`exec_kill` termination is `user`, timeout is `timeout`, server shutdown is `server`, and observable outside termination is `external`. A parent exit must complete the foreground client response even when descendants keep inherited stdout/stderr handles open; ordinary nonzero exits must not be mislabeled as external kills.
 38. Verify Tool Call pagination/table/compact rows/detail rows use stable ids keyed by log database primary key and a live insert does not replace unrelated existing rows during Morphlex reconciliation.
 39. Verify visible GUI headings, action buttons and dialog titles use consistent Title Case while ordinary field labels/body prose remain sentence case. Keep explanatory GUI copy short and operational: state what the control/view does and the user-visible consequence; avoid implementation prose when a shorter meaning-first sentence is sufficient.
-40. Confirm desktop mode creates no backend OS child: one `mrmcp.exe` owns Tauriless on the main OS thread plus the backend Deno Worker, Tauriless is drained at roughly 16 ms without blocking Deno, Worker readiness/shutdown use messages, readiness/shutdown timeout timers are cleared when no longer needed, and window destroy releases Tauriless and the Worker before the desktop main entrypoint exits explicitly. Verify GUI/HTTP/HTTPS listeners retry occupied base ports at +50 without persisting fallback ports; this resolves only listener collisions, so parallel test instances are expected to run from separate program directories for separate `.mrmcp` data. The compact header must keep related state grouped: brand/version, live/fallback plus effective ports in HTTP/HTTPS/GUI order, `💬 N active` with up to four latest `#Session(total Tool Calls)` entries using a five-minute Tool Call activity window, then `🛠️` Tool Calls in-flight, total, error and invalid counts. Where useful, header values are clickable only through normalized browser inputs handled by Deno: ports → Settings, active → unfiltered Sessions, recent Session → Tool Calls filtered by Session, in-flight → running Tool Calls, total → unfiltered Tool Calls, errors → failed Tool Calls, invalid → invalid Tool Calls. These shortcuts must update Deno `uiState` and use the normal Eta/SSE/Morphlex render path; never add browser-owned filters, querystring state or imperative DOM changes. Keep existing icons concise and differentiate related text semantically: active green, in-flight yellow when nonzero, errors red when nonzero, invalid purple when nonzero, totals/session counters blue-neutral, and zero alert counts muted. ACME HTTP-01 is disabled unless effective HTTP remains port 80. Confirm the Windows standalone build uses both `--no-terminal` and `--icon assets/mrmcp.ico`, and source-mode `deno run` remains terminal-attached for development.
-41. Verify Root/Command path existence/type checks run on blur rather than per keystroke, render inline warnings without blocking Root save, preserve the next focused control through the render, and keep Command path validation errors inline without closing the dialog.
-42. Verify every managed Root/Command/Confirm/Message dialog is opened solely by Eta-rendered `open` state plus CSS overlay, with no browser `showModal()`/`show()`/imperative close path; Escape only sends a Deno close intent.
+40. Confirm desktop mode creates no backend OS child: one `mrmcp.exe` owns Tauriless on the main OS thread plus the backend Deno Worker, Tauriless is drained at roughly 16 ms without blocking Deno, Worker readiness/shutdown use messages, readiness/shutdown timeout timers are cleared when no longer needed, and actual window destruction releases Tauriless and the Worker before the desktop main entrypoint exits explicitly. A normal X/close-request hides the main window and keeps MrMCP running. Confirm the GUI opens no network listener and loads only through Tauriless `asset-request`; only HTTP/HTTPS public listeners retry occupied base ports at +50 without persisting fallback ports. Before creating the WebView, unsubscribe every Tauriless initial named event except `tauri://close-requested`, `tauri://destroyed`, `tauri://drag-drop` and built-in `tauriless://webview-message`; do not unsubscribe any of those four. Confirm rapid browser text inputs are coalesced while action/change/blur/submit/navigation flush pending input before delivery. Confirm the main window is created hidden, forced to logical inner size 1180×760, centered, iconized, then shown; tray menu contains only Quit, left tray click toggles show/hide, native directory-drop Workspace creation works, and new-Session OS notifications work through Tauriless. The compact header must keep related state grouped: brand/version, live/fallback plus effective HTTP/HTTPS ports, `💬 N active` with up to four latest `#Session(total Tool Calls)` entries using a five-minute Tool Call activity window, then `🛠️` Tool Calls in-flight, total, error and invalid counts. Where useful, header values are clickable only through normalized browser inputs handled by Deno: ports → Settings, active → unfiltered Sessions, recent Session → Tool Calls filtered by Session, in-flight → running Tool Calls, total → unfiltered Tool Calls, errors → failed Tool Calls, invalid → invalid Tool Calls. These shortcuts must update Deno `uiState` and use the normal Eta/Tauri-event/Morphlex render path; never add browser-owned filters, querystring state or imperative DOM changes. Keep existing icons concise and differentiate related text semantically: active green, in-flight yellow when nonzero, errors red when nonzero, invalid purple when nonzero, totals/session counters blue-neutral, and zero alert counts muted. ACME HTTP-01 is disabled unless effective HTTP remains port 80. Confirm the Windows standalone build uses both `--no-terminal` and `--icon assets/mrmcp.ico`, and source-mode `deno run` remains terminal-attached for development.
+41. Verify Workspace/Command path existence/type checks run on blur rather than per keystroke, field validation renders inline and disables Save while invalid, the next focused control survives validation rendering, and no browser-native validation bubble/error popup is used.
+42. Verify every managed Workspace/Command/Confirm dialog is opened solely by Eta-rendered `open` state plus CSS overlay, with no browser `alert()`/`confirm()`/`showModal()`/`show()`/imperative close path; generic errors use the Deno-owned non-modal notice balloon and Escape only sends a Deno close intent.
 43. Verify `publish_file` exposes no return-mode selector, Base64 image payload or MCP `resource_link`; its structured result contains the temporary HTTPS `uri`, its tool descriptor points to the versioned MCP App widget, and the widget reads `structuredContent.uri`, uses `<img>` for images and an Open File link for other MIME types. Confirm `exec` exposes no `return_files*` shortcut.
 44. Verify `publish_html` persists rows in `published_html`, returns a persistent unguessable HTTPS URI, remains fetchable after closing/reopening the SQLite connection/server, points to the dedicated MCP App widget, and renders through a nested iframe whose sandbox allows scripts/forms/modals/popups but never `allow-same-origin`. Confirm the outer widget declares the MrMCP origin in `frameDomains` and the tool description states that external networking is host/browser/CSP/CORS dependent.
-45. Verify the Dashboard Trash card derives its count and latest action/path from actual `.mrmcp/trash/<action_id>` directories across the program folder and every configured Root, so Empty Trash immediately produces zero with no stale path detail even when historical `trash_paths` Tool Call logs remain. Untrash count/details remain historical Tool Call activity and its path is labeled historical. Verify Settings Clear Operational Data and Dashboard Empty Trash use the shared Promise maintenance barrier: in-flight Tool Calls finish, new calls wait, maintenance runs, then waiting calls continue. Confirmation dialogs close immediately, no completion dialog appears, only the active action button shows spinner/live in-flight+waiting counts, and Dashboard Tool Calls In Flight tracks `activeCallControls.size` without browser polling.
+45. Verify the Dashboard Trash card derives its count and latest action/path from actual `.mrmcp/trash/<action_id>` directories across the program folder and every configured Workspace, so Empty Trash immediately produces zero with no stale path detail even when historical `trash_paths` Tool Call logs remain. Untrash count/details remain historical Tool Call activity and its path is labeled historical. Verify Settings Clear Operational Data and Dashboard Empty Trash use the shared Promise maintenance barrier: in-flight Tool Calls finish, new calls wait, maintenance runs, then waiting calls continue. Confirmation dialogs close immediately, no completion dialog appears, only the active action button shows spinner/live in-flight+waiting counts, and Dashboard Tool Calls In Flight tracks `activeCallControls.size` without browser polling.
 46. Run the desktop WebView on a machine with Deno and platform dependencies.
 47. Verify the public OAuth consent and invalid/expired-request pages render through the shared Eta instance with auto-escaped dynamic values, generic MrMCP branding, centered decision content, green **Authorize Access** and red **Cancel** buttons without button emoji, and no client-specific or intermediate success page. At representative desktop landscape viewports, including 1920×1200 and a shorter ~1695×862 browser viewport, confirm the centered card remains around half-width, all four details and both actions fit without scrolling, and text remains comfortably readable rather than collapsing from short-side `vmin` scaling. Confirm approve/deny still redirect directly to the registered OAuth callback with the standard code/error parameters.

@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.83 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and a Tauriless desktop window.
+MrMCP 0.10.84 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and a Tauriless desktop window.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -8,7 +8,7 @@ GUI library: Tauriless, imported directly from npm by Deno.
 
 import { DatabaseSync } from "node:sqlite";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { createBrotliCompress, createGzip, inflateRawSync } from "node:zlib";
+import { createBrotliCompress, createGzip, inflateRawSync, inflateSync } from "node:zlib";
 import { Readable, Writable } from "node:stream";
 import { spawn as nodeSpawn } from "node:child_process";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -26,30 +26,28 @@ const ASSETS_DIR = join(MODULE_DIR, "assets");
 const APP_DIR = Deno.build.standalone ? dirname(Deno.execPath()) : MODULE_DIR;
 const COMMANDS_TEMPLATE_PATH = join(MODULE_DIR, "commands.yaml");
 const COMMANDS_PATH = join(APP_DIR, "commands.yaml");
-const cliValue = name => { const index = Deno.args.indexOf(name); return index >= 0 ? String(Deno.args[index + 1] || "") : ""; };
-const GUI_PORT = 7332, PORT_FALLBACK_STEP = 50;
-const ADMIN_TOKEN = SELF.searchParams.get("admin") || cliValue("--admin") ||
-  Deno.env.get("MRMCP_ADMIN_TOKEN") || crypto.randomUUID().replaceAll("-", "");
+const PORT_FALLBACK_STEP = 50;
+const UI_INPUT_EVENT = "tauriless://webview-message", UI_RENDER_EVENT = "mrmcp://ui-render";
 const BASE_TOOLS = [
-  "create_context", "context_info", "read_file", "read_files", "write_file", "write_files",
+  "open_workspace", "workspace_info", "read_file", "read_files", "write_file", "write_files",
   "edit", "replace", "glob", "grep",
   "file_info", "create_directory", "copy_path", "move_path", "trash_paths", "untrash_action",
   "publish_file", "publish_html", "list_commands", "query_tool_calls", "exec", "exec_start", "exec_poll", "exec_write", "exec_kill", "exec_list",
   "js", "js_add_node_module_dir", "js_reset",
 ];
 const READ_TOOLS = new Set([
-  "context_info", "read_file", "read_files", "glob", "grep",
+  "workspace_info", "read_file", "read_files", "glob", "grep",
   "file_info", "list_commands", "query_tool_calls", "exec_poll", "exec_list",
 ]);
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.83";
+const VERSION = "0.10.84";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const CONTEXT_HANDLE_INPUT_DESCRIPTION = "Required opaque capability returned by create_context. Pass the exact value unchanged; never invent, modify, shorten, derive or substitute it.";
-const CONTEXT_HANDLE_OUTPUT_DESCRIPTION = "Opaque capability identifying a persistent MrMCP context. Pass this exact value unchanged as context_handle on later calls.";
-const CONTEXT_HANDLE_RULE = "Requires the exact context_handle returned by create_context.";
+const CONTEXT_HANDLE_INPUT_DESCRIPTION = "Required opaque capability returned by open_workspace. Pass the exact value unchanged; never invent, modify, shorten, derive or substitute it.";
+const CONTEXT_HANDLE_OUTPUT_DESCRIPTION = "Opaque capability identifying a persistent MrMCP Session. Pass this exact value unchanged as context_handle on later calls.";
+const CONTEXT_HANDLE_RULE = "Requires the exact Session context_handle returned by open_workspace.";
 const MCP_UI_EXTENSION = "io.modelcontextprotocol/ui";
 const MCP_UI_MIME_TYPE = "text/html;profile=mcp-app";
 const FILE_PREVIEW_UI_URI = "ui://mrmcp/file-preview-v4.html";
@@ -297,7 +295,7 @@ async function backend() {
   const SELF_CERT_PATH = join(TLS_DATA, "selfsigned.pem");
   const SELF_KEY_PATH = join(TLS_DATA, "selfsigned-key.pem");
   const PUBLIC_HOST = "0.0.0.0", HTTP_PORT = 80, HTTPS_PORT = 443;
-  let guiPort = GUI_PORT, mcpHttpPort = HTTP_PORT, mcpHttpsPort = HTTPS_PORT;
+  let mcpHttpPort = HTTP_PORT, mcpHttpsPort = HTTPS_PORT;
   const serveWithPortFallback = (basePort, start) => {
     for (let port = basePort; port <= 65535; port += PORT_FALLBACK_STEP) {
       try { return { server: start(port), port }; }
@@ -316,8 +314,10 @@ async function backend() {
   });
   Deno.mkdirSync(TEMP_DIR, { recursive: true });
   const db = new DatabaseSync(DB_PATH);
-  let uiRevision = 0;
-  const uiRenderStreams = new Set();
+  let uiRevision = 0, uiRenderConnected = false;
+  const deliverUiRender = payload => {
+    if (IS_BACKEND_WORKER) self.postMessage({ type: "ui-render", payload });
+  };
   const UI_SECTIONS = new Set(["dashboard", "sessions", "logs", "roots", "commands", "debug", "oauth", "settings", "help"]);
   const uiState = {
     currentSection: "dashboard",
@@ -332,8 +332,8 @@ async function backend() {
     logs: { page: 1, query: "", context: "", status: "", pageSize: 25, openRowId: "", selfTest: null },
     debug: { query: "", method: "", status: "", openRowId: "" },
   };
-  let uiRenderTimer = null, uiLogFilterTimer = null, uiRenderRunning = false, uiRenderQueued = false;
-  let uiInputChain = Promise.resolve(), uiInputDepth = 0;
+  let uiRenderTimer = null, uiLogFilterTimer = null, uiNoticeTimer = null, uiRenderRunning = false, uiRenderQueued = false;
+  let uiInputChain = Promise.resolve(), uiInputDepth = 0, uiInputRenderDelay = null;
   const normalizedUiScopes = scopes => [...new Set((Array.isArray(scopes) ? scopes : [scopes])
     .map(String).map(value => value.trim()).filter(Boolean))];
   function uiScopesAffectCurrent(scopes) {
@@ -346,7 +346,12 @@ async function backend() {
   }
   function queueUiRender(reason = "change", delay = 18) {
     uiRenderQueued = true;
-    if (!uiRenderStreams.size || uiInputDepth || uiRenderRunning || uiRenderTimer) return;
+    if (uiInputDepth) {
+      const value = Math.max(0, Number(delay) || 0);
+      uiInputRenderDelay = uiInputRenderDelay == null ? value : Math.min(uiInputRenderDelay, value);
+      return;
+    }
+    if (!uiRenderConnected || uiRenderRunning || uiRenderTimer) return;
     uiRenderTimer = setTimeout(() => {
       uiRenderTimer = null;
       drainUiRenderQueue(reason).catch(error => {
@@ -354,18 +359,13 @@ async function backend() {
         uiRenderRunning = false;
         uiRenderQueued = false;
         const message = htmlEscape(String(error?.stack || error));
-        const payload = JSON.stringify({
+        deliverUiRender({
           revision: ++uiRevision,
           html: `<div id="app" data-section="${htmlEscape(uiState.currentSection)}"><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div></header><main style="margin-left:0"><div class="card tls-alert"><h2>UI Render Failed</h2><pre>${message}</pre></div></main></div>`,
           section: uiState.currentSection,
           scroll: [0, 0], focus: null, ack: uiState.lastInputSequence,
           reason: "render-error", at: Date.now(),
         });
-        const chunk = enc.encode(`event: render\nid: ${uiRevision}\ndata: ${payload}\n\n`);
-        for (const subscriber of [...uiRenderStreams]) {
-          try { subscriber.controller.enqueue(chunk); }
-          catch { uiRenderStreams.delete(subscriber); }
-        }
       });
     }, Math.max(0, Number(delay) || 0));
   }
@@ -377,7 +377,7 @@ async function backend() {
         uiRenderQueued = false;
         await Promise.resolve();
         const html = await renderUiDocument();
-        const payload = JSON.stringify({
+        deliverUiRender({
           revision: ++uiRevision,
           html,
           section: uiState.currentSection,
@@ -387,37 +387,12 @@ async function backend() {
           reason,
           at: Date.now(),
         });
-        const chunk = enc.encode(`event: render\nid: ${uiRevision}\ndata: ${payload}\n\n`);
-        for (const subscriber of [...uiRenderStreams]) {
-          try { subscriber.controller.enqueue(chunk); }
-          catch { uiRenderStreams.delete(subscriber); }
-        }
         if (uiRenderQueued) await sleep(0);
       }
     } finally {
       uiRenderRunning = false;
       if (uiRenderQueued) queueUiRender("coalesced", 0);
     }
-  }
-  function uiEventStream() {
-    let subscriber;
-    const stream = new ReadableStream({
-      start(controller) {
-        subscriber = { controller };
-        uiRenderStreams.add(subscriber);
-        controller.enqueue(enc.encode(`: MrMCP UI stream connected\n\n`));
-        queueUiRender("connected", 0);
-      },
-      cancel() { if (subscriber) uiRenderStreams.delete(subscriber); },
-    });
-    return new Response(stream, {
-      headers: {
-        "content-type": "text/event-stream; charset=utf-8",
-        "cache-control": "no-store",
-        "connection": "keep-alive",
-        "x-accel-buffering": "no",
-      },
-    });
   }
   function uiScopesForSql(sql) {
     const statement = String(sql || "").trim().toLowerCase();
@@ -545,7 +520,7 @@ async function backend() {
       path TEXT NOT NULL,
       enabled INTEGER NOT NULL DEFAULT 1,
       created_at INTEGER NOT NULL,
-      UNIQUE(server_id,name),
+      UNIQUE(name),
       FOREIGN KEY(server_id) REFERENCES server_config(id) ON DELETE CASCADE
     );
     CREATE TABLE IF NOT EXISTS contexts(
@@ -675,7 +650,6 @@ async function backend() {
     `INSERT INTO server_config(id,name,oauth,created_at) VALUES(1,?,?,?)`,
     "MrMCP", 1, Date.now(),
   );
-  const SESSION = randomToken(), CSRF = randomToken();
   const processes = new Map(), jsKernels = new Map(), activeCallControls = new Map(),
     oauthConsents = new Map(), rateBuckets = new Map(), downloadTokens = new Map();
   let toolCallGate = null, toolCallsIdle = Promise.resolve(), resolveToolCallsIdle = null,
@@ -699,7 +673,7 @@ async function backend() {
     `, p.id, now - HEADER_ACTIVE_MS);
     if (headerActivityTimer) clearTimeout(headerActivityTimer);
     headerActivityTimer = null;
-    if (rows.length && uiRenderStreams.size) {
+    if (rows.length && uiRenderConnected) {
       const nextExpiry = Math.min(...rows.map(row => Number(row.last_at) + HEADER_ACTIVE_MS));
       headerActivityTimer = setTimeout(() => {
         headerActivityTimer = null;
@@ -785,7 +759,6 @@ async function backend() {
   let mcpTlsValid = false, mcpTlsTrusted = false, mcpTlsInfo = null;
   let mcpListenError = "", renewalTimer, processCleanupTimer, downloadCleanupTimer;
   const listenerFallbacks = () => [
-    guiPort !== GUI_PORT ? `GUI ${GUI_PORT}→${guiPort}` : "",
     mcpHttpActive && mcpHttpPort !== HTTP_PORT ? `HTTP ${HTTP_PORT}→${mcpHttpPort}` : "",
     mcpTlsActive && mcpHttpsPort !== HTTPS_PORT ? `HTTPS ${HTTPS_PORT}→${mcpHttpsPort}` : "",
   ].filter(Boolean);
@@ -1756,16 +1729,16 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     await issueLetsEncrypt().catch(() => {});
   }
 
-  // File tools can access every entry inside the selected configured root.
+  // File tools can access every entry inside the selected Workspace.
   async function safePath(root, path = ".") {
     const rootReal = await Deno.realPath(root);
     const target = resolve(rootReal, String(path || "."));
-    if (!within(rootReal, target)) throw new Error("Path outside selected root");
+    if (!within(rootReal, target)) throw new Error("Path outside selected Workspace");
     let current = target;
     for (;;) {
       try {
         const real = await Deno.realPath(current);
-        if (!within(rootReal, real)) throw new Error("Path resolves outside the selected root");
+        if (!within(rootReal, real)) throw new Error("Path resolves outside the selected Workspace");
         break;
       } catch (e) {
         if (!(e instanceof Deno.errors.NotFound)) throw e;
@@ -1950,8 +1923,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     }
   }
 
-  // Context handles are globally unique bearer capabilities over the stateless MCP transport.
-  // Each context has exactly one current root; root id 0 is the program folder fallback.
+  // Session context handles are globally unique bearer capabilities over the stateless MCP transport.
+  // Each Session has exactly one current Workspace; workspace id 0 is the program-folder fallback.
   const serverRoots = p => all(
     "SELECT * FROM roots WHERE server_id=? AND enabled=1 ORDER BY id", p.id,
   );
@@ -2007,6 +1980,44 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const value = String(name || "").trim();
     return value.length >= 1 && value.length <= 128 && !/[\/\\\x00-\x1f\x7f]/.test(value);
   };
+  const workspaceNameWarning = (name, id = 0) => {
+    const value = String(name || "").trim();
+    if (!validRootName(value)) return "Workspace name must be 1-128 characters and cannot contain slashes or control characters.";
+    return one("SELECT 1 FROM roots WHERE name=? AND id<>?", value, Number(id) || 0)
+      ? "Workspace name already exists."
+      : "";
+  };
+  const rootPathKey = value => {
+    const path = configuredRootPath(value);
+    return Deno.build.os === "windows" ? path.toLowerCase() : path;
+  };
+  async function addDroppedRoots(paths) {
+    const p = serverConfig(), roots = all("SELECT name,path FROM roots ORDER BY id");
+    const pathKeys = new Set(roots.map(root => rootPathKey(root.path)));
+    const labels = new Set(roots.map(root => String(root.name || "").trim().toLowerCase()));
+    const added = [];
+    for (const value of Array.isArray(paths) ? paths : []) {
+      const path = String(value || "").trim();
+      if (!path || pathKeys.has(rootPathKey(path))) continue;
+      let stat;
+      try { stat = await Deno.stat(path); } catch { continue; }
+      if (!stat.isDirectory) continue;
+      const absolute = configuredRootPath(path);
+      let base = String(basename(absolute) || absolute.replace(/[\\/]+$/, "") || "Workspace").trim().slice(0, 128) || "Workspace";
+      if (!validRootName(base)) base = "Workspace";
+      let name = base, suffix = 2;
+      while (labels.has(name.toLowerCase())) {
+        const tail = ` #${suffix++}`;
+        name = `${base.slice(0, 128 - tail.length)}${tail}`;
+      }
+      run("INSERT INTO roots(server_id,name,path,enabled,created_at) VALUES(?,?,?,?,?)",
+        p.id, name, path, 1, Date.now());
+      pathKeys.add(rootPathKey(path));
+      labels.add(name.toLowerCase());
+      added.push(name);
+    }
+    return added;
+  }
   function contextByHandle(p, handle) {
     return handle ? one(
       "SELECT * FROM contexts WHERE handle=? AND server_id=?",
@@ -2019,16 +2030,25 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       Number(id), p.id,
     ) : null;
   }
-  function createContext(p, protocolVersion = "", client = {}) {
+  const workspaceByName = (p, name, enabledOnly = true) => one(
+    `SELECT * FROM roots WHERE server_id=? AND name=?${enabledOnly ? " AND enabled=1" : ""}`,
+    p.id, String(name || "").trim(),
+  );
+  function createContext(p, workspace, protocolVersion = "", client = {}) {
     let handle;
     do handle = `ctx_${randomToken(24)}`;
     while (one("SELECT 1 FROM contexts WHERE handle=?", handle));
     const now = Date.now();
     run(`INSERT INTO contexts(handle,server_id,root_id,label,created_at,updated_at,last_active_at,protocol_version,auth_kind,oauth_client_id,client_name,user_agent)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, handle, p.id, 0, "", now, now, now, String(protocolVersion || ""),
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, handle, p.id, Number(workspace.id), "", now, now, now, String(protocolVersion || ""),
       String(client.auth_kind || ""), String(client.oauth_client_id || ""), String(client.client_name || ""),
       String(client.user_agent || "").slice(0, 512));
-    return one("SELECT * FROM contexts WHERE handle=?", handle);
+    const record = one("SELECT * FROM contexts WHERE handle=?", handle);
+    if (IS_BACKEND_WORKER) self.postMessage({ type: "context-created", context: {
+      id: record.id, client_name: record.client_name || "", auth_kind: record.auth_kind || "",
+      oauth_client_id: record.oauth_client_id || "", user_agent: record.user_agent || "",
+    } });
+    return record;
   }
   const contextExpired = context => !!context &&
     Date.now() - Number(context.last_active_at || context.created_at || 0) > CONTEXT_TTL_MS;
@@ -2067,21 +2087,21 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       label: context.label || `#${context.id}`,
       expired: contextExpired(context),
       protocol_version: context.protocol_version || "unknown",
-      root_id: root.id,
-      effective_root: root.name,
-      root_path: root.path,
-      fallback_root: root.id === 0,
+      workspace_id: root.id,
+      workspace_name: root.name,
+      workspace_path: root.path,
+      fallback_workspace: root.id === 0,
       created_at: context.created_at,
       updated_at: context.updated_at,
       last_active_at: context.last_active_at,
       expires_at: Number(context.last_active_at || context.created_at || 0) + CONTEXT_TTL_MS,
-      available_roots: roots.map(item => ({ id: item.id, name: item.name, selected: item.id === root.id })),
+      available_workspaces: roots.map(item => ({ id: item.id, name: item.name, selected: item.id === root.id })),
     };
   }
   function selectContextRoot(p, context, rootId) {
     rootId = Math.max(0, Number(rootId) || 0);
     const root = rootId ? serverRoots(p).find(item => item.id === rootId) : null;
-    if (rootId && !root) throw new Error(`Unknown or disabled root id: ${rootId}`);
+    if (rootId && !root) throw new Error(`Unknown or disabled Workspace id: ${rootId}`);
     run("UPDATE contexts SET root_id=?,updated_at=? WHERE handle=?", root?.id || 0, Date.now(), context.handle);
     return contextSnapshot(p, getContextRecord(p, context.handle));
   }
@@ -2097,7 +2117,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       display: relative(selection.root.path, absolute).replaceAll("\\", "/") || ".",
     };
   }
-  async function contextInfo(selection) {
+  async function workspaceInfo(selection) {
     let agentGuidancePath = null;
     for (const name of ["AGENTS.md", "agents.md"]) {
       const candidate = await resolveWorkspacePath(selection, name).catch(() => null);
@@ -2108,6 +2128,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       }
     }
     return {
+      workspace_name: selection.root.name,
       cwd: selection.root.path,
       agent_guidance_path: agentGuidancePath,
     };
@@ -2139,6 +2160,23 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       return String(error?.message || error);
     }
   }
+  const commandPathBlocksSave = warning => !!warning && warning !== "Command file does not exist yet.";
+  async function commandNameWarning(name, oldName = "") {
+    const value = String(name || "").trim(), previous = String(oldName || "").trim().toLowerCase();
+    if (!/^[A-Za-z0-9_.+-]{1,128}$/.test(value)) return "Command name must use only letters, numbers, _, ., + or -.";
+    const rows = await readCommandConfig();
+    return rows.some(row => row.name.toLowerCase() === value.toLowerCase() && row.name.toLowerCase() !== previous)
+      ? "Command name already exists."
+      : "";
+  }
+  const httpUrlWarning = (value, label) => {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    try {
+      const url = new URL(raw);
+      return ["http:", "https:"].includes(url.protocol) ? "" : `${label} must use HTTP or HTTPS.`;
+    } catch { return `${label} is not a valid URL.`; }
+  };
   async function commandTarget(relativePath) {
     const configured = await binPath(relativePath);
     if (Deno.build.os !== "windows" || windowsExecutableSuffix(configured.relative)) return configured;
@@ -2396,6 +2434,12 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
   function serverTools(p, fullAccess = true) {
     if (!fullAccess) return [];
     const available = new Set(BASE_TOOLS);
+    const workspaceNames = all("SELECT name FROM roots WHERE server_id=? AND enabled=1 ORDER BY name", p.id).map(row => row.name);
+    const workspaceNameInput = {
+      type: "string", minLength: 1, maxLength: 128,
+      ...(workspaceNames.length ? { enum: workspaceNames } : {}),
+      description: "Required unique name of an enabled MrMCP Workspace. The new Session is attached to this Workspace immediately.",
+    };
     const contextInput = {
       context_handle: {
         type: "string", minLength: 12, maxLength: 256,
@@ -2435,7 +2479,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         description: "Argument vector passed verbatim to the executable in this exact order. Put each option, option value and positional argument in its own array item; do not rewrite or reinterpret CLI syntax. When syntax is uncertain, run the program's --help first.",
       },
       shell_command: { type: "string", description: "Use only when shell syntax such as a pipeline or redirection is required. For normal direct execution use program + args. Never send a shell boolean/field; it is not part of this schema." },
-      cwd: { type: "string", default: ".", description: "Directory relative to the context's current root." },
+      cwd: { type: "string", default: ".", description: "Directory relative to the Session's current Workspace." },
       env: { type: "object", additionalProperties: { type: "string" } },
       stdin: { type: "string" },
       stdin_encoding: { type: "string", enum: ["text", "base64"], default: "text" },
@@ -2448,12 +2492,12 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     };
 
     const defs = {
-      create_context: [
-        "Create a new persistent MrMCP context capability. Call context_info immediately afterward, then pass the returned context_handle unchanged to every later tool.",
-        { properties: {} },
+      open_workspace: [
+        "Open a new MrMCP Session in the named Workspace and return its context_handle capability. The Workspace name is unique and the Session is attached to it immediately. Call workspace_info next, then pass the returned context_handle unchanged to every later tool.",
+        { properties: { name: workspaceNameInput }, required: ["name"] },
       ],
-      context_info: [
-        "Return the current absolute working root and the root-level AGENTS.md guidance path when present. Read and follow agent_guidance_path before repository work; call again after the operator changes the context root.",
+      workspace_info: [
+        "Return the current Workspace name, absolute working directory and Workspace-level AGENTS.md guidance path when present. Read and follow agent_guidance_path before repository work; call again after the operator changes the Session Workspace.",
         { properties: { ...contextInput } },
       ],
       read_file: [
@@ -2524,7 +2568,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         }, required: ["query", "replacement"] },
       ],
       glob: [
-        "List files recursively under the current root using a glob pattern, optional exclusions and explicit hidden/dependency traversal. Prefer this over find, dir, ls, exec, uv or Python.",
+        "List files recursively under the current Workspace using a glob pattern, optional exclusions and explicit hidden/dependency traversal. Prefer this over find, dir, ls, exec, uv or Python.",
         { properties: {
           path: { type: "string", default: "." }, pattern: { type: "string", default: "**/*" },
           exclude: { type: "array", items: { type: "string" }, default: [] },
@@ -2535,7 +2579,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         } },
       ],
       grep: [
-        "Search text under the current root without spawning rg, grep, uv or Python. Supports literal/regex matching, globs, exclusions, context lines, hidden/dependency traversal, encoding selection and content/file/count output modes.",
+        "Search text under the current Workspace without spawning rg, grep, uv or Python. Supports literal/regex matching, globs, exclusions, context lines, hidden/dependency traversal, encoding selection and content/file/count output modes.",
         { properties: {
           pattern: { type: "string" }, path: { type: "string", default: "." },
           glob: { type: "string", default: "**/*" },
@@ -2557,7 +2601,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       copy_path: ["Copy a file or directory recursively.", { properties: { from: { type: "string" }, to: { type: "string" }, ...contextInput }, required: ["from", "to"] }],
       move_path: ["Move or rename a path.", { properties: { from: { type: "string" }, to: { type: "string" }, ...contextInput }, required: ["from", "to"] }],
       trash_paths: [
-        "Move files or directories selected by explicit root-relative paths and/or one glob into a reversible .mrmcp/trash action. Each call creates one timestamped action directory plus a sibling JSON manifest; use untrash_action with the returned action_id to restore the whole action.",
+        "Move files or directories selected by explicit Workspace-relative paths and/or one glob into a reversible .mrmcp/trash action. Each call creates one timestamped action directory plus a sibling JSON manifest; use untrash_action with the returned action_id to restore the whole action.",
         { anyOf: [{ required: ["paths"] }, { required: ["glob"] }], properties: {
           paths: { type: "array", minItems: 1, maxItems: 200, items: { type: "string" } },
           glob: { type: "string" }, ...contextInput,
@@ -2638,14 +2682,14 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         limit: { type: "integer", minimum: 1, maximum: 200, default: 50 }, ...contextInput,
       } }],
       js: [
-        "Run JavaScript in a persistent lazy kernel scoped to the current context and root. Use it for computation or programmatic parsing, not ordinary file inspection, search or edits.",
+        "Run JavaScript in a persistent lazy kernel scoped to the current Session and Workspace. Use it for computation or programmatic parsing, not ordinary file inspection, search or edits.",
         { properties: {
           code: { type: "string" }, cwd: { type: "string", default: "." },
           timeout_ms: { type: "integer", minimum: 1, maximum: 120000, default: 30000 }, ...contextInput,
         }, required: ["code"] },
       ],
-      js_add_node_module_dir: ["Add a directory to the persistent JavaScript kernel for the current context and root.", { properties: { path: { type: "string" }, ...contextInput }, required: ["path"] }],
-      js_reset: ["Reset the persistent JavaScript kernel for the current context and root.", { properties: { ...contextInput } }],
+      js_add_node_module_dir: ["Add a directory to the persistent JavaScript kernel for the current Session and Workspace.", { properties: { path: { type: "string" }, ...contextInput }, required: ["path"] }],
+      js_reset: ["Reset the persistent JavaScript kernel for the current Session and Workspace.", { properties: { ...contextInput } }],
     };
 
     const nullableString = { anyOf: [{ type: "string" }, { type: "null" }] };
@@ -2680,12 +2724,16 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       stdin_open: { type: "boolean" }, success: { type: "boolean" },
     };
     const outputSchemas = {
-      create_context: outputSchema(),
-      context_info: outputSchema({
-        cwd: { type: "string", description: "Absolute path of the context's current root." },
+      open_workspace: outputSchema({
+        workspace_name: { type: "string", description: "Unique Workspace name selected for the new Session." },
+        cwd: { type: "string", description: "Absolute path of the selected Workspace." },
+      }),
+      workspace_info: outputSchema({
+        workspace_name: { type: "string", description: "Unique name of the Session's current Workspace." },
+        cwd: { type: "string", description: "Absolute path of the Session's current Workspace." },
         agent_guidance_path: {
           ...nullableString,
-          description: "Absolute root-level AGENTS.md or agents.md path. When non-null, read and follow it before modifying files under this context root.",
+          description: "Absolute Workspace-level AGENTS.md or agents.md path. When non-null, read and follow it before modifying files under this Workspace.",
         },
       }),
       read_file: outputSchema({ path: { type: "string" }, start_line: { type: "integer" }, end_line: { type: "integer" }, content: { type: "string" }, ...textMetadata }),
@@ -2720,7 +2768,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const processOutputSchema = outputSchema(processProperties);
 
     const titles = {
-      create_context: "Create context", context_info: "Context info", read_file: "Read", read_files: "Read batch",
+      open_workspace: "Open Workspace", workspace_info: "Workspace Info", read_file: "Read", read_files: "Read batch",
       write_file: "Write", write_files: "Write batch", edit: "Edit", replace: "Replace",
       glob: "Glob", grep: "Grep", trash_paths: "Trash paths", untrash_action: "Restore trash action",
       publish_file: "Publish File", publish_html: "Publish HTML", list_commands: "Command Catalog", query_tool_calls: "Query Tool Calls",
@@ -2743,7 +2791,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       required: [...new Set([...(value.required || []), "context_handle"])],
     });
     const tools = [...available].filter(name => defs[name]).map(name => {
-      const requiresContext = name !== "create_context";
+      const requiresContext = name !== "open_workspace";
       return {
         name,
         title: titles[name] || name.replaceAll("_", " ").replace(/\b\w/g, value => value.toUpperCase()),
@@ -2793,7 +2841,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       if (!tool.outputSchema.required?.includes("context_handle"))
         errors.push("outputSchema missing required context_handle");
       const expectedOutputs = {
-        context_info: ["cwd", "agent_guidance_path"],
+        open_workspace: ["workspace_name", "cwd"],
+        workspace_info: ["workspace_name", "cwd", "agent_guidance_path"],
         query_tool_calls: ["calls"],
         publish_html: ["id", "title", "uri", "height", "created_at"],
         glob: ["files", "truncated"],
@@ -2804,13 +2853,14 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       for (const key of expectedOutputs[tool.name] || [])
         if (!tool.outputSchema.properties?.[key]) errors.push(`outputSchema missing property ${key}`);
     }
-    if (tool.name === "create_context") {
-      if (tool.inputSchema?.properties?.context_handle) errors.push("create_context must not accept context_handle");
+    if (tool.name === "open_workspace") {
+      if (tool.inputSchema?.properties?.context_handle) errors.push("open_workspace must not accept context_handle");
     } else {
       if (!tool.inputSchema?.properties?.context_handle) errors.push("inputSchema missing context_handle");
       if (!tool.inputSchema?.required?.includes("context_handle")) errors.push("inputSchema context_handle must be required");
     }
     const expectedInputs = {
+      open_workspace: ["name"],
       glob: ["exclude", "include_hidden", "include_dependencies", "limit"],
       grep: ["exclude", "regex", "case_sensitive", "include_hidden", "include_dependencies", "max_file_bytes", "encoding", "context_before", "context_after", "output_mode", "max_results"],
       replace: ["exclude", "regex", "case_sensitive", "include_hidden", "include_dependencies", "max_file_bytes", "expected_replacements", "dry_run", "max_files"],
@@ -3400,9 +3450,12 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
 
   async function executeTool(p, name, args, execution) {
     const selection = execution.selection;
-    if (name === "create_context") return {};
-    if (!selection?.context || !selection?.root) throw new Error("Context selection is missing");
-    if (name === "context_info") return await contextInfo(selection);
+    if (name === "open_workspace") return {
+      workspace_name: selection.root.name,
+      cwd: selection.root.path,
+    };
+    if (!selection?.context || !selection?.root) throw new Error("Session Workspace selection is missing");
+    if (name === "workspace_info") return await workspaceInfo(selection);
 
     const resolvePath = path => resolveWorkspacePath(selection, path);
     const readOne = async pathArg => {
@@ -3690,7 +3743,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         const addCandidate = async raw => {
           const target = await resolvePath(raw);
           if (!await exists(target.path)) throw new Error(`Path not found: ${raw}`);
-          if (resolve(target.path) === resolve(rootReal)) throw new Error("Cannot trash the current root");
+          if (resolve(target.path) === resolve(rootReal)) throw new Error("Cannot trash the current Workspace");
           if (resolve(target.path) === resolve(metadataRoot) || within(metadataRoot, target.path))
             throw new Error("Cannot trash .mrmcp metadata");
           candidates.push(target);
@@ -3836,7 +3889,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         started_at: new Date(row.started_at).toISOString(),
         completed_at: row.completed_at ? new Date(row.completed_at).toISOString() : null,
         tool: row.tool, status: row.status, duration_ms: row.duration_ms,
-        root_name: row.root_name, root_path: row.root_path,
+        workspace_name: row.root_name, workspace_path: row.root_path,
         input: parseJson(row.input_json, row.input_json),
         result: parseJson(row.resolved_json, row.resolved_json || null),
         output: row.stdout || "",
@@ -3929,9 +3982,9 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     return { context_handle: String(handle || ""), ...extras };
   }
   function contextControlMessage(kind) {
-    if (kind === "missing") return "context_handle is required. Call create_context, then repeat this tool call with the exact value returned.";
-    if (kind === "expired") return "The context_handle has expired. Call create_context, then repeat the requested tool call.";
-    if (kind === "invalid") return "The context_handle is invalid. Reuse a valid handle or call create_context.";
+    if (kind === "missing") return "context_handle is required. Call open_workspace with the Workspace name, then repeat this tool call with the exact handle returned.";
+    if (kind === "expired") return "The Session context_handle has expired. Call open_workspace with the Workspace name, then repeat the requested tool call.";
+    if (kind === "invalid") return "The Session context_handle is invalid. Reuse a valid handle or call open_workspace with a Workspace name.";
     return "";
   }
   function contextControlToolResult(p, name, args, resolution) {
@@ -4142,8 +4195,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         responseBody = downloadRequest ? "[binary download body omitted]"
           : publishedHtmlRequest ? "[published HTML body omitted]" : await debugBody(response.clone());
       } catch (e) { error += (error ? "\n" : "") + "Debug capture error: " + String(e?.stack || e); }
-      const remote = info?.remoteAddr
-        ? `${info.remoteAddr.hostname || ""}${info.remoteAddr.port != null ? ":" + info.remoteAddr.port : ""}` : "";
+      const remote = remoteHost;
       run(`INSERT INTO debug_logs(ts,method,path,status,duration_ms,remote_addr,
         request_headers,request_body,response_headers,response_body,error)
         VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
@@ -4494,13 +4546,13 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 
     const serverInfoMeta = { "io.modelcontextprotocol/serverInfo": mcpServerInfo() };
     const instructions = fullAccess
-      ? "Call create_context once, then call context_info and pass the exact context_handle unchanged on every later tool call. " +
-        "context_info returns the current absolute root and agent_guidance_path; when that path is non-null, read and follow the referenced AGENTS.md before repository work. Call context_info again after the operator changes the Session root. " +
+      ? "Call open_workspace with the unique Workspace name; it creates a new Session already attached to that Workspace. Then call workspace_info and pass the exact context_handle unchanged on every later tool call. " +
+        "workspace_info returns the current Workspace name, absolute working directory and agent_guidance_path; when that path is non-null, read and follow the referenced AGENTS.md before repository work. Call workspace_info again after the operator changes the Session Workspace. " +
         "Use read_file/read_files, glob, grep, edit and replace directly for file inspection, discovery, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. " +
         "Use list_commands before other command-line work and invoke returned logical_name values directly through exec.program without PATH probes. " +
         "Command execution output is normalized to readable plain text before buffering or storage; ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec, exec_start, exec_poll and custom commands accept separate_streams=true when individual stdout/stderr are needed. Use query_tool_calls to inspect and filter calls that actually reached this MrMCP Session; requests blocked upstream before dispatch are absent. " +
         "Use publish_file to present existing files through its MCP App widget, and publish_html when an interactive self-contained HTML/CSS/JavaScript visualization is more appropriate. " +
-        "Every authenticated client can invoke every published tool; context_handle is the bearer capability selecting persistent context state."
+        "Every authenticated client can invoke every published tool; context_handle is the bearer capability selecting the persistent Session and its current Workspace."
       : "The MrMCP endpoint is reachable, but anonymous access exposes no tools. Authenticate with OAuth or Basic authentication.";
 
     const r = { jsonrpc: "2.0", id: x.id };
@@ -4586,19 +4638,27 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           } else {
           const toolArgs = { ...rawToolArgs };
           let toolResult;
-          if (x.params.name === "create_context") {
+          if (x.params.name === "open_workspace") {
             delete toolArgs.context_handle;
-            const record = createContext(p, observedProtocol, {
-              auth_kind: auth.kind,
-              oauth_client_id: auth.clientId || "",
-              client_name: auth.clientName || "",
-              user_agent: req.headers.get("user-agent") || "",
-            });
-            const selection = { context: record, root: selectedContextRoot(p, record) };
-            toolResult = await callTool(
-              p, x.params.name, toolArgs,
-              { authKind: auth.kind, contextHandle: record.handle, selection },
-            );
+            const workspace = workspaceByName(p, toolArgs.name);
+            if (!workspace) {
+              const error = `Unknown or disabled Workspace: ${String(toolArgs.name || "")}`;
+              const structuredContent = contextEnvelope("", { error });
+              toolResult = { content: [{ type: "text", text: error }], structuredContent, isError: true };
+              rejectToolCall(p, x.params.name, toolArgs, error, "", "invalid", toolResult);
+            } else {
+              const record = createContext(p, workspace, observedProtocol, {
+                auth_kind: auth.kind,
+                oauth_client_id: auth.clientId || "",
+                client_name: auth.clientName || "",
+                user_agent: req.headers.get("user-agent") || "",
+              });
+              const selection = { context: record, root: runtimeWorkspaceRoot(workspace) };
+              toolResult = await callTool(
+                p, x.params.name, toolArgs,
+                { authKind: auth.kind, contextHandle: record.handle, selection },
+              );
+            }
           } else {
             const resolution = resolveContext(p, toolArgs.context_handle, observedProtocol);
             if (resolution.kind === "active") {
@@ -4631,11 +4691,6 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     });
   }
 
-  const hasSession = req => (req.headers.get("cookie") || "").split(/;\s*/)
-    .some(x => x === `mrmcp_session=${SESSION}`);
-  const requireApi = (req, u) => req.method === "GET"
-    ? (hasSession(req) || u?.searchParams.get("csrf") === CSRF)
-    : hasSession(req) && req.headers.get("x-mrmcp-csrf") === CSRF;
   function serverBasicUrl(p) {
     if (!p.basic_enabled) return "";
     const password = openSecret(p.basic_secret_enc);
@@ -4659,8 +4714,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       mcp_https_enabled: true, mcp_https_port: mcpHttpsPort, mcp_https_port_base: HTTPS_PORT, mcp_https_active: mcpTlsActive,
       debug_http_log: getCfg("debug_http_log", "0") === "1",
       inherit_system_path: getCfg("inherit_system_path", "1") === "1",
-      external_url: getCfg("external_url", ""), gui_url: `http://127.0.0.1:${guiPort}/`,
-      gui_port: guiPort, gui_port_base: GUI_PORT,
+      external_url: getCfg("external_url", ""), gui_transport: "Tauriless local asset protocol",
       listener_fallback: listenerFallbacks().length > 0, listener_fallbacks: listenerFallbacks(),
       public_ip: currentIp, public_ip_checked_at: Number(getCfg("public_ip_checked_at", "0")),
       sslip_hostname: currentSslip, sslip_http_base_url: "",
@@ -4742,10 +4796,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         display_label: `#${context.id}`,
         expired: contextExpired(context),
         expires_at: Number(context.last_active_at || context.created_at || 0) + CONTEXT_TTL_MS,
-        effective_root: root?.name || "Program folder",
-        effective_root_path: root?.path || APP_DIR,
-        root_id: root?.id || 0,
-        fallback_root: !root,
+        workspace_name: root?.name || "Program folder",
+        workspace_path: root?.path || APP_DIR,
+        workspace_id: root?.id || 0,
+        fallback_workspace: !root,
       };
     });
   };
@@ -4826,7 +4880,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       sslip_https_mcp_url: mcpTlsActive && automaticSslipHttps ? `${automaticSslipHttps}/mcp` : "",
       sslip_metadata_url: mcpTlsActive && automaticSslipHttps
         ? `${automaticSslipHttps}/.well-known/oauth-protected-resource/mcp` : "",
-      fallback_root_path: APP_DIR,
+      fallback_workspace_path: APP_DIR,
       protocol_versions: MCP_PROTOCOLS,
       context_ttl_days: Math.round(CONTEXT_TTL_MS / 86400000),
     };
@@ -4932,30 +4986,30 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   }
 
   const fragmentTemplates = {
-    sidebar: `<? const current=it.data?.state?.currentSection||"dashboard",items=[["dashboard","🏠","Dashboard"],["oauth","🔐","Clients"],["sessions","💬","Sessions"],["roots","📁","Roots"],["logs","🛠️","Tool Calls"],["commands","🧰","Commands"],["debug","🐞","HTTP Log"],["settings","⚙️","Settings"],["help","❓","Help"]]; items.forEach(([id,icon,label])=>{ ?><button data-page="<?= id ?>" class="<?= current===id?'nav-active':'' ?>"<?= current===id?' aria-current=page':'' ?>><span class=menu-icon><?= icon ?></span><?= label ?></button><? }) ?>`,
+    sidebar: `<? const current=it.data?.state?.currentSection||"dashboard",items=[["dashboard","🏠","Dashboard"],["oauth","🔐","Clients"],["sessions","💬","Sessions"],["roots","📁","Workspaces"],["logs","🛠️","Tool Calls"],["commands","🧰","Commands"],["debug","🐞","HTTP Log"],["settings","⚙️","Settings"],["help","❓","Help"]]; items.forEach(([id,icon,label])=>{ ?><button data-page="<?= id ?>" class="<?= current===id?'nav-active':'' ?>"<?= current===id?' aria-current=page':'' ?>><span class=menu-icon><?= icon ?></span><?= label ?></button><? }) ?>`,
     view: `<? const s=it.data?.state||{},section=s.currentSection||"dashboard",settings=s.settings||{}; ?>
 <? if(section==="dashboard"){ ?><section id=dashboard class=page><div class=row><h2 class=grow>🏠 Dashboard</h2><span class=muted>Runtime · activity · endpoints</span></div><div id=cards class=grid></div><div id=trashActivity class=grid></div><div class=dashboard-grid><div><h3>🌐 Server</h3><div id=endpoints></div></div><div><h3>🔒 TLS and Connectivity</h3><div id=tlsStatus></div></div></div></section>
-<? } else if(section==="sessions"){ ?><section id=sessions class=page><div class=row><h2 class=grow>💬 Sessions</h2><span class=muted>Live updates</span></div><p class=muted>Persistent MCP contexts. Assign their working folder from <b>📁 Roots</b>.</p><? if(s.sessions?.oauthClientId){ ?><div class=row><span class=muted>OAuth filter</span><code><?= s.sessions.oauthClientId ?></code><button class=small data-action=clear-session-oauth>✕ Clear</button></div><? } ?><div class=card><b>Client Continuity</b><p class=muted>ChatGPT may create a new Session after model or thinking changes. Client/auth/User-Agent metadata is best effort.</p></div><div id=contextList></div></section>
-<? } else if(section==="roots"){ ?><section id=roots class=page><div class=row><h2 class=grow>📁 Roots</h2><button class=primary data-action=new-root>➕ Add Root</button></div><p class=muted>Drag Sessions to choose where future Tool Calls run. Running processes stay in their original folder.</p><div id=rootList></div></section>
+<? } else if(section==="sessions"){ ?><section id=sessions class=page><div class=row><h2 class=grow>💬 Sessions</h2><span class=muted>Live updates</span></div><p class=muted>Persistent MCP Sessions. Each Session is attached to a <b>📁 Workspace</b>.</p><? if(s.sessions?.oauthClientId){ ?><div class=row><span class=muted>OAuth filter</span><code><?= s.sessions.oauthClientId ?></code><button class=small data-action=clear-session-oauth>✕ Clear</button></div><? } ?><div class=card><b>Client Continuity</b><p class=muted>ChatGPT may create a new Session after model or thinking changes. Client/auth/User-Agent metadata is best effort.</p></div><div id=contextList></div></section>
+<? } else if(section==="roots"){ ?><section id=roots class=page><div class=row><h2 class=grow>📁 Workspaces</h2><button class=primary data-action=new-root>➕ Add Workspace</button></div><p class=muted>Workspace names are unique. Drag Sessions to change where future Tool Calls run; running processes stay in their original folder.</p><div id=rootList></div></section>
 <? } else if(section==="commands"){ const c=s.commands||{}; ?><section id=commands class=page><div class=row><h2 class=grow>🧰 Extra Commands</h2><button data-action=download-all-commands>⬇️ Download All</button><button class=primary data-action=new-command>➕ Register Command</button></div><p class=muted><code>commands.yaml</code> defines catalog entries. Executables in <code>.mrmcp/bin</code> appear automatically.</p><div class=row><input id=commandQuery class=grow placeholder="Search name, path or description…" value="<?= c.query||'' ?>"><label class=small><input id=commandIncludeMissing type=checkbox<?= c.includeMissing!==false?' checked':'' ?>> Show Unavailable</label><select id=commandPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(c.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-commands>🔎 Search</button></div><div id=commandList></div></section>
 <? } else if(section==="logs"){ const l=s.logs||{}; ?><section id=logs class=page><h2>🛠️ Tool Calls</h2><p class=muted>Click a row for details. Terminate active work from Actions.</p><div class=row><input id=logQuery class=grow placeholder="Search input, output, errors…" value="<?= l.query||'' ?>"><select id=logContext><option value="">All sessions</option><? (s.contextValues||[]).forEach(v=>{ ?><option value="<?= v.pk ?>"<?= String(l.context||"")===String(v.pk)?" selected":"" ?>>#<?= v.pk ?></option><? }) ?></select><select id=logStatus class="<?= l.status||'' ?>"><option value="">All states</option><? ['completed','failed','invalid','running'].forEach(v=>{ ?><option class="<?= v ?>" value="<?= v ?>"<?= l.status===v?' selected':'' ?>><?= v ?></option><? }) ?></select><select id=logPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(l.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=clear-log-filters>🧹 Clear Filters</button></div><? if(l.selfTest){ ?><div id=logSelfTest class=card><div class=row><h3 class=grow>🧪 MCP Self-Test</h3><button class=small data-action=copy-detail data-target=logDetail>📋 Copy JSON</button><button class=small data-action=close-self-test>✕ Close</button></div><pre id=logDetail><?= it.pretty(l.selfTest) ?></pre></div><? } ?><div id=logList></div></section>
 <? } else if(section==="debug"){ const d=s.debug||{}; ?><section id=debug class=page><div class=row><h2 class=grow>🐞 HTTP Debug Log</h2><label class=small style="margin:0"><input id=debugHttpLog type=checkbox<?= s.debug?.enabled?" checked":"" ?>> Enabled</label><button data-action=save-debug-settings>✅ Apply</button><button class=danger data-action=clear-debug>🗑️ Clear</button></div><p class=muted>Off by default. Secrets are redacted. Click a row for request JSON.</p><div class=row><input id=debugQuery class=grow placeholder="Search URL, headers, body or errors…" value="<?= d.query||'' ?>"><select id=debugMethod><option value="">All methods</option><? ['GET','POST','OPTIONS'].forEach(v=>{ ?><option<?= d.method===v?' selected':'' ?>><?= v ?></option><? }) ?></select><input id=debugStatus type=number placeholder="Status" value="<?= d.status||'' ?>"><button data-action=load-debug>🔎 Search</button></div><div id=debugList></div></section>
 <? } else if(section==="oauth"){ ?><section id=oauth class=page><h2>🔐 OAuth Clients</h2><div id=oauthList></div></section>
-<? } else if(section==="settings"){ ?><section id=settings class=page><h2>⚙️ Settings</h2><div class=grid><div class=card><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code>http://127.0.0.1:<?= settings.gui_port ?></code><? if(settings.gui_port!==settings.gui_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.gui_port_base ?></span><? } ?> · embedded WebView / browser</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><label>Public base URL override</label><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><label>Public IPv4 lookup URLs (one per line)</label><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><label>Automatic DNS suffix</label><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><label>ACME directory URL</label><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card><h3>🔒 Certificate</h3><label>Let's Encrypt email</label><input id=tlsEmail type=email value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div><div class=card><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><p class=muted>Off: child <code>PATH</code> contains only <code>.mrmcp/bin</code>. Other environment variables are unchanged.</p></div><div class=card><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published HTML and metrics. Keeps auth, Sessions, Roots, settings, tools and files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div><p><button class=primary data-action=save-settings>💾 Save Settings</button></p></section>
-<? } else if(section==="help"){ ?><section id=help class=page><h2>❓ Help</h2><div class=card><h3>Connect ChatGPT Web</h3><ol><li>Make sure the Dashboard shows a trusted HTTPS certificate. ChatGPT needs a remote HTTPS MCP endpoint; use <code><?= settings.external_base_url ? settings.external_base_url + "/mcp" : "https://your-host/mcp" ?></code>.</li><li>In ChatGPT Web, enable Developer mode. In managed workspaces the current path is <b>Workspace settings → Permissions &amp; Roles → Connected Data Developer mode / Create custom MCP connectors</b>. Authorized users may also find the toggle under <b>Settings → Apps → Advanced Settings</b>.</li><li>Create a custom app from <b>Workspace settings → Apps → Create</b> or <b>Settings → Apps → Create</b>, enter the MrMCP endpoint, choose the offered authentication method, then select <b>Scan Tools</b>.</li><li>If OAuth is enabled in MrMCP, complete the authorization prompt. After the tool scan completes, create the app and select it from a new ChatGPT conversation.</li></ol></div><div class=card><h3>Authentication</h3><p>For ChatGPT, OAuth is the preferred MrMCP setup because ChatGPT can discover the authorization metadata, complete consent, and keep refresh-token connectivity. MrMCP also supports Basic authentication for MCP clients that offer it. Authentication grants access to the server; the <code>context_handle</code> selects persistent context state after authentication.</p></div><div class=card><h3>Write Access</h3><p>MrMCP does not maintain a separate read/write allowlist: every authenticated client receives every published tool. ChatGPT controls whether write/modify actions are usable through the app's permissions and action controls. As of this build, OpenAI documents full MCP write/modify support for Business, Enterprise and Edu; Pro custom MCP access is limited to read/fetch, and availability may change. Test write tools in Developer mode first. Where available, use <b>Workspace settings → Apps → Configure Actions / Action control</b> to enable the required actions. ChatGPT may still ask for confirmation before a write.</p></div><div class=card><h3>Using MrMCP in a Chat</h3><ol><li>Start a new chat and select the MrMCP app from the tools/apps menu.</li><li>On first use, ChatGPT should call <code>create_context</code>; later calls should reuse the returned <code>context_handle</code>.</li><li>Choose the working root for that Session in the MrMCP <b>Roots</b> page by dragging the Session into the desired root.</li><li>If you change ChatGPT model or thinking level, the MCP context may be recreated even inside the same conversation. Check the Sessions page if continuity matters.</li></ol><p class=muted>ChatGPT UI labels and plan availability can change. Current OpenAI references: <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt" target=_blank rel=noopener>Developer mode and MCP apps in ChatGPT</a> · <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt" target=_blank rel=noopener>Apps in ChatGPT</a>.</p></div></section><? } ?>`,
-    dialogs: `<? const dialog=it.data?.state?.dialog; ?><? if(dialog){ ?><div id=dialogOverlay class=dialog-overlay><? if(dialog.kind==="root"){ const r=dialog.data||{}; ?><dialog id=rootDialog open data-managed-dialog=root><form id=rootForm><input id=rid type=hidden value="<?= r.id||'' ?>"><h2>📁 Root</h2><label>Logical name</label><input id=rname required value="<?= r.name||'' ?>"><div class=row><label class=grow>Directory path</label><? if(r.path_warning){ ?><span class=field-warning>⚠ <?= r.path_warning ?></span><? } ?></div><input id=rpath required placeholder="C:\\projects\\my-root, /srv/my-root or ./project" value="<?= r.path||'' ?>"><div class=muted>Relative to the program folder.</div><label><input id=renabled type=checkbox<?= r.enabled!==false?' checked':'' ?>> Enabled</label><? if(r.form_warning){ ?><div class=field-warning>⚠ <?= r.form_warning ?></div><? } ?><p class=row><button class=primary type=submit>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="command"){ const c=dialog.data||{}; ?><dialog id=commandDialog open data-managed-dialog=command><form id=commandForm><input id=coldName type=hidden value="<?= c.registered?c.name:'' ?>"><h2>🧰 Command Catalog Entry</h2><label>Logical name</label><input id=cname pattern="[A-Za-z0-9_.+-]+" required value="<?= c.name||'' ?>"><div class=row><label class=grow>Path below .mrmcp/bin</label><? if(c.path_warning){ ?><span class=field-warning>⚠ <?= c.path_warning ?></span><? } ?></div><input id=cpath placeholder="Optional; defaults to logical name; Windows suffix optional" value="<?= c.path||'' ?>"><label>Description for the agent</label><textarea id=cdescription placeholder="Optional: what it does and when the agent should use it."><?= c.description||'' ?></textarea><label>Download URL</label><input id=cdownloadUrl type=url placeholder="https://example.com/tool" value="<?= c.download_url||'' ?>"><label>Documentation URL</label><input id=cdocumentationUrl type=url placeholder="https://example.com/docs" value="<?= c.documentation_url||'' ?>"><? if(c.form_warning){ ?><div class=field-warning>⚠ <?= c.form_warning ?></div><? } ?><p class=row><button class=primary type=submit>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="confirm"){ ?><dialog id=confirmDialog open data-managed-dialog=confirm><h2>⚠️ <?= dialog.title||"Confirm Action" ?></h2><p><?= dialog.message||"Continue?" ?></p><p class=row><button class="primary danger" data-action=confirm-dialog>✓ Confirm</button><button data-action=close-dialog>✕ Cancel</button></p></dialog><? } else if(dialog.kind==="message"){ ?><dialog id=messageDialog open data-managed-dialog=message><h2><?= dialog.title||"MrMCP" ?></h2><pre><?= dialog.message||"" ?></pre><p><button class=primary data-action=close-dialog>✓ Close</button></p></dialog><? } ?></div><? } ?>`,
-    status: `<? const d=it.data||{},s=d.settings||{},a=d.activity||{},bad=!!s.mcp_listen_error,warn=!!s.listener_fallback,recent=a.recent_sessions||[],inFlight=a.tool_calls_in_flight||0,errors=a.tool_calls_errors||0,invalid=a.tool_calls_invalid||0; ?><span class="status-group <?= d.live!=="connected"?(d.live==="reconnecting"?"pending":"failed"):(bad?"failed":(warn?"pending":"ok")) ?>"><?= d.live!=="connected"?(d.live==="reconnecting"?"🟡 reconnecting":"🔴 offline"):(bad?"🔴 listener error":(warn?"🟡 fallback":"🟢 live")) ?></span><span class="status-group status-link" data-action=header-settings title="HTTP / HTTPS / GUI effective listener ports">🔌 <span class=status-ports><?= s.mcp_http_active?s.mcp_http_port:"off" ?>/<?= s.mcp_https_active?s.mcp_https_port:"off" ?>/<?= s.gui_port||"?" ?></span><? if(warn){ ?> <span class=pending>⚠</span><? } ?></span><span class=status-group title="Sessions with a Tool Call in the last <?= a.active_window_minutes||5 ?> minutes">💬 <span class="status-link <?= a.active_sessions?'ok':'muted' ?>" data-action=header-sessions><?= a.active_sessions||0 ?> active</span><? if(recent.length){ ?> · <span class=status-sessions><? recent.forEach((x,i)=>{ ?><?= i?" ":"" ?><span class=status-link data-action=session-tool-calls data-id="<?= x.id ?>">#<?= x.id ?>(<?= x.tool_calls ?>)</span><? }) ?></span><? } ?></span><span class=status-group title="Tool Calls in flight / total recorded / failed / invalid">🛠️ <span class="status-link <?= inFlight?'pending':'muted' ?>" data-action=header-tool-calls data-status=running><?= inFlight ?> in flight</span> · <span class="status-link status-total" data-action=header-tool-calls data-status=""><?= a.tool_calls_total||0 ?> total</span> · <span class="status-link <?= errors?'failed':'muted' ?>" data-action=header-tool-calls data-status=failed><?= errors ?> errors</span> · <span class="status-link <?= invalid?'invalid':'muted' ?>" data-action=header-tool-calls data-status=invalid><?= invalid ?> invalid</span></span>`,
-    cards: `<? const meta={sessions:["💬","Sessions"],roots:["📁","Roots"],tool_calls:["🛠️","Tool Calls"],tool_calls_in_flight:["🛠️","Tool Calls In Flight"],failed_calls:["⚠️","Failed Calls"],http_requests:["🌐","HTTP Requests"]}; Object.entries(it.data || {}).forEach(([key,value]) => { const item=meta[key]||["•",key]; ?><div class=card><div class=muted><?= item[0] ?> <?= item[1] ?></div><strong style="font-size:24px"><?= value ?></strong></div><? }) ?>`,
+<? } else if(section==="settings"){ ?><section id=settings class=page><h2>⚙️ Settings</h2><div class=grid><div class=card><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div><div class=card><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><p class=muted>Off: child <code>PATH</code> contains only <code>.mrmcp/bin</code>. Other environment variables are unchanged.</p></div><div class=card><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published HTML and metrics. Keeps auth, Sessions, Workspaces, settings, tools and files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div><p><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></p></section>
+<? } else if(section==="help"){ ?><section id=help class=page><h2>❓ Help</h2><div class=card><h3>Connect ChatGPT Web</h3><ol><li>Make sure the Dashboard shows a trusted HTTPS certificate. ChatGPT needs a remote HTTPS MCP endpoint; use <code><?= settings.external_base_url ? settings.external_base_url + "/mcp" : "https://your-host/mcp" ?></code>.</li><li>In ChatGPT Web, enable Developer mode. In managed workspaces the current path is <b>Workspace settings → Permissions &amp; Roles → Connected Data Developer mode / Create custom MCP connectors</b>. Authorized users may also find the toggle under <b>Settings → Apps → Advanced Settings</b>.</li><li>Create a custom app from <b>Workspace settings → Apps → Create</b> or <b>Settings → Apps → Create</b>, enter the MrMCP endpoint, choose the offered authentication method, then select <b>Scan Tools</b>.</li><li>If OAuth is enabled in MrMCP, complete the authorization prompt. After the tool scan completes, create the app and select it from a new ChatGPT conversation.</li></ol></div><div class=card><h3>Authentication</h3><p>For ChatGPT, OAuth is the preferred MrMCP setup because ChatGPT can discover the authorization metadata, complete consent, and keep refresh-token connectivity. MrMCP also supports Basic authentication for MCP clients that offer it. Authentication grants access to the server; the <code>context_handle</code> selects persistent context state after authentication.</p></div><div class=card><h3>Write Access</h3><p>MrMCP does not maintain a separate read/write allowlist: every authenticated client receives every published tool. ChatGPT controls whether write/modify actions are usable through the app's permissions and action controls. As of this build, OpenAI documents full MCP write/modify support for Business, Enterprise and Edu; Pro custom MCP access is limited to read/fetch, and availability may change. Test write tools in Developer mode first. Where available, use <b>Workspace settings → Apps → Configure Actions / Action control</b> to enable the required actions. ChatGPT may still ask for confirmation before a write.</p></div><div class=card><h3>Using MrMCP in a Chat</h3><ol><li>Start a new chat and select the MrMCP app from the tools/apps menu.</li><li>On first use, ChatGPT should call <code>open_workspace</code> with the unique Workspace <code>name</code>; later calls should reuse the returned <code>context_handle</code>.</li><li>The new Session starts in that Workspace. Use the MrMCP <b>Workspaces</b> page to move a Session to another Workspace if needed.</li><li>If you change ChatGPT model or thinking level, the MCP context may be recreated even inside the same conversation. Check the Sessions page if continuity matters.</li></ol><p class=muted>ChatGPT UI labels and plan availability can change. Current OpenAI references: <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt" target=_blank rel=noopener>Developer mode and MCP apps in ChatGPT</a> · <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt" target=_blank rel=noopener>Apps in ChatGPT</a>.</p></div></section><? } ?>`,
+    dialogs: `<? const dialog=it.data?.state?.dialog; ?><? if(dialog){ ?><div id=dialogOverlay class=dialog-overlay><? if(dialog.kind==="root"){ const r=dialog.data||{}; ?><dialog id=rootDialog open data-managed-dialog=root><form id=rootForm><input id=rid type=hidden value="<?= r.id||'' ?>"><h2>📁 Workspace</h2><div class=row><label class=grow>Workspace name</label><? if(r.name_warning){ ?><span class=field-warning>⚠ <?= r.name_warning ?></span><? } ?></div><input id=rname value="<?= r.name||'' ?>"><div class=row><label class=grow>Directory path</label><? if(r.path_warning){ ?><span class=field-warning>⚠ <?= r.path_warning ?></span><? } else if(!r.path_checked){ ?><span class=muted>Leave the field to validate the directory.</span><? } ?></div><input id=rpath placeholder="C:\\projects\\my-workspace, /srv/my-workspace or ./project" value="<?= r.path||'' ?>"><div class=muted>Relative to the program folder.</div><label><input id=renabled type=checkbox<?= r.enabled!==false?' checked':'' ?>> Enabled</label><? if(r.form_warning){ ?><div class=field-warning>⚠ <?= r.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (r.name_warning||r.path_warning||!r.path_checked||r.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="command"){ const c=dialog.data||{}; ?><dialog id=commandDialog open data-managed-dialog=command><form id=commandForm><input id=coldName type=hidden value="<?= c.registered?c.name:'' ?>"><h2>🧰 Command Catalog Entry</h2><div class=row><label class=grow>Logical name</label><? if(c.name_warning){ ?><span class=field-warning>⚠ <?= c.name_warning ?></span><? } ?></div><input id=cname value="<?= c.name||'' ?>"><div class=row><label class=grow>Path below .mrmcp/bin</label><? if(c.path_warning){ ?><span class="<?= c.path_error?'field-warning':'muted' ?>"><?= c.path_error?'⚠ ':'' ?><?= c.path_warning ?></span><? } else if(!c.path_checked){ ?><span class=muted>Leave the field to validate the path.</span><? } ?></div><input id=cpath placeholder="Optional; defaults to logical name; Windows suffix optional" value="<?= c.path||'' ?>"><label>Description for the agent</label><textarea id=cdescription placeholder="Optional: what it does and when the agent should use it."><?= c.description||'' ?></textarea><div class=row><label class=grow>Download URL</label><? if(c.download_warning){ ?><span class=field-warning>⚠ <?= c.download_warning ?></span><? } ?></div><input id=cdownloadUrl placeholder="https://example.com/tool" value="<?= c.download_url||'' ?>"><div class=row><label class=grow>Documentation URL</label><? if(c.documentation_warning){ ?><span class=field-warning>⚠ <?= c.documentation_warning ?></span><? } ?></div><input id=cdocumentationUrl placeholder="https://example.com/docs" value="<?= c.documentation_url||'' ?>"><? if(c.form_warning){ ?><div class=field-warning>⚠ <?= c.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (c.name_warning||c.path_error||!c.path_checked||c.download_warning||c.documentation_warning||c.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="confirm"){ ?><dialog id=confirmDialog open data-managed-dialog=confirm><h2>⚠️ <?= dialog.title||"Confirm Action" ?></h2><p><?= dialog.message||"Continue?" ?></p><p class=row><button class="primary danger" data-action=confirm-dialog>✓ Confirm</button><button data-action=close-dialog>✕ Cancel</button></p></dialog><? } ?></div><? } ?>`,
+    status: `<? const d=it.data||{},s=d.settings||{},a=d.activity||{},bad=!!s.mcp_listen_error,warn=!!s.listener_fallback,recent=a.recent_sessions||[],inFlight=a.tool_calls_in_flight||0,errors=a.tool_calls_errors||0,invalid=a.tool_calls_invalid||0; ?><span class="status-group <?= d.live!=="connected"?(d.live==="reconnecting"?"pending":"failed"):(bad?"failed":(warn?"pending":"ok")) ?>"><?= d.live!=="connected"?(d.live==="reconnecting"?"🟡 reconnecting":"🔴 offline"):(bad?"🔴 listener error":(warn?"🟡 fallback":"🟢 live")) ?></span><span class="status-group status-link" data-action=header-settings title="HTTP / HTTPS effective listener ports; GUI uses local Tauriless assets">🔌 <span class=status-ports><?= s.mcp_http_active?s.mcp_http_port:"off" ?>/<?= s.mcp_https_active?s.mcp_https_port:"off" ?></span><? if(warn){ ?> <span class=pending>⚠</span><? } ?></span><span class=status-group title="Sessions with a Tool Call in the last <?= a.active_window_minutes||5 ?> minutes">💬 <span class="status-link <?= a.active_sessions?'ok':'muted' ?>" data-action=header-sessions><?= a.active_sessions||0 ?> active</span><? if(recent.length){ ?> · <span class=status-sessions><? recent.forEach((x,i)=>{ ?><?= i?" ":"" ?><span class=status-link data-action=session-tool-calls data-id="<?= x.id ?>">#<?= x.id ?>(<?= x.tool_calls ?>)</span><? }) ?></span><? } ?></span><span class=status-group title="Tool Calls in flight / total recorded / failed / invalid">🛠️ <span class="status-link <?= inFlight?'pending':'muted' ?>" data-action=header-tool-calls data-status=running><?= inFlight ?> in flight</span> · <span class="status-link status-total" data-action=header-tool-calls data-status=""><?= a.tool_calls_total||0 ?> total</span> · <span class="status-link <?= errors?'failed':'muted' ?>" data-action=header-tool-calls data-status=failed><?= errors ?> errors</span> · <span class="status-link <?= invalid?'invalid':'muted' ?>" data-action=header-tool-calls data-status=invalid><?= invalid ?> invalid</span></span>`,
+    cards: `<? const meta={sessions:["💬","Sessions"],roots:["📁","Workspaces"],tool_calls:["🛠️","Tool Calls"],tool_calls_in_flight:["🛠️","Tool Calls In Flight"],failed_calls:["⚠️","Failed Calls"],http_requests:["🌐","HTTP Requests"]}; Object.entries(it.data || {}).forEach(([key,value]) => { const item=meta[key]||["•",key]; ?><div class=card><div class=muted><?= item[0] ?> <?= item[1] ?></div><strong style="font-size:24px"><?= value ?></strong></div><? }) ?>`,
     trash_activity: `<? const d=it.data||{},m=d.maintenance||{},items=[["🗑️","Trash",d.trash,false],["↩️","Untrash",d.untrash,true]]; items.forEach(([icon,label,x,historical])=>{ x=x||{}; ?><div class=card><div class=row><div class=grow><div class=muted><?= icon ?> <?= label ?></div><strong style="font-size:24px"><?= x.count||0 ?></strong></div><? if(!historical){ const busy=m.active&&m.action==="trash"; ?><button class="small danger" data-action=empty-trash<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Emptying · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Empty Trash<? } ?></button><? } ?><? if(x.last_at){ ?><div class=muted>Last <?= it.logdt(x.last_at) ?></div><? } ?></div><? if(x.last_at){ ?><div><span class=muted>Action</span> <code><?= x.action_id||"—" ?></code></div><div style="margin-top:5px"><span class=muted><?= historical?"Trash path (historical)":"Trash path" ?></span><br><code class=context-id><?= x.trash_path||"—" ?></code></div><? } else { ?><div class=muted><?= historical ? "No completed untrash actions." : "Trash is empty." ?></div><? } ?></div><? }) ?>`,
     tls: `<? const t=it.data||{}, problem=!t.tls_active_trusted||!!t.tls_last_error||!!t.mcp_listen_error; ?><div class="card <?= problem ? "tls-alert" : "tls-good" ?>"><div class=row><h3 class=grow>🔒 TLS / Let's Encrypt</h3><b class="<?= t.tls_active_trusted ? "ok" : "failed" ?>"><?= t.tls_active_trusted ? "trusted" : (t.tls_active ? "fallback active" : "offline") ?></b></div><div class=grid><div><span class=muted>HTTPS Listener</span><br><b><?= t.mcp_https_active ? "0.0.0.0:"+t.mcp_https_port+" active" : "not listening" ?></b></div><div><span class=muted>Active Certificate</span><br><b><?= t.tls_active_kind || "none" ?> · <?= t.tls_active_valid ? "valid" : "invalid" ?></b></div><div><span class=muted>Expires</span><br><b><?= it.dt(t.tls_active_expires) || "unknown" ?></b></div><div><span class=muted>Last ACME Request</span><br><b><?= it.dt(t.tls_last_request_at) || "never recorded" ?></b></div><div><span class=muted>Last ACME Result</span><br><b class="<?= t.tls_last_request_valid ? "ok" : (t.tls_last_request_status === "error" ? "failed" : "pending") ?>"><? if (t.tls_last_request_status) { ?><?= t.tls_last_request_status ?> · certificate <?= t.tls_last_request_valid ? "valid" : "not valid" ?><? } else { ?>not recorded<? } ?></b></div><div><span class=muted>Last Valid Certificate</span><br><b><?= it.dt(t.tls_last_issued_at) || "not recorded" ?></b></div><div><span class=muted>Renewal Due</span><br><b><?= it.dt(t.tls_renewal_due_at) || "as soon as allowed" ?></b></div><div><span class=muted>Rate-Limit Reset</span><br><b><?= it.dt(t.tls_rate_limit_reset_at) || "none" ?></b></div><div><span class=muted>Next ACME Attempt</span><br><b><?= it.dt(t.tls_next_attempt_at) || "not scheduled" ?></b></div></div><? if (t.tls_last_error || t.mcp_listen_error) { ?><pre class=tls-error><?= t.tls_last_error || t.mcp_listen_error ?></pre><? } ?><? if (!t.tls_active_trusted) { ?><p class=failed><b>Public clients such as ChatGPT will reject the self-signed fallback until Let's Encrypt succeeds.</b></p><? } ?></div>`,
     urls: `<? (it.data || []).forEach(x => { if (!x?.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?><? if (x.note) { ?> <span class=muted><?= x.note ?></span><? } ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?>`,
-    roots: `<? const d=it.data||{},rows=d.roots||[],defaults=d.default_sessions||[]; ?><div class=roots-layout><div class=roots-named><h3>📁 Roots</h3><? if(!rows.length){ ?><div class=card><p class=muted>No roots registered.</p></div><? } ?><? rows.forEach(r => { ?><div class="card root-card<?= r.enabled?'':' root-disabled' ?>"<? if(r.enabled){ ?> data-root-drop="<?= r.id ?>"<? } ?>><div class=root-card-header><div class=grow><h3>📁 <?= r.name ?></h3><code class="<?= r.path_warning?'failed':'' ?>"<? if(r.path_warning){ ?> title="<?= r.path_warning ?>"<? } ?>><?= r.path ?></code></div><div class=command-actions><button class=small data-action=edit-root data-id="<?= r.id ?>">✏️ Edit</button><button class="small danger" data-action=delete-root data-id="<?= r.id ?>">🗑️ Delete</button></div></div><div class="<?= r.enabled?'ok':'muted' ?>"><?= r.enabled ? "enabled" : "disabled" ?></div><div class=root-session-list><? if(!r.enabled){ ?><div class=muted>Enable this root to assign Sessions.</div><? } else if(!(r.sessions||[]).length){ ?><div class=root-drop-empty>Drop a Session here</div><? } ?><? (r.sessions||[]).forEach(v=>{ ?><div class=session-chip draggable=true data-session-drag data-session-id="<?= v.pk ?>" title="Drag Session #<?= v.pk ?>"><div class=session-chip-main><span>💬</span><b>#<?= v.pk ?></b><span class=grow><?= v.client_name ?></span></div><div class=session-chip-meta><span><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></span><span><span class=muted>Last Activity</span> <?= it.logdt(v.last_active_at) ?></span><span><span class=muted>Status</span> <span class="<?= v.expired?'failed':'ok' ?>"><?= v.expired?'expired':'active' ?></span></span><span><span class=muted>Tool Calls:</span> <?= v.tool_calls||0 ?></span></div></div><? }) ?></div></div><? }) ?></div><div class=roots-default><div class=row><h3 class=grow>💬 Sessions</h3><span class=muted>No root assigned</span></div><div class="card default-root-card" data-root-drop="0"><p class=muted>Uses the program folder until assigned to a Root.</p><div class=root-session-list><? if(!defaults.length){ ?><div class=root-drop-empty>Drop a Session here to remove its named-root association.</div><? } ?><? defaults.forEach(v=>{ ?><div class=session-chip draggable=true data-session-drag data-session-id="<?= v.pk ?>" title="Drag Session #<?= v.pk ?>"><div class=session-chip-main><span>💬</span><b>#<?= v.pk ?></b><span class=grow><?= v.client_name ?></span></div><div class=session-chip-meta><span><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></span><span><span class=muted>Last Activity</span> <?= it.logdt(v.last_active_at) ?></span><span><span class=muted>Status</span> <span class="<?= v.expired?'failed':'ok' ?>"><?= v.expired?'expired':'active' ?></span></span><span><span class=muted>Tool Calls:</span> <?= v.tool_calls||0 ?></span></div></div><? }) ?></div></div></div></div>`,
-    context: `<? const d=it.data||{},values=d.values||[]; ?><? if (!values.length) { ?><p class=muted>No sessions have been issued yet.</p><? } else { ?><table><tr><th>ID</th><th>Context</th><th>Client / Auth</th><th>State / Protocol</th><th>Current Root</th><th>Activity</th><th>Tool Calls</th><th></th></tr><? values.forEach(v=>{ const ua=String(v.user_agent||""); ?><tr><td class=idcell>#<?= v.pk ?></td><td class=context-id><code><?= v.context_handle ?></code></td><td><b><?= v.client_name||"Unknown client" ?></b><br><span class=muted><?= v.auth_kind||"unknown auth" ?></span><? if(ua){ ?><div class=muted title="<?= ua ?>"><?= ua.slice(0,72) ?><?= ua.length>72?"…":"" ?></div><? } ?></td><td class=nowrap><b class="<?= v.expired ? 'failed' : 'ok' ?>"><?= v.expired ? "⌛ expired" : "🟢 active" ?></b><br><code><?= v.protocol_version||"unknown" ?></code></td><td><b><?= v.effective_root ?></b><div class="<?= v.effective_root_warning?'failed':'muted' ?>"<? if(v.effective_root_warning){ ?> title="<?= v.effective_root_warning ?>"<? } ?>><?= v.effective_root_path ?></div></td><td class=context-dates><div><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></div><div><span class=muted>Updated</span> <?= it.logdt(v.updated_at) ?></div><div><span class=muted>Active</span> <?= it.logdt(v.last_active_at) ?></div><div><span class=muted>Expires</span> <?= it.logdt(v.expires_at) ?></div></td><td class=nowrap><?= v.tool_calls||0 ?> <button class=small data-action=session-tool-calls data-id="<?= v.pk ?>">🛠️ View Calls</button></td><td><button class=danger data-action=delete-context data-id="<?= v.pk ?>">🗑️ Delete</button></td></tr><? }) ?></table><? } ?>`,
+    roots: `<? const d=it.data||{},rows=d.roots||[],defaults=d.default_sessions||[]; ?><div class=roots-layout><div class=roots-named><h3>📁 Workspaces</h3><? if(!rows.length){ ?><div class=card><p class=muted>No Workspaces registered.</p></div><? } ?><? rows.forEach(r => { ?><div class="card root-card<?= r.enabled?'':' root-disabled' ?>"<? if(r.enabled){ ?> data-root-drop="<?= r.id ?>"<? } ?>><div class=root-card-header><div class=grow><h3>📁 <?= r.name ?></h3><code class="<?= r.path_warning?'failed':'' ?>"<? if(r.path_warning){ ?> title="<?= r.path_warning ?>"<? } ?>><?= r.path ?></code></div><div class=command-actions><button class=small data-action=edit-root data-id="<?= r.id ?>">✏️ Edit</button><button class="small danger" data-action=delete-root data-id="<?= r.id ?>">🗑️ Delete</button></div></div><div class="<?= r.enabled?'ok':'muted' ?>"><?= r.enabled ? "enabled" : "disabled" ?></div><div class=root-session-list><? if(!r.enabled){ ?><div class=muted>Enable this Workspace to assign Sessions.</div><? } else if(!(r.sessions||[]).length){ ?><div class=root-drop-empty>Drop a Session here</div><? } ?><? (r.sessions||[]).forEach(v=>{ ?><div class=session-chip draggable=true data-session-drag data-session-id="<?= v.pk ?>" title="Drag Session #<?= v.pk ?>"><div class=session-chip-main><span>💬</span><b>#<?= v.pk ?></b><span class=grow><?= v.client_name ?></span></div><div class=session-chip-meta><span><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></span><span><span class=muted>Last Activity</span> <?= it.logdt(v.last_active_at) ?></span><span><span class=muted>Status</span> <span class="<?= v.expired?'failed':'ok' ?>"><?= v.expired?'expired':'active' ?></span></span><span><span class=muted>Tool Calls:</span> <?= v.tool_calls||0 ?></span></div></div><? }) ?></div></div><? }) ?></div><div class=roots-default><div class=row><h3 class=grow>💬 Sessions</h3><span class=muted>No Workspace assigned</span></div><div class="card default-root-card" data-root-drop="0"><p class=muted>Uses the program folder until assigned to a Workspace.</p><div class=root-session-list><? if(!defaults.length){ ?><div class=root-drop-empty>Drop a Session here to remove its Workspace association.</div><? } ?><? defaults.forEach(v=>{ ?><div class=session-chip draggable=true data-session-drag data-session-id="<?= v.pk ?>" title="Drag Session #<?= v.pk ?>"><div class=session-chip-main><span>💬</span><b>#<?= v.pk ?></b><span class=grow><?= v.client_name ?></span></div><div class=session-chip-meta><span><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></span><span><span class=muted>Last Activity</span> <?= it.logdt(v.last_active_at) ?></span><span><span class=muted>Status</span> <span class="<?= v.expired?'failed':'ok' ?>"><?= v.expired?'expired':'active' ?></span></span><span><span class=muted>Tool Calls:</span> <?= v.tool_calls||0 ?></span></div></div><? }) ?></div></div></div></div>`,
+    context: `<? const d=it.data||{},values=d.values||[]; ?><? if (!values.length) { ?><p class=muted>No Sessions have been issued yet.</p><? } else { ?><table><tr><th>ID</th><th>Session Handle</th><th>Client / Auth</th><th>State / Protocol</th><th>Current Workspace</th><th>Activity</th><th>Tool Calls</th><th></th></tr><? values.forEach(v=>{ const ua=String(v.user_agent||""); ?><tr><td class=idcell>#<?= v.pk ?></td><td class=context-id><code><?= v.context_handle ?></code></td><td><b><?= v.client_name||"Unknown client" ?></b><br><span class=muted><?= v.auth_kind||"unknown auth" ?></span><? if(ua){ ?><div class=muted title="<?= ua ?>"><?= ua.slice(0,72) ?><?= ua.length>72?"…":"" ?></div><? } ?></td><td class=nowrap><b class="<?= v.expired ? 'failed' : 'ok' ?>"><?= v.expired ? "⌛ expired" : "🟢 active" ?></b><br><code><?= v.protocol_version||"unknown" ?></code></td><td><b><?= v.workspace_name ?></b><div class="<?= v.workspace_warning?'failed':'muted' ?>"<? if(v.workspace_warning){ ?> title="<?= v.workspace_warning ?>"<? } ?>><?= v.workspace_path ?></div></td><td class=context-dates><div><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></div><div><span class=muted>Updated</span> <?= it.logdt(v.updated_at) ?></div><div><span class=muted>Active</span> <?= it.logdt(v.last_active_at) ?></div><div><span class=muted>Expires</span> <?= it.logdt(v.expires_at) ?></div></td><td class=nowrap><?= v.tool_calls||0 ?> <button class=small data-action=session-tool-calls data-id="<?= v.pk ?>">🛠️ View Calls</button></td><td><button class=danger data-action=delete-context data-id="<?= v.pk ?>">🗑️ Delete</button></td></tr><? }) ?></table><? } ?>`,
     commands: `<? const d=it.data || {}, rows=d.commands || []; ?><div class=muted><?= d.total || 0 ?> command<?= d.total === 1 ? "" : "s" ?> · page <?= d.page || 1 ?>/<?= d.pages || 1 ?> · config <code><?= d.config_file || "" ?></code></div><table class=commands-table><tr><th>Name</th><th>Relative path</th><th class=command-description>Description</th><th>Links</th><th>Source</th><th>State</th><th class=command-action-cell></th></tr><? rows.forEach(c => { ?><tr><td><code><?= c.name ?></code></td><td><code><?= c.path ?></code></td><td class=command-description><?= c.description || "—" ?></td><td><? if (c.documentation_url) { ?><a href="<?= c.documentation_url ?>" target=_blank rel=noopener>📖 Docs</a><? } else { ?>—<? } ?></td><td><?= c.source ?></td><td class="<?= c.present && c.executable ? "ok" : "failed" ?>"><?= c.present ? (c.executable ? "✅ available" : "⚠️ not executable") : "❌ missing" ?></td><td class=command-action-cell><div class=command-actions><button data-action=edit-command data-name="<?= c.name ?>" data-path="<?= c.path ?>">✏️ Edit</button><? if (c.registered && c.download_url) { ?><button data-action=download-command data-name="<?= c.name ?>">⬇️ Download</button><? } ?><? if (c.registered) { ?><button class=danger data-action=delete-command data-name="<?= c.name ?>">🗑️ Delete</button><? } ?></div></td></tr><? }) ?></table><div class=row><button data-action=commands-prev<?= d.page <= 1 ? " disabled" : "" ?>>Previous</button><button data-action=commands-next<?= d.has_more ? "" : " disabled" ?>>Next</button></div>`,
     oauth: `<table class=oauth-table><tr><th>Client</th><th>Sessions</th><th>Tokens</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td class=oauth-client><b><?= c.name ?></b><div class=oauth-client-id title="<?= c.client_id ?>"><code><?= c.client_id ?></code></div><div class=oauth-meta><span class=muted>Created</span> <?= it.logdt(c.created_at) ?></div></td><td class=oauth-meta><div class=oauth-count><b><?= c.session_count||0 ?></b> total</div><div><span class=muted>First</span> <?= c.first_session_at ? it.logdt(c.first_session_at) : "—" ?></div><div><span class=muted>Last</span> <?= c.last_session_at ? it.logdt(c.last_session_at) : "—" ?></div></td><td><div class=oauth-tokens><div class=oauth-token><b><?= c.token_count||0 ?></b> <span>Access</span><div class=oauth-meta><span class=muted>Issued</span> <?= c.last_token_at ? it.logdt(c.last_token_at) : "—" ?></div></div><div class=oauth-token><b><?= c.refresh_token_count||0 ?></b> <span>Refresh</span><div class=oauth-meta><span class=muted>Used</span> <?= c.last_refresh_at ? it.logdt(c.last_refresh_at) : "—" ?></div></div></div></td><td class=oauth-actions><button class=small data-action=oauth-sessions data-id="<?= c.client_id ?>">💬 View Sessions</button><button class="small danger" data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> Available Tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,
     logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=idcell><?= l.context_id ? "#"+l.context_id : "—" ?></td><td><code><?= l.tool ?></code></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Force</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><section class=json-detail><div class=row><b class=grow>MCP Result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div></td></tr><? } }) ?></tbody></table>`,
-    debug: `<? const d=it.data||{}; if (!d.enabled) { ?><p class=muted>HTTP debug logging is disabled.</p><? } else { ?><table><tr><th>ID</th><th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>Remote</th><th>Error</th></tr><? (d.rows || []).forEach(r => { ?><tr data-action=select-debug data-id="<?= r.id ?>" title="Click to expand"><td class=idcell>#<?= r.id ?></td><td class=nowrap><?= it.logdt(r.ts) ?></td><td><b><?= r.method ?></b></td><td><code><?= r.path ?></code></td><td class="<?= r.status >= 400 ? "failed" : "ok" ?>"><?= r.status ?></td><td><?= r.duration_ms ?>ms</td><td><?= r.remote_addr ?></td><td><?= r.error_preview ?></td></tr><? if(String(d.openRowId||"")===String(r.id)&&d.openDetail){ ?><tr class=detail-row data-detail-kind=http data-detail-id="<?= r.id ?>"><td colspan=8><div class=detail-panel><div class=row><b class=grow>HTTP Request #<?= r.id ?></b><button class=small data-action=copy-detail data-target="http-json-<?= r.id ?>">📋 Copy JSON</button><button class=small data-action=close-row-detail data-kind=http>✕ Close</button></div><pre id="http-json-<?= r.id ?>"><?= it.pretty(d.openDetail) ?></pre></div></td></tr><? } }) ?></table><? } ?>`,
+    debug: `<? const d=it.data||{}; if (!d.enabled) { ?><p class=muted>HTTP debug logging is disabled.</p><? } else { ?><table><tr><th>ID</th><th>Time</th><th>Session</th><th>Client</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>IP</th><th>Error</th></tr><? (d.rows || []).forEach(r => { ?><tr data-action=select-debug data-id="<?= r.id ?>" title="Click to expand"><td class=idcell>#<?= r.id ?></td><td class=nowrap><?= it.logdt(r.ts) ?></td><td class=idcell><?= r.context_id ? "#"+r.context_id : "—" ?></td><td><? if(r.client_id){ ?><code><?= r.client_id ?></code><? } else { ?>—<? } ?></td><td><b><?= r.method ?></b></td><td><code><?= r.path ?></code></td><td class="<?= r.status >= 400 ? "failed" : "ok" ?>"><?= r.status ?></td><td><?= r.duration_ms ?>ms</td><td class=nowrap><?= r.remote_addr||"—" ?><? if(r.remote_addr){ ?> (<?= r.remote_count||1 ?>)<? } ?></td><td><?= r.error_preview ?></td></tr><? if(String(d.openRowId||"")===String(r.id)&&d.openDetail){ const x=d.openDetail; ?><tr class=detail-row data-detail-kind=http data-detail-id="<?= r.id ?>"><td colspan=10><div class="detail-panel http-detail-panel"><div class="row http-detail-head"><div class=grow><b>HTTP Request #<?= r.id ?></b><div class=http-detail-meta><span><?= it.logdt(x.ts) ?></span><span><? if(x.context_id){ ?>Session #<?= x.context_id ?><? } else { ?>No Session<? } ?></span><span><? if(x.client_id){ ?>Client <code><?= x.client_id ?></code><? } else { ?>No client id<? } ?></span><span><?= x.remote_addr||"unknown IP" ?><? if(x.remote_addr){ ?> · <?= x.remote_count||1 ?> total request<?= Number(x.remote_count||1)===1?'':'s' ?><? } ?></span><span><?= x.duration_ms ?>ms</span></div></div><button class=small data-action=copy-detail data-target="http-json-<?= r.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=http>✕ Close</button></div><div class=http-detail-grid><section class=http-detail-block><div class=row><h4 class=grow>→ Request</h4><b><?= x.method ?></b> <code><?= x.path ?></code></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.request_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.request_body||{}) ?></pre></section><section class=http-detail-block><div class=row><h4 class=grow>← Response</h4><b class="<?= x.status>=400?'failed':'ok' ?>"><?= x.status ?></b></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.response_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.response_body||{}) ?></pre></section></div><? if(x.error){ ?><section class="http-detail-block http-detail-error"><h4 class=failed>Error</h4><pre><?= x.error ?></pre></section><? } ?><details class=http-detail-raw><summary>Raw record</summary><pre id="http-json-<?= r.id ?>"><?= it.pretty(x) ?></pre></details></div></td></tr><? } }) ?></table><? } ?>`,
   };
   const fragmentDate = value => {
     if (!value) return "";
@@ -5053,23 +5107,49 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       : eta.renderString(fragmentTemplates[name], context);
   }
   async function uiInternalApi(path, { method = "GET", body } = {}) {
-    const headers = new Headers({ cookie: `mrmcp_session=${SESSION}`, "x-mrmcp-csrf": CSRF });
+    const headers = new Headers();
     let payload;
     if (body !== undefined) {
       headers.set("content-type", "application/json");
       payload = JSON.stringify(body);
     }
-    const request = new Request(`http://127.0.0.1:${guiPort}${path}`, { method, headers, body: payload });
+    const request = new Request(`http://mrmcp.local${path}`, { method, headers, body: payload });
     const response = await guiApi(request, new URL(request.url));
     const raw = await response.text();
     const data = raw ? parseJson(raw, { error: raw }) : {};
     if (!response.ok) throw new Error(data?.error || `HTTP ${response.status}`);
     return data;
   }
+  function settingsFieldWarnings(settings = {}) {
+    const warnings = {};
+    const external = String(settings.external_url || "").trim();
+    if (external) {
+      try {
+        const url = new URL(external);
+        if (url.protocol !== "https:" || (url.port && url.port !== "443")) warnings.external_url = "Public base URL must use HTTPS on port 443.";
+      } catch { warnings.external_url = "Public base URL is not a valid URL."; }
+    }
+    const urls = Array.isArray(settings.public_ip_urls)
+      ? settings.public_ip_urls : String(settings.public_ip_urls || "").split(/\r?\n/);
+    const invalidLookup = urls.map(String).map(value => value.trim()).filter(Boolean).find(value => {
+      try { return new URL(value).protocol !== "https:"; } catch { return true; }
+    });
+    if (invalidLookup) warnings.public_ip_urls = "Every public IP lookup URL must be a valid HTTPS URL.";
+    const suffix = String(settings.sslip_suffix || "").trim();
+    if (!/^[A-Za-z0-9.-]+$/.test(suffix) || !suffix.includes(".")) warnings.sslip_suffix = "Automatic DNS suffix must be a valid domain suffix.";
+    const acme = String(settings.acme_directory_url || "").trim();
+    try { if (!acme || new URL(acme).protocol !== "https:") warnings.acme_directory_url = "ACME directory must be a valid HTTPS URL."; }
+    catch { warnings.acme_directory_url = "ACME directory must be a valid HTTPS URL."; }
+    const email = String(settings.tls_email || "").trim();
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) warnings.tls_email = "Let's Encrypt email is not valid.";
+    return warnings;
+  }
   function uiSettingsProjection(settings) {
     const draft = uiState.settingsDraft || {};
     const projected = { ...settings, ...draft };
     if (typeof projected.public_ip_urls === "string") projected.public_ip_urls = projected.public_ip_urls.split(/\r?\n/);
+    projected.field_warnings = settingsFieldWarnings(projected);
+    projected.save_disabled = Object.values(projected.field_warnings).some(Boolean);
     return projected;
   }
   async function buildUiRenderModel() {
@@ -5092,7 +5172,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       const warnings = await Promise.all(roots.map(async root => [Number(root.id), await rootPathWarning(root.path)]));
       const byId = new Map(warnings);
       for (const context of projection.context_values || [])
-        context.effective_root_warning = context.fallback_root ? "" : (byId.get(Number(context.root_id)) || "");
+        context.workspace_warning = context.fallback_workspace ? "" : (byId.get(Number(context.workspace_id)) || "");
     }
     if (section === "commands") {
       const current = uiState.commands;
@@ -5173,15 +5253,23 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       renderEtaFragment("status", { settings: projection.settings, activity: projection.header_activity, live: "connected" }),
       renderEtaFragment("dialogs", { state: viewState }),
     ]);
-    const banner = uiState.notice
-      ? `<div id=errorBanner class=banner style="display:block">${htmlEscape(uiState.notice.message || "")}</div>`
-      : `<div id=errorBanner class=banner></div>`;
-    return `<div id="app" data-section="${htmlEscape(section)}"><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div><div id=uiStatus class=status>${status}</div></header>${banner}<aside><div id=sidebar>${sidebar}</div></aside><main><div id=mainView>${view}</div></main><div id=dialogHost>${dialogs}</div></div>`;
+    const notice = uiState.notice
+      ? `<div id=uiNotice class="notice-balloon ${htmlEscape(uiState.notice.kind || "error")}">${htmlEscape(uiState.notice.message || "")}</div>`
+      : "";
+    return `<div id="app" data-section="${htmlEscape(section)}"><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div><div id=uiStatus class=status>${status}</div></header>${notice}<aside><div id=sidebar>${sidebar}</div></aside><main><div id=mainView>${view}</div></main><div id=dialogHost>${dialogs}</div></div>`;
   }
 
-  function uiMessage(title, message) {
-    uiState.dialog = { kind: "message", title, message: String(message || "") };
-    queueUiRender("message", 0);
+  function uiNotice(message, kind = "error") {
+    if (uiNoticeTimer) clearTimeout(uiNoticeTimer);
+    const notice = { message: String(message || ""), kind };
+    uiState.notice = notice;
+    queueUiRender("notice", 0);
+    uiNoticeTimer = setTimeout(() => {
+      uiNoticeTimer = null;
+      if (uiState.notice !== notice) return;
+      uiState.notice = null;
+      queueUiRender("notice-dismiss", 0);
+    }, kind === "error" ? 6500 : kind === "info" ? 5000 : 3000);
   }
   function uiConfirm(title, message, confirmAction, data = {}) {
     uiState.dialog = { kind: "confirm", title, message, confirmAction, data };
@@ -5239,7 +5327,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       try { await uiDownloadOne(row.name, overwrite || !!row.present); }
       catch (error) { failures.push(`${row.name}: ${String(error?.message || error)}`); }
     }
-    if (failures.length) uiMessage("Download Errors", failures.join("\n"));
+    if (failures.length) uiNotice(`Download errors:\n${failures.join("\n")}`);
   }
   async function uiRunConfirmedAction(dialog) {
     const data = dialog?.data || {};
@@ -5280,16 +5368,22 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const action = String(event.action || ""), data = event.dataset || {}, values = event.values || {};
     switch (action) {
       case "new-root":
-        uiState.dialog = { kind: "root", data: { enabled: true, path_warning: "" } };
+        uiState.dialog = { kind: "root", data: {
+          enabled: true, name_warning: "Workspace name is required.", path_warning: "", path_checked: false, form_warning: "",
+        } };
         break;
       case "edit-root": {
         const root = one("SELECT * FROM roots WHERE id=?", Number(data.id));
-        if (!root) throw new Error("Root not found");
-        uiState.dialog = { kind: "root", data: { ...root, enabled: !!root.enabled, path_warning: await rootPathWarning(root.path) } };
+        if (!root) throw new Error("Workspace not found");
+        uiState.dialog = { kind: "root", data: {
+          ...root, enabled: !!root.enabled,
+          name_warning: workspaceNameWarning(root.name, root.id), path_warning: await rootPathWarning(root.path),
+          path_checked: true, form_warning: "",
+        } };
         break;
       }
       case "delete-root":
-        uiConfirm("Delete Root", "Delete this registered root? Existing files are not removed.", "delete-root", { id: data.id });
+        uiConfirm("Delete Workspace", "Delete this registered Workspace? Existing files are not removed.", "delete-root", { id: data.id });
         return;
       case "delete-context":
         uiConfirm("Delete Session", "Delete this persistent MCP context? Running processes are not terminated.", "delete-context", { id: data.id });
@@ -5332,12 +5426,23 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         uiState.sessions.oauthClientId = "";
         break;
       case "new-command":
-        uiState.dialog = { kind: "command", data: { name: "", path: "", description: "", download_url: "", documentation_url: "", registered: false, path_warning: "" } };
+        uiState.dialog = { kind: "command", data: {
+          name: "", path: "", description: "", download_url: "", documentation_url: "", registered: false,
+          name_warning: "Command name is required.", path_warning: "", path_error: false, path_checked: true,
+          download_warning: "", documentation_warning: "", form_warning: "",
+        } };
         break;
       case "edit-command": {
         const row = await uiCommandRow(String(data.name || ""), String(data.path || ""));
         if (!row) throw new Error("Command not found");
-        uiState.dialog = { kind: "command", data: { ...row, old_name: row.name, path_warning: await commandPathWarning(row.path) } };
+        const pathWarning = await commandPathWarning(row.path);
+        uiState.dialog = { kind: "command", data: {
+          ...row, old_name: row.name,
+          name_warning: await commandNameWarning(row.name, row.name),
+          path_warning: pathWarning, path_error: commandPathBlocksSave(pathWarning), path_checked: true,
+          download_warning: httpUrlWarning(row.download_url, "Download URL"),
+          documentation_warning: httpUrlWarning(row.documentation_url, "Documentation URL"), form_warning: "",
+        } };
         break;
       }
       case "delete-command":
@@ -5419,10 +5524,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         uiConfirm("Clear HTTP Debug Log", "Delete all HTTP debug log rows?", "clear-debug");
         return;
       case "clear-database":
-        uiConfirm("Clear Operational Data", "Delete Tool Calls, process history, HTTP logs, published HTML and reset request metrics? Authentication, Sessions, Roots, settings and registered tools are preserved. Files, certificates, commands and trash on disk are not touched.", "clear-database");
+        uiConfirm("Clear Operational Data", "Delete Tool Calls, process history, HTTP logs, published HTML and reset request metrics? Authentication, Sessions, Workspaces, settings and registered tools are preserved. Files, certificates, commands and trash on disk are not touched.", "clear-database");
         return;
       case "empty-trash":
-        uiConfirm("Empty Trash", "Permanently delete all contents of .mrmcp/trash under the program folder and every configured Root? This cannot be undone.", "empty-trash");
+        uiConfirm("Empty Trash", "Permanently delete all contents of .mrmcp/trash under the program folder and every configured Workspace? This cannot be undone.", "empty-trash");
         return;
       case "detect-ip":
         await uiInternalApi("/api/network/detect", { method: "POST" });
@@ -5432,20 +5537,29 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         const result = await uiInternalApi("/api/tls/issue", { method: "POST" });
         const certificate = result.certificate || {};
         if (!certificate.requested && certificate.reason)
-          uiMessage("Certificate Request", certificate.reason + (certificate.next_attempt_at ? `\nNext attempt: ${new Date(certificate.next_attempt_at).toLocaleString()}` : ""));
+          uiNotice(certificate.reason + (certificate.next_attempt_at ? `\nNext attempt: ${new Date(certificate.next_attempt_at).toLocaleString()}` : ""), "info");
         break;
       }
-      case "save-settings":
-        await uiInternalApi("/api/settings", { method: "POST", body: {
+      case "save-settings": {
+        const body = {
           external_url: String(values.externalUrl || ""),
           tls_email: String(values.tlsEmail || ""),
           public_ip_urls: String(values.publicIpUrls || "").split(/\r?\n/),
           sslip_suffix: String(values.sslipSuffix || ""),
           acme_directory_url: String(values.acmeDirectoryUrl || ""),
           inherit_system_path: !!values.inheritSystemPath,
-        } });
+        };
+        const warnings = settingsFieldWarnings(body);
+        if (Object.values(warnings).some(Boolean)) {
+          uiState.settingsDraft = { ...body, public_ip_urls: body.public_ip_urls.join("\n") };
+          queueUiRender("settings-invalid", 0);
+          return;
+        }
+        await uiInternalApi("/api/settings", { method: "POST", body });
         uiState.settingsDraft = null;
+        uiNotice("Settings saved.", "ok");
         break;
+      }
       case "close-dialog":
         uiState.dialog = null;
         break;
@@ -5470,6 +5584,11 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         case "bootstrap":
           queueUiRender("bootstrap", 0);
           return;
+        case "native-drop": {
+          const added = await addDroppedRoots(event.paths);
+          if (added.length) uiNotice(`${added.length === 1 ? "Workspace" : "Workspaces"} added: ${added.join(", ")}`, "ok");
+          return;
+        }
         case "navigate": {
           const section = String(event.section || "");
           if (UI_SECTIONS.has(section)) {
@@ -5491,21 +5610,49 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         case "blur": {
           const id = String(event.id || "");
           uiUpdateDraft(id, event.value, event.checked);
-          if (id === "rpath" && uiState.dialog?.kind === "root")
+          if (id === "rpath" && uiState.dialog?.kind === "root") {
             uiState.dialog.data.path_warning = await rootPathWarning(event.value);
-          else if (id === "cpath" && uiState.dialog?.kind === "command")
-            uiState.dialog.data.path_warning = await commandPathWarning(event.value);
+            uiState.dialog.data.path_checked = true;
+          } else if (id === "cpath" && uiState.dialog?.kind === "command") {
+            const warning = await commandPathWarning(event.value);
+            uiState.dialog.data.path_warning = warning;
+            uiState.dialog.data.path_error = commandPathBlocksSave(warning);
+            uiState.dialog.data.path_checked = true;
+          }
           else return;
           queueUiRender(`blur:${id}`, 0);
           return;
         }
-        case "input": {
-          const id = String(event.id || "");
-          uiUpdateDraft(id, event.value, event.checked);
-          if (uiState.dialog?.kind === "root" && ["rname", "rpath", "renabled"].includes(id)) uiState.dialog.data.form_warning = "";
-          if (uiState.dialog?.kind === "command" && ["cname", "cpath", "cdescription", "cdownloadUrl", "cdocumentationUrl"].includes(id)) uiState.dialog.data.form_warning = "";
-          if (id === "logQuery") {
-            uiState.logs.page = 1;
+        case "input":
+        case "inputs": {
+          const items = event.type === "inputs" ? (Array.isArray(event.items) ? event.items : []) : [event];
+          let renderDraft = false, filterLogs = false;
+          for (const item of items) {
+            const id = String(item.id || "");
+            uiUpdateDraft(id, item.value, item.checked);
+            if (uiState.dialog?.kind === "root" && ["rname", "rpath", "renabled"].includes(id)) {
+              const d = uiState.dialog.data;
+              d.form_warning = "";
+              if (id === "rname") d.name_warning = workspaceNameWarning(item.value, d.id);
+              if (id === "rpath") { d.path_warning = ""; d.path_checked = false; }
+              renderDraft = true;
+            }
+            if (uiState.dialog?.kind === "command" && ["cname", "cpath", "cdescription", "cdownloadUrl", "cdocumentationUrl"].includes(id)) {
+              const d = uiState.dialog.data;
+              d.form_warning = "";
+              if (id === "cname") d.name_warning = await commandNameWarning(item.value, d.old_name);
+              if (id === "cpath") {
+                d.path_warning = ""; d.path_error = false; d.path_checked = !String(item.value || "").trim();
+              }
+              if (id === "cdownloadUrl") d.download_warning = httpUrlWarning(item.value, "Download URL");
+              if (id === "cdocumentationUrl") d.documentation_warning = httpUrlWarning(item.value, "Documentation URL");
+              renderDraft = true;
+            }
+            if (["externalUrl", "tlsEmail", "publicIpUrls", "sslipSuffix", "acmeDirectoryUrl"].includes(id)) renderDraft = true;
+            if (id === "logQuery") { uiState.logs.page = 1; filterLogs = true; }
+          }
+          if (renderDraft) queueUiRender("input:draft", 40);
+          if (filterLogs) {
             if (uiLogFilterTimer) clearTimeout(uiLogFilterTimer);
             uiLogFilterTimer = setTimeout(() => {
               uiLogFilterTimer = null;
@@ -5543,20 +5690,40 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         case "submit": {
           const values = event.values || {};
           if (event.formId === "rootForm") {
+            const d = uiState.dialog?.kind === "root" ? uiState.dialog.data : null;
+            if (!d) return;
+            d.name_warning = workspaceNameWarning(values.rname, Number(values.rid) || 0);
+            d.path_warning = await rootPathWarning(values.rpath);
+            d.path_checked = true;
+            d.form_warning = "";
+            if (d.name_warning || d.path_warning) {
+              queueUiRender("submit:rootForm-invalid", 0);
+              return;
+            }
             try {
               await uiInternalApi("/api/roots/save", { method: "POST", body: {
                 id: Number(values.rid) || null, name: values.rname, path: values.rpath, enabled: !!values.renabled,
               } });
               uiState.dialog = null;
+              uiNotice(`Workspace ${String(values.rname || "").trim()} saved.`, "ok");
             } catch (error) {
-              if (uiState.dialog?.kind === "root") {
-                uiState.dialog.data.form_warning = String(error?.message || error);
-                queueUiRender("submit:rootForm-warning", 0);
-                return;
-              }
-              throw error;
+              d.form_warning = String(error?.message || error);
+              queueUiRender("submit:rootForm-warning", 0);
+              return;
             }
           } else if (event.formId === "commandForm") {
+            const d = uiState.dialog?.kind === "command" ? uiState.dialog.data : null;
+            if (!d) return;
+            d.name_warning = await commandNameWarning(values.cname, values.coldName);
+            d.download_warning = httpUrlWarning(values.cdownloadUrl, "Download URL");
+            d.documentation_warning = httpUrlWarning(values.cdocumentationUrl, "Documentation URL");
+            const pathWarning = await commandPathWarning(values.cpath);
+            d.path_warning = pathWarning; d.path_error = commandPathBlocksSave(pathWarning); d.path_checked = true;
+            d.form_warning = "";
+            if (d.name_warning || d.path_error || d.download_warning || d.documentation_warning) {
+              queueUiRender("submit:commandForm-invalid", 0);
+              return;
+            }
             try {
               await uiInternalApi("/api/commands/save", { method: "POST", body: {
                 old_name: values.coldName, name: values.cname, path: values.cpath,
@@ -5565,15 +5732,11 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
               } });
               uiState.dialog = null;
               uiState.commands.page = 1;
+              uiNotice(`Command ${String(values.cname || "").trim()} saved.`, "ok");
             } catch (error) {
-              if (uiState.dialog?.kind === "command") {
-                const message = String(error?.message || error);
-                if (/path|\.mrmcp[\\/]bin/i.test(message)) uiState.dialog.data.path_warning = message;
-                else uiState.dialog.data.form_warning = message;
-                queueUiRender("submit:commandForm-warning", 0);
-                return;
-              }
-              throw error;
+              d.form_warning = String(error?.message || error);
+              queueUiRender("submit:commandForm-warning", 0);
+              return;
             }
           }
           queueUiRender(`submit:${event.formId}`);
@@ -5584,38 +5747,35 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           return;
       }
     } catch (error) {
-      uiState.dialog = { kind: "message", title: "Error", message: String(error?.message || error) };
+      uiNotice(String(error?.message || error));
       queueUiRender("input-error", 0);
     }
   }
 
 
+  function enqueueUiInput(message) {
+    uiRenderConnected = true;
+    uiInputChain = uiInputChain.then(async () => {
+      uiInputDepth += 1;
+      uiInputRenderDelay = null;
+      try { await handleUiInput(message); }
+      finally {
+        uiInputDepth -= 1;
+        const delay = uiInputRenderDelay ?? 0;
+        uiInputRenderDelay = null;
+        if (uiRenderQueued) queueUiRender("input-complete", delay);
+      }
+    }).catch(error => {
+      uiNotice(String(error?.message || error));
+      queueUiRender("input-transport-error", 0);
+    });
+  }
+
   async function guiApi(req, u) {
-    if (!requireApi(req, u)) return json({ error: "Unauthorized" }, 401);
-    if (u.pathname === "/api/events" && req.method === "GET") return uiEventStream();
-    if (u.pathname === "/api/ui-input" && req.method === "GET") {
-      const { socket, response } = Deno.upgradeWebSocket(req);
-      socket.onmessage = event => {
-        let message;
-        try { message = JSON.parse(String(event.data || "{}")); }
-        catch { return; }
-        uiInputChain = uiInputChain.then(async () => {
-          uiInputDepth += 1;
-          try { await handleUiInput(message); }
-          finally {
-            uiInputDepth -= 1;
-            if (uiRenderQueued) queueUiRender("input-complete", 0);
-          }
-        }).catch(error => {
-          uiState.dialog = { kind: "message", title: "Error", message: String(error?.message || error) };
-          queueUiRender("websocket-error", 0);
-        });
-      };
-      socket.onopen = () => queueUiRender("input-connected", 0);
-      return response;
-    }
     if (u.pathname === "/api/settings" && req.method === "POST") {
       const x = await bodyJson(req);
+      const warnings = settingsFieldWarnings(x), firstWarning = Object.values(warnings).find(Boolean);
+      if (firstWarning) return json({ error: firstWarning }, 400);
       if (x.external_url) {
         let external;
         try { external = new URL(String(x.external_url)); }
@@ -5653,8 +5813,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     if (u.pathname === "/api/roots/save" && req.method === "POST") {
       const x = await bodyJson(req), p = serverConfig(), name = String(x.name || "").trim(),
         path = String(x.path ?? ""), rootId = Number(x.id) || 0, enabled = !!x.enabled;
-      if (!validRootName(name)) return json({ error: "Root name must be 1-128 characters and cannot contain slashes or control characters" }, 400);
-      if (!path.trim()) return json({ error: "Root path is required" }, 400);
+      const nameWarning = workspaceNameWarning(name, rootId);
+      if (nameWarning) return json({ error: nameWarning, field: "name" }, 400);
+      const pathWarning = await rootPathWarning(path);
+      if (pathWarning) return json({ error: pathWarning, field: "path" }, 400);
       if (rootId) {
         run("UPDATE roots SET name=?,path=?,enabled=? WHERE id=? AND server_id=?",
           name, path, +enabled, rootId, p.id);
@@ -5668,7 +5830,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       const x = await bodyJson(req), p = serverConfig(), root = one(
         "SELECT * FROM roots WHERE id=? AND server_id=?", Number(x.id), p.id,
       );
-      if (!root) return json({ error: "Root not found" }, 404);
+      if (!root) return json({ error: "Workspace not found" }, 404);
       run("UPDATE contexts SET root_id=0,updated_at=? WHERE server_id=? AND root_id=?",
         Date.now(), p.id, root.id);
       run("DELETE FROM roots WHERE id=?", root.id);
@@ -5676,12 +5838,12 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     }
     if (u.pathname === "/api/context/select" && req.method === "POST") {
       const x = await bodyJson(req), p = serverConfig(), context = contextById(p, Number(x.id));
-      if (!context) return json({ error: "Context not found" }, 404);
+      if (!context) return json({ error: "Session not found" }, 404);
       return json({ ok: true, context: selectContextRoot(p, context, Number(x.root_id) || 0) });
     }
     if (u.pathname === "/api/context/delete" && req.method === "POST") {
       const x = await bodyJson(req), p = serverConfig(), context = contextById(p, Number(x.id));
-      if (!context) return json({ error: "Context not found" }, 404);
+      if (!context) return json({ error: "Session not found" }, 404);
       run("DELETE FROM contexts WHERE id=?", context.id);
       for (const key of [...jsKernels.keys()])
         if (key.startsWith(`${p.id}:${context.handle}:`)) destroyJsKernel(key, "context deleted");
@@ -5734,7 +5896,12 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     }));
     if (u.pathname === "/api/commands/save" && req.method === "POST") {
       const x = await bodyJson(req), name = String(x.name || "").trim(), old = String(x.old_name || "").trim();
-      if (!/^[A-Za-z0-9_.+-]{1,128}$/.test(name)) return json({ error: "Invalid command name" }, 400);
+      const nameWarning = await commandNameWarning(name, old);
+      if (nameWarning) return json({ error: nameWarning, field: "name" }, 400);
+      const downloadWarning = httpUrlWarning(x.download_url, "Download URL");
+      if (downloadWarning) return json({ error: downloadWarning, field: "download_url" }, 400);
+      const documentationWarning = httpUrlWarning(x.documentation_url, "Documentation URL");
+      if (documentationWarning) return json({ error: documentationWarning, field: "documentation_url" }, 400);
       let target;
       try { target = await binPath(String(x.path || "").trim() || name); } catch (e) { return json({ error: String(e.message || e) }, 400); }
       const row = normalizeCommandEntry({
@@ -5833,17 +6000,36 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       const status = u.searchParams.get("status") || "";
       const limit = Math.min(Number(u.searchParams.get("limit") || 300), 1000);
       const like = `%${q}%`;
-      return json(all(`SELECT id,ts,method,path,status,duration_ms,remote_addr,
-        substr(request_body,1,180) request_preview,substr(error,1,180) error_preview
-        FROM debug_logs WHERE (?='' OR method=?) AND (?='' OR CAST(status AS TEXT)=?)
-        AND (?='' OR method||path||request_headers||request_body||response_headers||response_body||error LIKE ?)
-        ORDER BY id DESC LIMIT ?`,
+      return json(all(`WITH enriched AS (
+        SELECT d.*, COALESCE(
+          CASE WHEN json_valid(d.request_body) THEN json_extract(d.request_body,'$.params.arguments.context_handle') END,
+          CASE WHEN json_valid(d.response_body) THEN json_extract(d.response_body,'$.result.structuredContent.context_handle') END,
+          ''
+        ) context_handle
+        FROM debug_logs d
+      )
+      SELECT d.id,d.ts,d.method,d.path,d.status,d.duration_ms,d.remote_addr,
+        c.id context_id,c.oauth_client_id client_id,
+        (SELECT COUNT(*) FROM debug_logs ip WHERE ip.remote_addr=d.remote_addr) remote_count,
+        substr(d.request_body,1,180) request_preview,substr(d.error,1,180) error_preview
+        FROM enriched d LEFT JOIN contexts c ON c.handle=d.context_handle
+        WHERE (?='' OR d.method=?) AND (?='' OR CAST(d.status AS TEXT)=?)
+        AND (?='' OR d.method||d.path||d.request_headers||d.request_body||d.response_headers||d.response_body||d.error||COALESCE(c.oauth_client_id,'')||COALESCE(CAST(c.id AS TEXT),'') LIKE ?)
+        ORDER BY d.id DESC LIMIT ?`,
         method, method, status, status, q, like, limit));
     }
     let dm = u.pathname.match(/^\/api\/debug\/(\d+)$/);
-    if (dm && req.method === "GET") return json(
-      one("SELECT * FROM debug_logs WHERE id=?", Number(dm[1])) || { error: "Not found" }
-    );
+    if (dm && req.method === "GET") return json(one(`WITH enriched AS (
+      SELECT d.*, COALESCE(
+        CASE WHEN json_valid(d.request_body) THEN json_extract(d.request_body,'$.params.arguments.context_handle') END,
+        CASE WHEN json_valid(d.response_body) THEN json_extract(d.response_body,'$.result.structuredContent.context_handle') END,
+        ''
+      ) context_handle
+      FROM debug_logs d WHERE d.id=?
+    )
+    SELECT d.*,c.id context_id,c.oauth_client_id client_id,
+      (SELECT COUNT(*) FROM debug_logs ip WHERE ip.remote_addr=d.remote_addr) remote_count
+      FROM enriched d LEFT JOIN contexts c ON c.handle=d.context_handle`, Number(dm[1])) || { error: "Not found" });
     if (u.pathname === "/api/debug/clear" && req.method === "POST") {
       run("DELETE FROM debug_logs");
       return json({ ok: true });
@@ -5932,34 +6118,28 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     return json({ error: "Not found" }, 404);
   }
 
-  // Eta renders server-side only. Browser assets are served from assets/ on disk or from Deno's compiled virtual filesystem.
+  // Eta renders server-side only. Tauriless serves the complete local UI through its asset protocol.
   const UI_SCRIPT_NONCE = randomToken();
   const GUI_LOGO_DATA_URL = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(Deno.readTextFileSync(join(ASSETS_DIR, "mrmcp-logo.svg")))}`;
   const GUI_MORPHLEX_JS = Deno.readTextFileSync(join(ASSETS_DIR, "morphlex.js"))
     .replace(/\nexport \{\n  morphInner,\n  morphDocument,\n  morph\n\};[\s\S]*$/, "");
-  const UI_CSP = `default-src 'self';base-uri 'none';object-src 'none';frame-ancestors 'self' http://127.0.0.1:*;form-action 'self';style-src 'unsafe-inline';script-src 'self' 'nonce-${UI_SCRIPT_NONCE}';connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:* ws://localhost:*;img-src 'self' data:`;
+  const UI_CSP = `default-src 'self';base-uri 'none';object-src 'none';frame-ancestors 'none';form-action 'self';style-src 'unsafe-inline';script-src 'self' 'nonce-${UI_SCRIPT_NONCE}';connect-src 'self' ipc: http://ipc.localhost;img-src 'self' data:`;
   const UI_TEMPLATE = String.raw`<!doctype html><html><head><meta charset=utf-8>
-<meta name=mrmcp-csrf content="__MRMCP_CSRF__">
 <meta http-equiv="Content-Security-Policy" content="${UI_CSP}">
 <meta name=viewport content="width=device-width,initial-scale=1"><link rel=icon href="${GUI_LOGO_DATA_URL}"><title>MrMCP</title><style>
-:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}aside button{display:block;width:100%;text-align:left;margin:3px 0;background:transparent;border:0}aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.banner{display:none;margin-left:170px;padding:9px 18px;background:#5a2020;color:#ffd7d7}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 8px 10px;background:#111318}.detail-panel{border:1px solid #343944;border-radius:8px;background:#0d0f12;padding:10px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.menu-icon{display:inline-block;width:22px;text-align:center}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout{grid-template-columns:1fr}.default-root-card{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){aside{width:130px}main,.banner{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
+:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}aside button{display:block;width:100%;text-align:left;margin:3px 0;background:transparent;border:0}aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.notice-balloon{position:fixed;top:64px;right:16px;z-index:1900;max-width:min(520px,calc(100vw - 32px));padding:10px 12px;border:1px solid #7d3f47;border-radius:9px;background:#25191b;color:#ffb7bf;box-shadow:0 8px 28px #0008}.notice-balloon.info{border-color:#365a7d;background:#16202b;color:#a9d5ff}.notice-balloon.ok{border-color:#356849;background:#16241b;color:#9ce8b1}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 18px 14px 28px;background:#111318}.detail-panel{border:1px solid #343944;border-left:3px solid #3984e8;border-radius:8px;background:#0d0f12;padding:14px 16px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.http-detail-head{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #292d34}.http-detail-meta{display:flex;gap:7px 16px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:#89909b}.http-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.http-detail-block{min-width:0;border:1px solid #292d34;border-radius:8px;background:#0a0c0f;padding:10px}.http-detail-block h4{margin:0}.http-detail-block pre{max-height:30vh}.http-detail-error{margin-top:12px;border-color:#68353a;background:#1d1012}.http-detail-raw{margin-top:12px}.http-detail-raw summary{cursor:pointer;color:#89909b}@media(max-width:1100px){.http-detail-grid{grid-template-columns:1fr}}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.menu-icon{display:inline-block;width:22px;text-align:center}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout{grid-template-columns:1fr}.default-root-card{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){aside{width:130px}main{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
 </style></head><body>
-<div id=app data-section=dashboard><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div><div class=status><span class=pending>connecting…</span></div></header><main style="margin-left:0"><div class=card>Connecting to the MrMCP UI service…</div></main></div>
+<div id=app data-section=dashboard><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div><div class=status><span class=pending>starting…</span></div></header><main style="margin-left:0"><div class=card>Starting the local MrMCP UI…</div></main></div>
 <script type=module nonce="${UI_SCRIPT_NONCE}">__MRMCP_BROWSER_JS__</script></body></html>`;
 
   function browserAppSource() {/*
 import { morphInner } from "/assets/morphlex.js";
 const app = document.getElementById("app");
-const csrf = document.querySelector('meta[name="mrmcp-csrf"]')?.content || "";
-let socket = null, renderStream = null, reconnectTimer = null, scrollTimer = null;
-let sequence = 0, lastSentSequence = 0;
-const outbox = [];
-function wsUrl() {
-  const url = new URL("/api/ui-input", location.href);
-  url.searchParams.set("csrf", csrf);
-  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-  return url.href;
-}
+const internals = window.__TAURI_INTERNALS__;
+const invoke = (command, payload = {}) => internals.invoke(command, payload);
+const UI_INPUT_EVENT = "tauriless://webview-message", UI_RENDER_EVENT = "mrmcp://ui-render";
+let scrollTimer = null, inputTimer = null, sequence = 0, lastSentSequence = 0;
+const pendingInputs = new Map();
 function focusState(element = document.activeElement) {
   if (!element?.id) return null;
   return {
@@ -5968,26 +6148,31 @@ function focusState(element = document.activeElement) {
     end: Number.isInteger(element.selectionEnd) ? element.selectionEnd : null,
   };
 }
-function send(event) {
+function sendRaw(event) {
   const envelope = { sequence: ++sequence, event: {
     ...event,
     focus: event.focus === undefined ? focusState() : event.focus,
     viewport: { section: app.dataset.section || "dashboard", x: scrollX, y: scrollY },
   } };
   lastSentSequence = envelope.sequence;
-  const encoded = JSON.stringify(envelope);
-  if (socket?.readyState === WebSocket.OPEN) socket.send(encoded);
-  else outbox.push(encoded);
+  return invoke("plugin:event|emit", { event: UI_INPUT_EVENT, payload: envelope })
+    .catch(error => console.error("MrMCP input delivery failed", error));
 }
-function flushOutbox() {
-  while (socket?.readyState === WebSocket.OPEN && outbox.length) socket.send(outbox.shift());
+async function flushInputs() {
+  if (inputTimer) { clearTimeout(inputTimer); inputTimer = null; }
+  if (!pendingInputs.size) return;
+  const items = [...pendingInputs.values()];
+  pendingInputs.clear();
+  await sendRaw({ type: "inputs", items });
 }
-function connectInput() {
-  clearTimeout(reconnectTimer);
-  socket?.close();
-  socket = new WebSocket(wsUrl());
-  socket.addEventListener("open", () => { flushOutbox(); send({ type: "bootstrap" }); });
-  socket.addEventListener("close", () => { reconnectTimer = setTimeout(connectInput, 500); });
+async function send(event) {
+  if (event.type !== "inputs") await flushInputs();
+  return await sendRaw(event);
+}
+function queueInput(element) {
+  pendingInputs.set(element.id, { id: element.id, value: element.value, checked: !!element.checked });
+  if (inputTimer) clearTimeout(inputTimer);
+  inputTimer = setTimeout(() => { inputTimer = null; void flushInputs(); }, 60);
 }
 function collectValues(scope) {
   const values = {};
@@ -6019,15 +6204,9 @@ function applyRender(payload) {
     }
   });
 }
-function connectRenderStream() {
-  renderStream?.close();
-  const url = new URL("/api/events", location.href);
-  url.searchParams.set("csrf", csrf);
-  renderStream = new EventSource(url.href);
-  renderStream.addEventListener("render", event => {
-    try { applyRender(JSON.parse(event.data)); }
-    catch (error) { console.error("MrMCP render failed", error); }
-  });
+async function listen(event, handler) {
+  const handlerId = internals.transformCallback(handler);
+  return await invoke("plugin:event|listen", { event, target: { kind: "Any" }, handler: handlerId });
 }
 document.addEventListener("click", event => {
   const copy = event.target.closest("[data-copy]");
@@ -6081,7 +6260,7 @@ document.addEventListener("focusout", event => {
 document.addEventListener("input", event => {
   const element = event.target;
   if (!element.id) return;
-  send({ type: "input", id: element.id, value: element.value, checked: !!element.checked, focus: focusState(element) });
+  queueInput(element);
 });
 document.addEventListener("focusin", event => {
   if (event.target?.id) send({ type: "focus", focus: focusState(event.target) });
@@ -6106,44 +6285,19 @@ addEventListener("scroll", () => {
     type: "scroll", section: app.dataset.section || "dashboard", x: scrollX, y: scrollY,
   }), 80);
 }, { passive: true });
-connectInput();
-connectRenderStream();
+listen(UI_RENDER_EVENT, event => {
+  try { applyRender(event.payload); }
+  catch (error) { console.error("MrMCP render failed", error); }
+}).then(() => send({ type: "bootstrap" })).catch(error => {
+  console.error("MrMCP UI bootstrap failed", error);
+});
 */}
 
   const BROWSER_JS = browserAppSource.toString().match(/\/\*([\s\S]*)\*\//)[1]
     .replace('import { morphInner } from "/assets/morphlex.js";\n', "");
   const GUI_BROWSER_JS = `${GUI_MORPHLEX_JS}\n${BROWSER_JS}`;
-  const PAGE_TEMPLATE = UI_TEMPLATE.replace("__MRMCP_CSRF__", "<?= it.csrf ?>");
-  function ui() { return eta.renderString(PAGE_TEMPLATE, { csrf: CSRF }).replace("__MRMCP_BROWSER_JS__", GUI_BROWSER_JS); }
-
-  async function guiHandler(req) {
-    const u = new URL(req.url);
-    if (u.pathname === "/login" && u.searchParams.get("token") === ADMIN_TOKEN) return new Response(null, {
-      status: 302,
-      headers: { location: "/", "set-cookie": `mrmcp_session=${SESSION}; HttpOnly; SameSite=Strict; Path=/` },
-    });
-    if (u.pathname.startsWith("/api/") && requireApi(req, u)) return await guiApi(req, u);
-    if (!hasSession(req)) return text("Unauthorized", 401);
-    if (u.pathname.startsWith("/api/")) return await guiApi(req, u);
-    if (u.pathname.startsWith("/assets/")) return await staticAssetResponse(u.pathname);
-    if (u.pathname === "/app.js") return text(BROWSER_JS, 200, "text/javascript; charset=utf-8", {
-      "cache-control": "no-store", "x-content-type-options": "nosniff",
-    });
-    if (u.pathname === "/" || u.pathname === "/index.html") return text(ui(), 200, "text/html; charset=utf-8", {
-      "cache-control": "no-store",
-      "content-security-policy": UI_CSP,
-      "referrer-policy": "no-referrer",
-      "x-content-type-options": "nosniff",
-    });
-    return text("Not found", 404);
-  }
-
-  const guiBound = serveWithPortFallback(GUI_PORT, port => Deno.serve(
-    { hostname: "127.0.0.1", port, onListen() {} },
-    req => guiHandler(req).catch(e => json({ error: String(e?.stack || e) }, 500)),
-  ));
-  const guiServer = guiBound.server;
-  guiPort = guiBound.port;
+  const PAGE_TEMPLATE = UI_TEMPLATE;
+  function ui() { return eta.renderString(PAGE_TEMPLATE, {}).replace("__MRMCP_BROWSER_JS__", GUI_BROWSER_JS); }
   restoreAcmeBackoff();
   await detectPublicIp().catch(error => setCfg("tls_last_error", [
     getCfg("tls_last_error", ""), String(error?.message || error),
@@ -6155,8 +6309,9 @@ connectRenderStream();
   downloadCleanupTimer = setInterval(() => expireDownloadTokens().catch(() => {}), 60 * 1000);
   const readyPayload = {
     type: "ready",
-    gui: `http://127.0.0.1:${guiPort}/login?token=${encodeURIComponent(ADMIN_TOKEN)}`,
-    ports: { gui: guiPort, http: mcpHttpPort, https: mcpHttpsPort },
+    gui: IS_BACKEND_WORKER ? "index.html" : null,
+    gui_html: IS_BACKEND_WORKER ? ui() : undefined,
+    ports: { http: mcpHttpPort, https: mcpHttpsPort },
     fallbacks: listenerFallbacks(),
   };
 
@@ -6169,6 +6324,7 @@ connectRenderStream();
     if (processCleanupTimer) clearInterval(processCleanupTimer);
     if (downloadCleanupTimer) clearInterval(downloadCleanupTimer);
     if (uiLogFilterTimer) clearTimeout(uiLogFilterTimer);
+    if (uiNoticeTimer) clearTimeout(uiNoticeTimer);
     if (headerActivityTimer) clearTimeout(headerActivityTimer);
     for (const key of [...jsKernels.keys()]) destroyJsKernel(key, "server shutdown");
     await Promise.allSettled(
@@ -6180,12 +6336,16 @@ connectRenderStream();
       Promise.allSettled([...processes.values()].map(rec => rec.done).filter(Boolean)),
       sleep(3000),
     ]);
-    await Promise.allSettled([guiServer.shutdown(), mcpHttpServer?.shutdown(), mcpHttpsServer?.shutdown()]);
+    await Promise.allSettled([mcpHttpServer?.shutdown(), mcpHttpsServer?.shutdown()]);
     await cleanupAllDownloadTokens();
     db.close();
   };
   if (IS_BACKEND_WORKER) {
     self.onmessage = event => {
+      if (event.data?.type === "ui-input") {
+        enqueueUiInput(event.data.payload);
+        return;
+      }
       if (event.data?.type !== "shutdown") return;
       (async () => {
         try { await shutdown(); self.postMessage({ type: "stopped" }); }
@@ -6202,10 +6362,7 @@ connectRenderStream();
 }
 
 async function spawnBackendWorker() {
-  const admin = crypto.randomUUID().replaceAll("-", "");
-  const workerUrl = new URL(SELF);
-  workerUrl.searchParams.set("admin", admin);
-  const worker = new Worker(workerUrl.href, { type: "module", name: "mrmcp-backend" });
+  const worker = new Worker(SELF.href, { type: "module", name: "mrmcp-backend" });
   let resolveReady, rejectReady;
   const ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
   const onMessage = event => {
@@ -6243,14 +6400,89 @@ async function stopBackendWorker(worker) {
 async function desktop() {
   const { worker: backendWorker, payload } = await spawnBackendWorker();
   const tauriless = new Tauriless(), pending = new Map();
-  let nextId = 1, drainTimer = null, closed = false, resolveClosed;
+  const nativeIcon = () => {
+    const ico = Deno.readFileSync(join(ASSETS_DIR, "mrmcp.ico"));
+    const view = new DataView(ico.buffer, ico.byteOffset, ico.byteLength), count = view.getUint16(4, true);
+    let entry = null;
+    for (let i = 0; i < count; i++) {
+      const p = 6 + i * 16, width = ico[p] || 256, height = ico[p + 1] || 256;
+      if (width === 32 && height === 32) {
+        entry = { size: view.getUint32(p + 8, true), offset: view.getUint32(p + 12, true) };
+        break;
+      }
+    }
+    if (!entry) throw new Error("MrMCP ICO has no 32x32 frame");
+    const png = ico.subarray(entry.offset, entry.offset + entry.size);
+    const be32 = p => ((png[p] * 0x1000000) + (png[p + 1] << 16) + (png[p + 2] << 8) + png[p + 3]) >>> 0;
+    if (png[0] !== 137 || png[1] !== 80 || png[2] !== 78 || png[3] !== 71) throw new Error("MrMCP 32x32 ICO frame is not PNG");
+    const idat = [];
+    let width = 0, height = 0;
+    for (let p = 8; p + 12 <= png.length;) {
+      const length = be32(p), type = String.fromCharCode(...png.subarray(p + 4, p + 8)), data = png.subarray(p + 8, p + 8 + length);
+      if (type === "IHDR") {
+        width = be32(p + 8); height = be32(p + 12);
+        if (png[p + 16] !== 8 || png[p + 17] !== 6 || png[p + 20] !== 0) throw new Error("Unsupported MrMCP icon PNG format");
+      } else if (type === "IDAT") idat.push(data);
+      if (type === "IEND") break;
+      p += length + 12;
+    }
+    const compressed = new Uint8Array(idat.reduce((n, chunk) => n + chunk.length, 0));
+    let offset = 0;
+    for (const chunk of idat) { compressed.set(chunk, offset); offset += chunk.length; }
+    const raw = inflateSync(compressed), stride = width * 4, rgba = new Uint8Array(width * height * 4);
+    const paeth = (a, b, c) => {
+      const p = a + b - c, pa = Math.abs(p - a), pb = Math.abs(p - b), pc = Math.abs(p - c);
+      return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+    };
+    for (let y = 0, src = 0; y < height; y++) {
+      const filter = raw[src++], row = y * stride;
+      for (let x = 0; x < stride; x++) {
+        const a = x >= 4 ? rgba[row + x - 4] : 0, b = y ? rgba[row - stride + x] : 0,
+          c = y && x >= 4 ? rgba[row - stride + x - 4] : 0;
+        const predictor = filter === 0 ? 0 : filter === 1 ? a : filter === 2 ? b :
+          filter === 3 ? Math.floor((a + b) / 2) : filter === 4 ? paeth(a, b, c) : NaN;
+        if (!Number.isFinite(predictor)) throw new Error(`Unsupported MrMCP icon PNG filter ${filter}`);
+        rgba[row + x] = (raw[src++] + predictor) & 255;
+      }
+    }
+    return { rgba: Array.from(rgba), width, height };
+  };
+  let nextId = 1, drainTimer = null, closed = false, windowVisible = false, resolveClosed, resolveWebviewReady;
   const windowClosed = new Promise(resolve => { resolveClosed = resolve; });
+  const webviewReady = new Promise(resolve => { resolveWebviewReady = resolve; });
   const request = (cmd, requestPayload = {}) => new Promise((resolve, reject) => {
     const id = nextId++;
     pending.set(id, { cmd, resolve, reject });
     try { tauriless.send({ id, cmd, payload: requestPayload }); }
     catch (error) { pending.delete(id); reject(error); }
   });
+  const emitToWebview = (event, eventPayload) => request("plugin:event|emit_to", {
+    target: { kind: "WebviewWindow", label: "main" }, event, payload: eventPayload,
+  });
+  const showWindow = async () => {
+    await request("plugin:window|show", { label: "main" });
+    await request("plugin:window|set_focus", { label: "main" });
+    windowVisible = true;
+  };
+  const hideWindow = async () => {
+    await request("plugin:window|hide", { label: "main" });
+    windowVisible = false;
+  };
+  const toggleWindow = () => windowVisible ? hideWindow() : showWindow();
+  const notifySession = context => {
+    const client = String(context.client_name || context.oauth_client_id || context.user_agent || context.auth_kind || "remote client").slice(0, 160);
+    return request("plugin:notification|notify", { options: {
+      title: "New MrMCP Session", body: `Session #${context.id} · ${client}`,
+    } });
+  };
+  const onWorkerMessage = event => {
+    if (event.data?.type === "ui-render") {
+      void emitToWebview(UI_RENDER_EVENT, event.data.payload).catch(error => console.error("MrMCP render delivery failed", error));
+    } else if (event.data?.type === "context-created") {
+      void notifySession(event.data.context || {}).catch(error => console.error("MrMCP notification failed", error));
+    }
+  };
+  backendWorker.addEventListener("message", onWorkerMessage);
   const drain = () => {
     for (const message of tauriless.drain().messages) {
       if (message.kind === "result") {
@@ -6259,8 +6491,30 @@ async function desktop() {
         pending.delete(message.id);
         message.ok ? callback.resolve(message.value)
           : callback.reject(new Error(`${callback.cmd}: ${JSON.stringify(message.error)}`));
-      } else if (message.kind === "event" && message.window === "main" && message.event === "tauri://destroyed") {
-        resolveClosed();
+      } else if (message.kind === "asset-request") {
+        const pathname = new URL(message.url).pathname;
+        void request("tauriless:asset-response", pathname === "/" || pathname === "/index.html" ? {
+          requestId: message.requestId, content: payload.gui_html, mime: "text/html; charset=utf-8",
+        } : {
+          requestId: message.requestId, status: 404, content: `Asset not found: ${pathname}`, mime: "text/plain; charset=utf-8",
+        }).catch(error => console.error("MrMCP asset response failed", error));
+      } else if (message.kind === "event" && message.window === "main") {
+        if (message.event === "tauri://close-requested") void hideWindow().catch(console.error);
+        else if (message.event === "tauri://destroyed") resolveClosed();
+        else if (message.event === UI_INPUT_EVENT) {
+          if (message.payload?.event?.type === "bootstrap") resolveWebviewReady(true);
+          backendWorker.postMessage({ type: "ui-input", payload: message.payload });
+        }
+        else if (message.event === "tauri://drag-drop") backendWorker.postMessage({
+          type: "ui-input", payload: { event: { type: "native-drop", paths: message.payload?.paths || [] } },
+        });
+      } else if (message.kind === "channel" && message.id === 9101) {
+        if (message.message === "tray-quit") resolveClosed();
+      } else if (message.kind === "channel" && message.id === 9102) {
+        let event = message.message || {};
+        if (typeof event === "string") try { event = JSON.parse(event); } catch { event = {}; }
+        if (event.type === "Click" && event.button === "Left" && event.buttonState === "Up")
+          void toggleWindow().catch(console.error);
       }
     }
   };
@@ -6275,12 +6529,33 @@ async function desktop() {
         resolveClosed();
       }
     }, 16);
+    for (const event of [
+      "tauri://resize", "tauri://move", "tauri://focus", "tauri://blur",
+      "tauri://scale-change", "tauri://theme-changed", "tauri://window-created", "tauri://webview-created",
+      "tauri://drag-enter", "tauri://drag-over", "tauri://drag-leave", "tauri://suspended", "tauri://resumed",
+      "deep-link://new-url", "log://log", "store://change",
+    ]) await request("tauriless:unsubscribe", { event });
     await request("plugin:webview|create_webview_window", { options: {
-      label: "main", title: `🧩 MrMCP ${VERSION}`, url: payload.gui,
-      width: 1180, height: 760, center: true, visible: true,
+      label: "main", title: `MrMCP ${VERSION}`, url: payload.gui,
+      width: 1180, height: 760, center: true, visible: false, dragDropEnabled: true,
     } });
+    await request("plugin:window|set_size", { label: "main", value: { Logical: { width: 1180, height: 760 } } });
+    await request("plugin:window|center", { label: "main" });
+    await request("plugin:window|set_icon", { label: "main", value: nativeIcon() });
+    if (!await waitFor(webviewReady, 10_000, null)) throw new Error("Tauriless WebView input bootstrap timed out");
+    const [menuRid] = await request("plugin:menu|new", {
+      kind: "Menu", options: { id: "mrmcp-tray-menu", items: [
+        { id: "tray-quit", text: "Quit MrMCP", enabled: true },
+      ] }, handler: "__CHANNEL__:9101",
+    });
+    await request("plugin:tray|new", { options: {
+      id: "mrmcp-tray", menu: [menuRid, "Menu"], icon: nativeIcon(),
+      tooltip: `MrMCP ${VERSION}`, showMenuOnLeftClick: false,
+    }, handler: "__CHANNEL__:9102" });
+    await showWindow();
     await windowClosed;
   } finally {
+    backendWorker.removeEventListener("message", onWorkerMessage);
     closed = true;
     if (drainTimer) clearInterval(drainTimer);
     for (const callback of pending.values()) callback.reject(new Error("Tauriless closing"));

@@ -1,8 +1,8 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.83
+# MrMCP 0.10.84
 
-MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
+MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a local Tauriless administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit Session `context_handle` capabilities.
 
 ### Tool Calls
 
@@ -10,11 +10,11 @@ Expanded process calls show a terminal-style command, optional stdin and combine
 
 ![MrMCP Tool Calls view](./assets/mrmcp-screenshot1.png)
 
-### Roots
+### Workspaces
 
-Named roots and unassigned Sessions are managed in one drag-and-drop view, with activity, status and Tool Calls counts visible on each Session.
+Named Workspaces and their Sessions are managed in one drag-and-drop view, with activity, status and Tool Calls counts visible on each Session.
 
-![MrMCP Roots and Sessions view](./assets/mrmcp-screenshot2.png)
+![MrMCP Workspaces and Sessions view](./assets/mrmcp-screenshot2.png)
 
 The desktop window uses Tauriless through the direct Deno import `import { Tauriless } from "npm:@mefistofelix/tauriless";`. Desktop mode keeps one OS process: Tauriless runs on the main OS thread with a ~16 ms Deno drain timer while the backend runs in a Deno Worker/isolate in the same `mrmcp.exe`. MrMCP has no hand-written FFI wrapper, vendored Tauriless native binaries, Node.js application, npm project, CLI scaffold, Rust/Tauri scaffold or Neutralinojs runtime.
 
@@ -46,13 +46,15 @@ Headless backend:
 deno run -A mrmcp.js --backend
 ```
 
-The administration interface normally starts at `http://127.0.0.1:7332/`. Desktop mode starts the backend in a Deno Worker in the same OS process, waits for a typed `ready` message, creates the `main` Tauriless webview window on the main OS thread, and opens the authenticated loopback URL returned by the backend. Deno drains Tauriless every ~16 ms; when the window is destroyed, MrMCP sends the Worker a graceful `shutdown` request before terminating the isolate as a bounded fallback, closes Tauriless and exits. The initial window size is 1180×760. This is the first Tauriless integration step; a later asset-protocol step can make the local GUI non-networked and remove its session/CSRF layer.
+The administration interface is local-only and opens no GUI network listener. Desktop mode starts the backend in a Deno Worker in the same OS process, waits for a typed `ready` message, removes unused Tauriless forwarded-event subscriptions before the WebView exists, creates the `main` Tauriless webview window on the main OS thread, and serves `index.html` through Tauriless' `asset-request` / `tauriless:asset-response` protocol. Only close-requested, destroyed, native directory drop and the built-in `tauriless://webview-message` host event remain subscribed. Small GUI assets are embedded in the local HTML response. Browser text edits are coalesced before crossing the event bridge; actions, changes, blur, submit and navigation flush pending edits first. Rendered Eta HTML returns through the Tauri event bus before Morphlex applies it. There is no GUI login token, cookie, session or CSRF layer. Deno drains Tauriless every ~16 ms; when the window is destroyed, MrMCP gracefully shuts down the Worker, closes Tauriless and exits. The main window is created hidden, forced to a logical 1180×760 inner size, centered and only then shown.
 
-Listener ports are runtime-resolved without changing configuration. If GUI 7332, HTTP 80 or HTTPS 443 is already occupied, that listener retries at `base + 50` repeatedly until it binds (for example 7332→7382, 80→130, 443→493). The compact header groups version, live/fallback state and effective ports in public-first order HTTP/HTTPS/GUI, recently active Sessions with `#id(total Tool Calls)`, and Tool Calls total/in-flight/error/invalid counts. Useful header values are server-routed shortcuts: ports open Settings, active opens all Sessions, a recent `#Session` opens that Session's Tool Calls, and in-flight/total/errors/invalid open Tool Calls filtered to running/all/failed/invalid. Every shortcut only sends a normalized input; Deno updates `uiState` and Eta renders the result through the normal SSE/Morphlex pipeline. Related values use semantic text colors: active green, in-flight yellow, errors red, invalid purple and totals/session counters blue-neutral. A Session is considered active when it has started a Tool Call within the last five minutes; at most the four most recently active Sessions are listed. ACME HTTP-01 is available only when the effective HTTP listener is still port 80; fallback instances may reuse existing certificates but cannot perform HTTP-01 issuance on the fallback HTTP port.
+Desktop mode also sets a native MrMCP window icon and creates a system-tray icon whose menu contains only **Quit**. A left click on the tray toggles the main window between visible and hidden; clicking the window X hides it without terminating MrMCP. Native directory drag/drop automatically adds enabled Workspaces: non-directory drops are ignored, an already configured effective path is a no-op, and the globally unique Workspace name uses the final directory name with the first free `Name`, `Name #2`, `Name #3`, ... form. Desktop mode also shows an OS notification whenever a remote MCP client opens a new Session.
+
+Public listener ports are runtime-resolved without changing configuration. If HTTP 80 or HTTPS 443 is already occupied, that listener retries at `base + 50` repeatedly until it binds (for example 80→130 or 443→493). The GUI has no listener or fallback port. The compact header groups version, live/fallback state and effective HTTP/HTTPS ports, recently active Sessions with `#id(total Tool Calls)`, and Tool Calls total/in-flight/error/invalid counts. Useful header values are server-routed shortcuts: ports open Settings, active opens all Sessions, a recent `#Session` opens that Session's Tool Calls, and in-flight/total/errors/invalid open Tool Calls filtered to running/all/failed/invalid. Every shortcut only sends a normalized Tauri event; Deno updates `uiState` and Eta renders the result through the normal Tauri-event/Morphlex pipeline. Related values use semantic text colors: active green, in-flight yellow, errors red, invalid purple and totals/session counters blue-neutral. A Session is considered active when it has started a Tool Call within the last five minutes; at most the four most recently active Sessions are listed. ACME HTTP-01 is available only when the effective HTTP listener is still port 80; fallback instances may reuse existing certificates but cannot perform HTTP-01 issuance on the fallback HTTP port.
 
 Port fallback only resolves listener collisions; it does not isolate application data. Parallel MrMCP instances intended for testing should be run from separate program directories so each has its own `.mrmcp` data directory and editable `commands.yaml`.
 
-The authenticated GUI serves `assets/` uniformly under `/assets/`. MCP `serverInfo` also advertises the MrMCP PNG logo at `${publicBase()}/mrmcp-icon.png`; that exact read-only HTTPS path is intentionally public so clients can fetch the icon without credentials, while ordinary `/assets/...` routes stay authenticated. With `deno run`, assets come directly from the repository `assets/` directory. Standalone builds embed that directory with `deno compile --include assets`, so the WebView and public icon use the same versioned files. `commands.yaml` is not a WebView asset: compile it separately with `--include commands.yaml`; on first standalone backend startup, MrMCP copies the embedded template beside the executable only if no editable physical `commands.yaml` exists there.
+The local GUI does not expose `/assets/...` routes. Its small CSS, Morphlex bootstrap and logo data are delivered inside the Tauriless local asset response. MCP `serverInfo` still advertises the MrMCP PNG logo at `${publicBase()}/mrmcp-icon.png`; that exact read-only HTTPS path is intentionally public so remote clients can fetch the icon. With `deno run`, source assets come from the repository `assets/` directory. Standalone builds embed that directory with `deno compile --include assets`, so the local GUI and public icon still use the same versioned files. `commands.yaml` is not a WebView asset: compile it separately with `--include commands.yaml`; on first standalone backend startup, MrMCP copies the embedded template beside the executable only if no editable physical `commands.yaml` exists there.
 
 Windows standalone build:
 
@@ -74,16 +76,16 @@ References:
 - [SEP-2567 — Sessionless MCP via Explicit State Handles](https://modelcontextprotocol.io/seps/2567-sessionless-mcp)
 - [SEP-2575 — Make MCP Stateless](https://modelcontextprotocol.io/seps/2575-stateless-mcp)
 
-MrMCP implements that application-level pattern with an explicit `create_context` tool and a required `context_handle` argument on every other tool. The handle is an opaque bearer capability, not a transport session identifier.
+MrMCP implements that application-level pattern with `open_workspace(name)`. A Workspace name is globally unique; opening one creates a new persistent Session already attached to that Workspace and returns its opaque `context_handle`. Every later tool requires that handle.
 
-### Create and reuse a context
+### Open a Workspace and reuse the Session
 
-1. Call `create_context` without `context_handle`.
-2. MrMCP creates and returns a globally unique, unguessable `ctx_...` value.
-3. Call `context_info` with that handle before repository work.
-4. `context_info` returns the current absolute root and, when present, the root-level `AGENTS.md` or `agents.md` path to read and follow.
-5. Pass the exact handle unchanged in `context_handle` on every later MrMCP tool call. Call `context_info` again after the operator changes the Session root.
-6. A missing, unknown or expired handle does not execute the requested operation and does not mint a replacement automatically. Recover with `create_context`, then repeat the requested call.
+1. Call `open_workspace` with the exact enabled Workspace `name`; it does not accept `context_handle`.
+2. MrMCP creates a new Session attached to that Workspace and returns a globally unique, unguessable `ctx_...` value plus the Workspace name and absolute `cwd`.
+3. Call `workspace_info` with that handle before repository work.
+4. `workspace_info` returns `workspace_name`, the absolute Workspace `cwd` and, when present, the Workspace-level `AGENTS.md` or `agents.md` path to read and follow.
+5. Pass the exact handle unchanged in `context_handle` on every later MrMCP tool call. Call `workspace_info` again after the operator changes the Session Workspace.
+6. A missing, unknown or expired handle does not execute the requested operation and does not mint a replacement automatically. Recover with `open_workspace(name)`, then repeat the requested call.
 
 Successful tool results repeat only the bearer capability as common metadata:
 
@@ -93,15 +95,15 @@ Successful tool results repeat only the bearer capability as common metadata:
 }
 ```
 
-A missing, invalid or expired handle returns `isError: true` with an `error` message explaining that `create_context` must be called. No replacement handle is minted automatically. Contexts expire after 30 days without activity.
+A missing, invalid or expired handle returns `isError: true` with an `error` message explaining that `open_workspace` must be called with a Workspace name. No replacement handle is minted automatically. Sessions expire after 30 days without activity.
 
-The handle itself selects the context after authentication. MrMCP does not bind contexts, processes or JavaScript kernels to the OAuth client or Basic credential that created them. Any authenticated client possessing a valid handle can use that context. The context row records best-effort metadata about the client that created it (authentication kind, OAuth client id/name when available, and User-Agent) for operator visibility only; those fields are not authorization or ownership controls.
+The handle itself selects the Session after authentication. MrMCP does not bind Sessions, processes or JavaScript kernels to the OAuth client or Basic credential that created them. Any authenticated client possessing a valid handle can use that Session. The Session row records best-effort metadata about the client that created it (authentication kind, OAuth client id/name when available, and User-Agent) for operator visibility only; those fields are not authorization or ownership controls.
 
 ### Why the GUI says “Sessions”
 
-The administration interface labels contexts **Sessions** because that is convenient for operators. Each row is identified in the GUI by a short numeric primary key; the long `ctx_...` bearer capability remains internal to MCP calls. This is only a GUI term. MrMCP does not implement protocol sessions and does not use `Mcp-Session-Id`.
+The administration interface labels persistent application handles **Sessions**. Each row is identified in the GUI by a short numeric primary key; the long `ctx_...` bearer capability remains the MCP tool capability. MrMCP still does not implement transport sessions and does not use `Mcp-Session-Id`.
 
-The Sessions table also shows best-effort creation-client metadata. MCP does not reliably expose the ChatGPT model or thinking/reasoning level, so MrMCP does not invent those values. Changing model or thinking level in the same ChatGPT conversation may cause ChatGPT to create another MCP context, so the same GUI Session is not guaranteed to persist across such changes.
+The Sessions table also shows best-effort creation-client metadata. MCP does not reliably expose the ChatGPT model or thinking/reasoning level, so MrMCP does not invent those values. Changing model or thinking level in the same ChatGPT conversation may cause ChatGPT to open another MrMCP Session, so the same GUI Session is not guaranteed to persist across such changes.
 
 ## Authentication and tool access
 
@@ -125,34 +127,31 @@ SQLite is treated directly as persistent application state; MrMCP does not maint
 - There are no `ALTER TABLE` migrations, backfills, aliases, old-key imports or legacy identifier acceptance.
 - Startup still verifies the columns that current code actually requires. If an existing table has an incompatible shape, stop MrMCP and recreate `.mrmcp/mrmcp.sqlite` rather than adding compatibility code.
 
-The current schema gives every context a numeric administrative primary key in `contexts.id` while retaining a unique opaque `context_handle` for MCP calls. Tool-call and process rows store both the numeric `context_id` snapshot used by the GUI and the opaque handle used by the protocol. Contexts additionally store the creation authentication kind, OAuth client id/name when available, and User-Agent as observational GUI metadata. A context stores exactly one current `root_id`; root id `0` denotes the program directory.
+The current schema gives every Session a numeric administrative primary key in `contexts.id` while retaining a unique opaque `context_handle` for MCP calls. Tool-call and process rows store both the numeric `context_id` snapshot used by the GUI and the opaque handle used by tools. Sessions additionally store creation authentication kind, OAuth client id/name when available, and User-Agent as observational GUI metadata. Internally each Session stores one current `root_id`; that legacy persistence name is not exposed as MCP terminology. Named Workspace names are globally unique with `UNIQUE(name)`. Internal id `0` denotes the program-directory fallback for an existing Session whose Workspace was removed or disabled; `open_workspace` never opens a new Session into that fallback.
 
-## Roots and filesystem isolation
+## Workspaces and filesystem isolation
 
-The Roots page lets the operator register named directories and assign one current root to each Session. Root paths may be absolute or relative; MrMCP stores the entered value unchanged, and resolves relative roots against the program folder only when the Root is actually used. Path existence/type validation runs when the path field loses focus and never blocks saving; invalid named-root paths are shown in red anywhere the administrative UI displays them. The page is split into **📁 Roots** on the left and **💬 Sessions** with **No root assigned** on the right. Each named-root card contains its current Session assignments. Session drag items keep the first line to Session id/client only and render Created, Last Activity, Status and `Tool Calls: N` together as compact metadata underneath; generic OAuth text is omitted there. The Default-root card explains that unassigned Sessions use the program folder without printing that folder's absolute path.
+The Workspaces page registers named directories and shows the Sessions currently attached to each Workspace. Workspace names are globally unique. Paths may be absolute or relative; MrMCP stores the entered value unchanged and resolves relative paths against the program folder only when the Workspace is actually used. Name/path errors are shown inline beside the field and disable Save; browser-native validation bubbles and error popups are not used. Path existence/type validation runs when the path field loses focus.
 
-- Drag a Session from the right-hand Sessions column into a named root to assign it.
-- Drag a Session from a named root back to the right-hand Sessions column to remove its named-root association; root id `0` is stored immediately.
-- Dragging directly between named roots reassigns the Session in one step.
-- Disabled roots remain visible for editing/deletion but cannot receive Sessions.
-- The Sessions page shows the current root name and path as read-only information; assignment is performed only from Roots.
-- A root may be assigned to any number of contexts.
-- Every context always has exactly one effective root.
-- A new context starts on the fallback root beside `mrmcp.js`.
-- Changing a Session's root affects new tool calls immediately.
-- Existing background or interactive processes continue in the directory where they started.
-- Disabling or deleting a root moves currently associated contexts to the fallback root without terminating processes.
+- `open_workspace(name)` creates a new Session directly in an enabled named Workspace.
+- Dragging an existing Session between Workspace cards reassigns it in one step.
+- The program-folder fallback bucket is available only for existing Sessions whose named Workspace is removed/disabled or explicitly cleared by the operator; it is not a valid `open_workspace` target.
+- Disabled Workspaces remain visible for editing/deletion but cannot be opened or receive Sessions.
+- The Sessions page shows the current Workspace name and path as read-only information; reassignment is performed from Workspaces.
+- A Workspace may be assigned to any number of Sessions, while every Session has exactly one effective Workspace/fallback directory.
+- Changing a Session's Workspace affects new tool calls immediately; existing background or interactive processes continue in the directory where they started.
+- Disabling or deleting a Workspace moves currently associated Sessions to the program-folder fallback without terminating processes.
 
-The public `context_info` tool returns the absolute root directory currently assigned to the supplied context plus a nullable absolute `agent_guidance_path`. A non-null path means guidance is present; no separate boolean is needed. MrMCP checks only the root-level `AGENTS.md`, then `agents.md`; it does not scan parent or child directories. When the path is present, the agent must read and follow that file before modifying the repository. Root identifiers, available roots and other administrative metadata are not exposed through MCP tools.
+The public `workspace_info` tool returns `workspace_name`, the absolute Workspace `cwd` and a nullable absolute `agent_guidance_path`. MrMCP checks only that Workspace's `AGENTS.md`, then `agents.md`; it does not scan parent or child directories. When the path is present, the agent must read and follow that file before modifying the repository. Internal Workspace ids and fallback metadata are not exposed by this tool.
 
-All relative paths and new child-process working directories must remain inside the root captured at the start of the tool call.
+All relative paths and new child-process working directories must remain inside the Workspace captured at the start of the tool call.
 
 ## Built-in tools
 
-Context and location:
+Session and Workspace:
 
-- `create_context`;
-- `context_info`;
+- `open_workspace` — requires the globally unique enabled Workspace `name` and creates a new Session attached to it;
+- `workspace_info` — returns the current Workspace name, absolute `cwd` and optional Workspace-level guidance path;
 - `query_tool_calls` — query calls that actually reached MrMCP for the same `context_handle`, with exact tool/status filters, literal full-record text search, stable backward pagination and a bounded result limit.
 
 Filesystem and text:
@@ -180,7 +179,7 @@ Managed termination uses the child-process API supplied by Deno/Node directly; M
 
 `query_tool_calls` reads only the supplied Session's `context_handle` history and excludes its own currently running call. `limit` defaults to 10 and is bounded to 1–50; `tool` and `status` are exact filters; `query` is a case-insensitive literal substring search across the complete stored log row; `before_id` returns only older stable log ids for backward pagination. Filters can be combined. The tool proves which requests reached MrMCP and shows their input, resolved result/output, status, timing and errors. Requests that reach MrMCP but fail protocol, tool-name, context or input-schema validation are recorded as `invalid`, never executed, and retain the received input plus the MCP/JSON-RPC error result returned to the client where a response body exists. Published tool input schemas remain strict; MrMCP mirrors the same validation server-side only as a defensive diagnostic layer for clients that send invalid calls anyway. A request rejected by a client/platform wrapper before MCP dispatch cannot be present, and MrMCP cannot expose an upstream reason code that was never delivered to the server.
 
-`trash_paths` is the removal path for files and directories. It accepts explicit root-relative `paths`, an optional root-relative `glob`, or both. Each call creates `.mrmcp/trash/<action_id>/` plus sibling metadata `.mrmcp/trash/<action_id>.json` inside the selected Root; the action id is the local date/time to the second with `-2`, `-3`, ... added only on collision. `.mrmcp` is reserved metadata and is excluded from trash selections/globs. Nested selections are collapsed so moving a selected directory does not separately move its children. `untrash_action(action_id)` restores the whole action or restores nothing: it preflights every original target first and rolls back any moves if a restore step fails. MrMCP intentionally exposes no permanent filesystem-delete tool; removal is reversible through trash actions.
+`trash_paths` is the removal path for files and directories. It accepts explicit Workspace-relative `paths`, an optional Workspace-relative `glob`, or both. Each call creates `.mrmcp/trash/<action_id>/` plus sibling metadata `.mrmcp/trash/<action_id>.json` inside the selected Workspace; the action id is the local date/time to the second with `-2`, `-3`, ... added only on collision. `.mrmcp` is reserved metadata and is excluded from trash selections/globs. Nested selections are collapsed so moving a selected directory does not separately move its children. `untrash_action(action_id)` restores the whole action or restores nothing: it preflights every original target first and rolls back any moves if a restore step fails. MrMCP intentionally exposes no permanent filesystem-delete tool; removal is reversible through trash actions.
 
 `glob`, `grep` and `replace` are intended to remove the need for improvised `uv`, Python or shell scripts during ordinary repository work:
 
@@ -190,7 +189,7 @@ Managed termination uses the child-process API supplied by Deno/Node directly; M
 
 Every built-in tool publishes a strict tool-specific output schema. The only common field is `context_handle`; failed calls additionally use `isError: true` and an `error` string. Internal log identifiers and derived status flags are not exposed through tool results.
 
-JavaScript kernels are created lazily and keyed by `(context_handle, root_id)`. Switching a Session to another root uses or creates that context-root kernel; switching back reuses its previous state. Different contexts never share JavaScript globals even when they use the same root.
+JavaScript kernels are created lazily and keyed internally by `(context_handle, root_id)`. Switching a Session to another Workspace uses or creates that Session-Workspace kernel; switching back reuses its previous state. Different Sessions never share JavaScript globals even when they use the same Workspace.
 
 Custom commands are described in `commands.yaml` and resolve below `.mrmcp/bin`. Executables found directly in that directory are also discoverable.
 
@@ -229,7 +228,7 @@ The interface contains:
 - Dashboard;
 - Clients;
 - Sessions;
-- Roots;
+- Workspaces;
 - Tool Calls;
 - Commands;
 - HTTP Log;
@@ -250,25 +249,25 @@ The backend keeps one ephemeral `uiState` object containing:
 - command search, page, page size and availability filter;
 - Tool-call query, Session-PK/status filters, numbered page and expanded database primary key;
 - HTTP-debug filters and expanded database primary key;
-- active dialog, confirmation or message;
-- in-progress Root, Command and Settings drafts;
+- active confirmation/form dialog and non-modal notice balloon;
+- in-progress Workspace, Command and Settings drafts plus inline validation state;
 - self-test output and the last processed browser-input sequence.
 
 The WebView does not keep an application-state object and does not query administrative JSON endpoints. Its responsibilities are deliberately narrow:
 
-1. delegate click, change, input, blur/focus, submit, keyboard, scroll and native drag/drop events;
-2. serialize those events and send them to Deno over `/api/ui-input` WebSocket; the drag data carries only the numeric Session PK and never mutates visible DOM state;
-3. receive complete server-rendered UI HTML over `/api/events` SSE;
+1. delegate click, change, input, blur/focus, submit, keyboard and scroll events;
+2. serialize those events and emit them through Tauri `plugin:event|emit`; text-input drafts are coalesced before crossing to the host, while action/blur/change/submit/navigation flush pending input first so no final edit can be lost; internal Session-to-Workspace drag data still carries only the numeric Session PK and never mutates visible DOM state;
+3. receive complete server-rendered UI payloads from the host through Tauri `plugin:event|listen` / `plugin:event|emit_to`;
 4. apply the HTML to `#app` with Morphlex;
 5. restore the scroll and focus values supplied by Deno.
 
 Deno processes browser events sequentially. It updates `uiState`, executes database/filesystem/process actions, and schedules a render only when required. MCP calls, process changes, logs, OAuth changes, TLS changes and other backend subsystems use the same render scheduler.
 
-Rendering is queued rather than performed synchronously inside the triggering operation. A short throttle coalesces bursts, only one render runs at a time, and additional requests received during a render cause one subsequent pass. Eta rendering uses its asynchronous API when available. When rendering completes, Deno broadcasts one `render` SSE event containing the full `#app` HTML and the authoritative scroll/focus metadata.
+Rendering is queued rather than performed synchronously inside the triggering operation. A short throttle coalesces bursts, only one render runs at a time, and additional requests received during a render cause one subsequent pass. Eta rendering uses its asynchronous API when available. When rendering completes, the Worker posts the full `#app` HTML and authoritative scroll/focus metadata to the main thread, which emits it to the WebView through Tauri.
 
 Eta chooses the active section with a conditional. `buildUiRenderModel()` queries only the data required by that section, then Eta renders the sidebar, active section, dialogs and section-specific rows. Inactive sections are neither rendered nor queried. Expanded Tool-call and HTTP rows are identified by their unique database primary key and are reconstructed by Eta after relevant backend events.
 
-Native confirmation and alert state is not kept in the browser. Confirmations, errors and forms are represented in Deno `uiState`; Eta alone decides whether every Root, Command, Confirm or Message dialog exists and renders it with the `open` attribute. The browser never calls `showModal()` or otherwise opens/closes dialogs imperatively; a CSS overlay provides modal presentation and Escape is only transported back to Deno as a close intent. The browser may perform a local clipboard write and may use the native drag `DataTransfer` object transiently to carry a Session PK to a root drop target; neither operation carries persistent or graphical application state.
+Confirmation and form state is not kept in the browser. Eta alone decides whether each Workspace, Command or Confirm dialog exists and renders it with the `open` attribute. Field errors are Deno-owned inline red messages beside the relevant field and keep Save disabled until valid; generic operational failures use a small non-modal Deno-owned red notice balloon rather than an alert/error dialog. The browser never calls `alert()`, `confirm()`, `showModal()` or otherwise opens/closes application dialogs imperatively; a CSS overlay provides modal confirmation/form presentation and Escape is only transported back to Deno as a close intent. The browser may perform a local clipboard write and may use native `DataTransfer` transiently to carry a Session PK to a Workspace drop target; neither operation carries persistent or graphical application state.
 
 ### Help
 
@@ -290,21 +289,38 @@ The Tool Calls page supports:
 
 ## TLS and connectivity
 
-MrMCP uses these base listener ports, with runtime `+50` fallback when a port is already occupied:
+MrMCP uses these base public listener ports, with runtime `+50` fallback when a port is already occupied:
 
 - HTTP 80 for ACME HTTP-01 challenges;
-- HTTPS 443 for MCP, OAuth and metadata;
-- loopback GUI 7332 for the administration UI.
+- HTTPS 443 for MCP, OAuth and metadata.
+
+The desktop GUI uses Tauriless local assets and opens no TCP listener.
 
 Fallback ports are runtime-only and never rewrite configuration. ACME HTTP-01 remains available only while the effective HTTP port is 80.
 
 The Settings and Dashboard pages display listener state, active certificate, validity, trust, expiry, ACME request history, backoff and next attempt. A valid certificate already stored in `.mrmcp` is reused.
 
-Settings also provides **Clear Operational Data**. It preserves authentication state, Sessions/contexts, Roots, server settings and registered tools, while deleting Tool Calls/search index rows, managed-process history, HTTP debug logs and persisted `publish_html` documents, and resetting request metrics. The Dashboard Trash card shows the trash actions that currently exist on disk and provides **Empty Trash**, which permanently removes the contents of `.mrmcp/trash` under the program folder and every configured Root without touching other root data. Untrash remains historical activity.
+Settings also provides **Clear Operational Data**. It preserves authentication state, Sessions, Workspaces, server settings and registered tools, while deleting Tool Calls/search index rows, managed-process history, HTTP debug logs and persisted `publish_html` documents, and resetting request metrics. The Dashboard Trash card shows the trash actions that currently exist on disk and provides **Empty Trash**, which permanently removes the contents of `.mrmcp/trash` under the program folder and every configured Workspace without touching other Workspace data. Untrash remains historical activity.
 
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### Unreleased
+
+### 0.10.84
+
+- Moved the desktop GUI from authenticated loopback HTTP to Tauriless' local asset protocol, eliminating GUI port 7332, login/session cookies, CSRF and the WebSocket/SSE transport.
+- Replaced GUI transport with the Tauri event bus: WebView inputs use `plugin:event|emit`, the backend Worker remains authoritative, and rendered Eta payloads return through `plugin:event|emit_to` before Morphlex applies them.
+- Added the native window icon and OS notification for newly created remote Sessions; reduced the tray menu to Quit, made left tray clicks toggle show/hide, and made the window X hide rather than exit.
+- Renamed the user-facing directory model from Roots to globally named **Workspaces**. `roots`/`root_id` remain internal persistence names, while `roots.name` is now `UNIQUE(name)`.
+- Replaced `create_context` / `context_info` with `open_workspace(name)` / `workspace_info`; opening a Workspace now creates a new Session already attached to it.
+- Changed native directory drops to add Workspaces automatically, ignoring files and already-configured paths; generated names use the first free `Name`, `Name #2`, `Name #3`, ... value.
+- Replaced error/message popups with inline field validation and disabled Save actions; generic operational failures use non-modal notice balloons.
+- Enriched HTTP Log rows with Session id, client id and per-IP request totals, removed remote ports, and redesigned expanded HTTP details into structured Request/Response panels.
+- Reduced Tauriless host event traffic by unsubscribing 16 unused initial events before WebView creation and using the built-in `tauriless://webview-message` event. Browser text input is coalesced before host delivery while action/blur/change/submit/navigation flush pending edits first.
+- Force the initial Tauriless inner window size to logical 1180×760 before showing the window, then center it.
+- Removed the decorative puzzle emoji from the native window title; it is now simply `MrMCP <version>`.
 
 ### 0.10.83
 
