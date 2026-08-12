@@ -1,9 +1,9 @@
 /*
-MrMCP 0.10.82 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and an embedded WebView desktop window.
+MrMCP 0.10.83 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and a Tauriless desktop window.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
-GUI library: jsr:@webview/webview@0.9.0, imported directly by Deno.
+GUI library: Tauriless, imported directly from npm by Deno.
 */
 
 import { DatabaseSync } from "node:sqlite";
@@ -17,6 +17,7 @@ import { isIP } from "node:net";
 import { Eta } from "jsr:@bgub/eta@4.6.0";
 import { parse as parseYaml, stringify as stringifyYaml } from "jsr:@std/yaml@1.1.2";
 import { contentType as mediaContentType, typeByExtension } from "jsr:@std/media-types@1.1.0";
+import { Tauriless } from "npm:@mefistofelix/tauriless";
 
 const SELF = new URL(import.meta.url);
 const IS_BACKEND_WORKER = globalThis.name === "mrmcp-backend";
@@ -43,7 +44,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.82";
+const VERSION = "0.10.83";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CONTEXT_HANDLE_INPUT_DESCRIPTION = "Required opaque capability returned by create_context. Pass the exact value unchanged; never invent, modify, shorten, derive or substitute it.";
@@ -355,7 +356,7 @@ async function backend() {
         const message = htmlEscape(String(error?.stack || error));
         const payload = JSON.stringify({
           revision: ++uiRevision,
-          html: `<div id="app" data-section="${htmlEscape(uiState.currentSection)}"><header><div class=brand><img class=brand-mark src="/assets/mrmcp-logo.svg" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div></header><main style="margin-left:0"><div class="card tls-alert"><h2>UI Render Failed</h2><pre>${message}</pre></div></main></div>`,
+          html: `<div id="app" data-section="${htmlEscape(uiState.currentSection)}"><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div></header><main style="margin-left:0"><div class="card tls-alert"><h2>UI Render Failed</h2><pre>${message}</pre></div></main></div>`,
           section: uiState.currentSection,
           scroll: [0, 0], focus: null, ack: uiState.lastInputSequence,
           reason: "render-error", at: Date.now(),
@@ -3170,8 +3171,9 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         resolve({ success: code === 0, code: code ?? -1, signal: signal || null });
       });
     });
+    const pid = Number(child.pid);
     return {
-      pid: child.pid,
+      pid: Number.isSafeInteger(pid) && pid > 0 ? pid : null,
       stdin: Writable.toWeb(child.stdin),
       stdout: Readable.toWeb(child.stdout),
       stderr: Readable.toWeb(child.stderr),
@@ -4631,7 +4633,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 
   const hasSession = req => (req.headers.get("cookie") || "").split(/;\s*/)
     .some(x => x === `mrmcp_session=${SESSION}`);
-  const requireApi = req => hasSession(req) && (req.method === "GET" || req.headers.get("x-mrmcp-csrf") === CSRF);
+  const requireApi = (req, u) => req.method === "GET"
+    ? (hasSession(req) || u?.searchParams.get("csrf") === CSRF)
+    : hasSession(req) && req.headers.get("x-mrmcp-csrf") === CSRF;
   function serverBasicUrl(p) {
     if (!p.basic_enabled) return "";
     const password = openSecret(p.basic_secret_enc);
@@ -5172,7 +5176,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const banner = uiState.notice
       ? `<div id=errorBanner class=banner style="display:block">${htmlEscape(uiState.notice.message || "")}</div>`
       : `<div id=errorBanner class=banner></div>`;
-    return `<div id="app" data-section="${htmlEscape(section)}"><header><div class=brand><img class=brand-mark src="/assets/mrmcp-logo.svg" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div><div id=uiStatus class=status>${status}</div></header>${banner}<aside><div id=sidebar>${sidebar}</div></aside><main><div id=mainView>${view}</div></main><div id=dialogHost>${dialogs}</div></div>`;
+    return `<div id="app" data-section="${htmlEscape(section)}"><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div><div id=uiStatus class=status>${status}</div></header>${banner}<aside><div id=sidebar>${sidebar}</div></aside><main><div id=mainView>${view}</div></main><div id=dialogHost>${dialogs}</div></div>`;
   }
 
   function uiMessage(title, message) {
@@ -5587,7 +5591,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 
 
   async function guiApi(req, u) {
-    if (!requireApi(req)) return json({ error: "Unauthorized" }, 401);
+    if (!requireApi(req, u)) return json({ error: "Unauthorized" }, 401);
     if (u.pathname === "/api/events" && req.method === "GET") return uiEventStream();
     if (u.pathname === "/api/ui-input" && req.method === "GET") {
       const { socket, response } = Deno.upgradeWebSocket(req);
@@ -5929,24 +5933,30 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   }
 
   // Eta renders server-side only. Browser assets are served from assets/ on disk or from Deno's compiled virtual filesystem.
-  const UI_CSP = "default-src 'self';base-uri 'none';object-src 'none';frame-ancestors 'self' http://127.0.0.1:*;form-action 'self';style-src 'unsafe-inline';script-src 'self';connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:* ws://localhost:*;img-src 'self' data:";
+  const UI_SCRIPT_NONCE = randomToken();
+  const GUI_LOGO_DATA_URL = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(Deno.readTextFileSync(join(ASSETS_DIR, "mrmcp-logo.svg")))}`;
+  const GUI_MORPHLEX_JS = Deno.readTextFileSync(join(ASSETS_DIR, "morphlex.js"))
+    .replace(/\nexport \{\n  morphInner,\n  morphDocument,\n  morph\n\};[\s\S]*$/, "");
+  const UI_CSP = `default-src 'self';base-uri 'none';object-src 'none';frame-ancestors 'self' http://127.0.0.1:*;form-action 'self';style-src 'unsafe-inline';script-src 'self' 'nonce-${UI_SCRIPT_NONCE}';connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:* ws://localhost:*;img-src 'self' data:`;
   const UI_TEMPLATE = String.raw`<!doctype html><html><head><meta charset=utf-8>
 <meta name=mrmcp-csrf content="__MRMCP_CSRF__">
 <meta http-equiv="Content-Security-Policy" content="${UI_CSP}">
-<meta name=viewport content="width=device-width,initial-scale=1"><link rel=icon href="/assets/mrmcp-logo.svg"><title>MrMCP</title><style>
+<meta name=viewport content="width=device-width,initial-scale=1"><link rel=icon href="${GUI_LOGO_DATA_URL}"><title>MrMCP</title><style>
 :root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}aside button{display:block;width:100%;text-align:left;margin:3px 0;background:transparent;border:0}aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.banner{display:none;margin-left:170px;padding:9px 18px;background:#5a2020;color:#ffd7d7}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 8px 10px;background:#111318}.detail-panel{border:1px solid #343944;border-radius:8px;background:#0d0f12;padding:10px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.menu-icon{display:inline-block;width:22px;text-align:center}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout{grid-template-columns:1fr}.default-root-card{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){aside{width:130px}main,.banner{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
 </style></head><body>
-<div id=app data-section=dashboard><header><div class=brand><img class=brand-mark src="/assets/mrmcp-logo.svg" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div><div class=status><span class=pending>connecting…</span></div></header><main style="margin-left:0"><div class=card>Connecting to the MrMCP UI service…</div></main></div>
-<script type=module src=/app.js></script></body></html>`;
+<div id=app data-section=dashboard><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div><div class=status><span class=pending>connecting…</span></div></header><main style="margin-left:0"><div class=card>Connecting to the MrMCP UI service…</div></main></div>
+<script type=module nonce="${UI_SCRIPT_NONCE}">__MRMCP_BROWSER_JS__</script></body></html>`;
 
   function browserAppSource() {/*
 import { morphInner } from "/assets/morphlex.js";
 const app = document.getElementById("app");
+const csrf = document.querySelector('meta[name="mrmcp-csrf"]')?.content || "";
 let socket = null, renderStream = null, reconnectTimer = null, scrollTimer = null;
 let sequence = 0, lastSentSequence = 0;
 const outbox = [];
 function wsUrl() {
   const url = new URL("/api/ui-input", location.href);
+  url.searchParams.set("csrf", csrf);
   url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
   return url.href;
 }
@@ -6011,7 +6021,9 @@ function applyRender(payload) {
 }
 function connectRenderStream() {
   renderStream?.close();
-  renderStream = new EventSource("/api/events");
+  const url = new URL("/api/events", location.href);
+  url.searchParams.set("csrf", csrf);
+  renderStream = new EventSource(url.href);
   renderStream.addEventListener("render", event => {
     try { applyRender(JSON.parse(event.data)); }
     catch (error) { console.error("MrMCP render failed", error); }
@@ -6098,9 +6110,11 @@ connectInput();
 connectRenderStream();
 */}
 
-  const BROWSER_JS = browserAppSource.toString().match(/\/\*([\s\S]*)\*\//)[1];
+  const BROWSER_JS = browserAppSource.toString().match(/\/\*([\s\S]*)\*\//)[1]
+    .replace('import { morphInner } from "/assets/morphlex.js";\n', "");
+  const GUI_BROWSER_JS = `${GUI_MORPHLEX_JS}\n${BROWSER_JS}`;
   const PAGE_TEMPLATE = UI_TEMPLATE.replace("__MRMCP_CSRF__", "<?= it.csrf ?>");
-  function ui() { return eta.renderString(PAGE_TEMPLATE, { csrf: CSRF }); }
+  function ui() { return eta.renderString(PAGE_TEMPLATE, { csrf: CSRF }).replace("__MRMCP_BROWSER_JS__", GUI_BROWSER_JS); }
 
   async function guiHandler(req) {
     const u = new URL(req.url);
@@ -6108,6 +6122,7 @@ connectRenderStream();
       status: 302,
       headers: { location: "/", "set-cookie": `mrmcp_session=${SESSION}; HttpOnly; SameSite=Strict; Path=/` },
     });
+    if (u.pathname.startsWith("/api/") && requireApi(req, u)) return await guiApi(req, u);
     if (!hasSession(req)) return text("Unauthorized", 401);
     if (u.pathname.startsWith("/api/")) return await guiApi(req, u);
     if (u.pathname.startsWith("/assets/")) return await staticAssetResponse(u.pathname);
@@ -6227,14 +6242,50 @@ async function stopBackendWorker(worker) {
 }
 async function desktop() {
   const { worker: backendWorker, payload } = await spawnBackendWorker();
+  const tauriless = new Tauriless(), pending = new Map();
+  let nextId = 1, drainTimer = null, closed = false, resolveClosed;
+  const windowClosed = new Promise(resolve => { resolveClosed = resolve; });
+  const request = (cmd, requestPayload = {}) => new Promise((resolve, reject) => {
+    const id = nextId++;
+    pending.set(id, { cmd, resolve, reject });
+    try { tauriless.send({ id, cmd, payload: requestPayload }); }
+    catch (error) { pending.delete(id); reject(error); }
+  });
+  const drain = () => {
+    for (const message of tauriless.drain().messages) {
+      if (message.kind === "result") {
+        const callback = pending.get(message.id);
+        if (!callback) continue;
+        pending.delete(message.id);
+        message.ok ? callback.resolve(message.value)
+          : callback.reject(new Error(`${callback.cmd}: ${JSON.stringify(message.error)}`));
+      } else if (message.kind === "event" && message.window === "main" && message.event === "tauri://destroyed") {
+        resolveClosed();
+      }
+    }
+  };
   try {
-    const { Webview, SizeHint } = await import("jsr:@webview/webview@0.9.0");
-    const webview = new Webview(true, { width: 1180, height: 760, hint: SizeHint.NONE });
-    webview.title = `🧩 MrMCP ${VERSION}`;
-    webview.navigate(payload.gui);
-    webview.run();
+    drainTimer = setInterval(() => {
+      if (closed) return;
+      try { drain(); }
+      catch (error) {
+        closed = true;
+        for (const callback of pending.values()) callback.reject(error);
+        pending.clear();
+        resolveClosed();
+      }
+    }, 16);
+    await request("plugin:webview|create_webview_window", { options: {
+      label: "main", title: `🧩 MrMCP ${VERSION}`, url: payload.gui,
+      width: 1180, height: 760, center: true, visible: true,
+    } });
+    await windowClosed;
   } finally {
-    await stopBackendWorker(backendWorker);
+    closed = true;
+    if (drainTimer) clearInterval(drainTimer);
+    for (const callback of pending.values()) callback.reject(new Error("Tauriless closing"));
+    pending.clear();
+    try { tauriless.close(); } finally { await stopBackendWorker(backendWorker); }
   }
 }
 

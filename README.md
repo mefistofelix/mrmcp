@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.82
+# MrMCP 0.10.83
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a loopback administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit `context_handle` capabilities for persistent application state.
 
@@ -16,7 +16,7 @@ Named roots and unassigned Sessions are managed in one drag-and-drop view, with 
 
 ![MrMCP Roots and Sessions view](./assets/mrmcp-screenshot2.png)
 
-The desktop window uses `jsr:@webview/webview@0.9.0`, imported directly by Deno. Desktop mode keeps one OS process: the WebView runs on the main thread while the backend runs in a Deno Worker/isolate in the same `mrmcp.exe`. The project has no Node.js application, npm install, CLI scaffold, Rust, Tauri or Neutralinojs runtime.
+The desktop window uses Tauriless through the direct Deno import `import { Tauriless } from "npm:@mefistofelix/tauriless";`. Desktop mode keeps one OS process: Tauriless runs on the main OS thread with a ~16 ms Deno drain timer while the backend runs in a Deno Worker/isolate in the same `mrmcp.exe`. MrMCP has no hand-written FFI wrapper, vendored Tauriless native binaries, Node.js application, npm project, CLI scaffold, Rust/Tauri scaffold or Neutralinojs runtime.
 
 ## Project files
 
@@ -31,7 +31,7 @@ The desktop window uses `jsr:@webview/webview@0.9.0`, imported directly by Deno.
 Requirements:
 
 - Deno with `node:sqlite` support.
-- Native dependencies required by `@webview/webview` on the target platform.
+- Tauriless support for the target platform, provided internally by the `@mefistofelix/tauriless` npm package.
 - Permission to listen on ports 80 and 443 when the public listeners are enabled.
 
 Desktop GUI:
@@ -46,7 +46,7 @@ Headless backend:
 deno run -A mrmcp.js --backend
 ```
 
-The administration interface normally starts at `http://127.0.0.1:7332/`. Desktop mode starts the backend in a Deno Worker in the same OS process, waits for a typed `ready` message, opens the authenticated loopback URL in the WebView, and on window close sends the Worker a graceful `shutdown` request before terminating the isolate as a bounded fallback. Once shutdown completes, the desktop process exits immediately. The initial window size is 1180×760.
+The administration interface normally starts at `http://127.0.0.1:7332/`. Desktop mode starts the backend in a Deno Worker in the same OS process, waits for a typed `ready` message, creates the `main` Tauriless webview window on the main OS thread, and opens the authenticated loopback URL returned by the backend. Deno drains Tauriless every ~16 ms; when the window is destroyed, MrMCP sends the Worker a graceful `shutdown` request before terminating the isolate as a bounded fallback, closes Tauriless and exits. The initial window size is 1180×760. This is the first Tauriless integration step; a later asset-protocol step can make the local GUI non-networked and remove its session/CSRF layer.
 
 Listener ports are runtime-resolved without changing configuration. If GUI 7332, HTTP 80 or HTTPS 443 is already occupied, that listener retries at `base + 50` repeatedly until it binds (for example 7332→7382, 80→130, 443→493). The compact header groups version, live/fallback state and effective ports in public-first order HTTP/HTTPS/GUI, recently active Sessions with `#id(total Tool Calls)`, and Tool Calls total/in-flight/error/invalid counts. Useful header values are server-routed shortcuts: ports open Settings, active opens all Sessions, a recent `#Session` opens that Session's Tool Calls, and in-flight/total/errors/invalid open Tool Calls filtered to running/all/failed/invalid. Every shortcut only sends a normalized input; Deno updates `uiState` and Eta renders the result through the normal SSE/Morphlex pipeline. Related values use semantic text colors: active green, in-flight yellow, errors red, invalid purple and totals/session counters blue-neutral. A Session is considered active when it has started a Tool Call within the last five minutes; at most the four most recently active Sessions are listed. ACME HTTP-01 is available only when the effective HTTP listener is still port 80; fallback instances may reuse existing certificates but cannot perform HTTP-01 issuance on the fallback HTTP port.
 
@@ -305,6 +305,14 @@ Settings also provides **Clear Operational Data**. It preserves authentication s
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### 0.10.83
+
+- Replaced the direct `@webview/webview` desktop shell with `Tauriless` imported directly through Deno as `npm:@mefistofelix/tauriless`; the main OS thread now drains Tauriless every ~16 ms while the existing backend remains a named Deno Worker in the same process.
+- Kept this first Tauriless integration on the existing authenticated loopback GUI URL, with window destruction driving graceful Worker shutdown; the next planned step is Tauriless asset-protocol delivery so the local GUI no longer needs a network listener/session/CSRF layer.
+- Hardened GUI bootstrap by embedding the logo, Morphlex and browser bootstrap directly into the authenticated page and allowing the page CSRF capability on persistent GUI GET channels, avoiding WebView subrequest-cookie failures.
+- Normalized the Windows managed-child PID before SQLite persistence so a missing/non-bindable Node-compatible `child.pid` is stored as `NULL` instead of breaking `exec` with a SQLite parameter-binding error.
+- No SQLite schema change.
 
 ### 0.10.82
 
