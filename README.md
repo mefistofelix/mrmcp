@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.84
+# MrMCP 0.10.85
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a local Tauriless administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit Session `context_handle` capabilities.
 
@@ -48,7 +48,7 @@ deno run -A mrmcp.js --backend
 
 The administration interface is local-only and opens no GUI network listener. Desktop mode starts the backend in a Deno Worker in the same OS process, waits for a typed `ready` message, removes unused Tauriless forwarded-event subscriptions before the WebView exists, creates the `main` Tauriless webview window on the main OS thread, and serves `index.html` through Tauriless' `asset-request` / `tauriless:asset-response` protocol. Only close-requested, destroyed, native directory drop and the built-in `tauriless://webview-message` host event remain subscribed. Small GUI assets are embedded in the local HTML response. Browser text edits are coalesced before crossing the event bridge; actions, changes, blur, submit and navigation flush pending edits first. Rendered Eta HTML returns through the Tauri event bus before Morphlex applies it. There is no GUI login token, cookie, session or CSRF layer. Deno drains Tauriless every ~16 ms; when the window is destroyed, MrMCP gracefully shuts down the Worker, closes Tauriless and exits. The main window is created hidden, forced to a logical 1180×760 inner size, centered and only then shown.
 
-Desktop mode also sets a native MrMCP window icon and creates a system-tray icon whose menu contains only **Quit**. A left click on the tray toggles the main window between visible and hidden; clicking the window X hides it without terminating MrMCP. Native directory drag/drop automatically adds enabled Workspaces: non-directory drops are ignored, an already configured effective path is a no-op, and the globally unique Workspace name uses the final directory name with the first free `Name`, `Name #2`, `Name #3`, ... form. Desktop mode also shows an OS notification whenever a remote MCP client opens a new Session.
+Desktop mode also sets a native MrMCP window icon and creates a system-tray icon whose menu contains only **Quit**. A left click on the tray toggles the main window between visible and hidden; if the window is minimized, the tray click restores it and brings it to the foreground instead of hiding it. Clicking the window X hides it without terminating MrMCP. Native directory drag/drop automatically adds enabled Workspaces: non-directory drops are ignored, an already configured effective path is a no-op, and the globally unique Workspace name uses the final directory name with the first free `Name`, `Name #2`, `Name #3`, ... form. A global **Desktop Notifications** setting controls all OS notifications and is enabled by default. When enabled, MrMCP notifies for newly created remote Sessions, incoming Tool Calls, Workspaces added by native directory drop, and dropped directories that already correspond to an existing Workspace. On Windows, before the first WebView is created, MrMCP calls Tauriless `tauriless:set-app-user-model-id` with `Deno.execPath()` and then uses the ordinary Tauri notification plugin; for a standalone build this makes the explicit AppUserModelID the absolute path of `mrmcp.exe`.
 
 Public listener ports are runtime-resolved without changing configuration. If HTTP 80 or HTTPS 443 is already occupied, that listener retries at `base + 50` repeatedly until it binds (for example 80→130 or 443→493). The GUI has no listener or fallback port. The compact header groups version, live/fallback state and effective HTTP/HTTPS ports, recently active Sessions with `#id(total Tool Calls)`, and Tool Calls total/in-flight/error/invalid counts. Useful header values are server-routed shortcuts: ports open Settings, active opens all Sessions, a recent `#Session` opens that Session's Tool Calls, and in-flight/total/errors/invalid open Tool Calls filtered to running/all/failed/invalid. Every shortcut only sends a normalized Tauri event; Deno updates `uiState` and Eta renders the result through the normal Tauri-event/Morphlex pipeline. Related values use semantic text colors: active green, in-flight yellow, errors red, invalid purple and totals/session counters blue-neutral. A Session is considered active when it has started a Tool Call within the last five minutes; at most the four most recently active Sessions are listed. ACME HTTP-01 is available only when the effective HTTP listener is still port 80; fallback instances may reuse existing certificates but cannot perform HTTP-01 issuance on the fallback HTTP port.
 
@@ -76,16 +76,15 @@ References:
 - [SEP-2567 — Sessionless MCP via Explicit State Handles](https://modelcontextprotocol.io/seps/2567-sessionless-mcp)
 - [SEP-2575 — Make MCP Stateless](https://modelcontextprotocol.io/seps/2575-stateless-mcp)
 
-MrMCP implements that application-level pattern with `open_workspace(name)`. A Workspace name is globally unique; opening one creates a new persistent Session already attached to that Workspace and returns its opaque `context_handle`. Every later tool requires that handle.
+MrMCP implements that application-level pattern with `open_workspace(name, current_context_handle?)`. A Workspace name is globally unique. With a valid active `current_context_handle`, opening a Workspace moves that same persistent Session to the Workspace and preserves its handle; with an omitted, empty, unknown or expired value, MrMCP creates a new Session there. Every later tool requires the returned handle.
 
 ### Open a Workspace and reuse the Session
 
-1. Call `open_workspace` with the exact enabled Workspace `name`; it does not accept `context_handle`.
-2. MrMCP creates a new Session attached to that Workspace and returns a globally unique, unguessable `ctx_...` value plus the Workspace name and absolute `cwd`.
-3. Call `workspace_info` with that handle before repository work.
-4. `workspace_info` returns `workspace_name`, the absolute Workspace `cwd` and, when present, the Workspace-level `AGENTS.md` or `agents.md` path to read and follow.
-5. Pass the exact handle unchanged in `context_handle` on every later MrMCP tool call. Call `workspace_info` again after the operator changes the Session Workspace.
-6. A missing, unknown or expired handle does not execute the requested operation and does not mint a replacement automatically. Recover with `open_workspace(name)`, then repeat the requested call.
+1. Call `open_workspace` with the exact enabled Workspace `name`. Optionally pass the Session you are already using as `current_context_handle`.
+2. If `current_context_handle` is active, MrMCP moves that same Session to the named Workspace and returns the same `ctx_...` handle. If it is omitted, empty, unknown or expired, MrMCP creates a new Session in that Workspace and returns its new globally unique, unguessable handle.
+3. The `open_workspace` result includes `workspace_name`, the absolute Workspace `cwd` and, when present, `agent_guidance_path` pointing to the Workspace-level `AGENTS.md` or `agents.md`; read and follow that file before repository work.
+4. Pass the exact returned handle unchanged in `context_handle` on every later MrMCP tool call. To switch Workspaces from MCP, call `open_workspace` again with that handle as `current_context_handle`.
+5. For tools other than `open_workspace`, a missing, unknown or expired required `context_handle` does not execute the requested operation and never mints a replacement automatically.
 
 Successful tool results repeat only the bearer capability as common metadata:
 
@@ -95,7 +94,7 @@ Successful tool results repeat only the bearer capability as common metadata:
 }
 ```
 
-A missing, invalid or expired handle returns `isError: true` with an `error` message explaining that `open_workspace` must be called with a Workspace name. No replacement handle is minted automatically. Sessions expire after 30 days without activity.
+For tools that require `context_handle`, a missing, invalid or expired handle returns `isError: true` with an `error` message explaining that `open_workspace` must be called with a Workspace name. Those calls never mint a replacement automatically. `open_workspace` itself treats an omitted, empty, unknown or expired `current_context_handle` as a request for a new Session. Sessions expire after 30 days without activity.
 
 The handle itself selects the Session after authentication. MrMCP does not bind Sessions, processes or JavaScript kernels to the OAuth client or Basic credential that created them. Any authenticated client possessing a valid handle can use that Session. The Session row records best-effort metadata about the client that created it (authentication kind, OAuth client id/name when available, and User-Agent) for operator visibility only; those fields are not authorization or ownership controls.
 
@@ -133,7 +132,7 @@ The current schema gives every Session a numeric administrative primary key in `
 
 The Workspaces page registers named directories and shows the Sessions currently attached to each Workspace. Workspace names are globally unique. Paths may be absolute or relative; MrMCP stores the entered value unchanged and resolves relative paths against the program folder only when the Workspace is actually used. Name/path errors are shown inline beside the field and disable Save; browser-native validation bubbles and error popups are not used. Path existence/type validation runs when the path field loses focus.
 
-- `open_workspace(name)` creates a new Session directly in an enabled named Workspace.
+- `open_workspace(name, current_context_handle?)` moves an active current Session directly into the enabled named Workspace while preserving its handle; without a usable current handle it creates a new Session there.
 - Dragging an existing Session between Workspace cards reassigns it in one step.
 - The program-folder fallback bucket is available only for existing Sessions whose named Workspace is removed/disabled or explicitly cleared by the operator; it is not a valid `open_workspace` target.
 - Disabled Workspaces remain visible for editing/deletion but cannot be opened or receive Sessions.
@@ -142,7 +141,7 @@ The Workspaces page registers named directories and shows the Sessions currently
 - Changing a Session's Workspace affects new tool calls immediately; existing background or interactive processes continue in the directory where they started.
 - Disabling or deleting a Workspace moves currently associated Sessions to the program-folder fallback without terminating processes.
 
-The public `workspace_info` tool returns `workspace_name`, the absolute Workspace `cwd` and a nullable absolute `agent_guidance_path`. MrMCP checks only that Workspace's `AGENTS.md`, then `agents.md`; it does not scan parent or child directories. When the path is present, the agent must read and follow that file before modifying the repository. Internal Workspace ids and fallback metadata are not exposed by this tool.
+`open_workspace` returns `workspace_name`, the absolute Workspace `cwd` and a nullable absolute `agent_guidance_path`. MrMCP checks only that Workspace's `AGENTS.md`, then `agents.md`; it does not scan parent or child directories. When the path is present, the agent must read and follow that file before modifying the repository. Internal Workspace ids and fallback metadata are not exposed.
 
 All relative paths and new child-process working directories must remain inside the Workspace captured at the start of the tool call.
 
@@ -150,8 +149,7 @@ All relative paths and new child-process working directories must remain inside 
 
 Session and Workspace:
 
-- `open_workspace` — requires the globally unique enabled Workspace `name` and creates a new Session attached to it;
-- `workspace_info` — returns the current Workspace name, absolute `cwd` and optional Workspace-level guidance path;
+- `open_workspace` — requires the globally unique enabled Workspace `name`; optionally reuses and switches an active `current_context_handle`, otherwise creates a new Session, and directly returns `workspace_name`, `cwd` and nullable `agent_guidance_path`;
 - `query_tool_calls` — query calls that actually reached MrMCP for the same `context_handle`, with exact tool/status filters, literal full-record text search, stable backward pagination and a bounded result limit.
 
 Filesystem and text:
@@ -306,7 +304,14 @@ Both maintenance actions use the same Promise barrier, not an application queue:
 
 ## Development changelog
 
-### Unreleased
+### 0.10.85
+
+- Fixed desktop close handling so the WebView registers the Tauri close-request listener before bootstrap; the window X hides the window while MrMCP keeps running, tray visibility is read from Tauri rather than cached locally, and a tray click restores a minimized window before focusing it.
+- Added a global Desktop Notifications setting, enabled by default, covering newly created Sessions, incoming Tool Calls, successful native directory drops and dropped directories that already exist as Workspaces. On Windows the desktop host now sets the process AppUserModelID to `Deno.execPath()` through Tauriless before creating the first WebView, so subsequent Tauri plugin notifications use the registered standalone executable identity.
+- Fixed desktop tray Quit handling by attaching the Tauri channel to the `tray-quit` menu item itself and routing desktop channel messages by their payload instead of hard-coded callback ids; the tray menu label remains exactly **Quit** and normal window X remains hide-only.
+- Restored live Tool Call termination controls as soon as a running call becomes cancellable, with the force action labeled **Kill**.
+- Replaced the HTTP Log checkbox + Apply flow with one immediate, high-contrast **Logging ON / Logging OFF** button. Disabling recording stops new HTTP debug rows but keeps all stored rows, filters and details visible until explicitly cleared.
+- Extended `open_workspace` with optional `current_context_handle`: an active Session is switched to the named Workspace without changing its handle, while an omitted, empty, unknown or expired value creates a new Session. Its result also includes `workspace_name`, absolute `cwd` and nullable `agent_guidance_path`, and the redundant public `workspace_info` tool was removed.
 
 ### 0.10.84
 
@@ -314,7 +319,7 @@ Both maintenance actions use the same Promise barrier, not an application queue:
 - Replaced GUI transport with the Tauri event bus: WebView inputs use `plugin:event|emit`, the backend Worker remains authoritative, and rendered Eta payloads return through `plugin:event|emit_to` before Morphlex applies them.
 - Added the native window icon and OS notification for newly created remote Sessions; reduced the tray menu to Quit, made left tray clicks toggle show/hide, and made the window X hide rather than exit.
 - Renamed the user-facing directory model from Roots to globally named **Workspaces**. `roots`/`root_id` remain internal persistence names, while `roots.name` is now `UNIQUE(name)`.
-- Replaced `create_context` / `context_info` with `open_workspace(name)` / `workspace_info`; opening a Workspace now creates a new Session already attached to it.
+- Replaced the previous context-open flow with `open_workspace(name)`; opening a Workspace creates a Session already attached to it.
 - Changed native directory drops to add Workspaces automatically, ignoring files and already-configured paths; generated names use the first free `Name`, `Name #2`, `Name #3`, ... value.
 - Replaced error/message popups with inline field validation and disabled Save actions; generic operational failures use non-modal notice balloons.
 - Enriched HTTP Log rows with Session id, client id and per-IP request totals, removed remote ports, and redesigned expanded HTTP details into structured Request/Response panels.
