@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.86
+# MrMCP 0.10.87
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a local Tauriless administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit Session `context_handle` capabilities.
 
@@ -303,6 +303,11 @@ Settings also provides **Clear Operational Data**. It preserves authentication s
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### 0.10.87
+
+- Updated the pinned desktop dependency to `@mefistofelix/tauriless@0.1.11` and pass `name: "MrMCP"` with the Windows AppUserModelID registration. Windows keeps the simple production flow: call `tauriless:set-app-user-model-id` with the standalone executable path before the first WebView, then use the standard Tauri notification plugin without JS-side data-directory, shortcut or pinning workarounds.
+- Standardized desktop notification copy and added a Workspace notification whenever `open_workspace` successfully attaches a Session to a Workspace. Notification titles are compact (`MrMCP · Session`, `MrMCP · Workspace`, `MrMCP · Tool Call`) and bodies carry only the useful Session/tool/Workspace identifiers.
 
 ### 0.10.86
 

@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.86 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and a Tauriless desktop window.
+MrMCP 0.10.87 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and a Tauriless desktop window.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -17,7 +17,7 @@ import { isIP } from "node:net";
 import { Eta } from "jsr:@bgub/eta@4.6.0";
 import { parse as parseYaml, stringify as stringifyYaml } from "jsr:@std/yaml@1.1.2";
 import { contentType as mediaContentType, typeByExtension } from "jsr:@std/media-types@1.1.0";
-import { Tauriless } from "npm:@mefistofelix/tauriless@0.1.7";
+import { Tauriless } from "npm:@mefistofelix/tauriless@0.1.11";
 
 const SELF = new URL(import.meta.url);
 const IS_BACKEND_WORKER = globalThis.name === "mrmcp-backend";
@@ -42,7 +42,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.86";
+const VERSION = "0.10.87";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CONTEXT_HANDLE_INPUT_DESCRIPTION = "Required opaque capability returned by open_workspace. Pass the exact value unchanged; never invent, modify, shorten, derive or substitute it.";
@@ -2049,8 +2049,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       String(client.auth_kind || ""), String(client.oauth_client_id || ""), String(client.client_name || ""),
       String(client.user_agent || "").slice(0, 512));
     const record = one("SELECT * FROM contexts WHERE handle=?", handle);
-    const clientLabel = String(record.client_name || record.oauth_client_id || record.user_agent || record.auth_kind || "remote client").slice(0, 160);
-    postOsNotification("New MrMCP Session", `Session #${record.id} · ${clientLabel}`);
+    const clientLabel = String(record.client_name || record.oauth_client_id || record.user_agent || record.auth_kind || "remote client").slice(0, 120);
+    postOsNotification("MrMCP · Session", `#${record.id} · ${clientLabel}`);
     return record;
   }
   const contextExpired = context => !!context &&
@@ -2943,7 +2943,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       Date.now(), p.id, "mcp", tool, JSON.stringify(args), contextId, String(contextHandle || ""),
       Number(root?.id || 0), String(root?.name || ""), String(root?.path || ""));
     const id = Number(inserted.lastInsertRowid);
-    postOsNotification("MrMCP Tool Call", `#${id} · ${tool}${contextId ? ` · Session #${contextId}` : ""}`);
+    postOsNotification("MrMCP · Tool Call", `#${id} · ${tool}${contextId ? ` · Session #${contextId}` : ""}`);
     return id;
   }
   function updateLog(id, fields) {
@@ -4663,6 +4663,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
                   user_agent: req.headers.get("user-agent") || "",
                 });
               }
+              postOsNotification("MrMCP · Workspace", `Session #${record.id} · ${workspace.name}`);
               const selection = { context: record, root: runtimeWorkspaceRoot(workspace) };
               toolResult = await callTool(
                 p, x.params.name, toolArgs,
@@ -5602,8 +5603,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           const { added, existing } = await addDroppedRoots(event.paths);
           if (added.length) uiNotice(`${added.length === 1 ? "Workspace" : "Workspaces"} added: ${added.join(", ")}`, "ok");
           if (added.length || existing.length) postOsNotification(
-            added.length ? (existing.length ? "MrMCP Workspace Drop" : added.length === 1 ? "MrMCP Workspace Added" : "MrMCP Workspaces Added") : "MrMCP Workspace Already Exists",
-            [added.length && `Added: ${added.join(", ")}`, existing.length && `Already exists: ${existing.join(", ")}`].filter(Boolean).join(" · "),
+            "MrMCP · Workspace",
+            [added.length && `Added · ${added.join(", ")}`, existing.length && `Exists · ${existing.join(", ")}`].filter(Boolean).join(" · "),
           );
           return;
         }
@@ -6559,7 +6560,7 @@ async function desktop() {
       }
     }, 16);
     if (Deno.build.os === "windows") await request("tauriless:set-app-user-model-id", {
-      appId: Deno.execPath(),
+      appId: Deno.execPath(), name: "MrMCP",
     });
     for (const event of [
       "tauri://resize", "tauri://move", "tauri://focus", "tauri://blur",
