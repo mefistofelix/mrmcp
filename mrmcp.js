@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.89 — Deno-owned event-driven UI with structured desktop notifications and explicit context capabilities.
+MrMCP 0.10.90 — Deno-owned event-driven UI with structured desktop notifications and explicit context capabilities.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -42,7 +42,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.89";
+const VERSION = "0.10.90";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000;
@@ -3044,7 +3044,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     if (context && previousCalls && now - lastCallAt >= SESSION_ACTIVE_MS)
       postOsNotification("session", "🟢 Session Active", sessionLabel);
     const commandPreview = compactExecCommand(p, tool, args);
-    postOsNotification("tool_call", "🛠️ Tool Call", `• 🔧 #${id} · ${tool}${commandPreview ? `\n• ⌨️ ${commandPreview}` : ""}${sessionLabel ? `\n${sessionLabel}` : ""}`);
+    postOsNotification("tool_call", `🛠️ Tool Call #${id}`, `${sessionLabel ? `${sessionLabel}\n` : ""}• 🔧 ${tool}${commandPreview ? `\n• ⌨️ ${commandPreview}` : ""}`);
     return id;
   }
   function updateLog(id, fields) {
@@ -6182,6 +6182,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       return json({ ok: true });
     }
     if (u.pathname === "/api/logs" && req.method === "GET") {
+      const p = serverConfig();
       const q = (u.searchParams.get("q") || "").trim();
       const contextId = Math.max(0, Number(u.searchParams.get("context")) || 0);
       const status = u.searchParams.get("status") || "";

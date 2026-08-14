@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.89
+# MrMCP 0.10.90
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a local Tauriless administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit Session `context_handle` capabilities.
 
@@ -305,6 +305,11 @@ Settings also provides **Clear Operational Data**. It preserves authentication s
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### 0.10.90
+
+- Fixed Tool Calls UI rendering after compact `exec*` previews were added: the logs API now resolves its server configuration before building command previews instead of referencing an undefined `p`.
+- Moved the Tool Call number into the desktop notification title (`🛠️ Tool Call #123`) and place the Session summary first in the body, before the tool name/command preview, so context is read first.
 
 ### 0.10.89
 
