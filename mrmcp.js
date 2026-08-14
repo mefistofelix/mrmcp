@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.87 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and a Tauriless desktop window.
+MrMCP 0.10.88 — Deno-owned event-driven UI and stateless MCP server with explicit context capabilities and a Tauriless desktop window.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -29,24 +29,24 @@ const COMMANDS_PATH = join(APP_DIR, "commands.yaml");
 const PORT_FALLBACK_STEP = 50;
 const UI_INPUT_EVENT = "tauriless://webview-message", UI_RENDER_EVENT = "mrmcp://ui-render";
 const BASE_TOOLS = [
-  "open_workspace", "read_file", "read_files", "write_file", "write_files",
+  "list_workspaces", "open_workspace", "read_file", "read_files", "write_file", "write_files",
   "edit", "replace", "glob", "grep",
   "file_info", "create_directory", "copy_path", "move_path", "trash_paths", "untrash_action",
   "publish_file", "publish_html", "list_commands", "query_tool_calls", "exec", "exec_start", "exec_poll", "exec_write", "exec_kill", "exec_list",
   "js", "js_add_node_module_dir", "js_reset",
 ];
 const READ_TOOLS = new Set([
-  "read_file", "read_files", "glob", "grep",
+  "list_workspaces", "read_file", "read_files", "glob", "grep",
   "file_info", "list_commands", "query_tool_calls", "exec_poll", "exec_list",
 ]);
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.87";
+const VERSION = "0.10.88";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const CONTEXT_HANDLE_INPUT_DESCRIPTION = "Required opaque capability returned by open_workspace. Pass the exact value unchanged; never invent, modify, shorten, derive or substitute it.";
-const CONTEXT_HANDLE_OUTPUT_DESCRIPTION = "Opaque capability identifying a persistent MrMCP Session. Pass this exact value unchanged as context_handle on later calls.";
+const CONTEXT_HANDLE_OUTPUT_DESCRIPTION = "Opaque capability identifying a persistent Session. Pass this exact value unchanged as context_handle on later calls.";
 const CONTEXT_HANDLE_RULE = "Requires the exact Session context_handle returned by open_workspace.";
 const MCP_UI_EXTENSION = "io.modelcontextprotocol/ui";
 const MCP_UI_MIME_TYPE = "text/html;profile=mcp-app";
@@ -461,6 +461,11 @@ async function backend() {
     CREATE INDEX IF NOT EXISTS logs_tool ON logs(tool,started_at DESC);
     CREATE INDEX IF NOT EXISTS logs_context ON logs(context_handle,started_at DESC);
     CREATE INDEX IF NOT EXISTS logs_context_id ON logs(context_id,started_at DESC);
+    CREATE TABLE IF NOT EXISTS tool_call_descriptors(
+      log_id INTEGER PRIMARY KEY,
+      descriptor_json TEXT NOT NULL,
+      FOREIGN KEY(log_id) REFERENCES logs(id) ON DELETE CASCADE
+    );
     CREATE TABLE IF NOT EXISTS debug_logs(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       ts INTEGER NOT NULL,
@@ -590,9 +595,9 @@ async function backend() {
     return result;
   };
   const getCfg = (key, fallback) => one("SELECT value FROM config WHERE key=?", key)?.value ?? fallback;
-  const desktopNotificationsEnabled = () => getCfg("desktop_notifications", "1") === "1";
-  const postOsNotification = (title, body) => {
-    if (IS_BACKEND_WORKER && desktopNotificationsEnabled()) self.postMessage({ type: "os-notification", title, body });
+  const desktopNotificationEnabled = type => getCfg(`desktop_notifications_${type}`, getCfg("desktop_notifications", "1")) === "1";
+  const postOsNotification = (type, title, body) => {
+    if (IS_BACKEND_WORKER && desktopNotificationEnabled(type)) self.postMessage({ type: "os-notification", title, body });
   };
   const setCfg = (key, value) => run(
     "INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -604,6 +609,7 @@ async function backend() {
     contexts: ["id", "handle", "server_id", "root_id", "created_at", "updated_at", "last_active_at", "protocol_version", "auth_kind", "oauth_client_id", "client_name", "user_agent"],
     process_runs: ["context_id", "context_handle", "root_id", "root_name", "root_path", "stdout_tail", "stderr_tail"],
     logs: ["id", "server_name", "tool", "status", "input_json", "context_id", "context_handle", "root_id", "root_name", "root_path"],
+    tool_call_descriptors: ["log_id", "descriptor_json"],
     oauth_refresh_tokens: ["token_hash", "client_id", "server_id", "resource", "scope", "last_used_at"],
     published_html: ["id", "server_id", "context_handle", "title", "html", "height", "created_at"],
   };
@@ -2050,7 +2056,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       String(client.user_agent || "").slice(0, 512));
     const record = one("SELECT * FROM contexts WHERE handle=?", handle);
     const clientLabel = String(record.client_name || record.oauth_client_id || record.user_agent || record.auth_kind || "remote client").slice(0, 120);
-    postOsNotification("MrMCP · Session", `#${record.id} · ${clientLabel}`);
+    postOsNotification("session", `Session · ${workspace.name}`, `#${record.id} · ${clientLabel}`);
     return record;
   }
   const contextExpired = context => !!context &&
@@ -2437,11 +2443,9 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
   function serverTools(p, fullAccess = true) {
     if (!fullAccess) return [];
     const available = new Set(BASE_TOOLS);
-    const workspaceNames = all("SELECT name FROM roots WHERE server_id=? AND enabled=1 ORDER BY name", p.id).map(row => row.name);
     const workspaceNameInput = {
       type: "string", minLength: 1, maxLength: 128,
-      ...(workspaceNames.length ? { enum: workspaceNames } : {}),
-      description: "Required unique name of an enabled MrMCP Workspace. The selected Session is attached to this Workspace immediately.",
+      description: "Name of the enabled Workspace to open. Any enabled Workspace name may be supplied; the value is validated when the tool runs. The selected Session is attached to this Workspace immediately.",
     };
     const contextInput = {
       context_handle: {
@@ -2489,12 +2493,16 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       timeout_ms: { type: "integer", minimum: 0, maximum: 604800000 },
       separate_streams: {
         type: "boolean", default: false,
-        description: "Also return stdout and stderr separately. By default process tools return one combined output stream in the order MrMCP observes data arriving from the two process pipes.",
+        description: "Also return stdout and stderr separately. By default process tools return one combined output stream in the order the server observes data arriving from the two process pipes.",
       },
       ...contextInput,
     };
 
     const defs = {
+      list_workspaces: [
+        "List the names of all enabled Workspaces that may be passed to open_workspace. This tool does not require a Session.",
+        { properties: {} },
+      ],
       open_workspace: [
         "Open the named Workspace and return the Session context_handle to use afterward. Pass current_context_handle to move an existing active Session to that Workspace without changing its handle. If current_context_handle is omitted, empty, unknown or expired, a new Session is created instead. The result includes workspace_name, cwd and agent_guidance_path. Read agent_guidance_path when non-null, then pass the returned context_handle unchanged to every later tool.",
         { properties: {
@@ -2617,7 +2625,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         { properties: { action_id: { type: "string" }, ...contextInput }, required: ["action_id"] },
       ],
       publish_file: [
-        "Present an existing file to the user through MrMCP's attached MCP App widget. This is the supported ChatGPT presentation path: MrMCP puts a temporary HTTPS URL in structuredContent and the widget renders image/* through an HTML img element or shows an Open File action for other MIME types. Do not read/Base64-encode the file and do not try to construct inline or resource_link preview modes; simply call publish_file after creating the file.",
+        "Present an existing file to the user through the attached MCP App widget. This is the supported ChatGPT presentation path: the server puts a temporary HTTPS URL in structuredContent and the widget renders image/* through an HTML img element or shows an Open File action for other MIME types. Do not read/Base64-encode the file and do not try to construct inline or resource_link preview modes; simply call publish_file after creating the file.",
         { properties: {
           path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" },
           expires_in: { type: "integer", minimum: 30, maximum: 604800, default: 86400 },
@@ -2626,7 +2634,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         }, required: ["path"] },
       ],
       publish_html: [
-        "Render arbitrary interactive HTML through MrMCP's attached MCP App widget. The HTML is persisted in SQLite and remains available after MrMCP restarts; the widget loads its persistent HTTPS URL inside a nested sandboxed iframe that allows scripts, forms, modals and popup links but deliberately omits allow-same-origin, so the document cannot access the MCP App or host DOM and origin-dependent storage/cookie APIs may be unavailable. Prefer self-contained HTML/CSS/JavaScript for portable results. Remote images, fonts, scripts, modules, fetch/WebSocket calls and other network dependencies may work when the current host/browser permits them, but are host/CSP dependent and normal browser CORS still applies, so do not assume they are portable. The whole MCP request, including HTML and JSON, is limited by MrMCP's 2 MiB request-body limit.",
+        "Render arbitrary interactive HTML through the attached MCP App widget. The HTML is persisted in SQLite and remains available after server restarts; the widget loads its persistent HTTPS URL inside a nested sandboxed iframe that allows scripts, forms, modals and popup links but deliberately omits allow-same-origin, so the document cannot access the MCP App or host DOM and origin-dependent storage/cookie APIs may be unavailable. Prefer self-contained HTML/CSS/JavaScript for portable results. Remote images, fonts, scripts, modules, fetch/WebSocket calls and other network dependencies may work when the current host/browser permits them, but are host/CSP dependent and normal browser CORS still applies, so do not assume they are portable. The whole MCP request, including HTML and JSON, is limited by the server's 2 MiB request-body limit.",
         { properties: {
           html: { type: "string", minLength: 1 },
           title: { type: "string", default: "Interactive HTML", maxLength: 200 },
@@ -2642,7 +2650,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         } },
       ],
       query_tool_calls: [
-        "Query tool-call history that actually reached MrMCP for this exact context_handle. Filters may be combined. query is a case-insensitive literal substring search across the complete stored log record; tool and status are exact filters; before_id pages backward by stable log id. Use this to diagnose tool behavior or distinguish server-side failures from requests blocked before MCP dispatch; an upstream-blocked request cannot appear here.",
+        "Query tool-call history that actually reached the server for this exact context_handle. Filters may be combined. query is a case-insensitive literal substring search across the complete stored log record; tool and status are exact filters; before_id pages backward by stable log id. Use this to diagnose tool behavior or distinguish server-side failures from requests blocked before MCP dispatch; an upstream-blocked request cannot appear here.",
         { properties: {
           limit: { type: "integer", minimum: 1, maximum: 50, default: 10 },
           tool: { type: "string", maxLength: 128, description: "Exact tool-name filter." },
@@ -2653,7 +2661,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         } },
       ],
       exec: [
-        "Run a foreground command. For normal direct execution use program + args and never send a shell boolean/field; use shell_command only when actual shell syntax such as a pipeline or redirection is required. Pass args verbatim and in order; consult the program's --help when CLI syntax is uncertain. Process output is normalized to readable plain text before it is buffered or stored. Read output together with status and exit_code to understand what happened; set separate_streams=true only when separate stdout/stderr are useful. Do not invoke shell commands, uv or Python to read, list, search, edit or replace files when the structured MrMCP tools cover the operation.",
+        "Run a foreground command. For normal direct execution use program + args and never send a shell boolean/field; use shell_command only when actual shell syntax such as a pipeline or redirection is required. Pass args verbatim and in order; consult the program's --help when CLI syntax is uncertain. Process output is normalized to readable plain text before it is buffered or stored. Read output together with status and exit_code to understand what happened; set separate_streams=true only when separate stdout/stderr are useful. Do not invoke shell commands, uv or Python to read, list, search, edit or replace files when the structured tools cover the operation.",
         { oneOf: [{ required: ["program"] }, { required: ["shell_command"] }], properties: {
           ...execInput,
           timeout_ms: { type: "integer", minimum: 1, maximum: 3600000, default: 120000 },
@@ -2710,6 +2718,11 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       properties: { ...envelopeProperties, ...properties },
       required: ["context_handle"],
     });
+    const sessionlessOutputSchema = (properties = {}) => ({
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      type: "object", additionalProperties: false,
+      properties,
+    });
     const textMetadata = {
       encoding: { type: "string" }, bom: { type: "boolean" }, line_endings: { type: "string" },
     };
@@ -2729,6 +2742,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       stdin_open: { type: "boolean" }, success: { type: "boolean" },
     };
     const outputSchemas = {
+      list_workspaces: sessionlessOutputSchema({ workspaces: stringArray }),
       open_workspace: outputSchema({
         workspace_name: { type: "string", description: "Unique Workspace name selected for the returned Session." },
         cwd: { type: "string", description: "Absolute path of the selected Workspace." },
@@ -2769,7 +2783,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const processOutputSchema = outputSchema(processProperties);
 
     const titles = {
-      open_workspace: "Open Workspace", read_file: "Read", read_files: "Read batch",
+      list_workspaces: "List Workspaces", open_workspace: "Open Workspace", read_file: "Read", read_files: "Read batch",
       write_file: "Write", write_files: "Write batch", edit: "Edit", replace: "Replace",
       glob: "Glob", grep: "Grep", trash_paths: "Trash paths", untrash_action: "Restore trash action",
       publish_file: "Publish File", publish_html: "Publish HTML", list_commands: "Command Catalog", query_tool_calls: "Query Tool Calls",
@@ -2792,7 +2806,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       required: [...new Set([...(value.required || []), "context_handle"])],
     });
     const tools = [...available].filter(name => defs[name]).map(name => {
-      const requiresContext = name !== "open_workspace";
+      const requiresContext = !["list_workspaces", "open_workspace"].includes(name);
       return {
         name,
         title: titles[name] || name.replaceAll("_", " ").replace(/\b\w/g, value => value.toUpperCase()),
@@ -2839,9 +2853,12 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     else {
       if (tool.outputSchema.type !== "object") errors.push("outputSchema.type must be object");
       if (tool.outputSchema.additionalProperties !== false) errors.push("outputSchema.additionalProperties must be false");
-      if (!tool.outputSchema.required?.includes("context_handle"))
+      if (tool.name !== "list_workspaces" && !tool.outputSchema.required?.includes("context_handle"))
         errors.push("outputSchema missing required context_handle");
+      if (tool.name === "list_workspaces" && tool.outputSchema.properties?.context_handle)
+        errors.push("list_workspaces output must not expose context_handle");
       const expectedOutputs = {
+        list_workspaces: ["workspaces"],
         open_workspace: ["workspace_name", "cwd", "agent_guidance_path"],
         query_tool_calls: ["calls"],
         publish_html: ["id", "title", "uri", "height", "created_at"],
@@ -2854,9 +2871,14 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         if (!tool.outputSchema.properties?.[key]) errors.push(`outputSchema missing property ${key}`);
     }
     if (tool.name === "open_workspace") {
+      const workspaceName = tool.inputSchema?.properties?.name;
+      if (workspaceName?.type !== "string") errors.push("open_workspace name must be a string");
+      if (workspaceName?.enum) errors.push("open_workspace name must not enumerate configured Workspace names");
       if (tool.inputSchema?.properties?.context_handle) errors.push("open_workspace must not accept context_handle");
       if (!tool.inputSchema?.properties?.current_context_handle) errors.push("open_workspace missing optional current_context_handle");
       if (tool.inputSchema?.required?.includes("current_context_handle")) errors.push("open_workspace current_context_handle must be optional");
+    } else if (tool.name === "list_workspaces") {
+      if (tool.inputSchema?.properties?.context_handle) errors.push("list_workspaces must not accept context_handle");
     } else {
       if (!tool.inputSchema?.properties?.context_handle) errors.push("inputSchema missing context_handle");
       if (!tool.inputSchema?.required?.includes("context_handle")) errors.push("inputSchema context_handle must be required");
@@ -2936,14 +2958,18 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     };
   }
 
-  function beginLog(p, tool, args, contextHandle = "", root = null) {
+  function beginLog(p, tool, args, contextHandle = "", root = null, descriptor = null) {
     const contextId = Number(contextByHandle(p, contextHandle)?.id || 0);
     const inserted = run(`INSERT INTO logs(started_at,server_id,server_name,tool,status,input_json,
       context_id,context_handle,root_id,root_name,root_path) VALUES(?,?,?,?,'received',?,?,?,?,?,?)`,
       Date.now(), p.id, "mcp", tool, JSON.stringify(args), contextId, String(contextHandle || ""),
       Number(root?.id || 0), String(root?.name || ""), String(root?.path || ""));
     const id = Number(inserted.lastInsertRowid);
-    postOsNotification("MrMCP · Tool Call", `#${id} · ${tool}${contextId ? ` · Session #${contextId}` : ""}`);
+    if (descriptor) run(
+      "INSERT INTO tool_call_descriptors(log_id,descriptor_json) VALUES(?,?)",
+      id, JSON.stringify(descriptor),
+    );
+    postOsNotification("tool_call", root?.name ? `Tool Call · ${root.name}` : "Tool Call", `#${id} · ${tool}${contextId ? ` · Session #${contextId}` : ""}`);
     return id;
   }
   function updateLog(id, fields) {
@@ -2960,8 +2986,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         id, l.server_name, l.tool, l.input_json, l.result_json || l.resolved_json || l.stdout || '', l.stderr, l.error);
     } catch {}
   }
-  function rejectToolCall(p, tool, args, message, contextHandle = "", status = "failed", result = { error: message }) {
-    const id = beginLog(p, tool, args, contextHandle), completed = Date.now();
+  function rejectToolCall(p, tool, args, message, contextHandle = "", status = "failed", result = { error: message }, descriptor = null) {
+    const id = beginLog(p, tool, args, contextHandle, null, descriptor), completed = Date.now();
     updateLog(id, {
       completed_at: completed, duration_ms: 0, status,
       error: message, result_json: JSON.stringify(result),
@@ -3454,6 +3480,9 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
 
   async function executeTool(p, name, args, execution) {
     const selection = execution.selection;
+    if (name === "list_workspaces") return {
+      workspaces: all("SELECT name FROM roots WHERE server_id=? AND enabled=1 ORDER BY name", p.id).map(row => row.name),
+    };
     if (name === "open_workspace") return await workspaceInfo(selection);
     if (!selection?.context || !selection?.root) throw new Error("Session Workspace selection is missing");
     const resolvePath = path => resolveWorkspacePath(selection, path);
@@ -3986,11 +4015,11 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     if (kind === "invalid") return "The Session context_handle is invalid. Reuse a valid handle or call open_workspace with a Workspace name.";
     return "";
   }
-  function contextControlToolResult(p, name, args, resolution) {
+  function contextControlToolResult(p, name, args, resolution, descriptor = null) {
     const handle = resolution.record?.handle || resolution.supplied_handle || "";
     const error = contextControlMessage(resolution.kind);
     const structuredContent = contextEnvelope(handle, { error });
-    const id = beginLog(p, name, args, handle);
+    const id = beginLog(p, name, args, handle, null, descriptor);
     const toolResult = {
       content: [{ type: "text", text: error }],
       structuredContent, isError: true,
@@ -4006,7 +4035,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
 
   async function callTool(p, name, args, callInfo) {
     await waitForToolCallGate();
-    const id = beginLog(p, name, args, callInfo.contextHandle, callInfo.selection?.root), started = Date.now();
+    const id = beginLog(p, name, args, callInfo.contextHandle, callInfo.selection?.root, callInfo.descriptor), started = Date.now();
     if (!activeCallControls.size)
       toolCallsIdle = new Promise(resolve => { resolveToolCallsIdle = resolve; });
     const control = { log_id: id, cancel: null, kind: "", process_id: "", kernel_id: "" };
@@ -4030,10 +4059,11 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         : JSON.stringify(publicLogResult, null, 2);
       const stderr = typeof publicLogResult.stderr === "string" ? publicLogResult.stderr : "";
       const status = publicResult.success === false ? "failed" : "completed";
-      const envelope = contextEnvelope(callInfo.contextHandle);
+      const includeContext = name !== "list_workspaces";
+      const envelope = includeContext ? contextEnvelope(callInfo.contextHandle) : {};
       const structuredContent = { ...publicResult, ...envelope };
       const full = typeof publicResult.content === "string"
-        ? `${publicResult.content}\n\ncontext_handle: ${envelope.context_handle}`
+        ? includeContext ? `${publicResult.content}\n\ncontext_handle: ${envelope.context_handle}` : publicResult.content
         : JSON.stringify(structuredContent, null, 2);
       const max = 1024 * 1024, rendered = full.length > max
         ? full.slice(0, max) + `\n\n[truncated; full output in log ${id}]` : full;
@@ -4047,10 +4077,14 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       return toolResult;
     } catch (error) {
       const message = String(error?.stack || error);
-      const envelope = contextEnvelope(callInfo.contextHandle);
+      const includeContext = name !== "list_workspaces";
+      const envelope = includeContext ? contextEnvelope(callInfo.contextHandle) : {};
       const structuredContent = { error: String(error?.message || error), ...envelope };
+      const text = includeContext
+        ? `${String(error?.message || error)}\ncontext_handle: ${envelope.context_handle}`
+        : String(error?.message || error);
       const toolResult = {
-        content: [{ type: "text", text: `${String(error?.message || error)}\ncontext_handle: ${envelope.context_handle}` }],
+        content: [{ type: "text", text }],
         structuredContent, isError: true,
       };
       updateLog(id, {
@@ -4485,9 +4519,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       if (x.method !== "tools/call") return "";
       const toolName = typeof x.params?.name === "string" && x.params.name
         ? x.params.name : "(invalid tools/call)";
+      const descriptor = fullAccess ? serverTools(p, true).find(tool => tool.name === toolName) : null;
       return rejectToolCall(
         p, toolName, x.params?.arguments || x.params || {}, message,
-        String(x.params?.arguments?.context_handle || ""), "invalid", result,
+        String(x.params?.arguments?.context_handle || ""), "invalid", result, descriptor,
       );
     };
     const rpcError = (status, code, message, data = undefined, logInvalid = false) => {
@@ -4548,13 +4583,13 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 
     const serverInfoMeta = { "io.modelcontextprotocol/serverInfo": mcpServerInfo() };
     const instructions = fullAccess
-      ? "Call open_workspace with the unique Workspace name. If you already have the current Session handle, pass it as current_context_handle to move that same Session to the Workspace; if it is omitted, empty, unknown or expired, open_workspace creates a new Session. The result includes workspace_name, absolute cwd and agent_guidance_path; when that path is non-null, read and follow the referenced AGENTS.md before repository work. Pass the returned context_handle unchanged on every later tool call. " +
+      ? "Use list_workspaces when you need to discover the enabled Workspace names, then call open_workspace with the desired name. If you already have the current Session handle, pass it as current_context_handle to move that same Session to the Workspace; if it is omitted, empty, unknown or expired, open_workspace creates a new Session. The result includes workspace_name, absolute cwd and agent_guidance_path; when that path is non-null, read and follow the referenced AGENTS.md before repository work. Pass the returned context_handle unchanged on every later Session-bound tool call. " +
         "Use read_file/read_files, glob, grep, edit and replace directly for file inspection, discovery, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. " +
         "Use list_commands before other command-line work and invoke returned logical_name values directly through exec.program without PATH probes. " +
-        "Command execution output is normalized to readable plain text before buffering or storage; ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec, exec_start, exec_poll and custom commands accept separate_streams=true when individual stdout/stderr are needed. Use query_tool_calls to inspect and filter calls that actually reached this MrMCP Session; requests blocked upstream before dispatch are absent. " +
+        "Command execution output is normalized to readable plain text before buffering or storage; ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec, exec_start, exec_poll and custom commands accept separate_streams=true when individual stdout/stderr are needed. Use query_tool_calls to inspect and filter calls that actually reached this Session; requests blocked upstream before dispatch are absent. " +
         "Use publish_file to present existing files through its MCP App widget, and publish_html when an interactive self-contained HTML/CSS/JavaScript visualization is more appropriate. " +
         "Every authenticated client can invoke every published tool; context_handle is the bearer capability selecting the persistent Session and its current Workspace."
-      : "The MrMCP endpoint is reachable, but anonymous access exposes no tools. Authenticate with OAuth or Basic authentication.";
+      : "The endpoint is reachable, but anonymous access exposes no tools. Authenticate with OAuth or Basic authentication.";
 
     const r = { jsonrpc: "2.0", id: x.id };
     let responseStatus = 200;
@@ -4634,12 +4669,17 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
             r.error = { code: -32602, message: validationError };
             rejectToolCall(
               p, x.params.name, rawToolArgs, validationError,
-              String(rawToolArgs?.context_handle || ""), "invalid", { jsonrpc: "2.0", id: x.id, error: r.error },
+              String(rawToolArgs?.context_handle || ""), "invalid", { jsonrpc: "2.0", id: x.id, error: r.error }, descriptor,
             );
           } else {
           const toolArgs = { ...rawToolArgs };
           let toolResult;
-          if (x.params.name === "open_workspace") {
+          if (x.params.name === "list_workspaces") {
+            toolResult = await callTool(
+              p, x.params.name, toolArgs,
+              { authKind: auth.kind, contextHandle: "", selection: null, descriptor },
+            );
+          } else if (x.params.name === "open_workspace") {
             delete toolArgs.context_handle;
             const workspace = workspaceByName(p, toolArgs.name);
             if (!workspace) {
@@ -4648,7 +4688,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
               const error = `Unknown or disabled Workspace: ${String(toolArgs.name || "")}`;
               const structuredContent = contextEnvelope(handle, { error });
               toolResult = { content: [{ type: "text", text: error }], structuredContent, isError: true };
-              rejectToolCall(p, x.params.name, toolArgs, error, handle, "invalid", toolResult);
+              rejectToolCall(p, x.params.name, toolArgs, error, handle, "invalid", toolResult, descriptor);
             } else {
               const current = resolveContext(p, toolArgs.current_context_handle, observedProtocol);
               let record;
@@ -4663,11 +4703,11 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
                   user_agent: req.headers.get("user-agent") || "",
                 });
               }
-              postOsNotification("MrMCP · Workspace", `Session #${record.id} · ${workspace.name}`);
+              postOsNotification("workspace", `Workspace · ${workspace.name}`, `Session #${record.id}`);
               const selection = { context: record, root: runtimeWorkspaceRoot(workspace) };
               toolResult = await callTool(
                 p, x.params.name, toolArgs,
-                { authKind: auth.kind, contextHandle: record.handle, selection },
+                { authKind: auth.kind, contextHandle: record.handle, selection, descriptor },
               );
             }
           } else {
@@ -4676,9 +4716,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
               const selection = { context: resolution.record, root: selectedContextRoot(p, resolution.record) };
               toolResult = await callTool(
                 p, x.params.name, toolArgs,
-                { authKind: auth.kind, contextHandle: resolution.record.handle, selection },
+                { authKind: auth.kind, contextHandle: resolution.record.handle, selection, descriptor },
               );
-            } else toolResult = contextControlToolResult(p, x.params.name, toolArgs, resolution);
+            } else toolResult = contextControlToolResult(p, x.params.name, toolArgs, resolution, descriptor);
           }
           r.result = modernRequest
             ? {
@@ -4724,7 +4764,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       mcp_http_role: "acme-only", acme_http_available: mcpHttpActive && mcpHttpPort === HTTP_PORT,
       mcp_https_enabled: true, mcp_https_port: mcpHttpsPort, mcp_https_port_base: HTTPS_PORT, mcp_https_active: mcpTlsActive,
       debug_http_log: getCfg("debug_http_log", "0") === "1",
-      desktop_notifications: desktopNotificationsEnabled(),
+      desktop_notifications_session: desktopNotificationEnabled("session"),
+      desktop_notifications_workspace: desktopNotificationEnabled("workspace"),
+      desktop_notifications_tool_call: desktopNotificationEnabled("tool_call"),
       inherit_system_path: getCfg("inherit_system_path", "1") === "1",
       external_url: getCfg("external_url", ""), gui_transport: "Tauriless local asset protocol",
       listener_fallback: listenerFallbacks().length > 0, listener_fallbacks: listenerFallbacks(),
@@ -5007,8 +5049,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 <? } else if(section==="logs"){ const l=s.logs||{}; ?><section id=logs class=page><h2>🛠️ Tool Calls</h2><p class=muted>Click a row for details. Terminate active work from Actions.</p><div class=row><input id=logQuery class=grow placeholder="Search input, output, errors…" value="<?= l.query||'' ?>"><select id=logContext><option value="">All sessions</option><? (s.contextValues||[]).forEach(v=>{ ?><option value="<?= v.pk ?>"<?= String(l.context||"")===String(v.pk)?" selected":"" ?>>#<?= v.pk ?></option><? }) ?></select><select id=logStatus class="<?= l.status||'' ?>"><option value="">All states</option><? ['completed','failed','invalid','running'].forEach(v=>{ ?><option class="<?= v ?>" value="<?= v ?>"<?= l.status===v?' selected':'' ?>><?= v ?></option><? }) ?></select><select id=logPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(l.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=clear-log-filters>🧹 Clear Filters</button></div><? if(l.selfTest){ ?><div id=logSelfTest class=card><div class=row><h3 class=grow>🧪 MCP Self-Test</h3><button class=small data-action=copy-detail data-target=logDetail>📋 Copy JSON</button><button class=small data-action=close-self-test>✕ Close</button></div><pre id=logDetail><?= it.pretty(l.selfTest) ?></pre></div><? } ?><div id=logList></div></section>
 <? } else if(section==="debug"){ const d=s.debug||{},enabled=!!s.debug?.enabled; ?><section id=debug class=page><div class=row><h2 class=grow>🐞 HTTP Debug Log</h2><button class="debug-toggle <?= enabled?'enabled':'disabled' ?>" data-action=toggle-debug-settings aria-pressed="<?= enabled?'true':'false' ?>"><?= enabled?"🟢 Logging ON · Disable":"🔴 Logging OFF · Enable" ?></button><button class=danger data-action=clear-debug>🗑️ Clear</button></div><p class=muted>Off by default. Secrets are redacted. Disabling stops new records but keeps stored data visible. Click a row for request JSON.</p><div class=row><input id=debugQuery class=grow placeholder="Search URL, headers, body or errors…" value="<?= d.query||'' ?>"><select id=debugMethod><option value="">All methods</option><? ['GET','POST','OPTIONS'].forEach(v=>{ ?><option<?= d.method===v?' selected':'' ?>><?= v ?></option><? }) ?></select><input id=debugStatus type=number placeholder="Status" value="<?= d.status||'' ?>"><button data-action=load-debug>🔎 Search</button></div><div id=debugList></div></section>
 <? } else if(section==="oauth"){ ?><section id=oauth class=page><h2>🔐 OAuth Clients</h2><div id=oauthList></div></section>
-<? } else if(section==="settings"){ ?><section id=settings class=page><h2>⚙️ Settings</h2><div class=grid><div class=card><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div><div class=card><h3>🔔 Desktop Notifications</h3><label><input id=desktopNotifications type=checkbox<?= settings.desktop_notifications?" checked":"" ?>> Enable desktop OS notifications</label><p class=muted>Applies globally to MrMCP desktop OS notifications.</p></div><div class=card><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><p class=muted>Off: child <code>PATH</code> contains only <code>.mrmcp/bin</code>. Other environment variables are unchanged.</p></div><div class=card><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published HTML and metrics. Keeps auth, Sessions, Workspaces, settings, tools and files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div><p><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></p></section>
-<? } else if(section==="help"){ ?><section id=help class=page><h2>❓ Help</h2><div class=card><h3>Connect ChatGPT Web</h3><ol><li>Make sure the Dashboard shows a trusted HTTPS certificate. ChatGPT needs a remote HTTPS MCP endpoint; use <code><?= settings.external_base_url ? settings.external_base_url + "/mcp" : "https://your-host/mcp" ?></code>.</li><li>In ChatGPT Web, enable Developer mode. In managed workspaces the current path is <b>Workspace settings → Permissions &amp; Roles → Connected Data Developer mode / Create custom MCP connectors</b>. Authorized users may also find the toggle under <b>Settings → Apps → Advanced Settings</b>.</li><li>Create a custom app from <b>Workspace settings → Apps → Create</b> or <b>Settings → Apps → Create</b>, enter the MrMCP endpoint, choose the offered authentication method, then select <b>Scan Tools</b>.</li><li>If OAuth is enabled in MrMCP, complete the authorization prompt. After the tool scan completes, create the app and select it from a new ChatGPT conversation.</li></ol></div><div class=card><h3>Authentication</h3><p>For ChatGPT, OAuth is the preferred MrMCP setup because ChatGPT can discover the authorization metadata, complete consent, and keep refresh-token connectivity. MrMCP also supports Basic authentication for MCP clients that offer it. Authentication grants access to the server; the <code>context_handle</code> selects persistent context state after authentication.</p></div><div class=card><h3>Write Access</h3><p>MrMCP does not maintain a separate read/write allowlist: every authenticated client receives every published tool. ChatGPT controls whether write/modify actions are usable through the app's permissions and action controls. As of this build, OpenAI documents full MCP write/modify support for Business, Enterprise and Edu; Pro custom MCP access is limited to read/fetch, and availability may change. Test write tools in Developer mode first. Where available, use <b>Workspace settings → Apps → Configure Actions / Action control</b> to enable the required actions. ChatGPT may still ask for confirmation before a write.</p></div><div class=card><h3>Using MrMCP in a Chat</h3><ol><li>Start a new chat and select the MrMCP app from the tools/apps menu.</li><li>Call <code>open_workspace</code> with the unique Workspace <code>name</code>. When continuing an existing Session, also pass its handle as <code>current_context_handle</code>; MrMCP moves that same Session to the Workspace. If the handle is omitted, empty, unknown or expired, a new Session is created.</li><li>The result already includes <code>workspace_name</code>, absolute <code>cwd</code> and <code>agent_guidance_path</code>. Read that file when non-null, then reuse the returned <code>context_handle</code> on later calls. The Workspaces page can also move Sessions manually.</li><li>If you change ChatGPT model or thinking level, the MCP context may be recreated even inside the same conversation. Check the Sessions page if continuity matters.</li></ol><p class=muted>ChatGPT UI labels and plan availability can change. Current OpenAI references: <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt" target=_blank rel=noopener>Developer mode and MCP apps in ChatGPT</a> · <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt" target=_blank rel=noopener>Apps in ChatGPT</a>.</p></div></section><? } ?>`,
+<? } else if(section==="settings"){ ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><div class=grid><div class=card><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div><div class=card><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Windows already identifies notifications as belonging to MrMCP; notification titles show the Workspace when available.</p></div><div class=card><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><p class=muted>Off: child <code>PATH</code> contains only <code>.mrmcp/bin</code>. Other environment variables are unchanged.</p></div><div class=card><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published HTML and metrics. Keeps auth, Sessions, Workspaces, settings, tools and files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></section>
+<? } else if(section==="help"){ ?><section id=help class=page><h2>❓ Help</h2><div class=card><h3>Connect ChatGPT Web</h3><ol><li>Make sure the Dashboard shows a trusted HTTPS certificate. ChatGPT needs a remote HTTPS MCP endpoint; use <code><?= settings.external_base_url ? settings.external_base_url + "/mcp" : "https://your-host/mcp" ?></code>.</li><li>In ChatGPT Web, enable Developer mode. In managed workspaces the current path is <b>Workspace settings → Permissions &amp; Roles → Connected Data Developer mode / Create custom MCP connectors</b>. Authorized users may also find the toggle under <b>Settings → Apps → Advanced Settings</b>.</li><li>Create a custom app from <b>Workspace settings → Apps → Create</b> or <b>Settings → Apps → Create</b>, enter the MrMCP endpoint, choose the offered authentication method, then select <b>Scan Tools</b>.</li><li>If OAuth is enabled in MrMCP, complete the authorization prompt. After the tool scan completes, create the app and select it from a new ChatGPT conversation.</li></ol></div><div class=card><h3>Authentication</h3><p>For ChatGPT, OAuth is the preferred MrMCP setup because ChatGPT can discover the authorization metadata, complete consent, and keep refresh-token connectivity. MrMCP also supports Basic authentication for MCP clients that offer it. Authentication grants access to the server; the <code>context_handle</code> selects persistent context state after authentication.</p></div><div class=card><h3>Write Access</h3><p>MrMCP does not maintain a separate read/write allowlist: every authenticated client receives every published tool. ChatGPT controls whether write/modify actions are usable through the app's permissions and action controls. As of this build, OpenAI documents full MCP write/modify support for Business, Enterprise and Edu; Pro custom MCP access is limited to read/fetch, and availability may change. Test write tools in Developer mode first. Where available, use <b>Workspace settings → Apps → Configure Actions / Action control</b> to enable the required actions. ChatGPT may still ask for confirmation before a write.</p></div><div class=card><h3>Using MrMCP in a Chat</h3><ol><li>Start a new chat and select the MrMCP app from the tools/apps menu.</li><li>If needed, call <code>list_workspaces</code> to discover the enabled Workspace names, then call <code>open_workspace</code> with the desired <code>name</code>. When continuing an existing Session, also pass its handle as <code>current_context_handle</code>; MrMCP moves that same Session to the Workspace. If the handle is omitted, empty, unknown or expired, a new Session is created.</li><li>The result already includes <code>workspace_name</code>, absolute <code>cwd</code> and <code>agent_guidance_path</code>. Read that file when non-null, then reuse the returned <code>context_handle</code> on later Session-bound calls. The Workspaces page can also move Sessions manually.</li><li>If you change ChatGPT model or thinking level, the MCP context may be recreated even inside the same conversation. Check the Sessions page if continuity matters.</li></ol><p class=muted>ChatGPT UI labels and plan availability can change. Current OpenAI references: <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt" target=_blank rel=noopener>Developer mode and MCP apps in ChatGPT</a> · <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt" target=_blank rel=noopener>Apps in ChatGPT</a>.</p></div></section><? } ?>`,
     dialogs: `<? const dialog=it.data?.state?.dialog; ?><? if(dialog){ ?><div id=dialogOverlay class=dialog-overlay><? if(dialog.kind==="root"){ const r=dialog.data||{}; ?><dialog id=rootDialog open data-managed-dialog=root><form id=rootForm><input id=rid type=hidden value="<?= r.id||'' ?>"><h2>📁 Workspace</h2><div class=row><label class=grow>Workspace name</label><? if(r.name_warning){ ?><span class=field-warning>⚠ <?= r.name_warning ?></span><? } ?></div><input id=rname value="<?= r.name||'' ?>"><div class=row><label class=grow>Directory path</label><? if(r.path_warning){ ?><span class=field-warning>⚠ <?= r.path_warning ?></span><? } else if(!r.path_checked){ ?><span class=muted>Leave the field to validate the directory.</span><? } ?></div><input id=rpath placeholder="C:\\projects\\my-workspace, /srv/my-workspace or ./project" value="<?= r.path||'' ?>"><div class=muted>Relative to the program folder.</div><label><input id=renabled type=checkbox<?= r.enabled!==false?' checked':'' ?>> Enabled</label><? if(r.form_warning){ ?><div class=field-warning>⚠ <?= r.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (r.name_warning||r.path_warning||!r.path_checked||r.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="command"){ const c=dialog.data||{}; ?><dialog id=commandDialog open data-managed-dialog=command><form id=commandForm><input id=coldName type=hidden value="<?= c.registered?c.name:'' ?>"><h2>🧰 Command Catalog Entry</h2><div class=row><label class=grow>Logical name</label><? if(c.name_warning){ ?><span class=field-warning>⚠ <?= c.name_warning ?></span><? } ?></div><input id=cname value="<?= c.name||'' ?>"><div class=row><label class=grow>Path below .mrmcp/bin</label><? if(c.path_warning){ ?><span class="<?= c.path_error?'field-warning':'muted' ?>"><?= c.path_error?'⚠ ':'' ?><?= c.path_warning ?></span><? } else if(!c.path_checked){ ?><span class=muted>Leave the field to validate the path.</span><? } ?></div><input id=cpath placeholder="Optional; defaults to logical name; Windows suffix optional" value="<?= c.path||'' ?>"><label>Description for the agent</label><textarea id=cdescription placeholder="Optional: what it does and when the agent should use it."><?= c.description||'' ?></textarea><div class=row><label class=grow>Download URL</label><? if(c.download_warning){ ?><span class=field-warning>⚠ <?= c.download_warning ?></span><? } ?></div><input id=cdownloadUrl placeholder="https://example.com/tool" value="<?= c.download_url||'' ?>"><div class=row><label class=grow>Documentation URL</label><? if(c.documentation_warning){ ?><span class=field-warning>⚠ <?= c.documentation_warning ?></span><? } ?></div><input id=cdocumentationUrl placeholder="https://example.com/docs" value="<?= c.documentation_url||'' ?>"><? if(c.form_warning){ ?><div class=field-warning>⚠ <?= c.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (c.name_warning||c.path_error||!c.path_checked||c.download_warning||c.documentation_warning||c.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="confirm"){ ?><dialog id=confirmDialog open data-managed-dialog=confirm><h2>⚠️ <?= dialog.title||"Confirm Action" ?></h2><p><?= dialog.message||"Continue?" ?></p><p class=row><button class="primary danger" data-action=confirm-dialog>✓ Confirm</button><button data-action=close-dialog>✕ Cancel</button></p></dialog><? } ?></div><? } ?>`,
     status: `<? const d=it.data||{},s=d.settings||{},a=d.activity||{},bad=!!s.mcp_listen_error,warn=!!s.listener_fallback,recent=a.recent_sessions||[],inFlight=a.tool_calls_in_flight||0,errors=a.tool_calls_errors||0,invalid=a.tool_calls_invalid||0; ?><span class="status-group <?= d.live!=="connected"?(d.live==="reconnecting"?"pending":"failed"):(bad?"failed":(warn?"pending":"ok")) ?>"><?= d.live!=="connected"?(d.live==="reconnecting"?"🟡 reconnecting":"🔴 offline"):(bad?"🔴 listener error":(warn?"🟡 fallback":"🟢 live")) ?></span><span class="status-group status-link" data-action=header-settings title="HTTP / HTTPS effective listener ports; GUI uses local Tauriless assets">🔌 <span class=status-ports><?= s.mcp_http_active?s.mcp_http_port:"off" ?>/<?= s.mcp_https_active?s.mcp_https_port:"off" ?></span><? if(warn){ ?> <span class=pending>⚠</span><? } ?></span><span class=status-group title="Sessions with a Tool Call in the last <?= a.active_window_minutes||5 ?> minutes">💬 <span class="status-link <?= a.active_sessions?'ok':'muted' ?>" data-action=header-sessions><?= a.active_sessions||0 ?> active</span><? if(recent.length){ ?> · <span class=status-sessions><? recent.forEach((x,i)=>{ ?><?= i?" ":"" ?><span class=status-link data-action=session-tool-calls data-id="<?= x.id ?>">#<?= x.id ?>(<?= x.tool_calls ?>)</span><? }) ?></span><? } ?></span><span class=status-group title="Tool Calls in flight / total recorded / failed / invalid">🛠️ <span class="status-link <?= inFlight?'pending':'muted' ?>" data-action=header-tool-calls data-status=running><?= inFlight ?> in flight</span> · <span class="status-link status-total" data-action=header-tool-calls data-status=""><?= a.tool_calls_total||0 ?> total</span> · <span class="status-link <?= errors?'failed':'muted' ?>" data-action=header-tool-calls data-status=failed><?= errors ?> errors</span> · <span class="status-link <?= invalid?'invalid':'muted' ?>" data-action=header-tool-calls data-status=invalid><?= invalid ?> invalid</span></span>`,
     cards: `<? const meta={sessions:["💬","Sessions"],roots:["📁","Workspaces"],tool_calls:["🛠️","Tool Calls"],tool_calls_in_flight:["🛠️","Tool Calls In Flight"],failed_calls:["⚠️","Failed Calls"],http_requests:["🌐","HTTP Requests"]}; Object.entries(it.data || {}).forEach(([key,value]) => { const item=meta[key]||["•",key]; ?><div class=card><div class=muted><?= item[0] ?> <?= item[1] ?></div><strong style="font-size:24px"><?= value ?></strong></div><? }) ?>`,
@@ -5020,7 +5062,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     commands: `<? const d=it.data || {}, rows=d.commands || []; ?><div class=muted><?= d.total || 0 ?> command<?= d.total === 1 ? "" : "s" ?> · page <?= d.page || 1 ?>/<?= d.pages || 1 ?> · config <code><?= d.config_file || "" ?></code></div><table class=commands-table><tr><th>Name</th><th>Relative path</th><th class=command-description>Description</th><th>Links</th><th>Source</th><th>State</th><th class=command-action-cell></th></tr><? rows.forEach(c => { ?><tr><td><code><?= c.name ?></code></td><td><code><?= c.path ?></code></td><td class=command-description><?= c.description || "—" ?></td><td><? if (c.documentation_url) { ?><a href="<?= c.documentation_url ?>" target=_blank rel=noopener>📖 Docs</a><? } else { ?>—<? } ?></td><td><?= c.source ?></td><td class="<?= c.present && c.executable ? "ok" : "failed" ?>"><?= c.present ? (c.executable ? "✅ available" : "⚠️ not executable") : "❌ missing" ?></td><td class=command-action-cell><div class=command-actions><button data-action=edit-command data-name="<?= c.name ?>" data-path="<?= c.path ?>">✏️ Edit</button><? if (c.registered && c.download_url) { ?><button data-action=download-command data-name="<?= c.name ?>">⬇️ Download</button><? } ?><? if (c.registered) { ?><button class=danger data-action=delete-command data-name="<?= c.name ?>">🗑️ Delete</button><? } ?></div></td></tr><? }) ?></table><div class=row><button data-action=commands-prev<?= d.page <= 1 ? " disabled" : "" ?>>Previous</button><button data-action=commands-next<?= d.has_more ? "" : " disabled" ?>>Next</button></div>`,
     oauth: `<table class=oauth-table><tr><th>Client</th><th>Sessions</th><th>Tokens</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td class=oauth-client><b><?= c.name ?></b><div class=oauth-client-id title="<?= c.client_id ?>"><code><?= c.client_id ?></code></div><div class=oauth-meta><span class=muted>Created</span> <?= it.logdt(c.created_at) ?></div></td><td class=oauth-meta><div class=oauth-count><b><?= c.session_count||0 ?></b> total</div><div><span class=muted>First</span> <?= c.first_session_at ? it.logdt(c.first_session_at) : "—" ?></div><div><span class=muted>Last</span> <?= c.last_session_at ? it.logdt(c.last_session_at) : "—" ?></div></td><td><div class=oauth-tokens><div class=oauth-token><b><?= c.token_count||0 ?></b> <span>Access</span><div class=oauth-meta><span class=muted>Issued</span> <?= c.last_token_at ? it.logdt(c.last_token_at) : "—" ?></div></div><div class=oauth-token><b><?= c.refresh_token_count||0 ?></b> <span>Refresh</span><div class=oauth-meta><span class=muted>Used</span> <?= c.last_refresh_at ? it.logdt(c.last_refresh_at) : "—" ?></div></div></div></td><td class=oauth-actions><button class=small data-action=oauth-sessions data-id="<?= c.client_id ?>">💬 View Sessions</button><button class="small danger" data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> Available Tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,
-    logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=idcell><?= l.context_id ? "#"+l.context_id : "—" ?></td><td><code><?= l.tool ?></code></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Kill</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><section class=json-detail><div class=row><b class=grow>MCP Result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div></td></tr><? } }) ?></tbody></table>`,
+    logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=idcell><?= l.context_id ? "#"+l.context_id : "—" ?></td><td><code><?= l.tool ?></code></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Kill</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><div class=tool-detail-grid><div class=tool-detail-main><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><section class=json-detail><div class=row><b class=grow>MCP Result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div><aside class=tool-descriptor><div class=row><b class=grow>Agent Tool Definition</b><? if(x.tool_descriptor){ ?><span class="descriptor-status <?= x.tool_descriptor_matches_current?'current':'outdated' ?>"><?= x.tool_descriptor_matches_current?'CURRENT':'OUTDATED' ?></span><button class=small data-action=copy-detail data-target="tool-descriptor-<?= l.id ?>">📋 Copy JSON</button><? } ?></div><? if(x.tool_descriptor){ ?><pre id="tool-descriptor-<?= l.id ?>" hidden><?= it.pretty(x.tool_descriptor) ?></pre><? if(x.tool_descriptor.title){ ?><div class=muted>Title</div><div><?= x.tool_descriptor.title ?></div><? } ?><div class=muted>Description</div><p><?= x.tool_descriptor.description||"—" ?></p><div class=muted>Input Schema</div><pre><?= it.pretty(x.tool_descriptor.inputSchema||{}) ?></pre><div class=muted>Output Schema</div><pre><?= it.pretty(x.tool_descriptor.outputSchema||{}) ?></pre><? } else { ?><p class=muted>No descriptor snapshot was recorded for this call.</p><? } ?></aside></div></div></td></tr><? } }) ?></tbody></table>`,
     debug: `<? const d=it.data||{},rows=d.rows||[]; ?><p class="<?= d.enabled?'ok':'failed' ?>"><b><?= d.enabled?'● Recording enabled':'● Recording disabled' ?></b><? if(!d.enabled){ ?> · showing stored requests<? } ?></p><? if(!rows.length){ ?><p class=muted>No stored HTTP debug requests match the current filters.</p><? } else { ?><table><tr><th>ID</th><th>Time</th><th>Session</th><th>Client</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>IP</th><th>Error</th></tr><? rows.forEach(r => { ?><tr data-action=select-debug data-id="<?= r.id ?>" title="Click to expand"><td class=idcell>#<?= r.id ?></td><td class=nowrap><?= it.logdt(r.ts) ?></td><td class=idcell><?= r.context_id ? "#"+r.context_id : "—" ?></td><td><? if(r.client_id){ ?><code><?= r.client_id ?></code><? } else { ?>—<? } ?></td><td><b><?= r.method ?></b></td><td><code><?= r.path ?></code></td><td class="<?= r.status >= 400 ? "failed" : "ok" ?>"><?= r.status ?></td><td><?= r.duration_ms ?>ms</td><td class=nowrap><?= r.remote_addr||"—" ?><? if(r.remote_addr){ ?> (<?= r.remote_count||1 ?>)<? } ?></td><td><?= r.error_preview ?></td></tr><? if(String(d.openRowId||"")===String(r.id)&&d.openDetail){ const x=d.openDetail; ?><tr class=detail-row data-detail-kind=http data-detail-id="<?= r.id ?>"><td colspan=10><div class="detail-panel http-detail-panel"><div class="row http-detail-head"><div class=grow><b>HTTP Request #<?= r.id ?></b><div class=http-detail-meta><span><?= it.logdt(x.ts) ?></span><span><? if(x.context_id){ ?>Session #<?= x.context_id ?><? } else { ?>No Session<? } ?></span><span><? if(x.client_id){ ?>Client <code><?= x.client_id ?></code><? } else { ?>No client id<? } ?></span><span><?= x.remote_addr||"unknown IP" ?><? if(x.remote_addr){ ?> · <?= x.remote_count||1 ?> total request<?= Number(x.remote_count||1)===1?'':'s' ?><? } ?></span><span><?= x.duration_ms ?>ms</span></div></div><button class=small data-action=copy-detail data-target="http-json-<?= r.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=http>✕ Close</button></div><div class=http-detail-grid><section class=http-detail-block><div class=row><h4 class=grow>→ Request</h4><b><?= x.method ?></b> <code><?= x.path ?></code></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.request_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.request_body||{}) ?></pre></section><section class=http-detail-block><div class=row><h4 class=grow>← Response</h4><b class="<?= x.status>=400?'failed':'ok' ?>"><?= x.status ?></b></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.response_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.response_body||{}) ?></pre></section></div><? if(x.error){ ?><section class="http-detail-block http-detail-error"><h4 class=failed>Error</h4><pre><?= x.error ?></pre></section><? } ?><details class=http-detail-raw><summary>Raw record</summary><pre id="http-json-<?= r.id ?>"><?= it.pretty(x) ?></pre></details></div></td></tr><? } }) ?></table><? } ?>`,
   };
   const fragmentDate = value => {
@@ -5317,11 +5359,12 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const settingsMap = {
       externalUrl: "external_url", tlsEmail: "tls_email", publicIpUrls: "public_ip_urls",
       sslipSuffix: "sslip_suffix", acmeDirectoryUrl: "acme_directory_url",
-      desktopNotifications: "desktop_notifications", inheritSystemPath: "inherit_system_path",
+      notifySession: "desktop_notifications_session", notifyWorkspace: "desktop_notifications_workspace",
+      notifyToolCall: "desktop_notifications_tool_call", inheritSystemPath: "inherit_system_path",
     };
     if (settingsMap[id]) {
       uiState.settingsDraft ||= {};
-      uiState.settingsDraft[settingsMap[id]] = ["desktopNotifications", "inheritSystemPath"].includes(id) ? !!checked : text;
+      uiState.settingsDraft[settingsMap[id]] = ["notifySession", "notifyWorkspace", "notifyToolCall", "inheritSystemPath"].includes(id) ? !!checked : text;
     }
   }
   async function uiCommandRow(name, path = "") {
@@ -5561,7 +5604,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           public_ip_urls: String(values.publicIpUrls || "").split(/\r?\n/),
           sslip_suffix: String(values.sslipSuffix || ""),
           acme_directory_url: String(values.acmeDirectoryUrl || ""),
-          desktop_notifications: !!values.desktopNotifications,
+          desktop_notifications_session: !!values.notifySession,
+          desktop_notifications_workspace: !!values.notifyWorkspace,
+          desktop_notifications_tool_call: !!values.notifyToolCall,
           inherit_system_path: !!values.inheritSystemPath,
         };
         const warnings = settingsFieldWarnings(body);
@@ -5602,10 +5647,14 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         case "native-drop": {
           const { added, existing } = await addDroppedRoots(event.paths);
           if (added.length) uiNotice(`${added.length === 1 ? "Workspace" : "Workspaces"} added: ${added.join(", ")}`, "ok");
-          if (added.length || existing.length) postOsNotification(
-            "MrMCP · Workspace",
-            [added.length && `Added · ${added.join(", ")}`, existing.length && `Exists · ${existing.join(", ")}`].filter(Boolean).join(" · "),
-          );
+          if (added.length || existing.length) {
+            const affected = [...added, ...existing];
+            postOsNotification(
+              "workspace",
+              affected.length === 1 ? `Workspace · ${affected[0]}` : "Workspace",
+              [added.length && `Added · ${added.join(", ")}`, existing.length && `Exists · ${existing.join(", ")}`].filter(Boolean).join(" · "),
+            );
+          }
           return;
         }
         case "navigate": {
@@ -5804,7 +5853,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       }
       for (const key of ["external_url", "tls_email", "sslip_suffix", "acme_directory_url"])
         if (x[key] != null) setCfg(key, x[key]);
-      if (x.desktop_notifications != null) setCfg("desktop_notifications", x.desktop_notifications ? "1" : "0");
+      for (const key of ["desktop_notifications_session", "desktop_notifications_workspace", "desktop_notifications_tool_call"])
+        if (x[key] != null) setCfg(key, x[key] ? "1" : "0");
       if (x.inherit_system_path != null) setCfg("inherit_system_path", x.inherit_system_path ? "1" : "0");
       if (Array.isArray(x.public_ip_urls)) setCfg("public_ip_urls_json", JSON.stringify(
         x.public_ip_urls.map(String).map(value => value.trim()).filter(value => /^https:\/\//i.test(value)),
@@ -6113,6 +6163,13 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       const detail = one(`SELECT id,started_at,completed_at,server_id,server_name,tool,status,input_json,resolved_json,
         stdout,stderr,error,result_json,duration_ms,context_id,context_handle FROM logs WHERE id=?`, logId);
       if (!detail) return json({ error: "Not found" });
+      const descriptor = one("SELECT descriptor_json FROM tool_call_descriptors WHERE log_id=?", logId);
+      if (descriptor?.descriptor_json) {
+        detail.tool_descriptor = parseJson(descriptor.descriptor_json, null);
+        const currentDescriptor = serverTools(serverConfig(), true).find(tool => tool.name === detail.tool) || null;
+        detail.tool_descriptor_current_available = !!currentDescriptor;
+        detail.tool_descriptor_matches_current = !!currentDescriptor && JSON.stringify(currentDescriptor) === JSON.stringify(detail.tool_descriptor);
+      }
       const process = [...processes.values()].find(record => record.log_id === logId);
       if (process) detail.process = processView(process);
       return json(detail);
@@ -6146,7 +6203,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   const UI_TEMPLATE = String.raw`<!doctype html><html><head><meta charset=utf-8>
 <meta http-equiv="Content-Security-Policy" content="${UI_CSP}">
 <meta name=viewport content="width=device-width,initial-scale=1"><link rel=icon href="${GUI_LOGO_DATA_URL}"><title>MrMCP</title><style>
-:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}aside button{display:block;width:100%;text-align:left;margin:3px 0;background:transparent;border:0}aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.notice-balloon{position:fixed;top:64px;right:16px;z-index:1900;max-width:min(520px,calc(100vw - 32px));padding:10px 12px;border:1px solid #7d3f47;border-radius:9px;background:#25191b;color:#ffb7bf;box-shadow:0 8px 28px #0008}.notice-balloon.info{border-color:#365a7d;background:#16202b;color:#a9d5ff}.notice-balloon.ok{border-color:#356849;background:#16241b;color:#9ce8b1}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.debug-toggle{font-weight:750;min-width:190px}.debug-toggle.enabled{background:#173f24;border-color:#347a49;color:#9ce8b1}.debug-toggle.disabled{background:#421d21;border-color:#7d3f47;color:#ffb7bf}.debug-toggle.enabled:hover{background:#20512f}.debug-toggle.disabled:hover{background:#53262b}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 18px 14px 28px;background:#111318}.detail-panel{border:1px solid #343944;border-left:3px solid #3984e8;border-radius:8px;background:#0d0f12;padding:14px 16px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.http-detail-head{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #292d34}.http-detail-meta{display:flex;gap:7px 16px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:#89909b}.http-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.http-detail-block{min-width:0;border:1px solid #292d34;border-radius:8px;background:#0a0c0f;padding:10px}.http-detail-block h4{margin:0}.http-detail-block pre{max-height:30vh}.http-detail-error{margin-top:12px;border-color:#68353a;background:#1d1012}.http-detail-raw{margin-top:12px}.http-detail-raw summary{cursor:pointer;color:#89909b}@media(max-width:1100px){.http-detail-grid{grid-template-columns:1fr}}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.menu-icon{display:inline-block;width:22px;text-align:center}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout{grid-template-columns:1fr}.default-root-card{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){aside{width:130px}main{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
+:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}aside button{display:block;width:100%;text-align:left;margin:3px 0;background:transparent;border:0}aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.notice-balloon{position:fixed;top:64px;right:16px;z-index:1900;max-width:min(520px,calc(100vw - 32px));padding:10px 12px;border:1px solid #7d3f47;border-radius:9px;background:#25191b;color:#ffb7bf;box-shadow:0 8px 28px #0008}.notice-balloon.info{border-color:#365a7d;background:#16202b;color:#a9d5ff}.notice-balloon.ok{border-color:#356849;background:#16241b;color:#9ce8b1}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.debug-toggle{font-weight:750;min-width:190px}.debug-toggle.enabled{background:#173f24;border-color:#347a49;color:#9ce8b1}.debug-toggle.disabled{background:#421d21;border-color:#7d3f47;color:#ffb7bf}.debug-toggle.enabled:hover{background:#20512f}.debug-toggle.disabled:hover{background:#53262b}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 18px 14px 28px;background:#111318}.detail-panel{border:1px solid #343944;border-left:3px solid #3984e8;border-radius:8px;background:#0d0f12;padding:14px 16px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.tool-detail-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:14px;align-items:start}.tool-detail-main{min-width:0}.tool-descriptor{min-width:0;position:sticky;top:10px;border:1px solid #343944;border-radius:8px;background:#111318;padding:12px}.tool-descriptor>.muted{margin-top:10px}.tool-descriptor p{margin:5px 0 10px;line-height:1.45}.tool-descriptor pre{margin:5px 0 10px;max-height:28vh}.descriptor-status{font-size:11px;font-weight:800;letter-spacing:.04em;padding:3px 6px;border-radius:5px}.descriptor-status.current{color:#75d58b;background:#16341f}.descriptor-status.outdated{color:#ffd166;background:#3a2f13}.http-detail-head{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #292d34}.http-detail-meta{display:flex;gap:7px 16px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:#89909b}.http-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.http-detail-block{min-width:0;border:1px solid #292d34;border-radius:8px;background:#0a0c0f;padding:10px}.http-detail-block h4{margin:0}.http-detail-block pre{max-height:30vh}.http-detail-error{margin-top:12px;border-color:#68353a;background:#1d1012}.http-detail-raw{margin-top:12px}.http-detail-raw summary{cursor:pointer;color:#89909b}@media(max-width:1100px){.tool-detail-grid,.http-detail-grid{grid-template-columns:1fr}.tool-descriptor{position:static}}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.menu-icon{display:inline-block;width:22px;text-align:center}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout{grid-template-columns:1fr}.default-root-card{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){aside{width:130px}main{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
 </style></head><body>
 <div id=app data-section=dashboard><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div><div class=status><span class=pending>starting…</span></div></header><main style="margin-left:0"><div class=card>Starting the local MrMCP UI…</div></main></div>
 <script type=module nonce="${UI_SCRIPT_NONCE}">__MRMCP_BROWSER_JS__</script></body></html>`;

@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.87
+# MrMCP 0.10.88
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a local Tauriless administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit Session `context_handle` capabilities.
 
@@ -48,7 +48,7 @@ deno run -A mrmcp.js --backend
 
 The administration interface is local-only and opens no GUI network listener. Desktop mode starts the backend in a Deno Worker in the same OS process, waits for a typed `ready` message, removes unused Tauriless forwarded-event subscriptions before the WebView exists, creates the `main` Tauriless webview window on the main OS thread, and serves `index.html` through Tauriless' `asset-request` / `tauriless:asset-response` protocol. Only close-requested, destroyed, native directory drop and the built-in `tauriless://webview-message` host event remain subscribed. Small GUI assets are embedded in the local HTML response. Browser text edits are coalesced before crossing the event bridge; actions, changes, blur, submit and navigation flush pending edits first. Rendered Eta HTML returns through the Tauri event bus before Morphlex applies it. There is no GUI login token, cookie, session or CSRF layer. Deno drains Tauriless every ~16 ms; when the window is destroyed, MrMCP gracefully shuts down the Worker, closes Tauriless and exits. The main window is created hidden, forced to a logical 1180×760 inner size, centered and only then shown.
 
-Desktop mode also sets a native MrMCP window icon and creates a system-tray icon whose menu contains only **Quit**. A left click on the tray toggles the main window between visible and hidden; if the window is minimized, the tray click restores it and brings it to the foreground instead of hiding it. Clicking the window X hides it without terminating MrMCP. Native directory drag/drop automatically adds enabled Workspaces: non-directory drops are ignored, an already configured effective path is a no-op, and the globally unique Workspace name uses the final directory name with the first free `Name`, `Name #2`, `Name #3`, ... form. A global **Desktop Notifications** setting controls all OS notifications and is enabled by default. When enabled, MrMCP notifies for newly created remote Sessions, incoming Tool Calls, Workspaces added by native directory drop, and dropped directories that already correspond to an existing Workspace. On Windows, before the first WebView is created, MrMCP calls Tauriless `tauriless:set-app-user-model-id` with `Deno.execPath()` and then uses the ordinary Tauri notification plugin; for a standalone build this makes the explicit AppUserModelID the absolute path of `mrmcp.exe`.
+Desktop mode also sets a native MrMCP window icon and creates a system-tray icon whose menu contains only **Quit**. A left click on the tray toggles the main window between visible and hidden; if the window is minimized, the tray click restores it and brings it to the foreground instead of hiding it. Clicking the window X hides it without terminating MrMCP. Native directory drag/drop automatically adds enabled Workspaces: non-directory drops are ignored, an already configured effective path is a no-op, and the globally unique Workspace name uses the final directory name with the first free `Name`, `Name #2`, `Name #3`, ... form. **Desktop Notifications** has independent checkboxes for Session, Workspace and Tool Call notifications, all enabled by default (existing installs inherit the previous global setting until these per-type values are saved). Notification titles do not repeat `MrMCP` because Windows already identifies the application; when a single Workspace is known, the title includes its name, for example `Tool Call · php-xmake`. On Windows, before the first WebView is created, MrMCP calls Tauriless `tauriless:set-app-user-model-id` with `Deno.execPath()` and then uses the ordinary Tauri notification plugin; for a standalone build this makes the explicit AppUserModelID the absolute path of `mrmcp.exe`.
 
 Public listener ports are runtime-resolved without changing configuration. If HTTP 80 or HTTPS 443 is already occupied, that listener retries at `base + 50` repeatedly until it binds (for example 80→130 or 443→493). The GUI has no listener or fallback port. The compact header groups version, live/fallback state and effective HTTP/HTTPS ports, recently active Sessions with `#id(total Tool Calls)`, and Tool Calls total/in-flight/error/invalid counts. Useful header values are server-routed shortcuts: ports open Settings, active opens all Sessions, a recent `#Session` opens that Session's Tool Calls, and in-flight/total/errors/invalid open Tool Calls filtered to running/all/failed/invalid. Every shortcut only sends a normalized Tauri event; Deno updates `uiState` and Eta renders the result through the normal Tauri-event/Morphlex pipeline. Related values use semantic text colors: active green, in-flight yellow, errors red, invalid purple and totals/session counters blue-neutral. A Session is considered active when it has started a Tool Call within the last five minutes; at most the four most recently active Sessions are listed. ACME HTTP-01 is available only when the effective HTTP listener is still port 80; fallback instances may reuse existing certificates but cannot perform HTTP-01 issuance on the fallback HTTP port.
 
@@ -80,13 +80,13 @@ MrMCP implements that application-level pattern with `open_workspace(name, curre
 
 ### Open a Workspace and reuse the Session
 
-1. Call `open_workspace` with the exact enabled Workspace `name`. Optionally pass the Session you are already using as `current_context_handle`.
+1. If the Workspace name is not already known, call sessionless `list_workspaces` to retrieve the enabled names. Then call `open_workspace` with the exact desired Workspace `name`. The published `name` schema is a free string rather than an enum of currently configured Workspaces; the server validates that the supplied name exists and is enabled when the call runs. Optionally pass the Session you are already using as `current_context_handle`.
 2. If `current_context_handle` is active, MrMCP moves that same Session to the named Workspace and returns the same `ctx_...` handle. If it is omitted, empty, unknown or expired, MrMCP creates a new Session in that Workspace and returns its new globally unique, unguessable handle.
 3. The `open_workspace` result includes `workspace_name`, the absolute Workspace `cwd` and, when present, `agent_guidance_path` pointing to the Workspace-level `AGENTS.md` or `agents.md`; read and follow that file before repository work.
-4. Pass the exact returned handle unchanged in `context_handle` on every later MrMCP tool call. To switch Workspaces from MCP, call `open_workspace` again with that handle as `current_context_handle`.
-5. For tools other than `open_workspace`, a missing, unknown or expired required `context_handle` does not execute the requested operation and never mints a replacement automatically.
+4. Pass the exact returned handle unchanged in `context_handle` on every later Session-bound tool call. To switch Workspaces from MCP, call `open_workspace` again with that handle as `current_context_handle`.
+5. `list_workspaces` remains sessionless. For tools other than `list_workspaces` and `open_workspace`, a missing, unknown or expired required `context_handle` does not execute the requested operation and never mints a replacement automatically.
 
-Successful tool results repeat only the bearer capability as common metadata:
+Successful Session-bound tool results repeat only the bearer capability as common metadata; `list_workspaces` returns only its Workspace-name list:
 
 ```json
 {
@@ -132,7 +132,7 @@ The current schema gives every Session a numeric administrative primary key in `
 
 The Workspaces page registers named directories and shows the Sessions currently attached to each Workspace. Workspace names are globally unique. Paths may be absolute or relative; MrMCP stores the entered value unchanged and resolves relative paths against the program folder only when the Workspace is actually used. Name/path errors are shown inline beside the field and disable Save; browser-native validation bubbles and error popups are not used. Path existence/type validation runs when the path field loses focus.
 
-- `open_workspace(name, current_context_handle?)` moves an active current Session directly into the enabled named Workspace while preserving its handle; without a usable current handle it creates a new Session there.
+- `open_workspace(name, current_context_handle?)` accepts any Workspace name as a string and validates it at execution time; it moves an active current Session directly into the enabled named Workspace while preserving its handle, or creates a new Session there without a usable current handle.
 - Dragging an existing Session between Workspace cards reassigns it in one step.
 - The program-folder fallback bucket is available only for existing Sessions whose named Workspace is removed/disabled or explicitly cleared by the operator; it is not a valid `open_workspace` target.
 - Disabled Workspaces remain visible for editing/deletion but cannot be opened or receive Sessions.
@@ -149,7 +149,8 @@ All relative paths and new child-process working directories must remain inside 
 
 Session and Workspace:
 
-- `open_workspace` — requires the globally unique enabled Workspace `name`; optionally reuses and switches an active `current_context_handle`, otherwise creates a new Session, and directly returns `workspace_name`, `cwd` and nullable `agent_guidance_path`;
+- `list_workspaces` — sessionless read-only discovery; returns only the names of enabled Workspaces;
+- `open_workspace` — requires the globally unique enabled Workspace `name` as a free string; optionally reuses and switches an active `current_context_handle`, otherwise creates a new Session, and directly returns `workspace_name`, `cwd` and nullable `agent_guidance_path`;
 - `query_tool_calls` — query calls that actually reached MrMCP for the same `context_handle`, with exact tool/status filters, literal full-record text search, stable backward pagination and a bounded result limit.
 
 Filesystem and text:
@@ -281,6 +282,7 @@ The Tool Calls page supports:
 - complete timestamps with compact relative ages;
 - compact rows without inline input/output JSON;
 - Eta-rendered expanded details keyed by stable log database ids so Morphlex preserves row identity during live inserts;
+- a right-side **Agent Tool Definition** panel showing the persisted descriptor snapshot used for that call: title/description plus input and output schemas. The snapshot is stored when the call arrives, so historical rows do not silently change when a tool definition is edited later; a **CURRENT** / **OUTDATED** badge compares that snapshot with the descriptor currently published by the server;
 - a Terminal block above MCP JSON only when the call result is actually process-like; ordinary filesystem, search and control tools do not render terminal chrome;
 - terminal command/cwd plus optional input `stdin` in its own panel and the combined normalized `output` stream, preferring live in-memory process output when available; base64 stdin is labeled without decoding it for display; process chunks enter the same coalesced Deno render queue so an expanded running call updates without polling; separately requested stdout/stderr remain available in MCP Result JSON;
 - Terminate and Force controls only when cancellation is real.
@@ -303,6 +305,13 @@ Settings also provides **Clear Operational Data**. It preserves authentication s
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### 0.10.88
+
+- Added sessionless read-only `list_workspaces`, returning only enabled Workspace names, while keeping `open_workspace.name` a free string validated at execution time instead of an enum of configured names.
+- Persist Tool Call descriptor snapshots and show the exact agent-facing title, description, input schema and output schema beside expanded calls, with a live **CURRENT** / **OUTDATED** comparison against the descriptor currently published by the server.
+- Split Desktop Notifications into independent Session, Workspace and Tool Call settings; notification titles no longer repeat `MrMCP` and include the Workspace name when one is known.
+- Moved **Save Settings** to the top of Settings so it remains immediately visible.
 
 ### 0.10.87
 
