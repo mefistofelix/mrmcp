@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.90 — Deno-owned event-driven UI with structured desktop notifications and explicit context capabilities.
+MrMCP 0.10.91 — Deno-owned event-driven UI with structured desktop notifications and explicit context capabilities.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -42,7 +42,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.90";
+const VERSION = "0.10.91";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000;
@@ -663,6 +663,21 @@ async function backend() {
       ? one("SELECT name FROM roots WHERE server_id=? AND id=?", p.id, Number(context.root_id))?.name
       : "Program folder") || "Program folder";
     return `💬 Session #${context.id}\n• 📁 ${workspace}\n• 🕒 ${notificationAge(context.created_at, now)}\n• 🛠️ ${count} Tool Call${count === 1 ? "" : "s"}`;
+  };
+  const compactNotificationError = value => {
+    const text = String(value ?? "").replace(/\s+/g, " ").trim();
+    return text.length > 160 ? `${text.slice(0, 159)}…` : text;
+  };
+  const toolCallNotificationBody = (p, tool, args, contextHandle = "", root = null, error = "") => {
+    const context = contextByHandle(p, contextHandle);
+    const session = context ? sessionNotificationLabel(p, context, null, Date.now(), root?.name || "") : "";
+    const command = compactExecCommand(p, tool, args);
+    return [
+      session,
+      `• 🔧 ${tool}`,
+      command && `• ⌨️ ${command}`,
+      error && `• ⚠️ ${compactNotificationError(error)}`,
+    ].filter(Boolean).join("\n");
   };
   const setCfg = (key, value) => run(
     "INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -3023,7 +3038,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     };
   }
 
-  function beginLog(p, tool, args, contextHandle = "", root = null, descriptor = null) {
+  function beginLog(p, tool, args, contextHandle = "", root = null, descriptor = null, notifyStart = true) {
     const context = contextByHandle(p, contextHandle), contextId = Number(context?.id || 0), now = Date.now();
     const previous = contextId ? one(
       "SELECT COUNT(*) tool_calls, MAX(started_at) last_call_at FROM logs WHERE server_id=? AND context_id=?",
@@ -3043,8 +3058,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     );
     if (context && previousCalls && now - lastCallAt >= SESSION_ACTIVE_MS)
       postOsNotification("session", "🟢 Session Active", sessionLabel);
-    const commandPreview = compactExecCommand(p, tool, args);
-    postOsNotification("tool_call", `🛠️ Tool Call #${id}`, `${sessionLabel ? `${sessionLabel}\n` : ""}• 🔧 ${tool}${commandPreview ? `\n• ⌨️ ${commandPreview}` : ""}`);
+    if (notifyStart)
+      postOsNotification("tool_call", `🛠️ Tool Call #${id}`, toolCallNotificationBody(p, tool, args, contextHandle, root));
     return id;
   }
   function updateLog(id, fields) {
@@ -3062,12 +3077,17 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     } catch {}
   }
   function rejectToolCall(p, tool, args, message, contextHandle = "", status = "failed", result = { error: message }, descriptor = null) {
-    const id = beginLog(p, tool, args, contextHandle, null, descriptor), completed = Date.now();
+    const id = beginLog(p, tool, args, contextHandle, null, descriptor, false), completed = Date.now();
     updateLog(id, {
       completed_at: completed, duration_ms: 0, status,
       error: message, result_json: JSON.stringify(result),
     });
     indexLog(id);
+    postOsNotification(
+      "tool_call",
+      status === "invalid" ? `⚠️ Invalid Tool Call #${id}` : `❌ Tool Call Rejected #${id}`,
+      toolCallNotificationBody(p, tool, args, contextHandle, null, message),
+    );
     emitUiChange(["state"], status === "invalid" ? "tool-call-invalid" : "tool-call-rejected");
     return id;
   }
@@ -4094,7 +4114,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const handle = resolution.record?.handle || resolution.supplied_handle || "";
     const error = contextControlMessage(resolution.kind);
     const structuredContent = contextEnvelope(handle, { error });
-    const id = beginLog(p, name, args, handle, null, descriptor);
+    const id = beginLog(p, name, args, handle, null, descriptor, false);
     const toolResult = {
       content: [{ type: "text", text: error }],
       structuredContent, isError: true,
@@ -4105,6 +4125,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       result_json: JSON.stringify(toolResultForLog(toolResult)), error,
     });
     indexLog(id);
+    postOsNotification("tool_call", `⚠️ Invalid Tool Call #${id}`, toolCallNotificationBody(p, name, args, handle, null, error));
     return toolResult;
   }
 
@@ -4149,6 +4170,12 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         result_json: JSON.stringify(toolResultForLog(toolResult)),
       });
       indexLog(id);
+      if (status === "failed") {
+        const failure = publicLogResult.error || publicLogResult.stderr ||
+          (publicLogResult.exit_code != null ? `Exit code ${publicLogResult.exit_code}${publicLogResult.signal ? ` · ${publicLogResult.signal}` : ""}` : "Tool returned an error");
+        postOsNotification("tool_call", `❌ Tool Call Failed #${id}`,
+          toolCallNotificationBody(p, name, args, callInfo.contextHandle, callInfo.selection?.root, failure));
+      }
       return toolResult;
     } catch (error) {
       const message = String(error?.stack || error);
@@ -4167,6 +4194,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         error: message, result_json: JSON.stringify(toolResultForLog(toolResult)),
       });
       indexLog(id);
+      postOsNotification("tool_call", `❌ Tool Call Failed #${id}`,
+        toolCallNotificationBody(p, name, args, callInfo.contextHandle, callInfo.selection?.root, error?.message || error));
       return toolResult;
     } finally {
       activeCallControls.delete(id);
