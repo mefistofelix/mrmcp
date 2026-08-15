@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.94 — Session-scoped persistent exec ids and non-consuming process status/output inspection.
+MrMCP 0.10.95 — Suspend desktop UI rendering while hidden or minimized and resynchronize on restore.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -42,7 +42,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.94";
+const VERSION = "0.10.95";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 3000;
@@ -391,7 +391,7 @@ async function backend() {
   });
   Deno.mkdirSync(TEMP_DIR, { recursive: true });
   const db = new DatabaseSync(DB_PATH);
-  let uiRevision = 0, uiRenderConnected = false;
+  let uiRevision = 0, uiRenderConnected = false, uiRenderVisible = false, uiRenderVisibilityEpoch = 0;
   const deliverUiRender = payload => {
     if (IS_BACKEND_WORKER) self.postMessage({ type: "ui-render", payload });
   };
@@ -421,6 +421,22 @@ async function backend() {
   function emitUiChange(scopes = ["state"], reason = "change") {
     if (uiScopesAffectCurrent(scopes)) queueUiRender(reason);
   }
+  function setUiRenderVisible(visible) {
+    const next = !!visible;
+    if (uiRenderVisible === next) {
+      if (next && uiRenderQueued) queueUiRender("visibility-sync", 0);
+      return;
+    }
+    uiRenderVisible = next;
+    uiRenderVisibilityEpoch += 1;
+    uiRenderQueued = true;
+    if (!next) {
+      if (uiRenderTimer) clearTimeout(uiRenderTimer);
+      uiRenderTimer = null;
+      return;
+    }
+    queueUiRender("visibility-sync", 0);
+  }
   function queueUiRender(reason = "change", delay = 18) {
     uiRenderQueued = true;
     if (uiInputDepth) {
@@ -428,12 +444,16 @@ async function backend() {
       uiInputRenderDelay = uiInputRenderDelay == null ? value : Math.min(uiInputRenderDelay, value);
       return;
     }
-    if (!uiRenderConnected || uiRenderRunning || uiRenderTimer) return;
+    if (!uiRenderConnected || !uiRenderVisible || uiRenderRunning || uiRenderTimer) return;
     uiRenderTimer = setTimeout(() => {
       uiRenderTimer = null;
       drainUiRenderQueue(reason).catch(error => {
         console.error("MrMCP UI render failed", error);
         uiRenderRunning = false;
+        if (!uiRenderVisible) {
+          uiRenderQueued = true;
+          return;
+        }
         uiRenderQueued = false;
         const message = htmlEscape(String(error?.stack || error));
         deliverUiRender({
@@ -447,13 +467,23 @@ async function backend() {
     }, Math.max(0, Number(delay) || 0));
   }
   async function drainUiRenderQueue(reason = "change") {
-    if (uiRenderRunning) return;
+    if (uiRenderRunning || !uiRenderConnected || !uiRenderVisible) return;
     uiRenderRunning = true;
     try {
-      while (uiRenderQueued) {
+      while (uiRenderQueued && uiRenderVisible) {
         uiRenderQueued = false;
         await Promise.resolve();
+        if (!uiRenderVisible) {
+          uiRenderQueued = true;
+          break;
+        }
+        const visibilityEpoch = uiRenderVisibilityEpoch;
         const html = await renderUiDocument();
+        if (!uiRenderVisible || visibilityEpoch !== uiRenderVisibilityEpoch) {
+          uiRenderQueued = true;
+          if (uiRenderVisible) continue;
+          break;
+        }
         deliverUiRender({
           revision: ++uiRevision,
           html,
@@ -464,11 +494,11 @@ async function backend() {
           reason,
           at: Date.now(),
         });
-        if (uiRenderQueued) await sleep(0);
+        if (uiRenderQueued && uiRenderVisible) await sleep(0);
       }
     } finally {
       uiRenderRunning = false;
-      if (uiRenderQueued) queueUiRender("coalesced", 0);
+      if (uiRenderQueued && uiRenderVisible) queueUiRender("coalesced", 0);
     }
   }
   function uiScopesForSql(sql) {
@@ -6960,6 +6990,10 @@ listen("tauri://close-requested", () => {
   };
   if (IS_BACKEND_WORKER) {
     self.onmessage = event => {
+      if (event.data?.type === "ui-visibility") {
+        setUiRenderVisible(event.data.visible);
+        return;
+      }
       if (event.data?.type === "ui-input") {
         enqueueUiInput(event.data.payload);
         return;
@@ -7067,7 +7101,7 @@ async function desktop() {
     }
     return { rgba: Array.from(rgba), width, height };
   };
-  let nextId = 1, drainTimer = null, closed = false, webviewMessagesReady = false, notificationsReady = false, resolveClosed, resolveWebviewReady;
+  let nextId = 1, drainTimer = null, windowVisibilityTimer = null, closed = false, webviewMessagesReady = false, notificationsReady = false, windowRenderVisible = false, resolveClosed, resolveWebviewReady;
   const workerMessageQueue = [], notificationQueue = [];
   const channel = () => `__CHANNEL__:${crypto.getRandomValues(new Uint32Array(1))[0]}`;
   const windowClosed = new Promise(resolve => { resolveClosed = resolve; });
@@ -7081,12 +7115,36 @@ async function desktop() {
   const emitToWebview = (event, eventPayload) => request("plugin:event|emit_to", {
     target: { kind: "WebviewWindow", label: "main" }, event, payload: eventPayload,
   });
+  const publishRenderVisibility = visible => {
+    const next = !!visible;
+    if (windowRenderVisible === next) return;
+    windowRenderVisible = next;
+    backendWorker.postMessage({ type: "ui-visibility", visible: next });
+  };
+  const syncWindowRenderVisibility = async () => {
+    const visible = !!await request("plugin:window|is_visible", { label: "main" });
+    const minimized = visible && !!await request("plugin:window|is_minimized", { label: "main" });
+    publishRenderVisibility(visible && !minimized);
+    return visible && !minimized;
+  };
+  const queueWindowRenderVisibilitySync = (delay = 25) => {
+    if (windowVisibilityTimer) clearTimeout(windowVisibilityTimer);
+    windowVisibilityTimer = setTimeout(() => {
+      windowVisibilityTimer = null;
+      void syncWindowRenderVisibility().catch(error => console.error("MrMCP window visibility sync failed", error));
+    }, Math.max(0, Number(delay) || 0));
+  };
   const showWindow = async () => {
     await request("plugin:window|unminimize", { label: "main" });
     await request("plugin:window|show", { label: "main" });
     await request("plugin:window|set_focus", { label: "main" });
+    await syncWindowRenderVisibility();
   };
-  const hideWindow = () => request("plugin:window|hide", { label: "main" });
+  const hideWindow = async () => {
+    const result = await request("plugin:window|hide", { label: "main" });
+    publishRenderVisibility(false);
+    return result;
+  };
   const toggleWindow = async () => {
     if (await request("plugin:window|is_minimized", { label: "main" })) return showWindow();
     return await request("plugin:window|is_visible", { label: "main" }) ? hideWindow() : showWindow();
@@ -7096,6 +7154,7 @@ async function desktop() {
   } });
   const handleWorkerMessage = data => {
     if (data?.type === "ui-render") {
+      if (!windowRenderVisible) return;
       void emitToWebview(UI_RENDER_EVENT, data.payload).catch(error => console.error("MrMCP render delivery failed", error));
     } else if (data?.type === "os-notification") {
       if (!notificationsReady) notificationQueue.push(data);
@@ -7127,6 +7186,7 @@ async function desktop() {
       } else if (message.kind === "event" && message.window === "main") {
         if (message.event === "tauri://close-requested") void hideWindow().catch(console.error);
         else if (message.event === "tauri://destroyed") resolveClosed();
+        else if (["tauri://resize", "tauri://focus", "tauri://blur"].includes(message.event)) queueWindowRenderVisibilitySync();
         else if (message.event === UI_INPUT_EVENT) {
           if (message.payload?.event?.type === "bootstrap") resolveWebviewReady(true);
           backendWorker.postMessage({ type: "ui-input", payload: message.payload });
@@ -7158,8 +7218,7 @@ async function desktop() {
       appId: Deno.execPath(), name: "MrMCP",
     });
     for (const event of [
-      "tauri://resize", "tauri://move", "tauri://focus", "tauri://blur",
-      "tauri://scale-change", "tauri://theme-changed", "tauri://window-created", "tauri://webview-created",
+      "tauri://move", "tauri://scale-change", "tauri://theme-changed", "tauri://window-created", "tauri://webview-created",
       "tauri://drag-enter", "tauri://drag-over", "tauri://drag-leave", "tauri://suspended", "tauri://resumed",
       "deep-link://new-url", "log://log", "store://change",
     ]) await request("tauriless:unsubscribe", { event });
@@ -7192,6 +7251,7 @@ async function desktop() {
     backendWorker.removeEventListener("message", onWorkerMessage);
     closed = true;
     if (drainTimer) clearInterval(drainTimer);
+    if (windowVisibilityTimer) clearTimeout(windowVisibilityTimer);
     for (const callback of pending.values()) callback.reject(new Error("Tauriless closing"));
     pending.clear();
     try { tauriless.close(); } finally { await stopBackendWorker(backendWorker); }
