@@ -1,12 +1,12 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.91
+# MrMCP 0.10.92
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a local Tauriless administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit Session `context_handle` capabilities.
 
 ### Tool Calls
 
-Expanded process calls show the full terminal-style command, optional stdin and combined output above the raw MCP input/result JSON. Compact `exec*` rows and desktop notifications also show a short command preview using only the executable basename, up to six arguments, 48 characters per argument and 180 characters overall; extra arguments collapse to `… +N args`.
+Expanded process calls show the full terminal-style command, optional stdin and combined output above the raw input, raw tool return value and final MCP result JSON. Every compact Tool Call row and desktop Tool Call notification shows the tool plus a short argument preview: up to six top-level arguments, 48 characters per value and 180 characters overall, with excess arguments collapsed to `… +N args`. Session bearer handles are omitted from previews. The `exec*` family keeps its command-aware form, using only the executable basename and resolving related process calls back to the command when available.
 
 ![MrMCP Tool Calls view](./assets/mrmcp-screenshot1.png)
 
@@ -280,11 +280,12 @@ The Tool Calls page supports:
 - automatically apply the full-text query and every filter change without a Search button;
 - numbered pagination above the table;
 - complete timestamps with compact relative ages;
-- compact rows without inline input/output JSON;
+- compact rows without inline input/output JSON, but with every tool's bounded argument preview;
 - Eta-rendered expanded details keyed by stable log database ids so Morphlex preserves row identity during live inserts;
 - a right-side **Agent Tool Definition** panel showing the persisted descriptor snapshot used for that call: title/description plus input and output schemas. The snapshot is stored when the call arrives, so historical rows do not silently change when a tool definition is edited later; a **CURRENT** / **OUTDATED** badge compares that snapshot with the descriptor currently published by the server;
 - a Terminal block above MCP JSON only when the call result is actually process-like; ordinary filesystem, search and control tools do not render terminal chrome;
-- terminal command/cwd plus optional input `stdin` in its own panel and the combined normalized `output` stream, preferring live in-memory process output when available; base64 stdin is labeled without decoding it for display; process chunks enter the same coalesced Deno render queue so an expanded running call updates without polling; separately requested stdout/stderr remain available in MCP Result JSON;
+- the raw tool return value in its own JSON block for every completed call, including the `exec*` family, followed separately by the final MCP Result JSON;
+- terminal command/cwd plus optional input `stdin` in its own panel and the combined normalized `output` stream, preferring live in-memory process output when available; base64 stdin is labeled without decoding it for display; process chunks enter the same coalesced Deno render queue so an expanded running call updates without polling; separately requested stdout/stderr remain available in the return/MCP JSON;
 - Terminate and Force controls only when cancellation is real.
 
 ## TLS and connectivity
@@ -305,6 +306,12 @@ Settings also provides **Clear Operational Data**. It preserves authentication s
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### 0.10.92
+
+- Added bounded argument previews for every compact Tool Call row and desktop Tool Call notification, omitting Session bearer handles while preserving command-aware previews for the `exec*` family.
+- Expanded Tool Call details with a separate **Tool Return Value JSON** block before the final **MCP Result JSON**, including process/`exec*` calls.
+- No SQLite schema change.
 
 ### 0.10.91
 
