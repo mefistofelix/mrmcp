@@ -318,7 +318,9 @@ Both maintenance actions use the same Promise barrier, not an application queue:
 
 ## Development changelog
 
-### Unreleased
+### 0.10.97
+
+- Prevented horizontal overflow in the Dashboard Active Tool Calls panel; it now exposes vertical scrolling only while keeping long call summaries clipped/ellipsized within the fixed five-row viewport.
 
 ### 0.10.96
 
