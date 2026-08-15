@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.93 — request-scoped process progress, persistent exec attach and live Tool Call activity.
+MrMCP 0.10.94 — Session-scoped persistent exec ids and non-consuming process status/output inspection.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -32,17 +32,17 @@ const BASE_TOOLS = [
   "list_workspaces", "open_workspace", "read_file", "read_files", "write_file", "write_files",
   "edit", "replace", "glob", "grep",
   "file_info", "create_directory", "copy_path", "move_path", "trash_paths", "untrash_action",
-  "publish_file", "publish_html", "list_commands", "query_tool_calls", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list",
+  "publish_file", "publish_html", "list_commands", "query_tool_calls", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
   "js", "js_add_node_module_dir", "js_reset",
 ];
 const READ_TOOLS = new Set([
   "list_workspaces", "read_file", "read_files", "glob", "grep",
-  "file_info", "list_commands", "query_tool_calls", "exec_attach", "exec_list",
+  "file_info", "list_commands", "query_tool_calls", "exec_attach", "exec_list", "exec_status",
 ]);
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.93";
+const VERSION = "0.10.94";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 3000;
@@ -728,21 +728,22 @@ async function backend() {
   };
   const compactExecCommand = (p, tool, args = {}) => {
     if (!String(tool || "").startsWith("exec")) return "";
-    let spec = args && typeof args === "object" ? args : {};
+    let spec = args && typeof args === "object" ? args : {}, execPrefix = "";
     if (!["exec", "exec_start"].includes(tool)) {
-      const label = String(spec.label || ""), handle = String(spec.context_handle || "");
-      const live = label ? [...processes.values()].find(record =>
-        record.persistent && record.label === label && (!handle || record.context_handle === handle)) : null;
+      const execId = Number(spec.exec_id || 0), handle = String(spec.context_handle || "");
+      execPrefix = execId ? `#${execId} ` : "";
+      const live = execId ? [...processes.values()].find(record =>
+        record.persistent && record.log_id === execId && (!handle || record.context_handle === handle)) : null;
       const command = live?.command_json ? parseJson(live.command_json, {}) : {};
       if (command?.program) spec = command.shell
         ? { shell_command: String(command.args?.at?.(-1) || command.args?.[command.args.length - 1] || "") }
         : { program: command.catalog_name || command.program, args: Array.isArray(command.args) ? command.args : [] };
     }
-    if (typeof spec.shell_command === "string" && spec.shell_command) return compactShellCommand(spec.shell_command);
-    if (typeof spec.program !== "string" || !spec.program) return "";
+    if (typeof spec.shell_command === "string" && spec.shell_command) return capToolPreview(execPrefix + compactShellCommand(spec.shell_command));
+    if (typeof spec.program !== "string" || !spec.program) return execPrefix.trim();
     const argv = Array.isArray(spec.args) ? spec.args : [], shown = argv.slice(0, TOOL_PREVIEW_ARG_LIMIT).map(compactExecArg);
     const omitted = Math.max(0, argv.length - shown.length), suffix = omitted ? ` … +${omitted} args` : "";
-    return capToolPreview([compactProgramName(spec.program), ...shown].filter(Boolean).join(" "), suffix);
+    return capToolPreview(execPrefix + [compactProgramName(spec.program), ...shown].filter(Boolean).join(" "), suffix);
   };
   const compactToolCallPreview = (p, tool, args = {}) => {
     const command = compactExecCommand(p, tool, args);
@@ -840,7 +841,7 @@ async function backend() {
     `INSERT INTO server_config(id,name,oauth,created_at) VALUES(1,?,?,?)`,
     "MrMCP", 1, Date.now(),
   );
-  const processes = new Map(), persistentProcessLabels = new Set(), jsKernels = new Map(), activeCallControls = new Map(),
+  const processes = new Map(), jsKernels = new Map(), activeCallControls = new Map(),
     oauthConsents = new Map(), rateBuckets = new Map(), downloadTokens = new Map();
   let toolCallGate = null, toolCallsIdle = Promise.resolve(), resolveToolCallsIdle = null,
     maintenanceAction = "", maintenancePhase = "", waitingToolCalls = 0,
@@ -956,7 +957,7 @@ async function backend() {
         db.prepare("DELETE FROM debug_logs").run();
         db.prepare("DELETE FROM published_html").run();
         db.prepare("UPDATE metrics SET value=0").run();
-        db.prepare("DELETE FROM sqlite_sequence WHERE name IN ('logs','debug_logs')").run();
+        db.prepare("DELETE FROM sqlite_sequence WHERE name='debug_logs'").run();
         db.exec("COMMIT");
       } catch (error) {
         db.exec("ROLLBACK");
@@ -2686,10 +2687,9 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       },
       required: ["old_text", "new_text"],
     };
-    const processLabelInput = {
-      type: "string", minLength: 1, maxLength: 64,
-      pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
-      description: "Client-chosen persistent process label. Uniqueness is scoped to the exact Session: the logical key is (context_handle, label), so different Sessions may reuse the same label without conflict. Use a short stable name such as dev-server or worker-1, then pass the exact same label to exec_attach, exec_write and exec_kill.",
+    const execIdInput = {
+      type: "integer", minimum: 1,
+      description: "Persistent execution id returned by exec_start. It is the stable Tool Call id of the exec_start operation and is valid only with the same context_handle that created it.",
     };
     const execInput = {
       program: {
@@ -2885,33 +2885,39 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         } },
       ],
       exec_start: [
-        "Start a persistent interactive/background command and return immediately; this tool never carries live process output. label is mandatory and identifies the process within the exact Session for later exec_attach, exec_write and exec_kill calls; the logical key is (context_handle,label), so another Session may reuse the same label. The process keeps running after this Tool Call ends or its client disconnects. The complete normalized stdout/stderr transcript is retained server-side for the retained process lifetime, and stdin writes are also retained internally for diagnostics. Call exec_attach(label) to consume output. Only one retained persistent process may use a given label in the same Session at a time; concurrent duplicate starts are rejected, while a completed retained process with that label may be replaced. Persistent process state does not survive a server restart. stdin remains open until exec_write closes it or the process exits.",
-        { oneOf: [{ required: ["program", "label"] }, { required: ["shell_command", "label"] }], properties: {
-          ...execStartInput, label: processLabelInput,
+        "Start a persistent interactive/background command and return immediately; this tool never carries live process output. The result contains exec_id, the integer Tool Call id of this exec_start call. Pass that exact exec_id together with the same context_handle to exec_attach, exec_write, exec_kill or exec_status. The process keeps running after this Tool Call ends or its client disconnects. The complete normalized stdout/stderr transcript is retained in memory for the process lifetime and for up to 24 hours after completion, and stdin writes are retained internally for diagnostics. Use exec_attach to consume incremental output and exec_status to inspect state or retrieve all/tail output without consuming the attach cursor. Persistent state does not survive a server restart. stdin remains open until exec_write closes it or the process exits.",
+        { oneOf: [{ required: ["program"] }, { required: ["shell_command"] }], properties: {
+          ...execStartInput,
           timeout_ms: { type: "integer", minimum: 0, maximum: 604800000, default: 0 },
         } },
       ],
       exec_attach: [
-        "Consume output from one persistent process created by exec_start using its exact Session-scoped label. The complete normalized process transcript is retained server-side and each successful attach advances an internal cursor so already-returned combined output is not repeated. With _meta.progressToken, exec_attach sends all unread backlog and then new combined stdout/stderr incrementally as standard MCP notifications/progress until the process exits; the final result contains the complete unread transcript covered by that attachment and remaining_bytes is 0. Without a progressToken, exec_attach is a long-poll read: if unread output already exists it returns immediately with at most 16 KiB; otherwise, while the process is running, it waits for output and returns when 16 KiB accumulate or 100 ms have elapsed after the first new data. remaining_bytes reports how many already-buffered UTF-8 bytes still follow the returned chunk. Call exec_attach again immediately while remaining_bytes>0; when it is 0 and status is running, call exec_attach again whenever you want to wait for future output. If the process exits or is killed while attached, the call returns the final available chunk plus the final process status; killed/failed status is an error result but still includes that output. A client disconnect detaches only and never terminates the persistent process. Only one exec_attach may be active for a label at a time. separate_streams=true additionally returns complete current stdout/stderr snapshots in the final result. Use exec_list to discover labels and states.",
+        "Consume unread output from one persistent process created by exec_start. Pass the exact exec_id returned by exec_start and the same context_handle; ids from another Session are inaccessible. Each successful attach advances an internal cursor so already-returned combined output is not repeated. With _meta.progressToken, exec_attach sends all unread backlog and then new combined stdout/stderr incrementally as standard MCP notifications/progress until the process exits; the final result contains the complete unread transcript covered by that attachment and remaining_bytes is 0. Without a progressToken, exec_attach is a long-poll read: if unread output already exists it returns immediately with at most 16 KiB; otherwise, while the process is running, it waits for output and returns when 16 KiB accumulate or 100 ms have elapsed after the first new data. remaining_bytes reports how many already-buffered UTF-8 bytes still follow the returned chunk. Call exec_attach again immediately while remaining_bytes>0; when it is 0 and status is running, call it again whenever you want to wait for future output. If the process exits or is killed while attached, the final available chunk and final status are returned. A client disconnect detaches only and never terminates the persistent process. Only one exec_attach may be active for an exec_id at a time. Use exec_status when you need a non-consuming status/full-output/tail snapshot, including after completion or kill.",
         { properties: {
-          label: processLabelInput,
-          separate_streams: { type: "boolean", default: false, description: "Also return separate stdout/stderr in the final result; live MCP progress remains the combined observed-order output." },
+          exec_id: execIdInput,
+          separate_streams: { type: "boolean", default: false, description: "Also return complete current stdout/stderr snapshots in the final result; live MCP progress remains the combined observed-order output." },
           ...contextInput,
-        }, required: ["label"] },
+        }, required: ["exec_id"] },
       ],
-      exec_write: ["Write data to the open stdin of a persistent process created by exec_start. Address the process by its exact Session-scoped label. This call is ordinary JSON and does not attach to output; use exec_attach separately when live output is needed. Set close=true to close stdin after the optional write.", { properties: {
-        label: processLabelInput, data: { type: "string", default: "" },
+      exec_write: ["Write data to the open stdin of a persistent process created by exec_start. Pass the exact exec_id returned by exec_start and the same context_handle. This call does not attach to output. Set close=true to close stdin after the optional write.", { properties: {
+        exec_id: execIdInput, data: { type: "string", default: "" },
         encoding: { type: "string", enum: ["text", "base64"], default: "text" },
         close: { type: "boolean", default: false }, ...contextInput,
-      }, required: ["label"] }],
-      exec_kill: ["Terminate a persistent process created by exec_start, addressed by its exact Session-scoped label. Foreground exec calls are cancelled by cancelling/disconnecting their own Tool Call and are not controlled through exec_kill.", { properties: {
-        label: processLabelInput, signal: { type: "string", enum: ["SIGTERM", "SIGKILL"], default: "SIGTERM" },
+      }, required: ["exec_id"] }],
+      exec_kill: ["Terminate a still-running persistent process created by exec_start. Pass its exec_id and the same context_handle. Foreground exec calls are cancelled by cancelling/disconnecting their own Tool Call and are not controlled through exec_kill. After termination, use exec_status with output=all or output=tail to inspect retained output.", { properties: {
+        exec_id: execIdInput, signal: { type: "string", enum: ["SIGTERM", "SIGKILL"], default: "SIGTERM" },
         ...contextInput,
-      }, required: ["label"] }],
-      exec_list: ["List the persistent processes currently retained for this Session, including their unique labels, state, command and attachment/stdin state. Use this before exec_attach, exec_write or exec_kill when the label or current state is uncertain. include_completed=false restricts the result to still-running processes. Persistent process state is in memory and does not survive a server restart.", { properties: {
-        include_completed: { type: "boolean", default: true },
+      }, required: ["exec_id"] }],
+      exec_list: ["List only the persistent processes that are currently running for this exact Session. Each row includes exec_id, command, state and attachment/stdin state. Completed, failed, timed-out and killed processes are intentionally omitted; query a known completed exec_id with exec_status instead. Persistent process state is in memory and does not survive a server restart.", { properties: {
         limit: { type: "integer", minimum: 1, maximum: 200, default: 50 }, ...contextInput,
       } }],
+      exec_status: ["Inspect one persistent process created by exec_start without consuming its exec_attach cursor. Pass the exact exec_id and the same context_handle. This works while the process is running and after completion, failure, timeout or kill while its in-memory record is retained (normally up to 24 hours after completion; records do not survive a server restart). output=none returns status/metadata only; output=all returns the complete retained normalized combined stdout/stderr transcript; output=tail returns the last tail_lines normalized lines. separate_streams=true additionally applies the same output selection to stdout and stderr.", { properties: {
+        exec_id: execIdInput,
+        output: { type: "string", enum: ["none", "all", "tail"], default: "none" },
+        tail_lines: { type: "integer", minimum: 1, maximum: 10000, default: 200 },
+        separate_streams: { type: "boolean", default: false },
+        ...contextInput,
+      }, required: ["exec_id"] }],
       js: [
         "Run JavaScript in a persistent lazy kernel scoped to the current Session and Workspace. Use it for computation or programmatic parsing, not ordinary file inspection, search or edits.",
         { properties: {
@@ -2945,7 +2951,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       encoding: { type: "string" }, bom: { type: "boolean" }, line_endings: { type: "string" },
     };
     const processProperties = {
-      label: { type: "string", description: "Present for persistent processes created by exec_start." },
+      exec_id: { type: "integer", minimum: 1, description: "Present for persistent processes created by exec_start; equals that exec_start Tool Call id." },
       status: { type: "string" },
       command: {}, cwd: { type: "string" }, started_at: { type: "string" }, completed_at: nullableString,
       exit_code: { anyOf: [{ type: "integer" }, { type: "null" }] }, signal: nullableString,
@@ -2986,7 +2992,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       query_tool_calls: outputSchema({ calls: objectArray }),
       exec: outputSchema(processProperties),
       exec_start: outputSchema({
-        label: { type: "string" }, status: { type: "string" }, command: {},
+        exec_id: { type: "integer", minimum: 1 }, status: { type: "string" }, command: {},
         cwd: { type: "string" }, started_at: { type: "string" }, stdin_open: { type: "boolean" },
       }),
       exec_attach: outputSchema({
@@ -2996,9 +3002,14 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
           description: "UTF-8 bytes already buffered after the output returned by this attach call. When greater than zero, call exec_attach again immediately to drain the next chunk. When zero and status is running, exec_attach may still be called again and will wait for new output or process termination.",
         },
       }),
-      exec_write: outputSchema({ label: { type: "string" }, bytes_written: { type: "integer" }, stdin_open: { type: "boolean" } }),
-      exec_kill: outputSchema({ label: { type: "string" }, killed: { type: "boolean" }, signal: { type: "string" } }),
+      exec_write: outputSchema({ exec_id: { type: "integer", minimum: 1 }, bytes_written: { type: "integer" }, stdin_open: { type: "boolean" } }),
+      exec_kill: outputSchema({ exec_id: { type: "integer", minimum: 1 }, killed: { type: "boolean" }, signal: { type: "string" } }),
       exec_list: outputSchema({ processes: objectArray }),
+      exec_status: outputSchema({
+        ...processProperties,
+        output_mode: { type: "string", enum: ["none", "all", "tail"] },
+        attached: { type: "boolean" },
+      }),
       js: outputSchema({ kernel_id: { type: "string" }, cwd: { type: "string" }, value: { type: "string" }, stdout: { type: "string" }, stderr: { type: "string" }, module_dirs: stringArray }),
       js_add_node_module_dir: outputSchema({ kernel_id: { type: "string" }, path: { type: "string" }, module_dirs: stringArray }),
       js_reset: outputSchema({ reset: { type: "boolean" }, kernel_id: { type: "string" } }),
@@ -3012,7 +3023,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       glob: "Glob", grep: "Grep", trash_paths: "Trash paths", untrash_action: "Restore trash action",
       publish_file: "Publish File", publish_html: "Publish HTML", list_commands: "Command Catalog", query_tool_calls: "Query Tool Calls",
       exec: "Run Command", exec_start: "Start Persistent Command", exec_attach: "Attach Process Output", exec_write: "Write Stdin",
-      exec_kill: "Terminate Process", exec_list: "List Processes", js: "JavaScript Kernel",
+      exec_kill: "Terminate Process", exec_list: "List Processes", exec_status: "Process Status", js: "JavaScript Kernel",
       js_add_node_module_dir: "Add Module Directory", js_reset: "Reset JavaScript Kernel",
     };
     const annotations = name => ({
@@ -3090,7 +3101,9 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         grep: ["scanned_files", "matched_files", "results", "truncated"],
         replace: ["scanned_files", "total_replacements", "files"],
         edit: ["total_replacements", "files"],
-        exec_attach: ["output", "remaining_bytes"],
+        exec_start: ["exec_id"],
+        exec_attach: ["exec_id", "output", "remaining_bytes"],
+        exec_status: ["exec_id", "status", "output_mode"],
       };
       for (const key of expectedOutputs[tool.name] || [])
         if (!tool.outputSchema.properties?.[key]) errors.push(`outputSchema missing property ${key}`);
@@ -3115,12 +3128,14 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       replace: ["exclude", "regex", "case_sensitive", "include_hidden", "include_dependencies", "max_file_bytes", "expected_replacements", "dry_run", "max_files"],
       publish_html: ["html", "title", "height"],
       query_tool_calls: ["limit", "tool", "status", "query", "before_id"],
-      exec_start: ["label"], exec_attach: ["label"], exec_write: ["label"], exec_kill: ["label"],
+      exec_attach: ["exec_id"], exec_write: ["exec_id"], exec_kill: ["exec_id"], exec_status: ["exec_id", "output", "tail_lines"],
     };
     for (const key of expectedInputs[tool.name] || [])
       if (!tool.inputSchema.properties?.[key]) errors.push(`inputSchema missing property ${key}`);
-    if (["exec_attach", "exec_write", "exec_kill"].includes(tool.name) && tool.inputSchema.properties?.process_id)
-      errors.push(`${tool.name} must use label rather than process_id`);
+    if (["exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status"].includes(tool.name) && tool.inputSchema.properties?.label)
+      errors.push(`${tool.name} must not expose a client-chosen process label`);
+    if (["exec_attach", "exec_write", "exec_kill", "exec_status"].includes(tool.name) && tool.inputSchema.properties?.process_id)
+      errors.push(`${tool.name} must use exec_id rather than process_id`);
     if (["exec", "exec_start", "exec_attach"].includes(tool.name) && tool.outputSchema.properties?.pid)
       errors.push(`${tool.name} output must not expose OS pid`);
     if (tool.name === "exec_attach" && ["wait_ms", "output_offset", "stdout_offset", "stderr_offset"].some(key => tool.inputSchema.properties?.[key]))
@@ -3309,7 +3324,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     return "";
   }
   // Foreground exec is request-scoped and streamed live. Persistent processes are explicitly
-  // started with exec_start(label), then observed with exec_attach and controlled by label.
+  // started with exec_start, whose Tool Call id becomes exec_id for attach/status/write/kill.
   // Keep the complete normalized process transcript for the retained process lifetime: foreground exec
   // returns the whole transcript once, while repeated exec_attach calls consume it through attach_cursor.
   const processTail = value => value.length > 65536 ? value.slice(-65536) : value;
@@ -3470,7 +3485,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     };
     const combined = read("output", options.output_offset);
     const view = {
-      ...(rec.label ? { label: rec.label } : {}),
+      ...(rec.persistent ? { exec_id: rec.log_id } : {}),
       status: rec.status, command: rec.display,
       cwd: rec.cwd_display, context_handle: rec.context_handle,
       started_at: new Date(rec.started_at).toISOString(),
@@ -3489,19 +3504,42 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
   }
   function processStartView(rec) {
     return {
-      label: rec.label, status: rec.status, command: rec.display,
+      exec_id: rec.log_id, status: rec.status, command: rec.display,
       cwd: rec.cwd_display, context_handle: rec.context_handle,
       started_at: new Date(rec.started_at).toISOString(), stdin_open: !!rec.stdin_writer,
     };
   }
   function processListView(rec) {
     return {
-      label: rec.label, status: rec.status, command: rec.display,
+      exec_id: rec.log_id, status: rec.status, command: rec.display,
       cwd: rec.cwd_display, started_at: new Date(rec.started_at).toISOString(),
       completed_at: rec.completed_at ? new Date(rec.completed_at).toISOString() : null,
       exit_code: rec.exit_code, signal: rec.signal || null, stdin_open: !!rec.stdin_writer,
       attached: !!rec.attachment,
     };
+  }
+  function processTailLines(value, limit) {
+    const text = String(value || "");
+    if (!text) return "";
+    const trailing = text.endsWith("\n"), lines = text.split("\n");
+    if (trailing) lines.pop();
+    const result = lines.slice(-Math.max(1, Number(limit || 200))).join("\n");
+    return trailing && result ? result + "\n" : result;
+  }
+  function processStatusView(rec, args = {}) {
+    const mode = String(args.output || "none"), includeStreams = mode !== "none" && args.separate_streams === true;
+    const view = processView(rec, { separate_streams: includeStreams });
+    view.output_mode = mode; view.attached = !!rec.attachment; delete view.success;
+    if (mode === "none") {
+      delete view.output; delete view.stdout; delete view.stderr;
+    } else if (mode === "tail") {
+      view.output = processTailLines(view.output, args.tail_lines);
+      if (includeStreams) {
+        view.stdout = processTailLines(view.stdout, args.tail_lines);
+        view.stderr = processTailLines(view.stderr, args.tail_lines);
+      }
+    }
+    return view;
   }
   function processAdminView(rec, options = {}) {
     const progressRequested = rec.persistent
@@ -3571,19 +3609,6 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
   }
   async function startManagedProcess(p, args, persistent, execution = {}) {
     const target = await resolveWorkspacePath(execution.selection, args.cwd || ".");
-    const label = persistent ? String(args.label || "") : "";
-    let replaceExisting = null, labelKey = "";
-    if (persistent) {
-      labelKey = `${target.context.handle}\0${label}`;
-      if (persistentProcessLabels.has(labelKey)) throw new Error(`Persistent process label already in use: ${label}`);
-      const existing = [...processes.values()].find(record =>
-        record.persistent && record.context_handle === target.context.handle && record.label === label);
-      if (existing && ["starting", "running"].includes(existing.status))
-        throw new Error(`Persistent process label already in use: ${label}`);
-      replaceExisting = existing || null;
-      persistentProcessLabels.add(labelKey);
-    }
-    try {
     const defaultTimeout = persistent ? 0 : 120000;
     const spec = commandSpec(args), timeout = Math.max(0, Math.min(
       Number(args.timeout_ms ?? defaultTimeout), 604800000,
@@ -3615,16 +3640,15 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       args: spec.argv, cwd: target.path, env: processEnv, clearEnv: true,
       stdin: "piped", stdout: "piped", stderr: "piped",
     });
-    if (replaceExisting) processes.delete(replaceExisting.id);
     const rec = {
-      id: `proc_${randomToken(18)}`, label, persistent: !!persistent,
+      id: `proc_${randomToken(18)}`, persistent: !!persistent,
       pid: child.pid, child, log_id: Number(execution.logId || 0),
       server_id: p.id, server_name: "mcp", context_id: target.context.id, context_handle: target.context.handle,
       root_id: target.root.id, root_path: target.root.path, root_name: target.root.name,
       display: spec.display, command_json: JSON.stringify({
         program: spec.program, args: spec.argv, shell: spec.shell,
         catalog_name: spec.catalog_name || null, system_path_inherited: includeSystemPath,
-        ...(label ? { label } : {}), persistent: !!persistent,
+        ...(persistent ? { exec_id: Number(execution.logId || 0) } : {}), persistent: !!persistent,
       }),
       cwd: target.path, cwd_display: target.display, status: "running", started_at: Date.now(), completed_at: null,
       exit_code: null, signal: "", requested_signal: "", termination_source: "", timed_out: false, error: "",
@@ -3695,15 +3719,12 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       rec.stdin_writer = null;
     }
     return rec;
-    } finally {
-      if (labelKey) persistentProcessLabels.delete(labelKey);
-    }
   }
-  function persistentProcess(label, contextHandle = "") {
-    const wanted = String(label || ""), handle = String(contextHandle || "");
+  function persistentProcess(execId, contextHandle = "") {
+    const wanted = Number(execId || 0), handle = String(contextHandle || "");
     const rec = [...processes.values()].find(record =>
-      record.persistent && record.context_handle === handle && record.label === wanted);
-    if (!rec) throw new Error(`Unknown persistent process label for this Session: ${wanted || "(empty)"}. Use exec_list to inspect available labels.`);
+      record.persistent && record.context_handle === handle && record.log_id === wanted);
+    if (!rec) throw new Error(`Unknown persistent exec_id for this Session: ${wanted || "(missing)"}. Use exec_list for active executions; completed records are retained in memory for up to 24 hours and do not survive a server restart.`);
     return rec;
   }
   const processIsRunning = rec => ["starting", "running"].includes(rec.status);
@@ -3738,7 +3759,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
   }
   async function attachManagedProcess(rec, args, execution = {}) {
     if (!rec.persistent) throw new Error("exec_attach can attach only to a persistent process created by exec_start");
-    if (rec.attachment) throw new Error(`Persistent process ${rec.label} already has an active exec_attach`);
+    if (rec.attachment) throw new Error(`Persistent exec_id ${rec.log_id} already has an active exec_attach`);
     const progressMode = !!execution.progressRequested, progress = progressMode ? execution.progress : null;
     const start = Math.max(rec.attach_cursor, rec.output_base), startBytes = rec.attach_cursor_bytes;
     let sentCursor = start, sentBytes = startBytes, detached = false, detach;
@@ -3807,11 +3828,10 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       if (now - bucket.started > 2 * 60 * 1000) rateBuckets.delete(key);
     expireDownloadTokens(now).catch(() => {});
   }
-  function recentProcesses(contextHandle, includeCompleted = true, limit = 50) {
+  function activeProcesses(contextHandle, limit = 50) {
     const handle = String(contextHandle || "");
     return [...processes.values()]
-      .filter(record => record.persistent && record.context_handle === handle &&
-        (includeCompleted || ["starting", "running"].includes(record.status)))
+      .filter(record => record.persistent && record.context_handle === handle && processIsRunning(record))
       .sort((a, b) => b.started_at - a.started_at)
       .slice(0, limit)
       .map(processListView);
@@ -4348,11 +4368,11 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       return processStartView(record);
     }
     if (name === "exec_attach") return await attachManagedProcess(
-      persistentProcess(args.label, args.context_handle), args, execution,
+      persistentProcess(args.exec_id, args.context_handle), args, execution,
     );
     if (name === "exec_write") {
-      const record = persistentProcess(args.label, args.context_handle);
-      if (!record.stdin_writer) throw new Error(`Persistent process ${record.label} stdin is closed`);
+      const record = persistentProcess(args.exec_id, args.context_handle);
+      if (!record.stdin_writer) throw new Error(`Persistent exec_id ${record.log_id} stdin is closed`);
       if (args.data) {
         recordProcessInput(record, args.data, args.encoding);
         await record.stdin_writer.write(args.encoding === "base64"
@@ -4362,19 +4382,22 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         recordProcessInput(record, null, "utf-8", true);
         await record.stdin_writer.close(); record.stdin_writer = null;
       }
-      return { label: record.label,
+      return { exec_id: record.log_id,
         bytes_written: args.data ? (args.encoding === "base64"
           ? Buffer.from(String(args.data), "base64").length : enc.encode(String(args.data)).length) : 0,
         stdin_open: !!record.stdin_writer };
     }
     if (name === "exec_kill") {
-      const record = persistentProcess(args.label, args.context_handle);
-      return { label: record.label, killed: await terminateProcess(record, args.signal || "SIGTERM"),
+      const record = persistentProcess(args.exec_id, args.context_handle);
+      return { exec_id: record.log_id, killed: await terminateProcess(record, args.signal || "SIGTERM"),
         signal: args.signal || "SIGTERM" };
     }
-    if (name === "exec_list") return { processes: recentProcesses(
-      args.context_handle, args.include_completed !== false, Math.min(Number(args.limit || 50), 200),
+    if (name === "exec_list") return { processes: activeProcesses(
+      args.context_handle, Math.min(Number(args.limit || 50), 200),
     ) };
+    if (name === "exec_status") return processStatusView(
+      persistentProcess(args.exec_id, args.context_handle), args,
+    );
     const custom = one("SELECT * FROM custom_tools WHERE server_id=? AND name=?", p.id, name);
     if (!custom) throw new Error("Unknown tool");
     const arrayCommand = parseJson(custom.command, null), customArgs = Array.isArray(args.args) ? args.args.map(String) : [];
@@ -5068,7 +5091,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       ? "Use list_workspaces when you need to discover the enabled Workspace names, then call open_workspace with the desired name. If you already have the current Session handle, pass it as current_context_handle to move that same Session to the Workspace; if it is omitted, empty, unknown or expired, open_workspace creates a new Session. The result includes workspace_name, absolute cwd and agent_guidance_path; when that path is non-null, read and follow the referenced AGENTS.md before repository work. Pass the returned context_handle unchanged on every later Session-bound tool call. " +
         "Use read_file/read_files, glob, grep, edit and replace directly for file inspection, discovery, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. " +
         "Use list_commands before other command-line work and invoke returned logical_name values directly through exec.program without PATH probes. " +
-        "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; cancelling/disconnecting exec terminates its child. For persistent or interactive work, call exec_start with a Session-scoped label, then use exec_attach, exec_write, exec_list and exec_kill. Persistent labels are keyed by (context_handle,label), so different Sessions may reuse a label. exec_start returns immediately and retains the complete process transcript. exec_attach with progressToken streams unread backlog plus live output through progress until process exit and then returns that complete unread transcript; without progressToken it long-polls and returns at most 16 KiB of unread output plus remaining_bytes, so call it repeatedly to drain buffered output and call it again with remaining_bytes=0/status=running to wait for future output. Disconnecting exec_attach only detaches and never kills the persistent process. " +
+        "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; cancelling/disconnecting exec terminates its child. For persistent or interactive work, call exec_start; it immediately returns exec_id, which is the stable integer Tool Call id of that start. Pass that exec_id together with the same context_handle to exec_attach, exec_write, exec_kill or exec_status; ids from other Sessions are inaccessible. exec_list shows only currently running persistent executions in this Session. exec_status is the non-consuming way to inspect running or recently completed/killed executions and optionally retrieve all output or a tail. exec_attach with progressToken streams unread backlog plus live output through progress until process exit and then returns that complete unread transcript; without progressToken it long-polls and returns at most 16 KiB of unread output plus remaining_bytes, so call it repeatedly to drain buffered output and call it again with remaining_bytes=0/status=running to wait for future output. Disconnecting exec_attach only detaches and never kills the persistent process. " +
         "Use publish_file to present existing files through its MCP App widget, and publish_html when an interactive self-contained HTML/CSS/JavaScript visualization is more appropriate. " +
         "Every authenticated client can invoke every published tool; context_handle is the bearer capability selecting the persistent Session and its current Workspace."
       : "The endpoint is reachable, but anonymous access exposes no tools. Authenticate with OAuth or Basic authentication.";
@@ -6678,10 +6701,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         detail.tool_descriptor_matches_current = !!currentDescriptor && JSON.stringify(currentDescriptor) === JSON.stringify(detail.tool_descriptor);
       }
       let process = [...processes.values()].find(record => record.log_id === logId);
-      if (!process && detail.tool === "exec_attach") {
-        const input = parseJson(detail.input_json || "{}", {});
+      if (!process && ["exec_attach", "exec_write", "exec_kill", "exec_status"].includes(detail.tool)) {
+        const input = parseJson(detail.input_json || "{}", {}), execId = Number(input.exec_id || 0);
         process = [...processes.values()].find(record => record.persistent &&
-          record.context_handle === detail.context_handle && record.label === String(input.label || ""));
+          record.context_handle === detail.context_handle && record.log_id === execId);
       }
       const transport = one("SELECT progress_requested FROM tool_call_transport WHERE log_id=?", logId);
       detail.progress_requested = !!transport?.progress_requested;
