@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.92 — compact Tool Call argument previews with explicit raw return-value details.
+MrMCP 0.10.93 — request-scoped process progress, persistent exec attach and live Tool Call activity.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -8,7 +8,7 @@ GUI library: Tauriless, imported directly from npm by Deno.
 
 import { DatabaseSync } from "node:sqlite";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { createBrotliCompress, createGzip, inflateRawSync, inflateSync } from "node:zlib";
+import { inflateRawSync, inflateSync } from "node:zlib";
 import { Readable, Writable } from "node:stream";
 import { spawn as nodeSpawn } from "node:child_process";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -32,20 +32,20 @@ const BASE_TOOLS = [
   "list_workspaces", "open_workspace", "read_file", "read_files", "write_file", "write_files",
   "edit", "replace", "glob", "grep",
   "file_info", "create_directory", "copy_path", "move_path", "trash_paths", "untrash_action",
-  "publish_file", "publish_html", "list_commands", "query_tool_calls", "exec", "exec_start", "exec_poll", "exec_write", "exec_kill", "exec_list",
+  "publish_file", "publish_html", "list_commands", "query_tool_calls", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list",
   "js", "js_add_node_module_dir", "js_reset",
 ];
 const READ_TOOLS = new Set([
   "list_workspaces", "read_file", "read_files", "glob", "grep",
-  "file_info", "list_commands", "query_tool_calls", "exec_poll", "exec_list",
+  "file_info", "list_commands", "query_tool_calls", "exec_attach", "exec_list",
 ]);
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.92";
+const VERSION = "0.10.93";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-const SESSION_ACTIVE_MS = 10 * 60 * 1000;
+const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 3000;
 const CONTEXT_HANDLE_INPUT_DESCRIPTION = "Required opaque capability returned by open_workspace. Pass the exact value unchanged; never invent, modify, shorten, derive or substitute it.";
 const CONTEXT_HANDLE_OUTPUT_DESCRIPTION = "Opaque capability identifying a persistent Session. Pass this exact value unchanged as context_handle on later calls.";
 const CONTEXT_HANDLE_RULE = "Requires the exact Session context_handle returned by open_workspace.";
@@ -105,59 +105,135 @@ async function bodyText(req, max = MAX_REQUEST_BODY) {
 }
 const bodyJson = async req => JSON.parse(await bodyText(req) || "{}");
 const form = async req => new URLSearchParams(await bodyText(req));
-const HTTP_COMPRESSION_MIN_BYTES = 1024;
-function appendVary(headers, value) {
-  const values = new Map((headers.get("vary") || "").split(",")
-    .map(x => x.trim()).filter(Boolean).map(x => [x.toLowerCase(), x]));
-  values.set(value.toLowerCase(), value);
-  headers.set("vary", [...values.values()].join(", "));
-}
-function preferredContentEncoding(value) {
-  const qualities = new Map();
-  for (const item of String(value || "").split(",")) {
-    const [rawName, ...params] = item.trim().split(";");
-    const name = rawName.trim().toLowerCase();
-    if (!name) continue;
-    let quality = 1;
-    for (const param of params) {
-      const match = param.trim().match(/^q\s*=\s*(.*)$/i);
-      if (!match) continue;
-      const valid = match[1].match(/^(0(?:\.\d{0,3})?|1(?:\.0{0,3})?)$/);
-      quality = valid ? Number(valid[1]) : 0;
+const MCP_PROGRESS_BATCH_BYTES = 16 * 1024, MCP_PROGRESS_BATCH_MS = 100;
+const MCP_ATTACH_RESPONSE_BYTES = MCP_PROGRESS_BATCH_BYTES, MCP_ATTACH_RESPONSE_MS = MCP_PROGRESS_BATCH_MS;
+function progressTextChunks(value, maxBytes = MCP_PROGRESS_BATCH_BYTES) {
+  let text = String(value ?? "");
+  const chunks = [];
+  while (text) {
+    let high = Math.min(text.length, maxBytes);
+    if (high < text.length && /[\uD800-\uDBFF]/.test(text[high - 1]) && /[\uDC00-\uDFFF]/.test(text[high])) high--;
+    let candidate = text.slice(0, high), bytes = enc.encode(candidate).byteLength;
+    if (bytes > maxBytes) {
+      let low = 1, best = 1;
+      while (low <= high) {
+        const middle = (low + high) >> 1;
+        const size = enc.encode(text.slice(0, middle)).byteLength;
+        if (size <= maxBytes) { best = middle; low = middle + 1; }
+        else high = middle - 1;
+      }
+      if (best < text.length && /[\uD800-\uDBFF]/.test(text[best - 1]) && /[\uDC00-\uDFFF]/.test(text[best])) best--;
+      candidate = text.slice(0, Math.max(1, best));
     }
-    qualities.set(name, Math.max(qualities.get(name) || 0, quality));
+    chunks.push(candidate);
+    text = text.slice(candidate.length);
   }
-  const quality = name => qualities.has(name) ? qualities.get(name) : (qualities.get("*") || 0);
-  return [["br", quality("br"), 2], ["gzip", quality("gzip"), 1]]
-    .filter(([, q]) => q > 0)
-    .sort((a, b) => b[1] - a[1] || b[2] - a[2])[0]?.[0] || "";
+  return chunks;
 }
-function compressibleContentType(value) {
-  const type = String(value || "").split(";", 1)[0].trim().toLowerCase();
-  return type.startsWith("text/") || type === "application/json" || type.endsWith("+json") ||
-    type === "application/javascript" || type === "application/xml" || type.endsWith("+xml") ||
-    type === "application/yaml" || type === "application/x-yaml" || type === "image/svg+xml";
+function textPrefixByBytes(value, maxBytes) {
+  const text = String(value ?? "");
+  if (!text) return "";
+  let high = Math.min(text.length, maxBytes);
+  if (high < text.length && /[\uD800-\uDBFF]/.test(text[high - 1]) && /[\uDC00-\uDFFF]/.test(text[high])) high--;
+  let candidate = text.slice(0, high);
+  if (enc.encode(candidate).byteLength <= maxBytes) return candidate;
+  let low = 1, best = 1;
+  while (low <= high) {
+    const middle = (low + high) >> 1, slice = text.slice(0, middle);
+    if (enc.encode(slice).byteLength <= maxBytes) { best = middle; low = middle + 1; }
+    else high = middle - 1;
+  }
+  if (best < text.length && /[\uD800-\uDBFF]/.test(text[best - 1]) && /[\uDC00-\uDFFF]/.test(text[best])) best--;
+  return text.slice(0, Math.max(1, best));
 }
-function compressHttpResponse(req, response) {
-  if (!response.body || req.method === "HEAD" || [204, 205, 304].includes(response.status)) return response;
-  const headers = new Headers(response.headers);
-  if (new URL(req.url).pathname.startsWith("/oauth/") || headers.has("set-cookie")) return response;
-  if (!compressibleContentType(headers.get("content-type"))) return response;
-  appendVary(headers, "Accept-Encoding");
-  const rebuild = body => new Response(body, {
-    status: response.status, statusText: response.statusText, headers,
+function acceptsMediaType(value, mediaType) {
+  mediaType = String(mediaType).toLowerCase();
+  return String(value || "").split(",").some(item => {
+    const [rawType, ...params] = item.trim().toLowerCase().split(";");
+    if (rawType !== mediaType && rawType !== "*/*") return false;
+    const q = params.map(param => param.trim()).find(param => param.startsWith("q="));
+    return !q || Number(q.slice(2)) > 0;
   });
-  const length = Number(headers.get("content-length"));
-  if (headers.has("content-encoding") || headers.has("content-range") ||
-      /(?:^|,)\s*no-transform\s*(?:,|$)/i.test(headers.get("cache-control") || "") ||
-      !Number.isFinite(length) || length < HTTP_COMPRESSION_MIN_BYTES) return rebuild(response.body);
-  const encoding = preferredContentEncoding(req.headers.get("accept-encoding"));
-  if (!encoding) return rebuild(response.body);
-  headers.set("content-encoding", encoding);
-  headers.delete("content-length");
-  const source = Readable.fromWeb(response.body);
-  const compressed = source.pipe(encoding === "br" ? createBrotliCompress() : createGzip());
-  return rebuild(Readable.toWeb(compressed));
+}
+function createMcpProgressSink(send, progressToken) {
+  let pending = "", pendingBytes = 0, timer = null, progress = 0, closed = false, afterFlush = null;
+  const clearTimer = () => { if (timer) clearTimeout(timer); timer = null; };
+  const flush = () => {
+    clearTimer();
+    if (closed || progressToken == null || !pending) return false;
+    const message = pending, bytes = pendingBytes;
+    pending = ""; pendingBytes = 0; progress += bytes;
+    send({
+      jsonrpc: "2.0", method: "notifications/progress",
+      params: { progressToken, progress, message },
+    });
+    afterFlush?.(message, bytes);
+    return true;
+  };
+  const push = value => {
+    if (closed || progressToken == null) return;
+    for (const chunk of progressTextChunks(value)) {
+      const bytes = enc.encode(chunk).byteLength;
+      if (pending && pendingBytes + bytes > MCP_PROGRESS_BATCH_BYTES) flush();
+      pending += chunk; pendingBytes += bytes;
+      if (pendingBytes >= MCP_PROGRESS_BATCH_BYTES) flush();
+      else if (!timer) timer = setTimeout(flush, MCP_PROGRESS_BATCH_MS);
+    }
+  };
+  return {
+    push, flush,
+    setAfterFlush(callback) { afterFlush = typeof callback === "function" ? callback : null; },
+    close() { flush(); closed = true; clearTimer(); },
+    cancel() { closed = true; clearTimer(); pending = ""; pendingBytes = 0; },
+  };
+}
+function mcpSseResponse(id, progressToken, runner, headers = {}) {
+  let closed = false, progressSink = null;
+  const disconnectHandlers = new Set();
+  const body = new ReadableStream({
+    start(controller) {
+      const send = message => {
+        if (!closed) controller.enqueue(enc.encode(`data: ${JSON.stringify(message)}\n\n`));
+      };
+      progressSink = createMcpProgressSink(send, progressToken);
+      const stream = {
+        progress: progressSink,
+        onDisconnect(callback) {
+          if (typeof callback !== "function") return;
+          if (closed) Promise.resolve().then(callback).catch(() => {});
+          else disconnectHandlers.add(callback);
+        },
+      };
+      Promise.resolve().then(() => runner(stream)).then(result => {
+        if (closed) return;
+        progressSink.close();
+        send(result);
+        closed = true;
+        disconnectHandlers.clear();
+        controller.close();
+      }).catch(error => {
+        if (closed) return;
+        progressSink.close();
+        send({ jsonrpc: "2.0", id, error: { code: -32603, message: String(error?.message || error) } });
+        closed = true;
+        disconnectHandlers.clear();
+        controller.close();
+      });
+    },
+    cancel() {
+      if (closed) return;
+      closed = true;
+      progressSink?.cancel();
+      for (const callback of disconnectHandlers) Promise.resolve().then(callback).catch(() => {});
+      disconnectHandlers.clear();
+    },
+  });
+  return new Response(body, { status: 200, headers: {
+    "content-type": "text/event-stream; charset=utf-8",
+    "cache-control": "no-store",
+    "x-accel-buffering": "no",
+    ...headers,
+  } });
 }
 const within = (root, path) => {
   const r = relative(root, path);
@@ -400,6 +476,7 @@ async function backend() {
     if (!/^(?:insert|update|delete|replace)\b/.test(statement)) return [];
     const scopes = new Set();
     if (/\blogs\b/.test(statement)) ["logs", "sessions", "dashboard"].forEach(scope => scopes.add(scope));
+    if (/\btool_call_transport\b/.test(statement)) ["logs", "dashboard"].forEach(scope => scopes.add(scope));
     if (/\bcontexts\b/.test(statement)) ["sessions", "roots", "logs", "dashboard"].forEach(scope => scopes.add(scope));
     if (/\broots\b/.test(statement)) ["roots", "sessions", "dashboard"].forEach(scope => scopes.add(scope));
     if (/\bdebug_logs\b/.test(statement)) scopes.add("debug");
@@ -465,6 +542,11 @@ async function backend() {
     CREATE TABLE IF NOT EXISTS tool_call_descriptors(
       log_id INTEGER PRIMARY KEY,
       descriptor_json TEXT NOT NULL,
+      FOREIGN KEY(log_id) REFERENCES logs(id) ON DELETE CASCADE
+    );
+    CREATE TABLE IF NOT EXISTS tool_call_transport(
+      log_id INTEGER PRIMARY KEY,
+      progress_requested INTEGER NOT NULL DEFAULT 0,
       FOREIGN KEY(log_id) REFERENCES logs(id) ON DELETE CASCADE
     );
     CREATE TABLE IF NOT EXISTS debug_logs(
@@ -648,12 +730,10 @@ async function backend() {
     if (!String(tool || "").startsWith("exec")) return "";
     let spec = args && typeof args === "object" ? args : {};
     if (!["exec", "exec_start"].includes(tool)) {
-      const processId = String(spec.process_id || "");
-      const live = processId ? processes.get(processId) : null;
-      const stored = live?.command_json || (processId ? one(
-        "SELECT command_json FROM process_runs WHERE server_id=? AND id=?", p.id, processId,
-      )?.command_json : "");
-      const command = stored ? parseJson(stored, {}) : {};
+      const label = String(spec.label || ""), handle = String(spec.context_handle || "");
+      const live = label ? [...processes.values()].find(record =>
+        record.persistent && record.label === label && (!handle || record.context_handle === handle)) : null;
+      const command = live?.command_json ? parseJson(live.command_json, {}) : {};
       if (command?.program) spec = command.shell
         ? { shell_command: String(command.args?.at?.(-1) || command.args?.[command.args.length - 1] || "") }
         : { program: command.catalog_name || command.program, args: Array.isArray(command.args) ? command.args : [] };
@@ -687,13 +767,14 @@ async function backend() {
     const text = String(value ?? "").replace(/\s+/g, " ").trim();
     return text.length > 160 ? `${text.slice(0, 159)}…` : text;
   };
-  const toolCallNotificationBody = (p, tool, args, contextHandle = "", root = null, error = "") => {
+  const toolCallNotificationBody = (p, tool, args, contextHandle = "", root = null, error = "", progressRequested = false) => {
     const context = contextByHandle(p, contextHandle);
     const session = context ? sessionNotificationLabel(p, context, null, Date.now(), root?.name || "") : "";
     const preview = compactToolCallPreview(p, tool, args);
     return [
       session,
       `• 🔧 ${tool}${preview ? ` ${preview}` : ""}`,
+      progressRequested && "• 📡 Progress requested",
       error && `• ⚠️ ${compactNotificationError(error)}`,
     ].filter(Boolean).join("\n");
   };
@@ -708,6 +789,7 @@ async function backend() {
     process_runs: ["context_id", "context_handle", "root_id", "root_name", "root_path", "stdout_tail", "stderr_tail"],
     logs: ["id", "server_name", "tool", "status", "input_json", "context_id", "context_handle", "root_id", "root_name", "root_path"],
     tool_call_descriptors: ["log_id", "descriptor_json"],
+    tool_call_transport: ["log_id", "progress_requested"],
     oauth_refresh_tokens: ["token_hash", "client_id", "server_id", "resource", "scope", "last_used_at"],
     published_html: ["id", "server_id", "context_handle", "title", "html", "height", "created_at"],
   };
@@ -758,10 +840,11 @@ async function backend() {
     `INSERT INTO server_config(id,name,oauth,created_at) VALUES(1,?,?,?)`,
     "MrMCP", 1, Date.now(),
   );
-  const processes = new Map(), jsKernels = new Map(), activeCallControls = new Map(),
+  const processes = new Map(), persistentProcessLabels = new Set(), jsKernels = new Map(), activeCallControls = new Map(),
     oauthConsents = new Map(), rateBuckets = new Map(), downloadTokens = new Map();
   let toolCallGate = null, toolCallsIdle = Promise.resolve(), resolveToolCallsIdle = null,
-    maintenanceAction = "", maintenancePhase = "", waitingToolCalls = 0, headerActivityTimer = null;
+    maintenanceAction = "", maintenancePhase = "", waitingToolCalls = 0,
+    headerActivityTimer = null, dashboardToolCallTimer = null;
 
   const maintenanceProjection = () => ({
     active: !!toolCallGate, action: maintenanceAction, phase: maintenancePhase,
@@ -769,6 +852,35 @@ async function backend() {
   });
   const emitMaintenance = () => emitUiChange(["dashboard", "settings"], "maintenance");
   const emitToolCallActivity = () => emitUiChange(["state"], "tool-call-activity");
+  function dashboardToolCallsProjection(p) {
+    const now = Date.now(), cutoff = now - DASHBOARD_TOOL_CALL_TTL_MS;
+    const rows = all(`SELECT l.id,l.started_at,l.completed_at,l.context_id,l.tool,l.status,l.duration_ms,l.input_json,
+      COALESCE(t.progress_requested,0) progress_requested
+      FROM logs l LEFT JOIN tool_call_transport t ON t.log_id=l.id
+      WHERE l.server_id=? AND (l.status IN ('received','running') OR l.completed_at>=?)
+      ORDER BY l.started_at DESC`, p.id, cutoff).map(row => {
+      const active = !row.completed_at && ["received", "running"].includes(row.status);
+      return {
+        id: Number(row.id), context_id: Number(row.context_id) || 0, tool: row.tool, status: row.status,
+        call_preview: compactToolCallPreview(p, row.tool, parseJson(row.input_json || "{}", {})),
+        progress_requested: !!row.progress_requested, active,
+        elapsed_ms: Math.max(0, (active ? now : Number(row.completed_at || now)) - Number(row.started_at || now)),
+        completed_age_ms: active ? null : Math.max(0, now - Number(row.completed_at || now)),
+        ttl_ms: active ? null : Math.max(0, Number(row.completed_at || now) + DASHBOARD_TOOL_CALL_TTL_MS - now),
+      };
+    });
+    if (dashboardToolCallTimer) clearTimeout(dashboardToolCallTimer);
+    dashboardToolCallTimer = null;
+    if (rows.length && uiRenderConnected) {
+      const expiries = rows.filter(row => !row.active).map(row => now + Number(row.ttl_ms || 0));
+      const next = Math.min(rows.some(row => row.active) ? now + 1000 : Infinity, ...expiries, Infinity);
+      if (Number.isFinite(next)) dashboardToolCallTimer = setTimeout(() => {
+        dashboardToolCallTimer = null;
+        emitUiChange(["dashboard"], "dashboard-tool-call-tick");
+      }, Math.max(50, next - now + 10));
+    }
+    return rows;
+  }
   function headerActivityProjection(p) {
     const now = Date.now(), rows = all(`
       SELECT l.context_id, COUNT(*) tool_calls, MAX(l.started_at) last_at
@@ -2574,6 +2686,11 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       },
       required: ["old_text", "new_text"],
     };
+    const processLabelInput = {
+      type: "string", minLength: 1, maxLength: 64,
+      pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+      description: "Client-chosen persistent process label. Uniqueness is scoped to the exact Session: the logical key is (context_handle, label), so different Sessions may reuse the same label without conflict. Use a short stable name such as dev-server or worker-1, then pass the exact same label to exec_attach, exec_write and exec_kill.",
+    };
     const execInput = {
       program: {
         type: "string",
@@ -2595,6 +2712,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       },
       ...contextInput,
     };
+    const execStartInput = { ...execInput };
+    delete execStartInput.separate_streams;
 
     const defs = {
       list_workspaces: [
@@ -2759,36 +2878,37 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         } },
       ],
       exec: [
-        "Run a foreground command. For normal direct execution use program + args and never send a shell boolean/field; use shell_command only when actual shell syntax such as a pipeline or redirection is required. Pass args verbatim and in order; consult the program's --help when CLI syntax is uncertain. Process output is normalized to readable plain text before it is buffered or stored. Read output together with status and exit_code to understand what happened; set separate_streams=true only when separate stdout/stderr are useful. Do not invoke shell commands, uv or Python to read, list, search, edit or replace files when the structured tools cover the operation.",
+        "Run one foreground command and keep the Tool Call open until it exits. The complete normalized combined stdout/stderr transcript is retained server-side for this call. When the request supplies _meta.progressToken and accepts SSE, new output is also sent incrementally as standard MCP notifications/progress in batches of at most 16 KiB or 100 ms; after exit the final result still contains the complete transcript from process start. Without a progressToken, no incremental progress notifications are emitted and the call returns the complete transcript only when the process exits. If the client disconnects or cancels the request, the foreground child is terminated. For normal direct execution use program + args; use shell_command only for actual shell syntax. Pass argv verbatim and consult --help when syntax is uncertain. Use structured filesystem/text tools instead of exec when they cover the operation.",
         { oneOf: [{ required: ["program"] }, { required: ["shell_command"] }], properties: {
           ...execInput,
           timeout_ms: { type: "integer", minimum: 1, maximum: 3600000, default: 120000 },
         } },
       ],
       exec_start: [
-        "Start an interactive or background command. For normal direct execution use program + args and never send a shell boolean/field; use shell_command only when actual shell syntax such as a pipeline or redirection is required. Pass args verbatim and in order; consult the program's --help when CLI syntax is uncertain. Process output is normalized to readable plain text before it is buffered or stored. Use exec_poll, exec_write and exec_kill afterward; read the combined output with status and exit_code, or set separate_streams=true when separate stdout/stderr are useful.",
-        { oneOf: [{ required: ["program"] }, { required: ["shell_command"] }], properties: {
-          ...execInput, keep_stdin_open: { type: "boolean", default: true },
+        "Start a persistent interactive/background command and return immediately; this tool never carries live process output. label is mandatory and identifies the process within the exact Session for later exec_attach, exec_write and exec_kill calls; the logical key is (context_handle,label), so another Session may reuse the same label. The process keeps running after this Tool Call ends or its client disconnects. The complete normalized stdout/stderr transcript is retained server-side for the retained process lifetime, and stdin writes are also retained internally for diagnostics. Call exec_attach(label) to consume output. Only one retained persistent process may use a given label in the same Session at a time; concurrent duplicate starts are rejected, while a completed retained process with that label may be replaced. Persistent process state does not survive a server restart. stdin remains open until exec_write closes it or the process exits.",
+        { oneOf: [{ required: ["program", "label"] }, { required: ["shell_command", "label"] }], properties: {
+          ...execStartInput, label: processLabelInput,
           timeout_ms: { type: "integer", minimum: 0, maximum: 604800000, default: 0 },
         } },
       ],
-      exec_poll: ["Read incremental output and status for a process started by this context. Process output is normalized to readable plain text before it is buffered or stored. The default output field combines stdout and stderr in observed arrival order; use separate_streams=true only when the individual streams are needed.", { properties: {
-        process_id: { type: "string" }, output_offset: { type: "integer", minimum: 0, default: 0 },
-        separate_streams: { type: "boolean", default: false },
-        stdout_offset: { type: "integer", minimum: 0, default: 0, description: "Used only when separate_streams=true." },
-        stderr_offset: { type: "integer", minimum: 0, default: 0, description: "Used only when separate_streams=true." },
-        wait_ms: { type: "integer", minimum: 0, maximum: 30000, default: 0 }, ...contextInput,
-      }, required: ["process_id"] }],
-      exec_write: ["Write to a process started by this context, or close its stdin.", { properties: {
-        process_id: { type: "string" }, data: { type: "string", default: "" },
+      exec_attach: [
+        "Consume output from one persistent process created by exec_start using its exact Session-scoped label. The complete normalized process transcript is retained server-side and each successful attach advances an internal cursor so already-returned combined output is not repeated. With _meta.progressToken, exec_attach sends all unread backlog and then new combined stdout/stderr incrementally as standard MCP notifications/progress until the process exits; the final result contains the complete unread transcript covered by that attachment and remaining_bytes is 0. Without a progressToken, exec_attach is a long-poll read: if unread output already exists it returns immediately with at most 16 KiB; otherwise, while the process is running, it waits for output and returns when 16 KiB accumulate or 100 ms have elapsed after the first new data. remaining_bytes reports how many already-buffered UTF-8 bytes still follow the returned chunk. Call exec_attach again immediately while remaining_bytes>0; when it is 0 and status is running, call exec_attach again whenever you want to wait for future output. If the process exits or is killed while attached, the call returns the final available chunk plus the final process status; killed/failed status is an error result but still includes that output. A client disconnect detaches only and never terminates the persistent process. Only one exec_attach may be active for a label at a time. separate_streams=true additionally returns complete current stdout/stderr snapshots in the final result. Use exec_list to discover labels and states.",
+        { properties: {
+          label: processLabelInput,
+          separate_streams: { type: "boolean", default: false, description: "Also return separate stdout/stderr in the final result; live MCP progress remains the combined observed-order output." },
+          ...contextInput,
+        }, required: ["label"] },
+      ],
+      exec_write: ["Write data to the open stdin of a persistent process created by exec_start. Address the process by its exact Session-scoped label. This call is ordinary JSON and does not attach to output; use exec_attach separately when live output is needed. Set close=true to close stdin after the optional write.", { properties: {
+        label: processLabelInput, data: { type: "string", default: "" },
         encoding: { type: "string", enum: ["text", "base64"], default: "text" },
         close: { type: "boolean", default: false }, ...contextInput,
-      }, required: ["process_id"] }],
-      exec_kill: ["Terminate a process started by this context.", { properties: {
-        process_id: { type: "string" }, signal: { type: "string", enum: ["SIGTERM", "SIGKILL"], default: "SIGTERM" },
+      }, required: ["label"] }],
+      exec_kill: ["Terminate a persistent process created by exec_start, addressed by its exact Session-scoped label. Foreground exec calls are cancelled by cancelling/disconnecting their own Tool Call and are not controlled through exec_kill.", { properties: {
+        label: processLabelInput, signal: { type: "string", enum: ["SIGTERM", "SIGKILL"], default: "SIGTERM" },
         ...contextInput,
-      }, required: ["process_id"] }],
-      exec_list: ["List active and recent processes belonging to this context. Process history exposes combined terminal output rather than separate stdout/stderr streams.", { properties: {
+      }, required: ["label"] }],
+      exec_list: ["List the persistent processes currently retained for this Session, including their unique labels, state, command and attachment/stdin state. Use this before exec_attach, exec_write or exec_kill when the label or current state is uncertain. include_completed=false restricts the result to still-running processes. Persistent process state is in memory and does not survive a server restart.", { properties: {
         include_completed: { type: "boolean", default: true },
         limit: { type: "integer", minimum: 1, maximum: 200, default: 50 }, ...contextInput,
       } }],
@@ -2825,18 +2945,15 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       encoding: { type: "string" }, bom: { type: "boolean" }, line_endings: { type: "string" },
     };
     const processProperties = {
-      process_id: { type: "string" }, pid: { type: "integer" }, status: { type: "string" },
+      label: { type: "string", description: "Present for persistent processes created by exec_start." },
+      status: { type: "string" },
       command: {}, cwd: { type: "string" }, started_at: { type: "string" }, completed_at: nullableString,
       exit_code: { anyOf: [{ type: "integer" }, { type: "null" }] }, signal: nullableString,
       requested_signal: nullableString, termination_source: nullableString,
       timed_out: { type: "boolean" },
-      output: { type: "string", description: "Primary normalized process output. ANSI/OSC/control sequences are removed before buffering or storage; standalone carriage returns become line breaks so progress states remain visible. stdout and stderr are combined in observed arrival order." },
-      output_from: { type: "integer" }, output_next: { type: "integer" }, output_truncated_before: { anyOf: [{ type: "integer" }, { type: "null" }] },
-      stdout: { type: "string", description: "Separate normalized standard output, returned only when separate_streams=true." },
-      stdout_from: { type: "integer" }, stdout_next: { type: "integer" }, stdout_truncated_before: { anyOf: [{ type: "integer" }, { type: "null" }] },
-      stderr: { type: "string", description: "Separate normalized standard error, returned only when separate_streams=true. Some successful CLIs legitimately write progress or diagnostics here." },
-      stderr_from: { type: "integer" }, stderr_next: { type: "integer" },
-      stderr_truncated_before: { anyOf: [{ type: "integer" }, { type: "null" }] },
+      output: { type: "string", description: "Normalized combined process output. The complete process transcript is retained server-side for the retained process lifetime; ANSI/OSC/control sequences are removed before buffering or streaming, standalone carriage returns become line breaks and stdout/stderr are combined in observed arrival order." },
+      stdout: { type: "string", description: "Complete normalized standard output, returned only when separate_streams=true." },
+      stderr: { type: "string", description: "Complete normalized standard error, returned only when separate_streams=true. Some successful CLIs legitimately write progress or diagnostics here." },
       stdin_open: { type: "boolean" }, success: { type: "boolean" },
     };
     const outputSchemas = {
@@ -2868,10 +2985,19 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       list_commands: outputSchema({ query: { type: "string" }, page: { type: "integer" }, page_size: { type: "integer" }, total: { type: "integer" }, pages: { type: "integer" }, has_more: { type: "boolean" }, bin_directory: { type: "string" }, config_file: { type: "string" }, path_precedence: { type: "string" }, invocation: { type: "object", additionalProperties: true }, commands: objectArray }),
       query_tool_calls: outputSchema({ calls: objectArray }),
       exec: outputSchema(processProperties),
-      exec_start: outputSchema(processProperties),
-      exec_poll: outputSchema(processProperties),
-      exec_write: outputSchema({ process_id: { type: "string" }, bytes_written: { type: "integer" }, stdin_open: { type: "boolean" } }),
-      exec_kill: outputSchema({ process_id: { type: "string" }, killed: { type: "boolean" }, signal: { type: "string" } }),
+      exec_start: outputSchema({
+        label: { type: "string" }, status: { type: "string" }, command: {},
+        cwd: { type: "string" }, started_at: { type: "string" }, stdin_open: { type: "boolean" },
+      }),
+      exec_attach: outputSchema({
+        ...processProperties,
+        remaining_bytes: {
+          type: "integer", minimum: 0,
+          description: "UTF-8 bytes already buffered after the output returned by this attach call. When greater than zero, call exec_attach again immediately to drain the next chunk. When zero and status is running, exec_attach may still be called again and will wait for new output or process termination.",
+        },
+      }),
+      exec_write: outputSchema({ label: { type: "string" }, bytes_written: { type: "integer" }, stdin_open: { type: "boolean" } }),
+      exec_kill: outputSchema({ label: { type: "string" }, killed: { type: "boolean" }, signal: { type: "string" } }),
       exec_list: outputSchema({ processes: objectArray }),
       js: outputSchema({ kernel_id: { type: "string" }, cwd: { type: "string" }, value: { type: "string" }, stdout: { type: "string" }, stderr: { type: "string" }, module_dirs: stringArray }),
       js_add_node_module_dir: outputSchema({ kernel_id: { type: "string" }, path: { type: "string" }, module_dirs: stringArray }),
@@ -2885,7 +3011,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       write_file: "Write", write_files: "Write batch", edit: "Edit", replace: "Replace",
       glob: "Glob", grep: "Grep", trash_paths: "Trash paths", untrash_action: "Restore trash action",
       publish_file: "Publish File", publish_html: "Publish HTML", list_commands: "Command Catalog", query_tool_calls: "Query Tool Calls",
-      exec: "Run Command", exec_start: "Start Command", exec_poll: "Process Output", exec_write: "Write Stdin",
+      exec: "Run Command", exec_start: "Start Persistent Command", exec_attach: "Attach Process Output", exec_write: "Write Stdin",
       exec_kill: "Terminate Process", exec_list: "List Processes", js: "JavaScript Kernel",
       js_add_node_module_dir: "Add Module Directory", js_reset: "Reset JavaScript Kernel",
     };
@@ -2924,7 +3050,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     for (const custom of all("SELECT * FROM custom_tools WHERE server_id=? ORDER BY name", p.id)) tools.push({
       name: custom.name,
       title: custom.name.replaceAll("_", " ").replace(/\b\w/g, value => value.toUpperCase()),
-      description: `${custom.description || `Run configured command: ${custom.command}`} ${CONTEXT_HANDLE_RULE}`,
+      description: `${custom.description || `Run configured command: ${custom.command}`} This is a foreground command: normalized combined output may stream as request-scoped progress, the final result contains buffered status/output, and client disconnect/cancellation terminates the child. ${CONTEXT_HANDLE_RULE}`,
       inputSchema: schema({ properties: {
         args: { type: "array", items: { type: "string" }, default: [], description: "Argument vector appended verbatim and in order to the configured command." }, shell_command_suffix: { type: "string" },
         cwd: { type: "string", default: "." }, env: { type: "object", additionalProperties: { type: "string" } },
@@ -2964,6 +3090,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         grep: ["scanned_files", "matched_files", "results", "truncated"],
         replace: ["scanned_files", "total_replacements", "files"],
         edit: ["total_replacements", "files"],
+        exec_attach: ["output", "remaining_bytes"],
       };
       for (const key of expectedOutputs[tool.name] || [])
         if (!tool.outputSchema.properties?.[key]) errors.push(`outputSchema missing property ${key}`);
@@ -2988,9 +3115,18 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       replace: ["exclude", "regex", "case_sensitive", "include_hidden", "include_dependencies", "max_file_bytes", "expected_replacements", "dry_run", "max_files"],
       publish_html: ["html", "title", "height"],
       query_tool_calls: ["limit", "tool", "status", "query", "before_id"],
+      exec_start: ["label"], exec_attach: ["label"], exec_write: ["label"], exec_kill: ["label"],
     };
     for (const key of expectedInputs[tool.name] || [])
       if (!tool.inputSchema.properties?.[key]) errors.push(`inputSchema missing property ${key}`);
+    if (["exec_attach", "exec_write", "exec_kill"].includes(tool.name) && tool.inputSchema.properties?.process_id)
+      errors.push(`${tool.name} must use label rather than process_id`);
+    if (["exec", "exec_start", "exec_attach"].includes(tool.name) && tool.outputSchema.properties?.pid)
+      errors.push(`${tool.name} output must not expose OS pid`);
+    if (tool.name === "exec_attach" && ["wait_ms", "output_offset", "stdout_offset", "stderr_offset"].some(key => tool.inputSchema.properties?.[key]))
+      errors.push("exec_attach must not expose polling or offset arguments");
+    if (tool.name === "exec_start" && tool.inputSchema.properties?.separate_streams)
+      errors.push("exec_start must not expose separate_streams because it does not return process output");
     return errors;
   }
   function mcpSelfTest(p) {
@@ -3056,7 +3192,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     };
   }
 
-  function beginLog(p, tool, args, contextHandle = "", root = null, descriptor = null, notifyStart = true) {
+  function beginLog(p, tool, args, contextHandle = "", root = null, descriptor = null, notifyStart = true, progressRequested = false) {
     const context = contextByHandle(p, contextHandle), contextId = Number(context?.id || 0), now = Date.now();
     const previous = contextId ? one(
       "SELECT COUNT(*) tool_calls, MAX(started_at) last_call_at FROM logs WHERE server_id=? AND context_id=?",
@@ -3074,10 +3210,11 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       "INSERT INTO tool_call_descriptors(log_id,descriptor_json) VALUES(?,?)",
       id, JSON.stringify(descriptor),
     );
+    run("INSERT INTO tool_call_transport(log_id,progress_requested) VALUES(?,?)", id, progressRequested ? 1 : 0);
     if (context && previousCalls && now - lastCallAt >= SESSION_ACTIVE_MS)
       postOsNotification("session", "🟢 Session Active", sessionLabel);
     if (notifyStart)
-      postOsNotification("tool_call", `🛠️ Tool Call #${id}`, toolCallNotificationBody(p, tool, args, contextHandle, root));
+      postOsNotification("tool_call", `🛠️ Tool Call #${id}`, toolCallNotificationBody(p, tool, args, contextHandle, root, "", progressRequested));
     return id;
   }
   function updateLog(id, fields) {
@@ -3094,8 +3231,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         id, l.server_name, l.tool, l.input_json, l.result_json || l.resolved_json || l.stdout || '', l.stderr, l.error);
     } catch {}
   }
-  function rejectToolCall(p, tool, args, message, contextHandle = "", status = "failed", result = { error: message }, descriptor = null) {
-    const id = beginLog(p, tool, args, contextHandle, null, descriptor, false), completed = Date.now();
+  function rejectToolCall(p, tool, args, message, contextHandle = "", status = "failed", result = { error: message }, descriptor = null, progressRequested = false) {
+    const id = beginLog(p, tool, args, contextHandle, null, descriptor, false, progressRequested), completed = Date.now();
     updateLog(id, {
       completed_at: completed, duration_ms: 0, status,
       error: message, result_json: JSON.stringify(result),
@@ -3104,7 +3241,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     postOsNotification(
       "tool_call",
       status === "invalid" ? `⚠️ Invalid Tool Call #${id}` : `❌ Tool Call Rejected #${id}`,
-      toolCallNotificationBody(p, tool, args, contextHandle, null, message),
+      toolCallNotificationBody(p, tool, args, contextHandle, null, message, progressRequested),
     );
     emitUiChange(["state"], status === "invalid" ? "tool-call-invalid" : "tool-call-rejected");
     return id;
@@ -3171,18 +3308,45 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     }
     return "";
   }
-  // Long-running process management mirrors the Bash/BashOutput/KillShell pattern:
-  // exec is blocking; exec_start + exec_poll/exec_write/exec_kill is interactive.
-  const PROCESS_BUFFER_LIMIT = 4 * 1024 * 1024;
+  // Foreground exec is request-scoped and streamed live. Persistent processes are explicitly
+  // started with exec_start(label), then observed with exec_attach and controlled by label.
+  // Keep the complete normalized process transcript for the retained process lifetime: foreground exec
+  // returns the whole transcript once, while repeated exec_attach calls consume it through attach_cursor.
   const processTail = value => value.length > 65536 ? value.slice(-65536) : value;
-  function appendProcessBuffer(rec, key, value) {
-    const base = `${key}_base`;
-    rec[key] += value;
-    if (rec[key].length > PROCESS_BUFFER_LIMIT) {
-      const cut = rec[key].length - PROCESS_BUFFER_LIMIT;
-      rec[key] = rec[key].slice(cut);
-      rec[base] += cut;
-    }
+  function appendProcessBuffer(rec, key, value) { rec[key] += value; }
+  function notifyProcessActivity(rec) {
+    for (const wake of [...rec.output_waiters]) { rec.output_waiters.delete(wake); wake(); }
+  }
+  function processActivityWait(rec, timeoutMs = 0) {
+    let timer = null, settled = false, wake;
+    const promise = new Promise(resolve => {
+      wake = () => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        rec.output_waiters.delete(wake);
+        resolve("activity");
+      };
+      rec.output_waiters.add(wake);
+      if (timeoutMs > 0) timer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        rec.output_waiters.delete(wake);
+        resolve("timeout");
+      }, timeoutMs);
+    });
+    return { promise, cancel() {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      rec.output_waiters.delete(wake);
+    } };
+  }
+  function recordProcessInput(rec, data, encoding = "utf-8", close = false) {
+    if (data !== undefined && data !== null && String(data) !== "") rec.stdin_history.push({
+      at: Date.now(), data: String(data), encoding: encoding === "base64" ? "base64" : "utf-8",
+    });
+    if (close) rec.stdin_history.push({ at: Date.now(), close: true });
   }
   const terminalNormalizer = () => ({ mode: "text", pending_cr: false });
   function normalizeTerminalChunk(state, value, final = false) {
@@ -3238,7 +3402,12 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     if (!normalized) return;
     appendProcessBuffer(rec, stream, normalized);
     appendProcessBuffer(rec, "output", normalized);
+    rec.output_bytes += enc.encode(normalized).byteLength;
     rec.updated_at = Date.now();
+    rec.foreground_progress?.push(normalized);
+    const attachment = rec.attachment;
+    if (attachment?.progress) attachment.progress.push(normalized);
+    notifyProcessActivity(rec);
     emitUiChange(["logs"], "process-output");
   }
   async function pumpProcess(stream, rec, key) {
@@ -3301,25 +3470,45 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     };
     const combined = read("output", options.output_offset);
     const view = {
-      process_id: rec.id, pid: rec.pid, status: rec.status, command: rec.display,
+      ...(rec.label ? { label: rec.label } : {}),
+      status: rec.status, command: rec.display,
       cwd: rec.cwd_display, context_handle: rec.context_handle,
       started_at: new Date(rec.started_at).toISOString(),
       completed_at: rec.completed_at ? new Date(rec.completed_at).toISOString() : null,
       exit_code: rec.exit_code, signal: rec.signal || null, requested_signal: rec.requested_signal || null,
       termination_source: rec.termination_source || null, timed_out: !!rec.timed_out,
-      output: combined.value, output_from: combined.from, output_next: combined.next,
-      output_truncated_before: combined.truncated_before,
+      output: combined.value,
       stdin_open: !!rec.stdin_writer, error: rec.error || "",
       success: rec.status === "running" || rec.status === "completed",
     };
     if (options.separate_streams === true) {
       const out = read("stdout", options.stdout_offset), err = read("stderr", options.stderr_offset);
-      Object.assign(view, {
-        stdout: out.value, stdout_from: out.from, stdout_next: out.next, stdout_truncated_before: out.truncated_before,
-        stderr: err.value, stderr_from: err.from, stderr_next: err.next, stderr_truncated_before: err.truncated_before,
-      });
+      Object.assign(view, { stdout: out.value, stderr: err.value });
     }
     return view;
+  }
+  function processStartView(rec) {
+    return {
+      label: rec.label, status: rec.status, command: rec.display,
+      cwd: rec.cwd_display, context_handle: rec.context_handle,
+      started_at: new Date(rec.started_at).toISOString(), stdin_open: !!rec.stdin_writer,
+    };
+  }
+  function processListView(rec) {
+    return {
+      label: rec.label, status: rec.status, command: rec.display,
+      cwd: rec.cwd_display, started_at: new Date(rec.started_at).toISOString(),
+      completed_at: rec.completed_at ? new Date(rec.completed_at).toISOString() : null,
+      exit_code: rec.exit_code, signal: rec.signal || null, stdin_open: !!rec.stdin_writer,
+      attached: !!rec.attachment,
+    };
+  }
+  function processAdminView(rec, options = {}) {
+    const progressRequested = rec.persistent
+      ? !!rec.attachment?.progress_requested
+      : !!activeCallControls.get(rec.log_id)?.progress_requested;
+    return { process_id: rec.id, pid: rec.pid, progress_requested: progressRequested,
+      stdin_history: rec.stdin_history || [], ...processView(rec, options) };
   }
   function processSummary(rec, tail = 8192, separateStreams = false) {
     const outputTotal = rec.output_base + rec.output.length;
@@ -3380,9 +3569,22 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       },
     };
   }
-  async function startManagedProcess(p, args, background, execution = {}) {
+  async function startManagedProcess(p, args, persistent, execution = {}) {
     const target = await resolveWorkspacePath(execution.selection, args.cwd || ".");
-    const defaultTimeout = background ? 0 : 120000;
+    const label = persistent ? String(args.label || "") : "";
+    let replaceExisting = null, labelKey = "";
+    if (persistent) {
+      labelKey = `${target.context.handle}\0${label}`;
+      if (persistentProcessLabels.has(labelKey)) throw new Error(`Persistent process label already in use: ${label}`);
+      const existing = [...processes.values()].find(record =>
+        record.persistent && record.context_handle === target.context.handle && record.label === label);
+      if (existing && ["starting", "running"].includes(existing.status))
+        throw new Error(`Persistent process label already in use: ${label}`);
+      replaceExisting = existing || null;
+      persistentProcessLabels.add(labelKey);
+    }
+    try {
+    const defaultTimeout = persistent ? 0 : 120000;
     const spec = commandSpec(args), timeout = Math.max(0, Math.min(
       Number(args.timeout_ms ?? defaultTimeout), 604800000,
     ));
@@ -3413,22 +3615,30 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       args: spec.argv, cwd: target.path, env: processEnv, clearEnv: true,
       stdin: "piped", stdout: "piped", stderr: "piped",
     });
+    if (replaceExisting) processes.delete(replaceExisting.id);
     const rec = {
-      id: `proc_${randomToken(18)}`, pid: child.pid, child, log_id: Number(execution.logId || 0),
+      id: `proc_${randomToken(18)}`, label, persistent: !!persistent,
+      pid: child.pid, child, log_id: Number(execution.logId || 0),
       server_id: p.id, server_name: "mcp", context_id: target.context.id, context_handle: target.context.handle,
       root_id: target.root.id, root_path: target.root.path, root_name: target.root.name,
       display: spec.display, command_json: JSON.stringify({
         program: spec.program, args: spec.argv, shell: spec.shell,
         catalog_name: spec.catalog_name || null, system_path_inherited: includeSystemPath,
+        ...(label ? { label } : {}), persistent: !!persistent,
       }),
       cwd: target.path, cwd_display: target.display, status: "running", started_at: Date.now(), completed_at: null,
       exit_code: null, signal: "", requested_signal: "", termination_source: "", timed_out: false, error: "",
-      output: "", stdout: "", stderr: "", output_base: 0, stdout_base: 0, stderr_base: 0, updated_at: Date.now(),
-      output_readers: new Set(), output_normalizers: { stdout: terminalNormalizer(), stderr: terminalNormalizer() }, output_cancelled: false,
+      output: "", stdout: "", stderr: "", output_base: 0, stdout_base: 0, stderr_base: 0, output_bytes: 0, updated_at: Date.now(),
+      output_readers: new Set(), output_waiters: new Set(), output_normalizers: { stdout: terminalNormalizer(), stderr: terminalNormalizer() }, output_cancelled: false,
+      foreground_progress: persistent ? null : execution.progress || null,
+      attachment: null, attach_cursor: 0, attach_cursor_bytes: 0, stdin_history: [],
       stdin_writer: child.stdin.getWriter(), timeout_timer: null, done: null,
     };
     processes.set(rec.id, rec);
-    execution.setCancel?.((signal, source = "user") => terminateProcess(rec, signal, source), { process_id: rec.id, kind: "process" });
+    if (!persistent) {
+      execution.setCancel?.((signal, source = "user") => terminateProcess(rec, signal, source), { process_id: rec.id, kind: "process" });
+      execution.onDisconnect?.(() => terminateProcess(rec, "SIGTERM", "client"));
+    }
     run(`INSERT INTO process_runs(id,pid,server_id,server_name,context_id,context_handle,root_id,root_name,root_path,
       command_json,cwd,status,started_at,timeout_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       rec.id, rec.pid, p.id, "mcp", rec.context_id, rec.context_handle, rec.root_id, rec.root_name, rec.root_path,
@@ -3459,11 +3669,13 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       rec.stdin_writer = null;
       run(`UPDATE process_runs SET status=?,completed_at=?,exit_code=?,signal=?,stdout_tail=?,stderr_tail=?,error=? WHERE id=?`,
         rec.status, rec.completed_at, rec.exit_code, rec.signal, processTail(rec.output), processTail(rec.stderr), rec.error, rec.id);
+      notifyProcessActivity(rec);
       emitUiChange(["logs"], "process-exit");
       return rec;
     }).catch(error => {
       rec.completed_at = Date.now(); rec.status = "failed"; rec.error = String(error?.stack || error);
       run("UPDATE process_runs SET status='failed',completed_at=?,error=? WHERE id=?", rec.completed_at, rec.error, rec.id);
+      notifyProcessActivity(rec);
       emitUiChange(["logs"], "process-exit");
       return rec;
     });
@@ -3472,21 +3684,107 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       terminateProcess(rec, "SIGKILL", "timeout").catch(() => {});
     }, timeout);
     if (args.stdin != null) {
+      recordProcessInput(rec, args.stdin, args.stdin_encoding);
       const bytes = args.stdin_encoding === "base64"
         ? new Uint8Array(Buffer.from(String(args.stdin), "base64")) : enc.encode(String(args.stdin));
       await rec.stdin_writer.write(bytes);
     }
-    if (!background || args.keep_stdin_open === false) {
+    if (!persistent) {
+      recordProcessInput(rec, null, "utf-8", true);
       try { await rec.stdin_writer.close(); } catch {}
       rec.stdin_writer = null;
     }
     return rec;
+    } finally {
+      if (labelKey) persistentProcessLabels.delete(labelKey);
+    }
   }
-  function ownedProcess(id, contextHandle = "") {
-    const rec = processes.get(String(id || ""));
-    if (!rec || rec.context_handle !== String(contextHandle || ""))
-      throw new Error("Unknown process_id for this context_handle");
+  function persistentProcess(label, contextHandle = "") {
+    const wanted = String(label || ""), handle = String(contextHandle || "");
+    const rec = [...processes.values()].find(record =>
+      record.persistent && record.context_handle === handle && record.label === wanted);
+    if (!rec) throw new Error(`Unknown persistent process label for this Session: ${wanted || "(empty)"}. Use exec_list to inspect available labels.`);
     return rec;
+  }
+  const processIsRunning = rec => ["starting", "running"].includes(rec.status);
+  const processOutputEnd = rec => rec.output_base + rec.output.length;
+  function attachProcessView(rec, start, end, args, remainingBytes) {
+    const view = processView(rec, { separate_streams: args.separate_streams === true });
+    const from = Math.max(start, rec.output_base), to = Math.max(from, Math.min(end, processOutputEnd(rec)));
+    view.output = rec.output.slice(from - rec.output_base, to - rec.output_base);
+    view.remaining_bytes = Math.max(0, Number(remainingBytes || 0));
+    return view;
+  }
+  async function waitAttachBatch(rec, startBytes, disconnected) {
+    if (rec.output_bytes > startBytes || !processIsRunning(rec)) return "ready";
+    while (rec.output_bytes <= startBytes && processIsRunning(rec)) {
+      const wait = processActivityWait(rec);
+      const reason = await Promise.race([wait.promise, disconnected]);
+      wait.cancel();
+      if (reason === "disconnected") return reason;
+    }
+    if (rec.output_bytes <= startBytes || !processIsRunning(rec)) return "ready";
+    const deadline = Date.now() + MCP_ATTACH_RESPONSE_MS;
+    while (processIsRunning(rec) && rec.output_bytes - startBytes < MCP_ATTACH_RESPONSE_BYTES) {
+      const delay = deadline - Date.now();
+      if (delay <= 0) break;
+      const wait = processActivityWait(rec, delay);
+      const reason = await Promise.race([wait.promise, disconnected]);
+      wait.cancel();
+      if (reason === "disconnected") return reason;
+      if (reason === "timeout") break;
+    }
+    return "ready";
+  }
+  async function attachManagedProcess(rec, args, execution = {}) {
+    if (!rec.persistent) throw new Error("exec_attach can attach only to a persistent process created by exec_start");
+    if (rec.attachment) throw new Error(`Persistent process ${rec.label} already has an active exec_attach`);
+    const progressMode = !!execution.progressRequested, progress = progressMode ? execution.progress : null;
+    const start = Math.max(rec.attach_cursor, rec.output_base), startBytes = rec.attach_cursor_bytes;
+    let sentCursor = start, sentBytes = startBytes, detached = false, detach;
+    const attachment = { progress, progress_requested: progressMode };
+    const disconnected = new Promise(resolve => { detach = resolve; });
+    if (progress) progress.setAfterFlush((message, bytes) => {
+      sentCursor += message.length; sentBytes += bytes;
+      rec.attach_cursor = Math.max(rec.attach_cursor, sentCursor);
+      rec.attach_cursor_bytes = Math.max(rec.attach_cursor_bytes, sentBytes);
+    });
+    rec.attachment = attachment;
+    execution.onDisconnect?.(() => {
+      detached = true;
+      if (rec.attachment === attachment) rec.attachment = null;
+      progress?.setAfterFlush(null);
+      detach("disconnected");
+    });
+    try {
+      if (progressMode) {
+        const backlog = rec.output.slice(start - rec.output_base);
+        if (progress) { progress.push(backlog); progress.flush(); }
+        if (processIsRunning(rec)) await Promise.race([rec.done, disconnected]);
+        if (detached) return attachProcessView(
+          rec, start, sentCursor, args, Math.max(0, rec.output_bytes - sentBytes),
+        );
+        progress?.flush();
+        const end = processOutputEnd(rec);
+        rec.attach_cursor = end; rec.attach_cursor_bytes = rec.output_bytes;
+        return attachProcessView(rec, start, end, args, 0);
+      }
+
+      const reason = await waitAttachBatch(rec, startBytes, disconnected);
+      if (reason === "disconnected" || detached) return attachProcessView(
+        rec, start, start, args, Math.max(0, rec.output_bytes - startBytes),
+      );
+      const available = rec.output.slice(start - rec.output_base);
+      const chunk = textPrefixByBytes(available, MCP_ATTACH_RESPONSE_BYTES);
+      const chunkBytes = enc.encode(chunk).byteLength, end = start + chunk.length;
+      rec.attach_cursor = end; rec.attach_cursor_bytes = startBytes + chunkBytes;
+      return attachProcessView(
+        rec, start, end, args, Math.max(0, rec.output_bytes - rec.attach_cursor_bytes),
+      );
+    } finally {
+      if (rec.attachment === attachment) rec.attachment = null;
+      progress?.setAfterFlush(null);
+    }
   }
   function cleanupProcesses(maxAge = 24 * 60 * 60 * 1000) {
     const cutoff = Date.now() - maxAge;
@@ -3509,34 +3807,14 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       if (now - bucket.started > 2 * 60 * 1000) rateBuckets.delete(key);
     expireDownloadTokens(now).catch(() => {});
   }
-  async function pollManagedProcess(rec, args) {
-    if (!rec) throw new Error("Unknown process_id (processes do not survive server restart)");
-    const before = `${rec.status}:${rec.output_base + rec.output.length}`;
-    const wait = Math.max(0, Math.min(Number(args.wait_ms || 0), 30000)), until = Date.now() + wait;
-    while (Date.now() < until) {
-      const now = `${rec.status}:${rec.output_base + rec.output.length}`;
-      if (now !== before) break;
-      await sleep(Math.min(100, until - Date.now()));
-    }
-    return processView(rec, args);
-  }
   function recentProcesses(contextHandle, includeCompleted = true, limit = 50) {
     const handle = String(contextHandle || "");
-    const active = [...processes.values()].filter(record =>
-      record.context_handle === handle && (includeCompleted || record.status === "running"));
-    const ids = new Set(active.map(record => record.id));
-    const historic = includeCompleted ? all(
-      "SELECT * FROM process_runs WHERE context_handle=? ORDER BY started_at DESC LIMIT ?", handle, limit,
-    ).filter(record => !ids.has(record.id)).map(record => ({
-      process_id: record.id, pid: record.pid, status: record.status,
-      command: parseJson(record.command_json, record.command_json), cwd: record.cwd,
-      context_handle: record.context_handle,
-      started_at: new Date(record.started_at).toISOString(),
-      completed_at: record.completed_at ? new Date(record.completed_at).toISOString() : null,
-      exit_code: record.exit_code, signal: record.signal || null,
-      output_tail: normalizeTerminalOutput(record.stdout_tail), error: record.error,
-    })) : [];
-    return [...active.map(record => processView(record)), ...historic].slice(0, limit);
+    return [...processes.values()]
+      .filter(record => record.persistent && record.context_handle === handle &&
+        (includeCompleted || ["starting", "running"].includes(record.status)))
+      .sort((a, b) => b.started_at - a.started_at)
+      .slice(0, limit)
+      .map(processListView);
   }
 
   function jsKernelKey(p, contextHandle, rootId) {
@@ -4060,27 +4338,38 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       const key = jsKernelKey(p, selection.context.handle, selection.root.id);
       return { reset: destroyJsKernel(key), kernel_id: key };
     }
-    if (name === "exec" || name === "exec_start") {
-      const record = await startManagedProcess(p, args, name === "exec_start", execution);
-      if (name === "exec_start") return processView(record, args);
+    if (name === "exec") {
+      const record = await startManagedProcess(p, args, false, execution);
       await record.done;
       return processView(record, args);
     }
-    if (name === "exec_poll") return await pollManagedProcess(ownedProcess(args.process_id, args.context_handle), args);
+    if (name === "exec_start") {
+      const record = await startManagedProcess(p, args, true, execution);
+      return processStartView(record);
+    }
+    if (name === "exec_attach") return await attachManagedProcess(
+      persistentProcess(args.label, args.context_handle), args, execution,
+    );
     if (name === "exec_write") {
-      const record = ownedProcess(args.process_id, args.context_handle);
-      if (!record.stdin_writer) throw new Error("Process stdin is closed");
-      if (args.data) await record.stdin_writer.write(args.encoding === "base64"
-        ? new Uint8Array(Buffer.from(String(args.data), "base64")) : enc.encode(String(args.data)));
-      if (args.close) { await record.stdin_writer.close(); record.stdin_writer = null; }
-      return { process_id: record.id,
+      const record = persistentProcess(args.label, args.context_handle);
+      if (!record.stdin_writer) throw new Error(`Persistent process ${record.label} stdin is closed`);
+      if (args.data) {
+        recordProcessInput(record, args.data, args.encoding);
+        await record.stdin_writer.write(args.encoding === "base64"
+          ? new Uint8Array(Buffer.from(String(args.data), "base64")) : enc.encode(String(args.data)));
+      }
+      if (args.close) {
+        recordProcessInput(record, null, "utf-8", true);
+        await record.stdin_writer.close(); record.stdin_writer = null;
+      }
+      return { label: record.label,
         bytes_written: args.data ? (args.encoding === "base64"
           ? Buffer.from(String(args.data), "base64").length : enc.encode(String(args.data)).length) : 0,
         stdin_open: !!record.stdin_writer };
     }
     if (name === "exec_kill") {
-      const record = ownedProcess(args.process_id, args.context_handle);
-      return { process_id: record.id, killed: await terminateProcess(record, args.signal || "SIGTERM"),
+      const record = persistentProcess(args.label, args.context_handle);
+      return { label: record.label, killed: await terminateProcess(record, args.signal || "SIGTERM"),
         signal: args.signal || "SIGTERM" };
     }
     if (name === "exec_list") return { processes: recentProcesses(
@@ -4128,11 +4417,11 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     if (kind === "invalid") return "The Session context_handle is invalid. Reuse a valid handle or call open_workspace with a Workspace name.";
     return "";
   }
-  function contextControlToolResult(p, name, args, resolution, descriptor = null) {
+  function contextControlToolResult(p, name, args, resolution, descriptor = null, progressRequested = false) {
     const handle = resolution.record?.handle || resolution.supplied_handle || "";
     const error = contextControlMessage(resolution.kind);
     const structuredContent = contextEnvelope(handle, { error });
-    const id = beginLog(p, name, args, handle, null, descriptor, false);
+    const id = beginLog(p, name, args, handle, null, descriptor, false, progressRequested);
     const toolResult = {
       content: [{ type: "text", text: error }],
       structuredContent, isError: true,
@@ -4143,20 +4432,24 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       result_json: JSON.stringify(toolResultForLog(toolResult)), error,
     });
     indexLog(id);
-    postOsNotification("tool_call", `⚠️ Invalid Tool Call #${id}`, toolCallNotificationBody(p, name, args, handle, null, error));
+    postOsNotification("tool_call", `⚠️ Invalid Tool Call #${id}`, toolCallNotificationBody(p, name, args, handle, null, error, progressRequested));
     return toolResult;
   }
 
   async function callTool(p, name, args, callInfo) {
     await waitForToolCallGate();
-    const id = beginLog(p, name, args, callInfo.contextHandle, callInfo.selection?.root, callInfo.descriptor), started = Date.now();
+    const id = beginLog(
+      p, name, args, callInfo.contextHandle, callInfo.selection?.root, callInfo.descriptor, true, !!callInfo.progressRequested,
+    ), started = Date.now();
     if (!activeCallControls.size)
       toolCallsIdle = new Promise(resolve => { resolveToolCallsIdle = resolve; });
-    const control = { log_id: id, cancel: null, kind: "", process_id: "", kernel_id: "" };
+    const control = { log_id: id, cancel: null, kind: "", process_id: "", kernel_id: "", progress_requested: !!callInfo.progressRequested };
     activeCallControls.set(id, control);
     emitToolCallActivity();
     const executionState = {
       ...callInfo, logId: id,
+      progress: callInfo.requestStream?.progress || null,
+      onDisconnect(callback) { callInfo.requestStream?.onDisconnect(callback); },
       setCancel(cancel, metadata = {}) {
         control.cancel = cancel; Object.assign(control, metadata);
         emitUiChange(["logs"], "tool-call-cancellable");
@@ -4192,7 +4485,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         const failure = publicLogResult.error || publicLogResult.stderr ||
           (publicLogResult.exit_code != null ? `Exit code ${publicLogResult.exit_code}${publicLogResult.signal ? ` · ${publicLogResult.signal}` : ""}` : "Tool returned an error");
         postOsNotification("tool_call", `❌ Tool Call Failed #${id}`,
-          toolCallNotificationBody(p, name, args, callInfo.contextHandle, callInfo.selection?.root, failure));
+          toolCallNotificationBody(p, name, args, callInfo.contextHandle, callInfo.selection?.root, failure, !!callInfo.progressRequested));
       }
       return toolResult;
     } catch (error) {
@@ -4213,7 +4506,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       });
       indexLog(id);
       postOsNotification("tool_call", `❌ Tool Call Failed #${id}`,
-        toolCallNotificationBody(p, name, args, callInfo.contextHandle, callInfo.selection?.root, error?.message || error));
+        toolCallNotificationBody(p, name, args, callInfo.contextHandle, callInfo.selection?.root, error?.message || error, !!callInfo.progressRequested));
       return toolResult;
     } finally {
       activeCallControls.delete(id);
@@ -4316,12 +4609,17 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     for (const key of [...u.searchParams.keys()]) if (sensitiveKey(key)) u.searchParams.set(key, "[REDACTED]");
     return u.pathname + u.search;
   }
-  async function debugBody(message) {
-    const raw = await message.text();
+  function formatDebugBody(raw, type = "") {
+    raw = String(raw || "");
     if (!raw) return "";
-    const type = message.headers.get("content-type") || "";
     try {
       if (type.includes("json")) return truncateDebug(JSON.stringify(redactObject(JSON.parse(raw)), null, 2));
+      if (type.includes("text/event-stream")) return truncateDebug(raw.split(/\r?\n/).map(line => {
+        if (!line.startsWith("data:")) return line;
+        const payload = line.slice(5).trimStart();
+        try { return `data: ${JSON.stringify(redactObject(JSON.parse(payload)))}`; }
+        catch { return line; }
+      }).join("\n"));
       if (type.includes("x-www-form-urlencoded")) {
         const q = new URLSearchParams(raw), out = {};
         for (const [k, v] of q) out[k] = sensitiveKey(k) ? "[REDACTED]" : v;
@@ -4330,45 +4628,106 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     } catch {}
     return truncateDebug(raw);
   }
-  // Public request wrapper: metrics, rate limits, redacted diagnostics and headers.
-  async function tracedMcp(req, info, transport) {
+  async function debugBody(message) {
+    return formatDebugBody(await message.text(), message.headers.get("content-type") || "");
+  }
+  function debugCaptureBody(body) {
+    const reader = body.getReader(), decoder = new TextDecoder();
+    let captured = "", omitted = 0, decoderClosed = false;
+    const append = value => {
+      if (!value) return;
+      const room = Math.max(0, DEBUG_BODY_LIMIT - captured.length);
+      captured += value.slice(0, room);
+      omitted += Math.max(0, value.length - room);
+    };
+    const finishDecoder = () => {
+      if (!decoderClosed) { decoderClosed = true; append(decoder.decode()); }
+      return captured + (omitted ? `\n[truncated ${omitted} additional characters]` : "");
+    };
+    const stream = new ReadableStream({
+      async pull(controller) {
+        try {
+          const { value, done } = await reader.read();
+          if (done) { finishDecoder(); controller.close(); return; }
+          append(decoder.decode(value, { stream: true }));
+          controller.enqueue(value);
+        } catch (error) { controller.error(error); }
+      },
+      async cancel(reason) {
+        finishDecoder();
+        try { await reader.cancel(reason); } catch {}
+      },
+    });
+    return { stream, text: finishDecoder };
+  }
+  // Public request wrapper: insert diagnostics immediately, then update the same row when delivery completes.
+  async function tracedHttp(req, info, handler, rateLimit = true) {
     run("UPDATE metrics SET value=value+1 WHERE name='requests'");
-    const remoteHost = info?.remoteAddr?.hostname || "";
-    if (!allowRequest(remoteHost)) return json({ error: "Too many requests" }, 429, { "retry-after": "60" });
+    const remoteHost = info?.remoteAddr?.hostname || "", started = Date.now();
     const debugEnabled = getCfg("debug_http_log", "0") === "1";
     const requestPath = new URL(req.url).pathname;
     const downloadRequest = requestPath.startsWith("/download/");
     const publishedHtmlRequest = requestPath.startsWith("/published-html/");
-    const started = Date.now(), requestCopy = debugEnabled ? req.clone() : null;
-    let response, error = "";
-    try { response = await mcpHandler(req, info, transport); }
-    catch (e) {
-      error = String(e?.stack || e);
-      response = json({ error: String(e?.message || e) }, String(e?.message || e).includes("too large") ? 413 : 500);
-    }
+    let debugId = 0, debugError = "";
+    const requestBodyPromise = debugEnabled
+      ? debugBody(req.clone()).catch(error => {
+          debugError = `Debug request capture error: ${String(error?.stack || error)}`;
+          return "";
+        })
+      : null;
     if (debugEnabled) {
-      let requestBody = "", responseBody = "";
-      try {
-        requestBody = await debugBody(requestCopy);
-        responseBody = downloadRequest ? "[binary download body omitted]"
-          : publishedHtmlRequest ? "[published HTML body omitted]" : await debugBody(response.clone());
-      } catch (e) { error += (error ? "\n" : "") + "Debug capture error: " + String(e?.stack || e); }
-      const remote = remoteHost;
-      run(`INSERT INTO debug_logs(ts,method,path,status,duration_ms,remote_addr,
+      const inserted = run(`INSERT INTO debug_logs(ts,method,path,status,duration_ms,remote_addr,
         request_headers,request_body,response_headers,response_body,error)
         VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-        started, req.method, debugUrl(req.url), response.status, Date.now() - started, remote,
-        debugHeaders(req.headers), requestBody, debugHeaders(response.headers), responseBody, error);
+        started, req.method, debugUrl(req.url), 0, 0, remoteHost,
+        debugHeaders(req.headers), "", "", "", "");
+      debugId = Number(inserted.lastInsertRowid);
+      requestBodyPromise.then(body => {
+        if (debugId) run("UPDATE debug_logs SET request_body=? WHERE id=?", body, debugId);
+      }).catch(() => {});
     }
+
+    let response, handlerError = "";
+    if (rateLimit && !allowRequest(remoteHost)) response = json({ error: "Too many requests" }, 429, { "retry-after": "60" });
+    else try { response = await handler(); }
+    catch (error) {
+      handlerError = String(error?.stack || error);
+      response = json({ error: String(error?.message || error) }, String(error?.message || error).includes("too large") ? 413 : 500);
+    }
+
     const headers = new Headers(response.headers);
     headers.set("x-content-type-options", "nosniff");
     headers.set("referrer-policy", "no-referrer");
     headers.set("permissions-policy", "camera=(), microphone=(), geolocation=()");
     if (!headers.has("cache-control")) headers.set("cache-control", "no-store");
-    return compressHttpResponse(req, new Response(response.body, {
+    const responseType = String(headers.get("content-type") || "").toLowerCase();
+    let responseCapture = null, responseBody = downloadRequest ? "[binary download body omitted]"
+      : publishedHtmlRequest ? "[published HTML body omitted]" : "";
+    let body = response.body;
+    if (debugEnabled && body && !downloadRequest && !publishedHtmlRequest) {
+      responseCapture = debugCaptureBody(body);
+      body = responseCapture.stream;
+    }
+    const finalResponse = new Response(body, {
       status: response.status, statusText: response.statusText, headers,
-    }));
+    });
+
+    if (debugEnabled) {
+      const finalize = async deliveryError => {
+        let requestBody = "";
+        try { requestBody = await requestBodyPromise; }
+        catch (error) { debugError += `${debugError ? "\n" : ""}Debug request capture error: ${String(error?.stack || error)}`; }
+        if (responseCapture) responseBody = formatDebugBody(responseCapture.text(), responseType);
+        const errors = [handlerError, debugError, deliveryError ? `Response delivery error: ${String(deliveryError?.stack || deliveryError)}` : ""]
+          .filter(Boolean).join("\n");
+        run(`UPDATE debug_logs SET status=?,duration_ms=?,request_body=?,response_headers=?,response_body=?,error=? WHERE id=?`,
+          response.status, Date.now() - started, requestBody, debugHeaders(headers), responseBody, errors, debugId);
+      };
+      Promise.resolve(info?.completed).then(() => finalize(null), error => finalize(error)).catch(() => {});
+    }
+    return finalResponse;
   }
+  const tracedMcp = (req, info, transport) => tracedHttp(req, info, () => mcpHandler(req, info, transport));
 
 
   const oauthRedirectValid = value => {
@@ -4630,6 +4989,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 
     const requestMeta = x.params?._meta && typeof x.params._meta === "object"
       ? x.params._meta : {};
+    const progressRequested = Object.prototype.hasOwnProperty.call(requestMeta, "progressToken");
     const bodyProtocol = String(requestMeta["io.modelcontextprotocol/protocolVersion"] || "");
     const headerProtocol = String(req.headers.get("mcp-protocol-version") || "");
     const headerMethod = String(req.headers.get("mcp-method") || "");
@@ -4644,7 +5004,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       const descriptor = fullAccess ? serverTools(p, true).find(tool => tool.name === toolName) : null;
       return rejectToolCall(
         p, toolName, x.params?.arguments || x.params || {}, message,
-        String(x.params?.arguments?.context_handle || ""), "invalid", result, descriptor,
+        String(x.params?.arguments?.context_handle || ""), "invalid", result, descriptor, progressRequested,
       );
     };
     const rpcError = (status, code, message, data = undefined, logInvalid = false) => {
@@ -4708,7 +5068,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       ? "Use list_workspaces when you need to discover the enabled Workspace names, then call open_workspace with the desired name. If you already have the current Session handle, pass it as current_context_handle to move that same Session to the Workspace; if it is omitted, empty, unknown or expired, open_workspace creates a new Session. The result includes workspace_name, absolute cwd and agent_guidance_path; when that path is non-null, read and follow the referenced AGENTS.md before repository work. Pass the returned context_handle unchanged on every later Session-bound tool call. " +
         "Use read_file/read_files, glob, grep, edit and replace directly for file inspection, discovery, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. " +
         "Use list_commands before other command-line work and invoke returned logical_name values directly through exec.program without PATH probes. " +
-        "Command execution output is normalized to readable plain text before buffering or storage; ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec, exec_start, exec_poll and custom commands accept separate_streams=true when individual stdout/stderr are needed. Use query_tool_calls to inspect and filter calls that actually reached this Session; requests blocked upstream before dispatch are absent. " +
+        "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; cancelling/disconnecting exec terminates its child. For persistent or interactive work, call exec_start with a Session-scoped label, then use exec_attach, exec_write, exec_list and exec_kill. Persistent labels are keyed by (context_handle,label), so different Sessions may reuse a label. exec_start returns immediately and retains the complete process transcript. exec_attach with progressToken streams unread backlog plus live output through progress until process exit and then returns that complete unread transcript; without progressToken it long-polls and returns at most 16 KiB of unread output plus remaining_bytes, so call it repeatedly to drain buffered output and call it again with remaining_bytes=0/status=running to wait for future output. Disconnecting exec_attach only detaches and never kills the persistent process. " +
         "Use publish_file to present existing files through its MCP App widget, and publish_html when an interactive self-contained HTML/CSS/JavaScript visualization is more appropriate. " +
         "Every authenticated client can invoke every published tool; context_handle is the bearer capability selecting the persistent Session and its current Workspace."
       : "The endpoint is reachable, but anonymous access exposes no tools. Authenticate with OAuth or Basic authentication.";
@@ -4770,6 +5130,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           const logId = rejectToolCall(
             p, toolName, x.params?.arguments || x.params || {},
             "Authentication required for tool execution", String(x.params?.arguments?.context_handle || ""),
+            "failed", { error: "Authentication required for tool execution" }, null, progressRequested,
           );
           r.error = {
             code: -32001, message: "Authentication required for tool execution",
@@ -4779,7 +5140,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           r.error = { code: -32602, message: "tools/call requires params.name" };
           rejectToolCall(
             p, "(invalid tools/call)", x.params || {}, r.error.message,
-            String(x.params?.arguments?.context_handle || ""), "invalid", { jsonrpc: "2.0", id: x.id, error: r.error },
+            String(x.params?.arguments?.context_handle || ""), "invalid", { jsonrpc: "2.0", id: x.id, error: r.error }, null, progressRequested,
           );
         } else {
           const rawToolArgs = x.params?.arguments ?? {};
@@ -4791,64 +5152,78 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
             r.error = { code: -32602, message: validationError };
             rejectToolCall(
               p, x.params.name, rawToolArgs, validationError,
-              String(rawToolArgs?.context_handle || ""), "invalid", { jsonrpc: "2.0", id: x.id, error: r.error }, descriptor,
+              String(rawToolArgs?.context_handle || ""), "invalid", { jsonrpc: "2.0", id: x.id, error: r.error }, descriptor, progressRequested,
             );
           } else {
-          const toolArgs = { ...rawToolArgs };
-          let toolResult;
-          if (x.params.name === "list_workspaces") {
-            toolResult = await callTool(
-              p, x.params.name, toolArgs,
-              { authKind: auth.kind, contextHandle: "", selection: null, descriptor },
-            );
-          } else if (x.params.name === "open_workspace") {
-            delete toolArgs.context_handle;
-            const workspace = workspaceByName(p, toolArgs.name);
-            if (!workspace) {
-              const current = resolveContext(p, toolArgs.current_context_handle, observedProtocol);
-              const handle = current.kind === "active" ? current.record.handle : "";
-              const error = `Unknown or disabled Workspace: ${String(toolArgs.name || "")}`;
-              const structuredContent = contextEnvelope(handle, { error });
-              toolResult = { content: [{ type: "text", text: error }], structuredContent, isError: true };
-              rejectToolCall(p, x.params.name, toolArgs, error, handle, "invalid", toolResult, descriptor);
-            } else {
-              const current = resolveContext(p, toolArgs.current_context_handle, observedProtocol);
-              let record;
-              if (current.kind === "active") {
-                run("UPDATE contexts SET root_id=?,updated_at=? WHERE handle=?", workspace.id, Date.now(), current.record.handle);
-                record = getContextRecord(p, current.record.handle);
+            const toolArgs = { ...rawToolArgs };
+            const invokeTool = async requestStream => {
+              let toolResult;
+              if (x.params.name === "list_workspaces") {
+                toolResult = await callTool(
+                  p, x.params.name, toolArgs,
+                  { authKind: auth.kind, contextHandle: "", selection: null, descriptor, requestStream, progressRequested },
+                );
+              } else if (x.params.name === "open_workspace") {
+                delete toolArgs.context_handle;
+                const workspace = workspaceByName(p, toolArgs.name);
+                if (!workspace) {
+                  const current = resolveContext(p, toolArgs.current_context_handle, observedProtocol);
+                  const handle = current.kind === "active" ? current.record.handle : "";
+                  const error = `Unknown or disabled Workspace: ${String(toolArgs.name || "")}`;
+                  const structuredContent = contextEnvelope(handle, { error });
+                  toolResult = { content: [{ type: "text", text: error }], structuredContent, isError: true };
+                  rejectToolCall(p, x.params.name, toolArgs, error, handle, "invalid", toolResult, descriptor, progressRequested);
+                } else {
+                  const current = resolveContext(p, toolArgs.current_context_handle, observedProtocol);
+                  let record;
+                  if (current.kind === "active") {
+                    run("UPDATE contexts SET root_id=?,updated_at=? WHERE handle=?", workspace.id, Date.now(), current.record.handle);
+                    record = getContextRecord(p, current.record.handle);
+                  } else {
+                    record = createContext(p, workspace, observedProtocol, {
+                      auth_kind: auth.kind,
+                      oauth_client_id: auth.clientId || "",
+                      client_name: auth.clientName || "",
+                      user_agent: req.headers.get("user-agent") || "",
+                    });
+                  }
+                  postOsNotification("session", "📂 Workspace Opened", sessionNotificationLabel(p, record, null, Date.now(), workspace.name));
+                  const selection = { context: record, root: runtimeWorkspaceRoot(workspace) };
+                  toolResult = await callTool(
+                    p, x.params.name, toolArgs,
+                    { authKind: auth.kind, contextHandle: record.handle, selection, descriptor, requestStream, progressRequested },
+                  );
+                }
               } else {
-                record = createContext(p, workspace, observedProtocol, {
-                  auth_kind: auth.kind,
-                  oauth_client_id: auth.clientId || "",
-                  client_name: auth.clientName || "",
-                  user_agent: req.headers.get("user-agent") || "",
-                });
+                const resolution = resolveContext(p, toolArgs.context_handle, observedProtocol);
+                if (resolution.kind === "active") {
+                  const selection = { context: resolution.record, root: selectedContextRoot(p, resolution.record) };
+                  toolResult = await callTool(
+                    p, x.params.name, toolArgs,
+                    { authKind: auth.kind, contextHandle: resolution.record.handle, selection, descriptor, requestStream, progressRequested },
+                  );
+                } else toolResult = contextControlToolResult(p, x.params.name, toolArgs, resolution, descriptor, progressRequested);
               }
-              postOsNotification("session", "📂 Workspace Opened", sessionNotificationLabel(p, record, null, Date.now(), workspace.name));
-              const selection = { context: record, root: runtimeWorkspaceRoot(workspace) };
-              toolResult = await callTool(
-                p, x.params.name, toolArgs,
-                { authKind: auth.kind, contextHandle: record.handle, selection, descriptor },
+              return toolResult;
+            };
+            const customProcessTool = !!one("SELECT 1 present FROM custom_tools WHERE server_id=? AND name=?", p.id, x.params.name);
+            const streamingTool = x.params.name === "exec_attach" ||
+              (progressRequested && (x.params.name === "exec" || customProcessTool));
+            const acceptsSse = acceptsMediaType(req.headers.get("accept"), "text/event-stream");
+            const wrapResult = toolResult => ({
+              jsonrpc: "2.0", id: x.id,
+              result: { resultType: "complete", ...toolResult, _meta: serverInfoMeta },
+            });
+            if (streamingTool && acceptsSse) {
+              return mcpSseResponse(
+                x.id, requestMeta.progressToken,
+                async requestStream => wrapResult(await invokeTool(requestStream)),
+                { "mcp-protocol-version": responseProtocol },
               );
             }
-          } else {
-            const resolution = resolveContext(p, toolArgs.context_handle, observedProtocol);
-            if (resolution.kind === "active") {
-              const selection = { context: resolution.record, root: selectedContextRoot(p, resolution.record) };
-              toolResult = await callTool(
-                p, x.params.name, toolArgs,
-                { authKind: auth.kind, contextHandle: resolution.record.handle, selection, descriptor },
-              );
-            } else toolResult = contextControlToolResult(p, x.params.name, toolArgs, resolution, descriptor);
-          }
-          r.result = modernRequest
-            ? {
-                resultType: "complete",
-                ...toolResult,
-                _meta: serverInfoMeta,
-              }
-            : toolResult;
+            r.result = modernRequest
+              ? wrapResult(await invokeTool(null)).result
+              : await invokeTool(null);
           }
         }
       } else {
@@ -5083,6 +5458,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     }
     if (["all", "dashboard"].includes(section)) {
       result.server = serverProjection(p);
+      result.active_tool_calls = dashboardToolCallsProjection(p);
       result.stats = {
         context_values: one("SELECT COUNT(*) n FROM contexts WHERE server_id=? AND handle LIKE 'ctx_%'", p.id)?.n || 0,
         roots: one("SELECT COUNT(*) n FROM roots WHERE server_id=? AND enabled=1", p.id)?.n || 0,
@@ -5113,8 +5489,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 
     try {
       const bound = serveWithPortFallback(HTTP_PORT, port => Deno.serve(
-        { hostname: PUBLIC_HOST, port, onListen() {} },
-        req => {
+        { hostname: PUBLIC_HOST, port, automaticCompression: true, onListen() {} },
+        (req, info) => tracedHttp(req, info, () => {
           const token = req.method === "GET"
             ? new URL(req.url).pathname.match(/^\/\.well-known\/acme-challenge\/([^/]+)$/)?.[1]
             : "";
@@ -5125,7 +5501,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
             : text("Not found", 404, "text/plain; charset=utf-8", {
                 "cache-control": "no-store",
               });
-        },
+        }, false),
       ));
       mcpHttpServer = bound.server;
       mcpHttpPort = bound.port;
@@ -5138,7 +5514,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       const material = await selectTlsMaterial();
       const bound = serveWithPortFallback(HTTPS_PORT, port => Deno.serve(
         {
-          hostname: PUBLIC_HOST, port,
+          hostname: PUBLIC_HOST, port, automaticCompression: true,
           cert: material.certificate, key: material.key, onListen() {},
         },
         (req, info) => tracedMcp(req, info, "https"),
@@ -5164,7 +5540,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   const fragmentTemplates = {
     sidebar: `<? const current=it.data?.state?.currentSection||"dashboard",items=[["dashboard","🏠","Dashboard"],["oauth","🔐","Clients"],["sessions","💬","Sessions"],["roots","📁","Workspaces"],["logs","🛠️","Tool Calls"],["commands","🧰","Commands"],["debug","🐞","HTTP Log"],["settings","⚙️","Settings"],["help","❓","Help"]]; items.forEach(([id,icon,label])=>{ ?><button data-page="<?= id ?>" class="<?= current===id?'nav-active':'' ?>"<?= current===id?' aria-current=page':'' ?>><span class=menu-icon><?= icon ?></span><?= label ?></button><? }) ?>`,
     view: `<? const s=it.data?.state||{},section=s.currentSection||"dashboard",settings=s.settings||{}; ?>
-<? if(section==="dashboard"){ ?><section id=dashboard class=page><div class=row><h2 class=grow>🏠 Dashboard</h2><span class=muted>Runtime · activity · endpoints</span></div><div id=cards class=grid></div><div id=trashActivity class=grid></div><div class=dashboard-grid><div><h3>🌐 Server</h3><div id=endpoints></div></div><div><h3>🔒 TLS and Connectivity</h3><div id=tlsStatus></div></div></div></section>
+<? if(section==="dashboard"){ ?><section id=dashboard class=page><div class=row><h2 class=grow>🏠 Dashboard</h2><span class=muted>Runtime · activity · endpoints</span></div><div id=cards class=grid></div><div class=row><h3 class=grow>🛠️ Active Tool Calls</h3><span class=muted>Live · finished calls remain for 3s</span></div><div id=activeToolCalls></div><div id=trashActivity class=grid></div><div class=dashboard-grid><div><h3>🌐 Server</h3><div id=endpoints></div></div><div><h3>🔒 TLS and Connectivity</h3><div id=tlsStatus></div></div></div></section>
 <? } else if(section==="sessions"){ ?><section id=sessions class=page><div class=row><h2 class=grow>💬 Sessions</h2><span class=muted>Live updates</span></div><p class=muted>Persistent MCP Sessions. Each Session is attached to a <b>📁 Workspace</b>.</p><? if(s.sessions?.oauthClientId){ ?><div class=row><span class=muted>OAuth filter</span><code><?= s.sessions.oauthClientId ?></code><button class=small data-action=clear-session-oauth>✕ Clear</button></div><? } ?><div class=card><b>Client Continuity</b><p class=muted>ChatGPT may create a new Session after model or thinking changes. Client/auth/User-Agent metadata is best effort.</p></div><div id=contextList></div></section>
 <? } else if(section==="roots"){ ?><section id=roots class=page><div class=row><h2 class=grow>📁 Workspaces</h2><button class=primary data-action=new-root>➕ Add Workspace</button></div><p class=muted>Workspace names are unique. Drag Sessions to change where future Tool Calls run; running processes stay in their original folder.</p><div id=rootList></div></section>
 <? } else if(section==="commands"){ const c=s.commands||{}; ?><section id=commands class=page><div class=row><h2 class=grow>🧰 Extra Commands</h2><button data-action=download-all-commands>⬇️ Download All</button><button class=primary data-action=new-command>➕ Register Command</button></div><p class=muted><code>commands.yaml</code> defines catalog entries. Executables in <code>.mrmcp/bin</code> appear automatically.</p><div class=row><input id=commandQuery class=grow placeholder="Search name, path or description…" value="<?= c.query||'' ?>"><label class=small><input id=commandIncludeMissing type=checkbox<?= c.includeMissing!==false?' checked':'' ?>> Show Unavailable</label><select id=commandPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(c.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-commands>🔎 Search</button></div><div id=commandList></div></section>
@@ -5176,6 +5552,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     dialogs: `<? const dialog=it.data?.state?.dialog; ?><? if(dialog){ ?><div id=dialogOverlay class=dialog-overlay><? if(dialog.kind==="root"){ const r=dialog.data||{}; ?><dialog id=rootDialog open data-managed-dialog=root><form id=rootForm><input id=rid type=hidden value="<?= r.id||'' ?>"><h2>📁 Workspace</h2><div class=row><label class=grow>Workspace name</label><? if(r.name_warning){ ?><span class=field-warning>⚠ <?= r.name_warning ?></span><? } ?></div><input id=rname value="<?= r.name||'' ?>"><div class=row><label class=grow>Directory path</label><? if(r.path_warning){ ?><span class=field-warning>⚠ <?= r.path_warning ?></span><? } else if(!r.path_checked){ ?><span class=muted>Leave the field to validate the directory.</span><? } ?></div><input id=rpath placeholder="C:\\projects\\my-workspace, /srv/my-workspace or ./project" value="<?= r.path||'' ?>"><div class=muted>Relative to the program folder.</div><label><input id=renabled type=checkbox<?= r.enabled!==false?' checked':'' ?>> Enabled</label><? if(r.form_warning){ ?><div class=field-warning>⚠ <?= r.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (r.name_warning||r.path_warning||!r.path_checked||r.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="command"){ const c=dialog.data||{}; ?><dialog id=commandDialog open data-managed-dialog=command><form id=commandForm><input id=coldName type=hidden value="<?= c.registered?c.name:'' ?>"><h2>🧰 Command Catalog Entry</h2><div class=row><label class=grow>Logical name</label><? if(c.name_warning){ ?><span class=field-warning>⚠ <?= c.name_warning ?></span><? } ?></div><input id=cname value="<?= c.name||'' ?>"><div class=row><label class=grow>Path below .mrmcp/bin</label><? if(c.path_warning){ ?><span class="<?= c.path_error?'field-warning':'muted' ?>"><?= c.path_error?'⚠ ':'' ?><?= c.path_warning ?></span><? } else if(!c.path_checked){ ?><span class=muted>Leave the field to validate the path.</span><? } ?></div><input id=cpath placeholder="Optional; defaults to logical name; Windows suffix optional" value="<?= c.path||'' ?>"><label>Description for the agent</label><textarea id=cdescription placeholder="Optional: what it does and when the agent should use it."><?= c.description||'' ?></textarea><div class=row><label class=grow>Download URL</label><? if(c.download_warning){ ?><span class=field-warning>⚠ <?= c.download_warning ?></span><? } ?></div><input id=cdownloadUrl placeholder="https://example.com/tool" value="<?= c.download_url||'' ?>"><div class=row><label class=grow>Documentation URL</label><? if(c.documentation_warning){ ?><span class=field-warning>⚠ <?= c.documentation_warning ?></span><? } ?></div><input id=cdocumentationUrl placeholder="https://example.com/docs" value="<?= c.documentation_url||'' ?>"><? if(c.form_warning){ ?><div class=field-warning>⚠ <?= c.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (c.name_warning||c.path_error||!c.path_checked||c.download_warning||c.documentation_warning||c.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="confirm"){ ?><dialog id=confirmDialog open data-managed-dialog=confirm><h2>⚠️ <?= dialog.title||"Confirm Action" ?></h2><p><?= dialog.message||"Continue?" ?></p><p class=row><button class="primary danger" data-action=confirm-dialog>✓ Confirm</button><button data-action=close-dialog>✕ Cancel</button></p></dialog><? } ?></div><? } ?>`,
     status: `<? const d=it.data||{},s=d.settings||{},a=d.activity||{},bad=!!s.mcp_listen_error,warn=!!s.listener_fallback,recent=a.recent_sessions||[],inFlight=a.tool_calls_in_flight||0,errors=a.tool_calls_errors||0,invalid=a.tool_calls_invalid||0; ?><span class="status-group <?= d.live!=="connected"?(d.live==="reconnecting"?"pending":"failed"):(bad?"failed":(warn?"pending":"ok")) ?>"><?= d.live!=="connected"?(d.live==="reconnecting"?"🟡 reconnecting":"🔴 offline"):(bad?"🔴 listener error":(warn?"🟡 fallback":"🟢 live")) ?></span><span class="status-group status-link" data-action=header-settings title="HTTP / HTTPS effective listener ports; GUI uses local Tauriless assets">🔌 <span class=status-ports><?= s.mcp_http_active?s.mcp_http_port:"off" ?>/<?= s.mcp_https_active?s.mcp_https_port:"off" ?></span><? if(warn){ ?> <span class=pending>⚠</span><? } ?></span><span class=status-group title="Sessions with a Tool Call in the last <?= a.active_window_minutes||10 ?> minutes">💬 <span class="status-link <?= a.active_sessions?'ok':'muted' ?>" data-action=header-sessions><?= a.active_sessions||0 ?> active</span><? if(recent.length){ ?> · <span class=status-sessions><? recent.forEach((x,i)=>{ ?><?= i?" ":"" ?><span class=status-link data-action=session-tool-calls data-id="<?= x.id ?>">#<?= x.id ?>(<?= x.tool_calls ?>)</span><? }) ?></span><? } ?></span><span class=status-group title="Tool Calls in flight / total recorded / failed / invalid">🛠️ <span class="status-link <?= inFlight?'pending':'muted' ?>" data-action=header-tool-calls data-status=running><?= inFlight ?> in flight</span> · <span class="status-link status-total" data-action=header-tool-calls data-status=""><?= a.tool_calls_total||0 ?> total</span> · <span class="status-link <?= errors?'failed':'muted' ?>" data-action=header-tool-calls data-status=failed><?= errors ?> errors</span> · <span class="status-link <?= invalid?'invalid':'muted' ?>" data-action=header-tool-calls data-status=invalid><?= invalid ?> invalid</span></span>`,
     cards: `<? const meta={sessions:["💬","Sessions"],roots:["📁","Workspaces"],tool_calls:["🛠️","Tool Calls"],tool_calls_in_flight:["🛠️","Tool Calls In Flight"],failed_calls:["⚠️","Failed Calls"],http_requests:["🌐","HTTP Requests"]}; Object.entries(it.data || {}).forEach(([key,value]) => { const item=meta[key]||["•",key]; ?><div class=card><div class=muted><?= item[0] ?> <?= item[1] ?></div><strong style="font-size:24px"><?= value ?></strong></div><? }) ?>`,
+    active_tool_calls: `<? const rows=it.data||[],icons={completed:"✅",failed:"❌",invalid:"◆",killed:"❌",timed_out:"❌",running:"⏳",received:"⏳"}; ?><? if(!rows.length){ ?><div class="card muted">No active Tool Calls.</div><? } else { ?><div class="card dashboard-call-card"><table class=dashboard-call-table><thead><tr><th>State</th><th>Tool Call</th><th>Session</th><th>Time</th></tr></thead><tbody><? rows.forEach(l=>{ const ms=Number(l.elapsed_ms||0),elapsed=ms<1000?ms+"ms":(ms/1000).toFixed(ms<10000?1:0)+"s"; ?><tr class="<?= l.active?'':'dashboard-call-recent' ?>"<? if(!l.active){ ?> style="--dashboard-call-ttl:<?= Math.max(50,Number(l.ttl_ms||0)) ?>ms"<? } ?>><td class="<?= l.active?'pending':l.status ?> nowrap"><?= icons[l.status]||"•" ?> <?= l.active?"running":l.status ?></td><td class=dashboard-call-summary><code><?= l.tool ?></code><? if(l.call_preview){ ?> <span class=muted>·</span> <?= l.call_preview ?><? } ?><? if(l.progress_requested){ ?> <span class=progress-requested>📡 progress</span><? } ?></td><td class=idcell><?= l.context_id?"#"+l.context_id:"—" ?></td><td class=nowrap><?= elapsed ?><? if(!l.active){ ?> <span class=muted>· done</span><? } ?></td></tr><? }) ?></tbody></table></div><? } ?>`,
     trash_activity: `<? const d=it.data||{},m=d.maintenance||{},items=[["🗑️","Trash",d.trash,false],["↩️","Untrash",d.untrash,true]]; items.forEach(([icon,label,x,historical])=>{ x=x||{}; ?><div class=card><div class=row><div class=grow><div class=muted><?= icon ?> <?= label ?></div><strong style="font-size:24px"><?= x.count||0 ?></strong></div><? if(!historical){ const busy=m.active&&m.action==="trash"; ?><button class="small danger" data-action=empty-trash<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Emptying · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Empty Trash<? } ?></button><? } ?><? if(x.last_at){ ?><div class=muted>Last <?= it.logdt(x.last_at) ?></div><? } ?></div><? if(x.last_at){ ?><div><span class=muted>Action</span> <code><?= x.action_id||"—" ?></code></div><div style="margin-top:5px"><span class=muted><?= historical?"Trash path (historical)":"Trash path" ?></span><br><code class=context-id><?= x.trash_path||"—" ?></code></div><? } else { ?><div class=muted><?= historical ? "No completed untrash actions." : "Trash is empty." ?></div><? } ?></div><? }) ?>`,
     tls: `<? const t=it.data||{}, problem=!t.tls_active_trusted||!!t.tls_last_error||!!t.mcp_listen_error; ?><div class="card <?= problem ? "tls-alert" : "tls-good" ?>"><div class=row><h3 class=grow>🔒 TLS / Let's Encrypt</h3><b class="<?= t.tls_active_trusted ? "ok" : "failed" ?>"><?= t.tls_active_trusted ? "trusted" : (t.tls_active ? "fallback active" : "offline") ?></b></div><div class=grid><div><span class=muted>HTTPS Listener</span><br><b><?= t.mcp_https_active ? "0.0.0.0:"+t.mcp_https_port+" active" : "not listening" ?></b></div><div><span class=muted>Active Certificate</span><br><b><?= t.tls_active_kind || "none" ?> · <?= t.tls_active_valid ? "valid" : "invalid" ?></b></div><div><span class=muted>Expires</span><br><b><?= it.dt(t.tls_active_expires) || "unknown" ?></b></div><div><span class=muted>Last ACME Request</span><br><b><?= it.dt(t.tls_last_request_at) || "never recorded" ?></b></div><div><span class=muted>Last ACME Result</span><br><b class="<?= t.tls_last_request_valid ? "ok" : (t.tls_last_request_status === "error" ? "failed" : "pending") ?>"><? if (t.tls_last_request_status) { ?><?= t.tls_last_request_status ?> · certificate <?= t.tls_last_request_valid ? "valid" : "not valid" ?><? } else { ?>not recorded<? } ?></b></div><div><span class=muted>Last Valid Certificate</span><br><b><?= it.dt(t.tls_last_issued_at) || "not recorded" ?></b></div><div><span class=muted>Renewal Due</span><br><b><?= it.dt(t.tls_renewal_due_at) || "as soon as allowed" ?></b></div><div><span class=muted>Rate-Limit Reset</span><br><b><?= it.dt(t.tls_rate_limit_reset_at) || "none" ?></b></div><div><span class=muted>Next ACME Attempt</span><br><b><?= it.dt(t.tls_next_attempt_at) || "not scheduled" ?></b></div></div><? if (t.tls_last_error || t.mcp_listen_error) { ?><pre class=tls-error><?= t.tls_last_error || t.mcp_listen_error ?></pre><? } ?><? if (!t.tls_active_trusted) { ?><p class=failed><b>Public clients such as ChatGPT will reject the self-signed fallback until Let's Encrypt succeeds.</b></p><? } ?></div>`,
     urls: `<? (it.data || []).forEach(x => { if (!x?.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?><? if (x.note) { ?> <span class=muted><?= x.note ?></span><? } ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?>`,
@@ -5184,8 +5561,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     commands: `<? const d=it.data || {}, rows=d.commands || []; ?><div class=muted><?= d.total || 0 ?> command<?= d.total === 1 ? "" : "s" ?> · page <?= d.page || 1 ?>/<?= d.pages || 1 ?> · config <code><?= d.config_file || "" ?></code></div><table class=commands-table><tr><th>Name</th><th>Relative path</th><th class=command-description>Description</th><th>Links</th><th>Source</th><th>State</th><th class=command-action-cell></th></tr><? rows.forEach(c => { ?><tr><td><code><?= c.name ?></code></td><td><code><?= c.path ?></code></td><td class=command-description><?= c.description || "—" ?></td><td><? if (c.documentation_url) { ?><a href="<?= c.documentation_url ?>" target=_blank rel=noopener>📖 Docs</a><? } else { ?>—<? } ?></td><td><?= c.source ?></td><td class="<?= c.present && c.executable ? "ok" : "failed" ?>"><?= c.present ? (c.executable ? "✅ available" : "⚠️ not executable") : "❌ missing" ?></td><td class=command-action-cell><div class=command-actions><button data-action=edit-command data-name="<?= c.name ?>" data-path="<?= c.path ?>">✏️ Edit</button><? if (c.registered && c.download_url) { ?><button data-action=download-command data-name="<?= c.name ?>">⬇️ Download</button><? } ?><? if (c.registered) { ?><button class=danger data-action=delete-command data-name="<?= c.name ?>">🗑️ Delete</button><? } ?></div></td></tr><? }) ?></table><div class=row><button data-action=commands-prev<?= d.page <= 1 ? " disabled" : "" ?>>Previous</button><button data-action=commands-next<?= d.has_more ? "" : " disabled" ?>>Next</button></div>`,
     oauth: `<table class=oauth-table><tr><th>Client</th><th>Sessions</th><th>Tokens</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td class=oauth-client><b><?= c.name ?></b><div class=oauth-client-id title="<?= c.client_id ?>"><code><?= c.client_id ?></code></div><div class=oauth-meta><span class=muted>Created</span> <?= it.logdt(c.created_at) ?></div></td><td class=oauth-meta><div class=oauth-count><b><?= c.session_count||0 ?></b> total</div><div><span class=muted>First</span> <?= c.first_session_at ? it.logdt(c.first_session_at) : "—" ?></div><div><span class=muted>Last</span> <?= c.last_session_at ? it.logdt(c.last_session_at) : "—" ?></div></td><td><div class=oauth-tokens><div class=oauth-token><b><?= c.token_count||0 ?></b> <span>Access</span><div class=oauth-meta><span class=muted>Issued</span> <?= c.last_token_at ? it.logdt(c.last_token_at) : "—" ?></div></div><div class=oauth-token><b><?= c.refresh_token_count||0 ?></b> <span>Refresh</span><div class=oauth-meta><span class=muted>Used</span> <?= c.last_refresh_at ? it.logdt(c.last_refresh_at) : "—" ?></div></div></div></td><td class=oauth-actions><button class=small data-action=oauth-sessions data-id="<?= c.client_id ?>">💬 View Sessions</button><button class="small danger" data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> Available Tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,
-    logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=idcell><?= l.context_id ? "#"+l.context_id : "—" ?></td><td><code><?= l.tool ?></code><? if(l.call_preview){ ?><div class=tool-command-preview>↳ <?= l.call_preview ?></div><? } ?></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Kill</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><div class=tool-detail-grid><div class=tool-detail-main><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><? if(x.resolved_json){ ?><section class=json-detail><div class=row><b class=grow>Tool Return Value JSON</b><button class=small data-action=copy-detail data-target="tool-return-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-return-<?= l.id ?>"><?= it.prettyParsed(x.resolved_json) ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>MCP Result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div><aside class=tool-descriptor><div class=row><b class=grow>Agent Tool Definition</b><? if(x.tool_descriptor){ ?><span class="descriptor-status <?= x.tool_descriptor_matches_current?'current':'outdated' ?>"><?= x.tool_descriptor_matches_current?'CURRENT':'OUTDATED' ?></span><button class=small data-action=copy-detail data-target="tool-descriptor-<?= l.id ?>">📋 Copy JSON</button><? } ?></div><? if(x.tool_descriptor){ ?><pre id="tool-descriptor-<?= l.id ?>" hidden><?= it.pretty(x.tool_descriptor) ?></pre><? if(x.tool_descriptor.title){ ?><div class=muted>Title</div><div><?= x.tool_descriptor.title ?></div><? } ?><div class=muted>Description</div><p><?= x.tool_descriptor.description||"—" ?></p><div class=muted>Input Schema</div><pre><?= it.pretty(x.tool_descriptor.inputSchema||{}) ?></pre><div class=muted>Output Schema</div><pre><?= it.pretty(x.tool_descriptor.outputSchema||{}) ?></pre><? } else { ?><p class=muted>No descriptor snapshot was recorded for this call.</p><? } ?></aside></div></div></td></tr><? } }) ?></tbody></table>`,
-    debug: `<? const d=it.data||{},rows=d.rows||[]; ?><p class="<?= d.enabled?'ok':'failed' ?>"><b><?= d.enabled?'● Recording enabled':'● Recording disabled' ?></b><? if(!d.enabled){ ?> · showing stored requests<? } ?></p><? if(!rows.length){ ?><p class=muted>No stored HTTP debug requests match the current filters.</p><? } else { ?><table><tr><th>ID</th><th>Time</th><th>Session</th><th>Client</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>IP</th><th>Error</th></tr><? rows.forEach(r => { ?><tr data-action=select-debug data-id="<?= r.id ?>" title="Click to expand"><td class=idcell>#<?= r.id ?></td><td class=nowrap><?= it.logdt(r.ts) ?></td><td class=idcell><?= r.context_id ? "#"+r.context_id : "—" ?></td><td><? if(r.client_id){ ?><code><?= r.client_id ?></code><? } else { ?>—<? } ?></td><td><b><?= r.method ?></b></td><td><code><?= r.path ?></code></td><td class="<?= r.status >= 400 ? "failed" : "ok" ?>"><?= r.status ?></td><td><?= r.duration_ms ?>ms</td><td class=nowrap><?= r.remote_addr||"—" ?><? if(r.remote_addr){ ?> (<?= r.remote_count||1 ?>)<? } ?></td><td><?= r.error_preview ?></td></tr><? if(String(d.openRowId||"")===String(r.id)&&d.openDetail){ const x=d.openDetail; ?><tr class=detail-row data-detail-kind=http data-detail-id="<?= r.id ?>"><td colspan=10><div class="detail-panel http-detail-panel"><div class="row http-detail-head"><div class=grow><b>HTTP Request #<?= r.id ?></b><div class=http-detail-meta><span><?= it.logdt(x.ts) ?></span><span><? if(x.context_id){ ?>Session #<?= x.context_id ?><? } else { ?>No Session<? } ?></span><span><? if(x.client_id){ ?>Client <code><?= x.client_id ?></code><? } else { ?>No client id<? } ?></span><span><?= x.remote_addr||"unknown IP" ?><? if(x.remote_addr){ ?> · <?= x.remote_count||1 ?> total request<?= Number(x.remote_count||1)===1?'':'s' ?><? } ?></span><span><?= x.duration_ms ?>ms</span></div></div><button class=small data-action=copy-detail data-target="http-json-<?= r.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=http>✕ Close</button></div><div class=http-detail-grid><section class=http-detail-block><div class=row><h4 class=grow>→ Request</h4><b><?= x.method ?></b> <code><?= x.path ?></code></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.request_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.request_body||{}) ?></pre></section><section class=http-detail-block><div class=row><h4 class=grow>← Response</h4><b class="<?= x.status>=400?'failed':'ok' ?>"><?= x.status ?></b></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.response_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.response_body||{}) ?></pre></section></div><? if(x.error){ ?><section class="http-detail-block http-detail-error"><h4 class=failed>Error</h4><pre><?= x.error ?></pre></section><? } ?><details class=http-detail-raw><summary>Raw record</summary><pre id="http-json-<?= r.id ?>"><?= it.pretty(x) ?></pre></details></div></td></tr><? } }) ?></table><? } ?>`,
+    logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=idcell><?= l.context_id ? "#"+l.context_id : "—" ?></td><td><code><?= l.tool ?></code><? if(l.call_preview){ ?><div class=tool-command-preview>↳ <?= l.call_preview ?></div><? } ?><? if(l.progress_requested){ ?><div class=progress-requested>📡 Progress requested</div><? } ?></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Kill</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><? if(x.progress_requested){ ?><span class=progress-requested>📡 Progress requested</span><? } ?><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><div class=tool-detail-grid><div class=tool-detail-main><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><? if(x.resolved_json){ ?><section class=json-detail><div class=row><b class=grow>Tool Return Value JSON</b><button class=small data-action=copy-detail data-target="tool-return-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-return-<?= l.id ?>"><?= it.prettyParsed(x.resolved_json) ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>MCP Result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div><aside class=tool-descriptor><div class=row><b class=grow>Agent Tool Definition</b><? if(x.tool_descriptor){ ?><span class="descriptor-status <?= x.tool_descriptor_matches_current?'current':'outdated' ?>"><?= x.tool_descriptor_matches_current?'CURRENT':'OUTDATED' ?></span><button class=small data-action=copy-detail data-target="tool-descriptor-<?= l.id ?>">📋 Copy JSON</button><? } ?></div><? if(x.tool_descriptor){ ?><pre id="tool-descriptor-<?= l.id ?>" hidden><?= it.pretty(x.tool_descriptor) ?></pre><? if(x.tool_descriptor.title){ ?><div class=muted>Title</div><div><?= x.tool_descriptor.title ?></div><? } ?><div class=muted>Description</div><p><?= x.tool_descriptor.description||"—" ?></p><div class=muted>Input Schema</div><pre><?= it.pretty(x.tool_descriptor.inputSchema||{}) ?></pre><div class=muted>Output Schema</div><pre><?= it.pretty(x.tool_descriptor.outputSchema||{}) ?></pre><? } else { ?><p class=muted>No descriptor snapshot was recorded for this call.</p><? } ?></aside></div></div></td></tr><? } }) ?></tbody></table>`,
+    debug: `<? const d=it.data||{},rows=d.rows||[]; ?><p class="<?= d.enabled?'ok':'failed' ?>"><b><?= d.enabled?'● Recording enabled':'● Recording disabled' ?></b><? if(!d.enabled){ ?> · showing stored requests<? } ?></p><? if(!rows.length){ ?><p class=muted>No stored HTTP debug requests match the current filters.</p><? } else { ?><table><tr><th>ID</th><th>Time</th><th>Session</th><th>Client</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>IP</th><th>Error</th></tr><? rows.forEach(r => { ?><tr data-action=select-debug data-id="<?= r.id ?>" title="Click to expand"><td class=idcell>#<?= r.id ?></td><td class=nowrap><?= it.logdt(r.ts) ?></td><td class=idcell><?= r.context_id ? "#"+r.context_id : "—" ?></td><td><? if(r.client_id){ ?><code><?= r.client_id ?></code><? } else { ?>—<? } ?></td><td><b><?= r.method ?></b></td><td><code><?= r.path ?></code></td><td class="<?= !r.status?'pending':(r.status>=400?'failed':'ok') ?>"><?= r.status||"…" ?></td><td><?= r.status ? r.duration_ms+"ms" : "in flight" ?></td><td class=nowrap><?= r.remote_addr||"—" ?><? if(r.remote_addr){ ?> (<?= r.remote_count||1 ?>)<? } ?></td><td><?= r.error_preview ?></td></tr><? if(String(d.openRowId||"")===String(r.id)&&d.openDetail){ const x=d.openDetail; ?><tr class=detail-row data-detail-kind=http data-detail-id="<?= r.id ?>"><td colspan=10><div class="detail-panel http-detail-panel"><div class="row http-detail-head"><div class=grow><b>HTTP Request #<?= r.id ?></b><div class=http-detail-meta><span><?= it.logdt(x.ts) ?></span><span><? if(x.context_id){ ?>Session #<?= x.context_id ?><? } else { ?>No Session<? } ?></span><span><? if(x.client_id){ ?>Client <code><?= x.client_id ?></code><? } else { ?>No client id<? } ?></span><span><?= x.remote_addr||"unknown IP" ?><? if(x.remote_addr){ ?> · <?= x.remote_count||1 ?> total request<?= Number(x.remote_count||1)===1?'':'s' ?><? } ?></span><span><?= x.status ? x.duration_ms+"ms" : "in flight" ?></span></div></div><button class=small data-action=copy-detail data-target="http-json-<?= r.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=http>✕ Close</button></div><div class=http-detail-grid><section class=http-detail-block><div class=row><h4 class=grow>→ Request</h4><b><?= x.method ?></b> <code><?= x.path ?></code></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.request_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.request_body||{}) ?></pre></section><section class=http-detail-block><div class=row><h4 class=grow>← Response</h4><b class="<?= !x.status?'pending':(x.status>=400?'failed':'ok') ?>"><?= x.status||"in flight" ?></b></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.response_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.response_body||{}) ?></pre></section></div><? if(x.error){ ?><section class="http-detail-block http-detail-error"><h4 class=failed>Error</h4><pre><?= x.error ?></pre></section><? } ?><details class=http-detail-raw><summary>Raw record</summary><pre id="http-json-<?= r.id ?>"><?= it.pretty(x) ?></pre></details></div></td></tr><? } }) ?></table><? } ?>`,
   };
   const fragmentDate = value => {
     if (!value) return "";
@@ -5237,8 +5614,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const resolved = typeof log.resolved_json === "string" ? parseJson(log.resolved_json, {}) : (log.resolved_json || {});
     const live = log.process && typeof log.process === "object" ? log.process : null;
     const source = live || resolved || {};
-    const processLike = !!live || (!!source?.process_id && (
-      source.command != null || source.output != null || source.stdout != null || source.stderr != null
+    const processLike = !!live || (source?.command != null && (
+      source.output != null || source.stdout != null || source.stderr != null
     ));
     if (!processLike) return null;
     let command = "";
@@ -5406,6 +5783,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         failed_calls: projection.stats?.failures || 0,
         http_requests: projection.stats?.total_requests || 0,
       }));
+      view = fillUiMount(view, "activeToolCalls", await renderEtaFragment("active_tool_calls", projection.active_tool_calls || []));
       view = fillUiMount(view, "trashActivity", await renderEtaFragment("trash_activity", {
         ...(projection.trash_activity || {}), maintenance: projection.maintenance,
       }));
@@ -6266,9 +6644,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       rows = rows.map(row => {
         const process = processByLog.get(row.id), control = activeCallControls.get(row.id);
         const input = parseJson(row.input_json || "{}", {}), call_preview = compactToolCallPreview(p, row.tool, input);
+        const transport = one("SELECT progress_requested FROM tool_call_transport WHERE log_id=?", row.id);
         const { input_json: _inputJson, ...summary } = row;
-        return { ...summary, call_preview, killable: !!process || !!control?.cancel,
-          process_id: process?.id || control?.process_id || "" };
+        return { ...summary, call_preview, progress_requested: !!transport?.progress_requested,
+          killable: !!process || !!control?.cancel, process_id: process?.id || control?.process_id || "" };
       });
       return json({ rows, page, page_size: pageSize, total,
         pages: Math.max(1, Math.ceil(total / pageSize)), has_more: offset + rows.length < total });
@@ -6298,8 +6677,15 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         detail.tool_descriptor_current_available = !!currentDescriptor;
         detail.tool_descriptor_matches_current = !!currentDescriptor && JSON.stringify(currentDescriptor) === JSON.stringify(detail.tool_descriptor);
       }
-      const process = [...processes.values()].find(record => record.log_id === logId);
-      if (process) detail.process = processView(process);
+      let process = [...processes.values()].find(record => record.log_id === logId);
+      if (!process && detail.tool === "exec_attach") {
+        const input = parseJson(detail.input_json || "{}", {});
+        process = [...processes.values()].find(record => record.persistent &&
+          record.context_handle === detail.context_handle && record.label === String(input.label || ""));
+      }
+      const transport = one("SELECT progress_requested FROM tool_call_transport WHERE log_id=?", logId);
+      detail.progress_requested = !!transport?.progress_requested;
+      if (process) detail.process = processAdminView(process);
       return json(detail);
     }
     if (u.pathname === "/api/logs/delete" && req.method === "POST") {
@@ -6331,7 +6717,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   const UI_TEMPLATE = String.raw`<!doctype html><html><head><meta charset=utf-8>
 <meta http-equiv="Content-Security-Policy" content="${UI_CSP}">
 <meta name=viewport content="width=device-width,initial-scale=1"><link rel=icon href="${GUI_LOGO_DATA_URL}"><title>MrMCP</title><style>
-:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}#app>aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}#app>aside button{display:block;width:100%;text-align:left;margin:3px 0;background:transparent;border:0}#app>aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.notice-balloon{position:fixed;top:64px;right:16px;z-index:1900;max-width:min(520px,calc(100vw - 32px));padding:10px 12px;border:1px solid #7d3f47;border-radius:9px;background:#25191b;color:#ffb7bf;box-shadow:0 8px 28px #0008}.notice-balloon.info{border-color:#365a7d;background:#16202b;color:#a9d5ff}.notice-balloon.ok{border-color:#356849;background:#16241b;color:#9ce8b1}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.debug-toggle{font-weight:750;min-width:190px}.debug-toggle.enabled{background:#173f24;border-color:#347a49;color:#9ce8b1}.debug-toggle.disabled{background:#421d21;border-color:#7d3f47;color:#ffb7bf}.debug-toggle.enabled:hover{background:#20512f}.debug-toggle.disabled:hover{background:#53262b}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 18px 14px 28px;background:#111318}.detail-panel{border:1px solid #343944;border-left:3px solid #3984e8;border-radius:8px;background:#0d0f12;padding:14px 16px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.tool-detail-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:14px;align-items:start}.tool-detail-main{min-width:0}.tool-descriptor{min-width:0;position:sticky;top:10px;border:1px solid #343944;border-radius:8px;background:#111318;padding:12px}.tool-descriptor>.muted{margin-top:10px}.tool-descriptor p{margin:5px 0 10px;line-height:1.45}.tool-descriptor pre{margin:5px 0 10px;max-height:28vh}.descriptor-status{font-size:11px;font-weight:800;letter-spacing:.04em;padding:3px 6px;border-radius:5px}.descriptor-status.current{color:#75d58b;background:#16341f}.descriptor-status.outdated{color:#ffd166;background:#3a2f13}.http-detail-head{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #292d34}.http-detail-meta{display:flex;gap:7px 16px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:#89909b}.http-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.http-detail-block{min-width:0;border:1px solid #292d34;border-radius:8px;background:#0a0c0f;padding:10px}.http-detail-block h4{margin:0}.http-detail-block pre{max-height:30vh}.http-detail-error{margin-top:12px;border-color:#68353a;background:#1d1012}.http-detail-raw{margin-top:12px}.http-detail-raw summary{cursor:pointer;color:#89909b}@media(max-width:1100px){.tool-detail-grid,.http-detail-grid{grid-template-columns:1fr}.tool-descriptor{position:static}}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.tool-command-preview{margin-top:3px;max-width:440px;color:#c5cad3;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.menu-icon{display:inline-block;width:22px;text-align:center}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout{grid-template-columns:1fr}.default-root-card{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){#app>aside{width:130px}main{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
+:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}#app>aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}#app>aside button{display:block;width:100%;text-align:left;margin:3px 0;background:transparent;border:0}#app>aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.notice-balloon{position:fixed;top:64px;right:16px;z-index:1900;max-width:min(520px,calc(100vw - 32px));padding:10px 12px;border:1px solid #7d3f47;border-radius:9px;background:#25191b;color:#ffb7bf;box-shadow:0 8px 28px #0008}.notice-balloon.info{border-color:#365a7d;background:#16202b;color:#a9d5ff}.notice-balloon.ok{border-color:#356849;background:#16241b;color:#9ce8b1}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.debug-toggle{font-weight:750;min-width:190px}.debug-toggle.enabled{background:#173f24;border-color:#347a49;color:#9ce8b1}.debug-toggle.disabled{background:#421d21;border-color:#7d3f47;color:#ffb7bf}.debug-toggle.enabled:hover{background:#20512f}.debug-toggle.disabled:hover{background:#53262b}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 18px 14px 28px;background:#111318}.detail-panel{border:1px solid #343944;border-left:3px solid #3984e8;border-radius:8px;background:#0d0f12;padding:14px 16px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.tool-detail-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:14px;align-items:start}.tool-detail-main{min-width:0}.tool-descriptor{min-width:0;position:sticky;top:10px;border:1px solid #343944;border-radius:8px;background:#111318;padding:12px}.tool-descriptor>.muted{margin-top:10px}.tool-descriptor p{margin:5px 0 10px;line-height:1.45}.tool-descriptor pre{margin:5px 0 10px;max-height:28vh}.descriptor-status{font-size:11px;font-weight:800;letter-spacing:.04em;padding:3px 6px;border-radius:5px}.descriptor-status.current{color:#75d58b;background:#16341f}.descriptor-status.outdated{color:#ffd166;background:#3a2f13}.http-detail-head{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #292d34}.http-detail-meta{display:flex;gap:7px 16px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:#89909b}.http-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.http-detail-block{min-width:0;border:1px solid #292d34;border-radius:8px;background:#0a0c0f;padding:10px}.http-detail-block h4{margin:0}.http-detail-block pre{max-height:30vh}.http-detail-error{margin-top:12px;border-color:#68353a;background:#1d1012}.http-detail-raw{margin-top:12px}.http-detail-raw summary{cursor:pointer;color:#89909b}@media(max-width:1100px){.tool-detail-grid,.http-detail-grid{grid-template-columns:1fr}.tool-descriptor{position:static}}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.tool-command-preview{margin-top:3px;max-width:440px;color:#c5cad3;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.menu-icon{display:inline-block;width:22px;text-align:center}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-call-card{padding:0;overflow:hidden}.dashboard-call-table{margin:0;background:transparent}.dashboard-call-table th,.dashboard-call-table td{padding:7px 9px}.dashboard-call-summary{max-width:720px;overflow-wrap:anywhere}.dashboard-call-recent{animation:dashboardCallFade var(--dashboard-call-ttl,3s) linear forwards}@keyframes dashboardCallFade{from{opacity:1}to{opacity:.18}}.progress-requested{color:#8fd3ff;white-space:nowrap}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout{grid-template-columns:1fr}.default-root-card{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){#app>aside{width:130px}main{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
 </style></head><body>
 <div id=app data-section=dashboard><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div><div class=status><span class=pending>starting…</span></div></header><main style="margin-left:0"><div class=card>Starting the local MrMCP UI…</div></main></div>
 <script type=module nonce="${UI_SCRIPT_NONCE}">__MRMCP_BROWSER_JS__</script></body></html>`;
@@ -6534,6 +6920,7 @@ listen("tauri://close-requested", () => {
     if (uiLogFilterTimer) clearTimeout(uiLogFilterTimer);
     if (uiNoticeTimer) clearTimeout(uiNoticeTimer);
     if (headerActivityTimer) clearTimeout(headerActivityTimer);
+    if (dashboardToolCallTimer) clearTimeout(dashboardToolCallTimer);
     for (const key of [...jsKernels.keys()]) destroyJsKernel(key, "server shutdown");
     await Promise.allSettled(
       [...processes.values()]
