@@ -1,0 +1,17 @@
+diff --git a/tauriless/asset_protocol.rs b/tauriless/asset_protocol.rs
+--- a/tauriless/asset_protocol.rs
++++ b/tauriless/asset_protocol.rs
+@@ -43,10 +43,10 @@ impl AssetProtocol {
+         let outbox = Arc::clone(&self.outbox);
+         let next_id = Arc::clone(&self.next_id);
+ 
+-        // Override only Tauri's compile-time asset resolver. The standard
+-        // tauri://localhost origin and injected IPC remain unchanged.
++        // Diagnostic build: use a non-reserved scheme to distinguish a
++        // general WKWebView custom-protocol failure from overriding `tauri`.
+         builder.register_asynchronous_uri_scheme_protocol(
+-            "tauri",
++            "probe",
+             move |context, request, responder| {
+                 let request_id = next_id.fetch_add(1, Ordering::Relaxed);
+                 let url = request.uri().to_string();

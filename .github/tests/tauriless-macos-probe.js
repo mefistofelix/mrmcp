@@ -1,5 +1,6 @@
 import { Tauriless } from "npm:@mefistofelix/tauriless@0.1.12";
 
+const probeUrl = Deno.env.get("TAURILESS_PROBE_URL") ?? "index.html";
 const t = new Tauriless();
 const pending = new Map();
 let nextId = 1;
@@ -63,6 +64,6 @@ await Deno.writeTextFile(indexPath, `<!doctype html><meta charset="utf-8"><scrip
 
 timer = setInterval(drain, 16);
 request("plugin:webview|create_webview_window", {
-  options: { label: "main", title: "Tauriless Probe", url: "index.html", visible: true },
+  options: { label: "main", title: "Tauriless Probe", url: probeUrl, visible: true },
 }).catch(error => finish(4, `create failed: ${error}`));
 setTimeout(() => finish(2, "10s bootstrap timeout"), 10_000);

@@ -10,6 +10,7 @@ on:
       - "commands.yaml"
       - "assets/**"
       - ".github/tests/tauriless-macos-probe.js"
+      - ".github/tests/tauriless-probe-scheme.patch"
       - ".github/workflows/test-macos.yml"
   pull_request:
     paths:
@@ -17,6 +18,7 @@ on:
       - "commands.yaml"
       - "assets/**"
       - ".github/tests/tauriless-macos-probe.js"
+      - ".github/tests/tauriless-probe-scheme.patch"
       - ".github/workflows/test-macos.yml"
 
 permissions:
@@ -36,11 +38,18 @@ jobs:
             runner: macos-15
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
+    timeout-minutes: 30
 
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+
+      - name: Check out Tauriless source
+        uses: actions/checkout@v4
+        with:
+          repository: mefistofelix/tauriless
+          ref: main
+          path: tauriless-src
 
       - name: Set up Deno
         uses: denoland/setup-deno@v2
@@ -58,14 +67,34 @@ jobs:
       - name: Check source
         run: deno check --minimum-dependency-age=0 mrmcp.js
 
-      - name: Diagnose Tauriless asset bootstrap
+      - name: Baseline Tauriless 0.1.12 asset bootstrap
         shell: bash
         run: |
           set +e
-          deno run --minimum-dependency-age=0 --allow-ffi --allow-write .github/tests/tauriless-macos-probe.js
+          deno run --minimum-dependency-age=0 --allow-env --allow-ffi --allow-write .github/tests/tauriless-macos-probe.js
           status=$?
           set -e
-          echo "Tauriless probe exit: $status"
+          echo "Baseline Tauriless probe exit: $status"
+
+      - name: Build Tauriless diagnostic native library
+        shell: bash
+        run: |
+          set -euo pipefail
+          git -C tauriless-src apply "$GITHUB_WORKSPACE/.github/tests/tauriless-probe-scheme.patch"
+          cargo build --release --manifest-path tauriless-src/tauriless/Cargo.toml
+          file tauriless-src/tauriless/target/release/libtauriless.dylib
+
+      - name: Test non-reserved custom protocol with locally built Tauriless
+        shell: bash
+        env:
+          TAURILESS_LIBRARY_PATH: ${{ github.workspace }}/tauriless-src/tauriless/target/release/libtauriless.dylib
+          TAURILESS_PROBE_URL: probe://localhost/index.html
+        run: |
+          set +e
+          deno run --minimum-dependency-age=0 --allow-env --allow-ffi --allow-write .github/tests/tauriless-macos-probe.js
+          status=$?
+          set -e
+          echo "Locally built probe-scheme Tauriless exit: $status"
 
       - name: Build standalone
         shell: bash
