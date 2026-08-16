@@ -1,0 +1,100 @@
+name: Mac GUI Test
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "mrmcp.js"
+      - "commands.yaml"
+      - "assets/**"
+      - ".github/workflows/test-macos.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  gui-bootstrap:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - name: macOS Apple Silicon
+            runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.5
+
+      - name: Show runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          sw_vers
+          uname -a
+          uname -m
+
+      - name: Check source
+        run: deno check --minimum-dependency-age=0 mrmcp.js
+
+      - name: Build standalone
+        shell: bash
+        run: >-
+          deno compile --minimum-dependency-age=0 -A --unstable-ffi
+          --target ${{ matrix.target }}
+          --include assets --include commands.yaml
+          --output mrmcp-test
+          mrmcp.js
+
+      - name: Test WebView bootstrap
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/mrmcp.log"
+          ./mrmcp-test >"$log" 2>&1 &
+          pid=$!
+
+          cleanup() {
+            if kill -0 "$pid" 2>/dev/null; then
+              kill "$pid" 2>/dev/null || true
+              sleep 1
+              kill -9 "$pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          # MrMCP fails at 10 s when the WebView cannot complete its first
+          # WebView→Tauriless bootstrap message. Surviving 15 s exercises the
+          # real native WebView startup on this macOS runner rather than only
+          # checking that the binary compiles.
+          for second in $(seq 1 15); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              set +e
+              wait "$pid"
+              status=$?
+              set -e
+              echo "MrMCP exited during GUI bootstrap with status $status"
+              cat "$log"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if grep -Fq "Tauriless WebView input bootstrap timed out" "$log"; then
+            cat "$log"
+            exit 1
+          fi
+
+          echo "MrMCP remained alive past the 10 s WebView bootstrap deadline."
+          cat "$log"

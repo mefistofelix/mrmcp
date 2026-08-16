@@ -25,6 +25,7 @@ The desktop window uses Tauriless through a pinned literal dynamic Deno import i
 - `README.md` — user and operator documentation.
 - `AGENTS.md` — implementation invariants and release checks.
 - `.github/workflows/release.yml` — tag-driven release workflow that cross-compiles and publishes four standalone binaries: Windows x64, Linux x64, macOS x64 and macOS Apple Silicon (arm64).
+- `.github/workflows/test-macos.yml` — native macOS GUI smoke test on GitHub-hosted Intel and Apple Silicon runners; it builds and launches MrMCP and fails if the real WebView bootstrap exits or reaches its 10-second timeout.
 - `assets/` — static WebView/build assets: `morphlex.js`, SVG/PNG branding, Windows ICO and administration screenshots.
 
 ## Requirements and startup
@@ -328,6 +329,10 @@ Settings also provides **Clear Operational Data**. It preserves authentication s
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count and the live/recent five-second Tool Call table at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### Unreleased
+
+- Added a separate GitHub Actions macOS GUI smoke-test workflow. It runs natively on `macos-15-intel` and Apple Silicon `macos-15`, builds the matching standalone executable, launches the real Tauriless WebView, waits beyond MrMCP's 10-second bootstrap deadline and fails with the captured process log if the application exits or reports a WebView bootstrap timeout.
 
 ### 0.10.100
 
