@@ -79,3 +79,15 @@ jobs:
           status=$?
           set -e
           echo "Forced-resize probe exit: $status"
+
+      - name: Test ordinary HTTPS navigation
+        shell: bash
+        env:
+          TAURILESS_LIBRARY_PATH: ${{ github.workspace }}/tauriless-src/tauriless/target/release/libtauriless.dylib
+          TAURILESS_PROBE_URL: https://example.com/
+        run: |
+          set +e
+          deno run --minimum-dependency-age=0 --allow-env --allow-ffi --allow-write .github/tests/tauriless-macos-probe.js
+          status=$?
+          set -e
+          echo "HTTPS navigation probe exit: $status"
