@@ -7264,8 +7264,8 @@ async function desktop() {
   const onWorkerMessage = event => queueOrHandleWorkerMessage(event.data);
   backendWorker.addEventListener("message", onWorkerMessage);
   for (const data of earlyMessages) queueOrHandleWorkerMessage(data);
-  const drain = () => {
-    for (const message of tauriless.drain().messages) {
+  const pumpTauriless = () => {
+    for (const message of tauriless.run(16).messages) {
       if (message.kind === "result") {
         const callback = pending.get(message.id);
         if (!callback) continue;
@@ -7302,7 +7302,7 @@ async function desktop() {
   try {
     drainTimer = setInterval(() => {
       if (closed) return;
-      try { drain(); }
+      try { pumpTauriless(); }
       catch (error) {
         closed = true;
         for (const callback of pending.values()) callback.reject(error);
