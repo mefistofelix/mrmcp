@@ -1,0 +1,74 @@
+diff --git a/tauriless/asset_protocol.rs b/tauriless/asset_protocol.rs
+index bae4651..b8f44a4 100644
+--- a/tauriless/asset_protocol.rs
++++ b/tauriless/asset_protocol.rs
+@@ -41,46 +41,30 @@ impl AssetProtocol {
+     }
+ 
+     pub fn register(&self, builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
+-        let pending = Arc::clone(&self.pending);
+         let outbox = Arc::clone(&self.outbox);
+-        let next_id = Arc::clone(&self.next_id);
+-
+-        // Override only Tauri's compile-time asset resolver. The standard
+-        // tauri://localhost origin and injected IPC remain unchanged.
+-        builder.register_asynchronous_uri_scheme_protocol(
+-            "tauri",
+-            move |context, request, responder| {
+-                let request_id = next_id.fetch_add(1, Ordering::Relaxed);
+-                let url = request.uri().to_string();
+-                let url_path = request.uri().path().to_owned();
+-                let headers = request
+-                    .headers()
+-                    .iter()
+-                    .filter_map(|(name, value)| {
+-                        value.to_str().ok().map(|value| (name.as_str(), value))
+-                    })
+-                    .collect::<HashMap<_, _>>();
+-
+-                pending
+-                    .lock()
+-                    .expect("asset request mutex poisoned")
+-                    .insert(
+-                        request_id,
+-                        PendingRequest {
+-                            responder,
+-                            url_path,
+-                        },
+-                    );
+-                outbox.lock().expect("outbox mutex poisoned").push(json!({
+-                  "kind": "asset-request",
+-                  "requestId": request_id,
+-                  "webview": context.webview_label(),
+-                  "method": request.method().as_str(),
+-                  "url": url,
+-                  "headers": headers
+-                }));
+-            },
+-        )
++
++        // Diagnostic build: bypass the Deno roundtrip entirely. If this
++        // callback runs under the manual run_iteration() pump, log a marker
++        // and return the bootstrap page synchronously from Rust.
++        builder.register_uri_scheme_protocol("probe", move |context, request| {
++            outbox.lock().expect("outbox mutex poisoned").push(json!({
++              "kind": "sync-probe-request",
++              "webview": context.webview_label(),
++              "method": request.method().as_str(),
++              "url": request.uri().to_string()
++            }));
++
++            Response::builder()
++                .status(StatusCode::OK)
++                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
++                .body(br#"<!doctype html><meta charset="utf-8"><script>
++                  window.__TAURI_INTERNALS__.invoke("plugin:event|emit", {
++                    event: "tauriless://webview-message",
++                    payload: { type: "ready" }
++                  });
++                </script>"#.to_vec())
++                .expect("fixed sync probe response is valid")
++        })
+     }
+ 
+     pub fn respond(&self, payload: Value) -> Result<(), String> {

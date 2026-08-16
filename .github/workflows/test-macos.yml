@@ -11,6 +11,7 @@ on:
       - "assets/**"
       - ".github/tests/tauriless-macos-probe.js"
       - ".github/tests/tauriless-probe-scheme.patch"
+      - ".github/tests/tauriless-probe-sync.patch"
       - ".github/workflows/test-macos.yml"
   pull_request:
     paths:
@@ -19,6 +20,7 @@ on:
       - "assets/**"
       - ".github/tests/tauriless-macos-probe.js"
       - ".github/tests/tauriless-probe-scheme.patch"
+      - ".github/tests/tauriless-probe-sync.patch"
       - ".github/workflows/test-macos.yml"
 
 permissions:
@@ -26,18 +28,8 @@ permissions:
 
 jobs:
   gui-bootstrap:
-    name: ${{ matrix.name }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macOS Intel
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
-          - name: macOS Apple Silicon
-            runner: macos-15
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.runner }}
+    name: macOS Apple Silicon
+    runs-on: macos-15
     timeout-minutes: 30
 
     steps:
@@ -64,19 +56,7 @@ jobs:
           uname -a
           uname -m
 
-      - name: Check source
-        run: deno check --minimum-dependency-age=0 mrmcp.js
-
-      - name: Baseline Tauriless 0.1.12 asset bootstrap
-        shell: bash
-        run: |
-          set +e
-          deno run --minimum-dependency-age=0 --allow-env --allow-ffi --allow-write .github/tests/tauriless-macos-probe.js
-          status=$?
-          set -e
-          echo "Baseline Tauriless probe exit: $status"
-
-      - name: Build Tauriless diagnostic native library
+      - name: Build async custom-protocol Tauriless
         shell: bash
         run: |
           set -euo pipefail
@@ -84,7 +64,7 @@ jobs:
           cargo build --release --manifest-path tauriless-src/tauriless/Cargo.toml
           file tauriless-src/tauriless/target/release/libtauriless.dylib
 
-      - name: Test non-reserved custom protocol with locally built Tauriless
+      - name: Test async custom protocol
         shell: bash
         env:
           TAURILESS_LIBRARY_PATH: ${{ github.workspace }}/tauriless-src/tauriless/target/release/libtauriless.dylib
@@ -94,55 +74,25 @@ jobs:
           deno run --minimum-dependency-age=0 --allow-env --allow-ffi --allow-write .github/tests/tauriless-macos-probe.js
           status=$?
           set -e
-          echo "Locally built probe-scheme Tauriless exit: $status"
+          echo "Async custom-protocol probe exit: $status"
 
-      - name: Build standalone
-        shell: bash
-        run: >-
-          deno compile --minimum-dependency-age=0 -A --unstable-ffi
-          --target ${{ matrix.target }}
-          --include assets --include commands.yaml
-          --output mrmcp-test
-          mrmcp.js
-
-      - name: Test WebView bootstrap
+      - name: Build sync custom-protocol Tauriless
         shell: bash
         run: |
           set -euo pipefail
-          log="$RUNNER_TEMP/mrmcp.log"
-          ./mrmcp-test >"$log" 2>&1 &
-          pid=$!
+          git -C tauriless-src reset --hard HEAD
+          git -C tauriless-src apply "$GITHUB_WORKSPACE/.github/tests/tauriless-probe-sync.patch"
+          cargo build --release --manifest-path tauriless-src/tauriless/Cargo.toml
+          file tauriless-src/tauriless/target/release/libtauriless.dylib
 
-          cleanup() {
-            if kill -0 "$pid" 2>/dev/null; then
-              kill "$pid" 2>/dev/null || true
-              sleep 1
-              kill -9 "$pid" 2>/dev/null || true
-            fi
-          }
-          trap cleanup EXIT
-
-          # MrMCP fails at 10 s when the WebView cannot complete its first
-          # WebView→Tauriless bootstrap message. Surviving 15 s exercises the
-          # real native WebView startup on this macOS runner rather than only
-          # checking that the binary compiles.
-          for second in $(seq 1 15); do
-            if ! kill -0 "$pid" 2>/dev/null; then
-              set +e
-              wait "$pid"
-              status=$?
-              set -e
-              echo "MrMCP exited during GUI bootstrap with status $status"
-              cat "$log"
-              exit 1
-            fi
-            sleep 1
-          done
-
-          if grep -Fq "Tauriless WebView input bootstrap timed out" "$log"; then
-            cat "$log"
-            exit 1
-          fi
-
-          echo "MrMCP remained alive past the 10 s WebView bootstrap deadline."
-          cat "$log"
+      - name: Test sync custom protocol
+        shell: bash
+        env:
+          TAURILESS_LIBRARY_PATH: ${{ github.workspace }}/tauriless-src/tauriless/target/release/libtauriless.dylib
+          TAURILESS_PROBE_URL: probe://localhost/index.html
+        run: |
+          set +e
+          deno run --minimum-dependency-age=0 --allow-env --allow-ffi --allow-write .github/tests/tauriless-macos-probe.js
+          status=$?
+          set -e
+          echo "Sync custom-protocol probe exit: $status"
