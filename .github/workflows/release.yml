@@ -168,7 +168,15 @@ jobs:
           mkdir -p "$dmg_root"
           ditto "$app" "$dmg_root/MrMCP.app"
           ln -s /Applications "$dmg_root/Applications"
-          hdiutil create -volname "MrMCP $RELEASE_TAG" -srcfolder "$dmg_root" -size 512m -ov -format UDZO "dist/$MAC_ASSET"
+          for attempt in 1 2 3; do
+            rm -f "dist/$MAC_ASSET"
+            if hdiutil create -volname "MrMCP $RELEASE_TAG" -srcfolder "$dmg_root" -size 512m -ov -format UDZO "dist/$MAC_ASSET"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then exit 1; fi
+            hdiutil detach "/Volumes/MrMCP $RELEASE_TAG" -force >/dev/null 2>&1 || true
+            sleep 2
+          done
           hdiutil verify "dist/$MAC_ASSET"
 
           verify="$RUNNER_TEMP/mrmcp-dmg"
