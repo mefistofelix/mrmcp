@@ -1,0 +1,75 @@
+name: Mac Interactive Debug
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh_public_key:
+        description: Ephemeral SSH public key allowed to access this runner
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  debug:
+    name: macOS Apple Silicon interactive
+    runs-on: macos-15
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out MrMCP
+        uses: actions/checkout@v4
+
+      - name: Check out Tauriless
+        uses: actions/checkout@v4
+        with:
+          repository: mefistofelix/tauriless
+          ref: main
+          path: tauriless-src
+
+      - name: Check out Tauri 2.11.5
+        uses: actions/checkout@v4
+        with:
+          repository: tauri-apps/tauri
+          ref: tauri-v2.11.5
+          path: tauri-src
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.5
+
+      - name: Prepare private tmate session
+        shell: bash
+        env:
+          SSH_PUBLIC_KEY: ${{ inputs.ssh_public_key }}
+        run: |
+          set -euo pipefail
+          brew install tmate
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_PUBLIC_KEY" > "$HOME/.ssh/tmate_authorized_keys"
+          chmod 600 "$HOME/.ssh/tmate_authorized_keys"
+
+          socket="$RUNNER_TEMP/tmate.sock"
+          tmate -S "$socket" -a "$HOME/.ssh/tmate_authorized_keys" new-session -d
+          tmate -S "$socket" wait tmate-ready
+          tmate -S "$socket" display -p '#{tmate_ssh}' > "$RUNNER_TEMP/tmate-ssh.txt"
+          printf 'Runner: '; uname -a
+          printf 'Architecture: '; uname -m
+          printf 'tmate SSH: '; cat "$RUNNER_TEMP/tmate-ssh.txt"
+
+      - name: Publish connection information
+        uses: actions/upload-artifact@v4
+        with:
+          name: tmate-connection
+          path: ${{ runner.temp }}/tmate-ssh.txt
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Keep runner alive
+        shell: bash
+        run: |
+          echo 'Interactive runner ready; this job stays alive until cancelled or the 6-hour GitHub-hosted limit.'
+          while true; do sleep 300; done
