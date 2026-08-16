@@ -1,0 +1,59 @@
+diff --git a/tauriless/lib.rs b/tauriless/lib.rs
+index 905b711..4c4c6b5 100644
+--- a/tauriless/lib.rs
++++ b/tauriless/lib.rs
+@@ -57,6 +57,7 @@ const FORWARDED_EVENT_NAMES: &[&str] = &[
+     "tauriless://webview-message",
+ ];
+ const CREATE_WEBVIEW_WINDOW_COMMAND: &str = "plugin:webview|create_webview_window";
++const FORCE_RESIZE_COMMAND: &str = "tauriless:force-resize";
+ const SET_APP_USER_MODEL_ID_COMMAND: &str = "tauriless:set-app-user-model-id";
+ const DEFAULT_IDENTIFIER: &str = "Tauriless";
+ 
+@@ -189,6 +190,22 @@ impl Tauriless {
+             return self.create_webview(request);
+         }
+ 
++        if request.cmd == FORCE_RESIZE_COMMAND {
++            let webviews = self.app()?.webview_windows();
++            let webview = select_webview(webviews, request.webview.as_deref())?;
++            let size = webview.inner_size()?;
++            let resized = tauri::PhysicalSize::new(size.width.saturating_add(1), size.height);
++            let outcome = webview
++                .set_size(resized)
++                .map(|_| json!({
++                  "width": resized.width,
++                  "height": resized.height
++                }))
++                .map_err(|error| Value::String(error.to_string()));
++            result(&self.outbox, request.id, outcome);
++            return Ok(());
++        }
++
+         if self.app.is_none() {
+             return Err(Error::Request(format!(
+                 "no webview exists; the first command must be `{CREATE_WEBVIEW_WINDOW_COMMAND}`"
+@@ -351,6 +368,23 @@ impl Tauriless {
+             builder = builder.data_directory(data_directory.clone());
+         }
+ 
++        let navigation_outbox = Arc::clone(&self.outbox);
++        builder = builder.on_navigation(move |url| {
++            push(&navigation_outbox, json!({
++              "kind": "diagnostic-navigation",
++              "url": url.to_string()
++            }));
++            true
++        });
++        let page_load_outbox = Arc::clone(&self.outbox);
++        builder = builder.on_page_load(move |_webview, payload| {
++            push(&page_load_outbox, json!({
++              "kind": "diagnostic-page-load",
++              "event": format!("{:?}", payload.event()),
++              "url": payload.url().to_string()
++            }));
++        });
++
+         let outcome = builder.build().map_err(|error| {
+             #[cfg(windows)]
+             {

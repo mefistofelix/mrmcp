@@ -1,6 +1,7 @@
 import { Tauriless } from "npm:@mefistofelix/tauriless@0.1.12";
 
 const probeUrl = Deno.env.get("TAURILESS_PROBE_URL") ?? "index.html";
+const forceResize = Deno.env.get("TAURILESS_FORCE_RESIZE") === "1";
 const t = new Tauriless();
 const pending = new Map();
 let nextId = 1;
@@ -66,4 +67,12 @@ timer = setInterval(drain, 16);
 request("plugin:webview|create_webview_window", {
   options: { label: "main", title: "Tauriless Probe", url: probeUrl, visible: true },
 }).catch(error => finish(4, `create failed: ${error}`));
+if (forceResize) {
+  setTimeout(() => {
+    console.log("FORCE_RESIZE");
+    request("tauriless:force-resize").catch(error =>
+      console.error("force resize failed", error)
+    );
+  }, 2_000);
+}
 setTimeout(() => finish(2, "10s bootstrap timeout"), 10_000);
