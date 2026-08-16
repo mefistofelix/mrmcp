@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.101
+# MrMCP 0.10.102
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a local Tauriless administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit Session `context_handle` capabilities.
 
@@ -16,7 +16,7 @@ Named Workspaces and their Sessions are managed in one drag-and-drop view, with 
 
 ![MrMCP Workspaces and Sessions view](./assets/mrmcp-screenshot2.png)
 
-The desktop window uses Tauriless through a pinned literal dynamic Deno import inside `desktop()`: `await import("npm:@mefistofelix/tauriless@0.1.12")`. The backend Worker never evaluates Tauriless, because its module opens the native library eagerly with `Deno.dlopen`; this keeps the native bridge loaded only once in the process and avoids duplicate Objective-C class registration on macOS. Desktop mode keeps one OS process: Tauriless runs on the main OS thread with a ~16 ms Deno drain timer while the backend runs in a Deno Worker/isolate in the same executable. MrMCP has no hand-written FFI wrapper, vendored Tauriless native binaries, Node.js application, npm project, CLI scaffold, Rust/Tauri scaffold or Neutralinojs runtime.
+The desktop window uses Tauriless through a pinned literal dynamic Deno import inside `desktop()`: `await import("npm:@mefistofelix/tauriless@0.1.13")`. The backend Worker never evaluates Tauriless, because its module opens the native library eagerly with `Deno.dlopen`; this keeps the native bridge loaded only once in the process and avoids duplicate Objective-C class registration on macOS. Desktop mode keeps one OS process: Tauriless runs on the main OS thread with a ~16 ms Deno drain timer while the backend runs in a Deno Worker/isolate in the same executable. Direct `--backend` mode never imports Tauriless, loads WebView assets, queues GUI renders or emits desktop notifications. MrMCP has no hand-written FFI wrapper, vendored Tauriless native binaries, Node.js application, npm project, separate CLI scaffold, Rust/Tauri scaffold or Neutralinojs runtime.
 
 ## Project files
 
@@ -47,6 +47,14 @@ Headless backend:
 ```bash
 deno run -A mrmcp.js --backend
 ```
+
+Register one enabled Workspace in SQLite and exit immediately without starting listeners or GUI/runtime services:
+
+```bash
+deno run -A mrmcp.js --add-workspace "Workspace name" "/path/to/workspace"
+```
+
+The one-shot command uses the same Workspace name/path validation as the GUI, preserves the entered path string, rejects duplicate names, writes the current database and exits. `--backend` is strictly headless: it does not import Tauriless, read WebView assets, create GUI state traffic or request desktop notifications.
 
 The administration interface is local-only and opens no GUI network listener. Desktop mode starts the backend in a Deno Worker in the same OS process, waits for a typed `ready` message, removes unused Tauriless forwarded-event subscriptions before the WebView exists, creates the `main` Tauriless webview window on the main OS thread, and serves `index.html` through Tauriless' `asset-request` / `tauriless:asset-response` protocol. Close-requested, destroyed, native directory drop, resize/focus/blur visibility signals and the built-in `tauriless://webview-message` host event remain subscribed. Small GUI assets are embedded in the local HTML response. Browser text edits are coalesced before crossing the event bridge; actions, changes, blur, submit and navigation flush pending edits first. Rendered Eta HTML returns through the Tauri event bus before Morphlex applies it. There is no GUI login token, cookie, session or CSRF layer. Deno drains Tauriless every ~16 ms; when the window is destroyed, MrMCP gracefully shuts down the Worker, closes Tauriless and exits. The main window is created hidden, forced to a logical 1180×760 inner size, centered and only then shown.
 
@@ -255,7 +263,7 @@ The interface contains:
 - Settings;
 - Help.
 
-Projects, Active calls, Custom tools and Approvals are intentionally absent. The Clients page shows OAuth client creation time, first/last Session creation, latest access-token issue and latest refresh-token use, each with the same full/current-day timestamp plus compact relative age used elsewhere in the GUI. The Dashboard includes a compact **Active Tool Calls** table containing every in-flight call plus calls completed during the previous five seconds. Each row shows final/live state, the same bounded tool/argument summary used elsewhere, Session number, elapsed time and **📡 progress** when the client requested MCP progress. Completed rows fade during their short retention window and are removed by a Deno-owned one-shot render timer; there is no browser polling or browser-owned countdown. The Dashboard also exposes reversible-removal activity directly from completed Tool Call logs: separate Trash and Untrash cards show the completed-operation count plus the latest completion time, `action_id` and absolute trash path. For Untrash the displayed trash path is historical because a successful restore removes that action directory. Failed attempts do not increment either counter. The GUI header and favicon use the MrMCP balloon+folder brand mark; the native window title remains **🧩 MrMCP**. Emoji are limited to navigation, headings, principal actions, destructive actions and compact states.
+Projects, Active calls, Custom tools and Approvals are intentionally absent. The Clients page shows OAuth client creation time, first/last Session creation, latest access-token issue and latest refresh-token use, each with the same full/current-day timestamp plus compact relative age used elsewhere in the GUI. The Dashboard includes a compact **Active Tool Calls** table containing every in-flight call plus calls completed during the previous five seconds. Each row shows final/live state, the same bounded tool/argument summary used elsewhere, Session number, elapsed time and **📡 progress** when the client requested MCP progress. The panel has no internal scrollbar; it keeps a five-row minimum height and expands when more live/recent rows exist. Completed rows fade during their short retention window and are removed by a Deno-owned one-shot render timer; there is no browser polling or browser-owned countdown. The Dashboard also exposes reversible-removal activity directly from completed Tool Call logs: separate Trash and Untrash cards show the completed-operation count plus the latest completion time, `action_id` and absolute trash path. For Untrash the displayed trash path is historical because a successful restore removes that action directory. Failed attempts do not increment either counter. The GUI header and favicon use the MrMCP balloon+folder brand mark; the native window title remains **🧩 MrMCP**. Emoji are limited to navigation, headings, principal actions, destructive actions and compact states.
 
 ### Deno-owned event-driven rendering model
 
@@ -312,7 +320,7 @@ The Tool Calls page supports:
 
 ### HTTP Debug Log
 
-HTTP Debug Log recording is optional. When enabled, MrMCP inserts the diagnostic row as soon as the public request arrives, so a long-lived response is visible immediately as **in flight**. Request capture is filled as the finite request body becomes available. Ordinary responses complete the same row almost immediately; an SSE/streaming response keeps the same row open until Deno reports response delivery complete or interrupted, then MrMCP updates that row with final status, duration, response headers/body and any delivery error. Streaming response capture forwards the actual body while retaining only the bounded diagnostic transcript, so enabling HTTP Debug Log does not pre-read, clone or delay an SSE response.
+HTTP Debug Log recording is optional. When enabled, MrMCP inserts the diagnostic row as soon as the public request arrives, so a long-lived response is visible immediately as **in flight**. Request capture is filled as the finite request body becomes available. Ordinary responses complete the same row almost immediately; an SSE/streaming response keeps the same row open until Deno reports response delivery complete or interrupted, then MrMCP updates that row with final status, duration, response headers/body and any delivery error. For requests associated with a Session, MrMCP also persists the Session/Workspace snapshot in the additive `debug_log_workspaces` table; the HTTP Log Session column therefore shows `#Session` with the Workspace label beneath it even if that Session is later moved. Streaming response capture forwards the actual body while retaining only the bounded diagnostic transcript, so enabling HTTP Debug Log does not pre-read, clone or delay an SSE response.
 
 ## TLS and connectivity
 
@@ -332,6 +340,14 @@ Settings also provides **Clear Operational Data**. It preserves authentication s
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count and the live/recent five-second Tool Call table at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### 0.10.102
+
+- Updated the pinned desktop runtime to Tauriless `0.1.13`, including the bounded macOS run-loop fixes validated in the Tauriless release.
+- Removed the Dashboard Active Tool Calls internal scrollbar; the panel keeps its compact minimum height and expands for additional live/recent calls.
+- Added persistent HTTP-log Session/Workspace snapshots so each associated HTTP row shows the Workspace used for that call rather than the Session's later current Workspace.
+- Made direct `--backend` execution strictly headless: Tauriless is never imported, WebView assets are not read, GUI renders are not queued and desktop notifications are not emitted.
+- Added `--add-workspace <name> <path>` as a one-shot database command that validates and inserts an enabled Workspace, then exits without starting the server or desktop runtime.
 
 ### 0.10.101
 

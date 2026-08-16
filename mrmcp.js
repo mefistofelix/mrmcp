@@ -1,8 +1,9 @@
 /*
-MrMCP 0.10.101 — Package native macOS app bundles for Finder releases.
+MrMCP 0.10.102 — Update Tauriless and complete headless/log/dashboard improvements.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
+Add Workspace and exit: deno run -A mrmcp.js --add-workspace <name> <path>
 GUI library: Tauriless, imported directly from npm by Deno.
 */
 
@@ -20,6 +21,7 @@ import { contentType as mediaContentType, typeByExtension } from "jsr:@std/media
 
 const SELF = new URL(import.meta.url);
 const IS_BACKEND_WORKER = globalThis.name === "mrmcp-backend";
+const GUI_RUNTIME = IS_BACKEND_WORKER;
 const MODULE_DIR = dirname(fileURLToPath(SELF));
 const ASSETS_DIR = join(MODULE_DIR, "assets");
 const STANDALONE_DIR = Deno.build.standalone ? dirname(Deno.execPath()) : "";
@@ -31,6 +33,21 @@ const macosAppDataDir = () => {
   return join(home, "Library", "Application Support", "MrMCP");
 };
 const APP_DIR = MACOS_APP_BUNDLE ? macosAppDataDir() : Deno.build.standalone ? STANDALONE_DIR : MODULE_DIR;
+const configuredWorkspacePath = value => resolve(APP_DIR, String(value || "."));
+const validWorkspaceName = name => {
+  const value = String(name || "").trim();
+  return value.length >= 1 && value.length <= 128 && !/[\/\\\x00-\x1f\x7f]/.test(value);
+};
+async function workspacePathWarning(value) {
+  const raw = String(value ?? "");
+  if (!raw.trim()) return "Path is required.";
+  try {
+    const stat = await Deno.stat(configuredWorkspacePath(raw));
+    return stat.isDirectory ? "" : "Path does not point to a directory.";
+  } catch (error) {
+    return error instanceof Deno.errors.NotFound ? "Directory does not exist." : `Path is not accessible: ${String(error?.message || error)}`;
+  }
+}
 const COMMANDS_TEMPLATE_PATH = join(MODULE_DIR, "commands.yaml");
 const COMMANDS_PATH = join(APP_DIR, "commands.yaml");
 const PORT_FALLBACK_STEP = 50;
@@ -49,7 +66,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.101";
+const VERSION = "0.10.102";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;
@@ -361,8 +378,8 @@ self.onmessage = async event => {
 const JS_KERNEL_SOURCE = jsKernelWorkerSource.toString().match(/\/\*([\s\S]*)\*\//)[1];
 
 // Backend lifecycle, persistence and network services.
-async function backend() {
-  if (Deno.build.standalone) {
+async function backend({ addWorkspace = null } = {}) {
+  if (Deno.build.standalone && !addWorkspace) {
     await Deno.mkdir(APP_DIR, { recursive: true });
     try { await Deno.lstat(COMMANDS_PATH); }
     catch (error) {
@@ -392,12 +409,14 @@ async function backend() {
   };
   const BIN_DIR = join(DATA, "bin");
   const TEMP_DIR = join(DATA, "tmp");
-  Deno.mkdirSync(BIN_DIR, { recursive: true });
   Deno.mkdirSync(DATA, { recursive: true });
-  await Deno.remove(TEMP_DIR, { recursive: true }).catch(error => {
-    if (!(error instanceof Deno.errors.NotFound)) throw error;
-  });
-  Deno.mkdirSync(TEMP_DIR, { recursive: true });
+  if (!addWorkspace) {
+    Deno.mkdirSync(BIN_DIR, { recursive: true });
+    await Deno.remove(TEMP_DIR, { recursive: true }).catch(error => {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    });
+    Deno.mkdirSync(TEMP_DIR, { recursive: true });
+  }
   const db = new DatabaseSync(DB_PATH);
   let uiRevision = 0, uiRenderConnected = false, uiRenderVisible = false, uiRenderVisibilityEpoch = 0;
   const deliverUiRender = payload => {
@@ -428,7 +447,7 @@ async function backend() {
       values.has(uiState.currentSection) || (uiState.currentSection === "dashboard" && values.has("endpoints"));
   }
   function emitUiChange(scopes = ["state"], reason = "change") {
-    if (uiScopesAffectCurrent(scopes)) queueUiRender(reason);
+    if (GUI_RUNTIME && uiScopesAffectCurrent(scopes)) queueUiRender(reason);
   }
   function setUiRenderVisible(visible) {
     const next = !!visible;
@@ -447,6 +466,7 @@ async function backend() {
     queueUiRender("visibility-sync", 0);
   }
   function queueUiRender(reason = "change", delay = 18) {
+    if (!GUI_RUNTIME) return;
     uiRenderQueued = true;
     if (uiInputDepth) {
       const value = Math.max(0, Number(delay) || 0);
@@ -607,6 +627,14 @@ async function backend() {
     CREATE INDEX IF NOT EXISTS debug_logs_time ON debug_logs(ts DESC);
     CREATE INDEX IF NOT EXISTS debug_logs_status ON debug_logs(status,ts DESC);
     CREATE INDEX IF NOT EXISTS debug_logs_method ON debug_logs(method,ts DESC);
+    CREATE TABLE IF NOT EXISTS debug_log_workspaces(
+      debug_log_id INTEGER PRIMARY KEY,
+      context_id INTEGER NOT NULL DEFAULT 0,
+      root_id INTEGER NOT NULL DEFAULT 0,
+      root_name TEXT NOT NULL DEFAULT '',
+      root_path TEXT NOT NULL DEFAULT '',
+      FOREIGN KEY(debug_log_id) REFERENCES debug_logs(id) ON DELETE CASCADE
+    );
     CREATE TABLE IF NOT EXISTS oauth_clients(
       client_id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -835,6 +863,7 @@ async function backend() {
     logs: ["id", "server_name", "tool", "status", "input_json", "context_id", "context_handle", "root_id", "root_name", "root_path"],
     tool_call_descriptors: ["log_id", "descriptor_json"],
     tool_call_transport: ["log_id", "progress_requested"],
+    debug_log_workspaces: ["debug_log_id", "context_id", "root_id", "root_name", "root_path"],
     oauth_refresh_tokens: ["token_hash", "client_id", "server_id", "resource", "scope", "last_used_at"],
     published_html: ["id", "server_id", "context_handle", "title", "html", "height", "created_at"],
   };
@@ -847,6 +876,19 @@ async function backend() {
   if (schemaErrors.length) throw new Error(
     `Invalid clean database schema (${schemaErrors.join(", ")}). Delete .mrmcp/mrmcp.sqlite and restart.`,
   );
+  if (addWorkspace) {
+    const name = String(addWorkspace.name || "").trim(), path = String(addWorkspace.path || "");
+    if (!validWorkspaceName(name)) throw new Error("Workspace name must be 1-128 characters and cannot contain slashes or control characters.");
+    const pathWarning = await workspacePathWarning(path);
+    if (pathWarning) throw new Error(pathWarning);
+    if (one("SELECT 1 FROM roots WHERE name=?", name)) throw new Error("Workspace name already exists.");
+    if (!one("SELECT 1 FROM server_config WHERE id=1"))
+      db.prepare("INSERT INTO server_config(id,name,oauth,created_at) VALUES(1,?,?,?)").run("MrMCP", 1, Date.now());
+    db.prepare("INSERT INTO roots(server_id,name,path,enabled,created_at) VALUES(1,?,?,1,?)").run(name, path, Date.now());
+    db.close();
+    console.log(`Workspace added: ${name} -> ${path}`);
+    return;
+  }
   let fts = true;
   try {
     db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS logs_fts USING fts5(
@@ -2203,7 +2245,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
   const fallbackWorkspaceRoot = p => ({
     id: 0, server_id: p.id, name: "Program folder", path: APP_DIR, enabled: 1, fallback: true,
   });
-  const configuredRootPath = value => resolve(APP_DIR, String(value || "."));
+  const configuredRootPath = configuredWorkspacePath;
   async function emptyManagedTrash(p) {
     return await withToolCallsDrained("trash", async () => {
       const roots = [APP_DIR, ...all("SELECT path FROM roots WHERE server_id=? ORDER BY id", p.id).map(row => configuredRootPath(row.path))];
@@ -2238,20 +2280,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     });
   }
   const runtimeWorkspaceRoot = root => ({ ...root, stored_path: root.path, path: configuredRootPath(root.path) });
-  async function rootPathWarning(value) {
-    const raw = String(value ?? "");
-    if (!raw.trim()) return "Path is required.";
-    try {
-      const stat = await Deno.stat(configuredRootPath(raw));
-      return stat.isDirectory ? "" : "Path does not point to a directory.";
-    } catch (error) {
-      return error instanceof Deno.errors.NotFound ? "Directory does not exist." : `Path is not accessible: ${String(error?.message || error)}`;
-    }
-  }
-  const validRootName = name => {
-    const value = String(name || "").trim();
-    return value.length >= 1 && value.length <= 128 && !/[\/\\\x00-\x1f\x7f]/.test(value);
-  };
+  const rootPathWarning = workspacePathWarning;
+  const validRootName = validWorkspaceName;
   const workspaceNameWarning = (name, id = 0) => {
     const value = String(name || "").trim();
     if (!validRootName(value)) return "Workspace name must be 1-128 characters and cannot contain slashes or control characters.";
@@ -4792,6 +4822,26 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         try { requestBody = await requestBodyPromise; }
         catch (error) { debugError += `${debugError ? "\n" : ""}Debug request capture error: ${String(error?.stack || error)}`; }
         if (responseCapture) responseBody = formatDebugBody(responseCapture.text(), responseType);
+        const requestJson = parseJson(requestBody, null), responseJson = parseJson(responseBody, null);
+        const contextHandle = String(
+          responseJson?.result?.structuredContent?.context_handle ||
+          requestJson?.params?.arguments?.context_handle ||
+          requestJson?.params?.arguments?.current_context_handle || "",
+        );
+        if (contextHandle) {
+          const tool = String(requestJson?.params?.name || ""), finished = Date.now();
+          const call = tool
+            ? one(`SELECT context_id,root_id,root_name,root_path FROM logs
+                WHERE context_handle=? AND tool=? AND started_at BETWEEN ? AND ?
+                ORDER BY abs(started_at-?) ASC,id DESC LIMIT 1`, contextHandle, tool, started - 1000, finished + 1000, started)
+            : null;
+          const snapshot = call || one(`SELECT c.id context_id,c.root_id,
+              COALESCE(r.name,'Program folder') root_name,COALESCE(r.path,?) root_path
+              FROM contexts c LEFT JOIN roots r ON r.id=c.root_id WHERE c.handle=?`, APP_DIR, contextHandle);
+          if (snapshot) run(`INSERT OR REPLACE INTO debug_log_workspaces(debug_log_id,context_id,root_id,root_name,root_path)
+              VALUES(?,?,?,?,?)`, debugId, Number(snapshot.context_id || 0), Number(snapshot.root_id || 0),
+            String(snapshot.root_name || "Program folder"), String(snapshot.root_path || APP_DIR));
+        }
         const errors = [handlerError, debugError, deliveryError ? `Response delivery error: ${String(deliveryError?.stack || deliveryError)}` : ""]
           .filter(Boolean).join("\n");
         run(`UPDATE debug_logs SET status=?,duration_ms=?,request_body=?,response_headers=?,response_body=?,error=? WHERE id=?`,
@@ -5611,7 +5661,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     emitUiChange(["dashboard", "settings", "help", "tls", "endpoints"], "listeners");
   }
 
-  const fragmentTemplates = {
+  const fragmentTemplates = GUI_RUNTIME ? {
     sidebar: `<? const current=it.data?.state?.currentSection||"dashboard",items=[["dashboard","🏠","Dashboard"],["oauth","🔐","Clients"],["sessions","💬","Sessions"],["roots","📁","Workspaces"],["logs","🛠️","Tool Calls"],["commands","🧰","Commands"],["debug","🐞","HTTP Log"],["settings","⚙️","Settings"],["help","❓","Help"]]; items.forEach(([id,icon,label])=>{ ?><button data-page="<?= id ?>" class="<?= current===id?'nav-active':'' ?>"<?= current===id?' aria-current=page':'' ?>><span class=menu-icon><?= icon ?></span><?= label ?></button><? }) ?>`,
     view: `<? const s=it.data?.state||{},section=s.currentSection||"dashboard",settings=s.settings||{}; ?>
 <? if(section==="dashboard"){ ?><section id=dashboard class=page><div class=row><h2 class=grow>🏠 Dashboard</h2><span class=muted>Runtime · activity · endpoints</span></div><div id=cards class=grid></div><div class=row><h3 class=grow>🛠️ Active Tool Calls</h3><span class=muted>Live · finished calls remain for 5s</span></div><div id=activeToolCalls></div><div id=trashActivity class=grid></div><div class=dashboard-grid><div><h3>🌐 Server</h3><div id=endpoints></div></div><div><h3>🔒 TLS and Connectivity</h3><div id=tlsStatus></div></div></div></section>
@@ -5636,8 +5686,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     oauth: `<table class=oauth-table><tr><th>Client</th><th>Sessions</th><th>Tokens</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td class=oauth-client><b><?= c.name ?></b><div class=oauth-client-id title="<?= c.client_id ?>"><code><?= c.client_id ?></code></div><div class=oauth-meta><span class=muted>Created</span> <?= it.logdt(c.created_at) ?></div></td><td class=oauth-meta><div class=oauth-count><b><?= c.session_count||0 ?></b> total</div><div><span class=muted>First</span> <?= c.first_session_at ? it.logdt(c.first_session_at) : "—" ?></div><div><span class=muted>Last</span> <?= c.last_session_at ? it.logdt(c.last_session_at) : "—" ?></div></td><td><div class=oauth-tokens><div class=oauth-token><b><?= c.token_count||0 ?></b> <span>Access</span><div class=oauth-meta><span class=muted>Issued</span> <?= c.last_token_at ? it.logdt(c.last_token_at) : "—" ?></div></div><div class=oauth-token><b><?= c.refresh_token_count||0 ?></b> <span>Refresh</span><div class=oauth-meta><span class=muted>Used</span> <?= c.last_refresh_at ? it.logdt(c.last_refresh_at) : "—" ?></div></div></div></td><td class=oauth-actions><button class=small data-action=oauth-sessions data-id="<?= c.client_id ?>">💬 View Sessions</button><button class="small danger" data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> Available Tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,
     logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=idcell><?= l.context_id ? "#"+l.context_id : "—" ?></td><td><code><?= l.tool ?></code><? if(l.call_preview){ ?><div class=tool-command-preview>↳ <?= l.call_preview ?></div><? } ?><? if(l.progress_requested){ ?><div class=progress-requested>📡 Progress requested</div><? } ?></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Kill</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><? if(x.progress_requested){ ?><span class=progress-requested>📡 Progress requested</span><? } ?><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><div class=tool-detail-grid><div class=tool-detail-main><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><? if(x.resolved_json){ ?><section class=json-detail><div class=row><b class=grow>Tool Return Value JSON</b><button class=small data-action=copy-detail data-target="tool-return-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-return-<?= l.id ?>"><?= it.prettyParsed(x.resolved_json) ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>MCP Result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div><aside class=tool-descriptor><div class=row><b class=grow>Agent Tool Definition</b><? if(x.tool_descriptor){ ?><span class="descriptor-status <?= x.tool_descriptor_matches_current?'current':'outdated' ?>"><?= x.tool_descriptor_matches_current?'CURRENT':'OUTDATED' ?></span><button class=small data-action=copy-detail data-target="tool-descriptor-<?= l.id ?>">📋 Copy JSON</button><? } ?></div><? if(x.tool_descriptor){ ?><pre id="tool-descriptor-<?= l.id ?>" hidden><?= it.pretty(x.tool_descriptor) ?></pre><? if(x.tool_descriptor.title){ ?><div class=muted>Title</div><div><?= x.tool_descriptor.title ?></div><? } ?><div class=muted>Description</div><p><?= x.tool_descriptor.description||"—" ?></p><div class=muted>Input Schema</div><pre><?= it.pretty(x.tool_descriptor.inputSchema||{}) ?></pre><div class=muted>Output Schema</div><pre><?= it.pretty(x.tool_descriptor.outputSchema||{}) ?></pre><? } else { ?><p class=muted>No descriptor snapshot was recorded for this call.</p><? } ?></aside></div></div></td></tr><? } }) ?></tbody></table>`,
-    debug: `<? const d=it.data||{},rows=d.rows||[]; ?><p class="<?= d.enabled?'ok':'failed' ?>"><b><?= d.enabled?'● Recording enabled':'● Recording disabled' ?></b><? if(!d.enabled){ ?> · showing stored requests<? } ?></p><? if(!rows.length){ ?><p class=muted>No stored HTTP debug requests match the current filters.</p><? } else { ?><table><tr><th>ID</th><th>Time</th><th>Session</th><th>Client</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>IP</th><th>Error</th></tr><? rows.forEach(r => { ?><tr data-action=select-debug data-id="<?= r.id ?>" title="Click to expand"><td class=idcell>#<?= r.id ?></td><td class=nowrap><?= it.logdt(r.ts) ?></td><td class=idcell><?= r.context_id ? "#"+r.context_id : "—" ?></td><td><? if(r.client_id){ ?><code><?= r.client_id ?></code><? } else { ?>—<? } ?></td><td><b><?= r.method ?></b></td><td><code><?= r.path ?></code></td><td class="<?= !r.status?'pending':(r.status>=400?'failed':'ok') ?>"><?= r.status||"…" ?></td><td><?= r.status ? r.duration_ms+"ms" : "in flight" ?></td><td class=nowrap><?= r.remote_addr||"—" ?><? if(r.remote_addr){ ?> (<?= r.remote_count||1 ?>)<? } ?></td><td><?= r.error_preview ?></td></tr><? if(String(d.openRowId||"")===String(r.id)&&d.openDetail){ const x=d.openDetail; ?><tr class=detail-row data-detail-kind=http data-detail-id="<?= r.id ?>"><td colspan=10><div class="detail-panel http-detail-panel"><div class="row http-detail-head"><div class=grow><b>HTTP Request #<?= r.id ?></b><div class=http-detail-meta><span><?= it.logdt(x.ts) ?></span><span><? if(x.context_id){ ?>Session #<?= x.context_id ?><? } else { ?>No Session<? } ?></span><span><? if(x.client_id){ ?>Client <code><?= x.client_id ?></code><? } else { ?>No client id<? } ?></span><span><?= x.remote_addr||"unknown IP" ?><? if(x.remote_addr){ ?> · <?= x.remote_count||1 ?> total request<?= Number(x.remote_count||1)===1?'':'s' ?><? } ?></span><span><?= x.status ? x.duration_ms+"ms" : "in flight" ?></span></div></div><button class=small data-action=copy-detail data-target="http-json-<?= r.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=http>✕ Close</button></div><div class=http-detail-grid><section class=http-detail-block><div class=row><h4 class=grow>→ Request</h4><b><?= x.method ?></b> <code><?= x.path ?></code></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.request_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.request_body||{}) ?></pre></section><section class=http-detail-block><div class=row><h4 class=grow>← Response</h4><b class="<?= !x.status?'pending':(x.status>=400?'failed':'ok') ?>"><?= x.status||"in flight" ?></b></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.response_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.response_body||{}) ?></pre></section></div><? if(x.error){ ?><section class="http-detail-block http-detail-error"><h4 class=failed>Error</h4><pre><?= x.error ?></pre></section><? } ?><details class=http-detail-raw><summary>Raw record</summary><pre id="http-json-<?= r.id ?>"><?= it.pretty(x) ?></pre></details></div></td></tr><? } }) ?></table><? } ?>`,
-  };
+    debug: `<? const d=it.data||{},rows=d.rows||[]; ?><p class="<?= d.enabled?'ok':'failed' ?>"><b><?= d.enabled?'● Recording enabled':'● Recording disabled' ?></b><? if(!d.enabled){ ?> · showing stored requests<? } ?></p><? if(!rows.length){ ?><p class=muted>No stored HTTP debug requests match the current filters.</p><? } else { ?><table><tr><th>ID</th><th>Time</th><th>Session</th><th>Client</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>IP</th><th>Error</th></tr><? rows.forEach(r => { ?><tr data-action=select-debug data-id="<?= r.id ?>" title="Click to expand"><td class=idcell>#<?= r.id ?></td><td class=nowrap><?= it.logdt(r.ts) ?></td><td class=http-session><? if(r.context_id){ ?><div class=idcell>#<?= r.context_id ?></div><? if(r.workspace_name){ ?><div class=workspace-label>📁 <?= r.workspace_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><? if(r.client_id){ ?><code><?= r.client_id ?></code><? } else { ?>—<? } ?></td><td><b><?= r.method ?></b></td><td><code><?= r.path ?></code></td><td class="<?= !r.status?'pending':(r.status>=400?'failed':'ok') ?>"><?= r.status||"…" ?></td><td><?= r.status ? r.duration_ms+"ms" : "in flight" ?></td><td class=nowrap><?= r.remote_addr||"—" ?><? if(r.remote_addr){ ?> (<?= r.remote_count||1 ?>)<? } ?></td><td><?= r.error_preview ?></td></tr><? if(String(d.openRowId||"")===String(r.id)&&d.openDetail){ const x=d.openDetail; ?><tr class=detail-row data-detail-kind=http data-detail-id="<?= r.id ?>"><td colspan=10><div class="detail-panel http-detail-panel"><div class="row http-detail-head"><div class=grow><b>HTTP Request #<?= r.id ?></b><div class=http-detail-meta><span><?= it.logdt(x.ts) ?></span><span><? if(x.context_id){ ?>Session #<?= x.context_id ?><? } else { ?>No Session<? } ?></span><? if(x.workspace_name){ ?><span>📁 <?= x.workspace_name ?></span><? } ?><span><? if(x.client_id){ ?>Client <code><?= x.client_id ?></code><? } else { ?>No client id<? } ?></span><span><?= x.remote_addr||"unknown IP" ?><? if(x.remote_addr){ ?> · <?= x.remote_count||1 ?> total request<?= Number(x.remote_count||1)===1?'':'s' ?><? } ?></span><span><?= x.status ? x.duration_ms+"ms" : "in flight" ?></span></div></div><button class=small data-action=copy-detail data-target="http-json-<?= r.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=http>✕ Close</button></div><div class=http-detail-grid><section class=http-detail-block><div class=row><h4 class=grow>→ Request</h4><b><?= x.method ?></b> <code><?= x.path ?></code></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.request_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.request_body||{}) ?></pre></section><section class=http-detail-block><div class=row><h4 class=grow>← Response</h4><b class="<?= !x.status?'pending':(x.status>=400?'failed':'ok') ?>"><?= x.status||"in flight" ?></b></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.response_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.response_body||{}) ?></pre></section></div><? if(x.error){ ?><section class="http-detail-block http-detail-error"><h4 class=failed>Error</h4><pre><?= x.error ?></pre></section><? } ?><details class=http-detail-raw><summary>Raw record</summary><pre id="http-json-<?= r.id ?>"><?= it.pretty(x) ?></pre></details></div></td></tr><? } }) ?></table><? } ?>`,
+  } : {};
   const fragmentDate = value => {
     if (!value) return "";
     const date = new Date(value), now = new Date();
@@ -6673,12 +6723,14 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         FROM debug_logs d
       )
       SELECT d.id,d.ts,d.method,d.path,d.status,d.duration_ms,d.remote_addr,
-        c.id context_id,c.oauth_client_id client_id,
+        COALESCE(w.context_id,c.id,0) context_id,c.oauth_client_id client_id,w.root_name workspace_name,
         (SELECT COUNT(*) FROM debug_logs ip WHERE ip.remote_addr=d.remote_addr) remote_count,
         substr(d.request_body,1,180) request_preview,substr(d.error,1,180) error_preview
-        FROM enriched d LEFT JOIN contexts c ON c.handle=d.context_handle
+        FROM enriched d
+        LEFT JOIN debug_log_workspaces w ON w.debug_log_id=d.id
+        LEFT JOIN contexts c ON c.handle=d.context_handle
         WHERE (?='' OR d.method=?) AND (?='' OR CAST(d.status AS TEXT)=?)
-        AND (?='' OR d.method||d.path||d.request_headers||d.request_body||d.response_headers||d.response_body||d.error||COALESCE(c.oauth_client_id,'')||COALESCE(CAST(c.id AS TEXT),'') LIKE ?)
+        AND (?='' OR d.method||d.path||d.request_headers||d.request_body||d.response_headers||d.response_body||d.error||COALESCE(c.oauth_client_id,'')||COALESCE(CAST(COALESCE(w.context_id,c.id) AS TEXT),'')||COALESCE(w.root_name,'') LIKE ?)
         ORDER BY d.id DESC LIMIT ?`,
         method, method, status, status, q, like, limit));
     }
@@ -6691,9 +6743,11 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       ) context_handle
       FROM debug_logs d WHERE d.id=?
     )
-    SELECT d.*,c.id context_id,c.oauth_client_id client_id,
+    SELECT d.*,COALESCE(w.context_id,c.id,0) context_id,c.oauth_client_id client_id,w.root_name workspace_name,w.root_path workspace_path,
       (SELECT COUNT(*) FROM debug_logs ip WHERE ip.remote_addr=d.remote_addr) remote_count
-      FROM enriched d LEFT JOIN contexts c ON c.handle=d.context_handle`, Number(dm[1])) || { error: "Not found" });
+      FROM enriched d
+      LEFT JOIN debug_log_workspaces w ON w.debug_log_id=d.id
+      LEFT JOIN contexts c ON c.handle=d.context_handle`, Number(dm[1])) || { error: "Not found" });
     if (u.pathname === "/api/debug/clear" && req.method === "POST") {
       run("DELETE FROM debug_logs");
       return json({ ok: true });
@@ -6801,18 +6855,21 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   }
 
   // Eta renders server-side only. Tauriless serves the complete local UI through its asset protocol.
-  const UI_SCRIPT_NONCE = randomToken();
-  const GUI_LOGO_DATA_URL = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(Deno.readTextFileSync(join(ASSETS_DIR, "mrmcp-logo.svg")))}`;
-  const GUI_MORPHLEX_JS = Deno.readTextFileSync(join(ASSETS_DIR, "morphlex.js"))
-    .replace(/\nexport \{\n  morphInner,\n  morphDocument,\n  morph\n\};[\s\S]*$/, "");
+  const UI_SCRIPT_NONCE = GUI_RUNTIME ? randomToken() : "";
+  const GUI_LOGO_DATA_URL = GUI_RUNTIME
+    ? `data:image/svg+xml;charset=utf-8,${encodeURIComponent(Deno.readTextFileSync(join(ASSETS_DIR, "mrmcp-logo.svg")))}`
+    : "";
+  const GUI_MORPHLEX_JS = GUI_RUNTIME
+    ? Deno.readTextFileSync(join(ASSETS_DIR, "morphlex.js")).replace(/\nexport \{\n  morphInner,\n  morphDocument,\n  morph\n\};[\s\S]*$/, "")
+    : "";
   const UI_CSP = `default-src 'self';base-uri 'none';object-src 'none';frame-ancestors 'none';form-action 'self';style-src 'unsafe-inline';script-src 'self' 'nonce-${UI_SCRIPT_NONCE}';connect-src 'self' ipc: http://ipc.localhost;img-src 'self' data:`;
-  const UI_TEMPLATE = String.raw`<!doctype html><html><head><meta charset=utf-8>
+  const UI_TEMPLATE = GUI_RUNTIME ? String.raw`<!doctype html><html><head><meta charset=utf-8>
 <meta http-equiv="Content-Security-Policy" content="${UI_CSP}">
 <meta name=viewport content="width=device-width,initial-scale=1"><link rel=icon href="${GUI_LOGO_DATA_URL}"><title>MrMCP</title><style>
-:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}#app>aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}#app>aside button{display:block;width:100%;text-align:left;margin:3px 0;background:transparent;border:0}#app>aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.notice-balloon{position:fixed;top:64px;right:16px;z-index:1900;max-width:min(520px,calc(100vw - 32px));padding:10px 12px;border:1px solid #7d3f47;border-radius:9px;background:#25191b;color:#ffb7bf;box-shadow:0 8px 28px #0008}.notice-balloon.info{border-color:#365a7d;background:#16202b;color:#a9d5ff}.notice-balloon.ok{border-color:#356849;background:#16241b;color:#9ce8b1}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.debug-toggle{font-weight:750;min-width:190px}.debug-toggle.enabled{background:#173f24;border-color:#347a49;color:#9ce8b1}.debug-toggle.disabled{background:#421d21;border-color:#7d3f47;color:#ffb7bf}.debug-toggle.enabled:hover{background:#20512f}.debug-toggle.disabled:hover{background:#53262b}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 18px 14px 28px;background:#111318}.detail-panel{border:1px solid #343944;border-left:3px solid #3984e8;border-radius:8px;background:#0d0f12;padding:14px 16px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.tool-detail-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:14px;align-items:start}.tool-detail-main{min-width:0}.tool-descriptor{min-width:0;position:sticky;top:10px;border:1px solid #343944;border-radius:8px;background:#111318;padding:12px}.tool-descriptor>.muted{margin-top:10px}.tool-descriptor p{margin:5px 0 10px;line-height:1.45}.tool-descriptor pre{margin:5px 0 10px;max-height:28vh}.descriptor-status{font-size:11px;font-weight:800;letter-spacing:.04em;padding:3px 6px;border-radius:5px}.descriptor-status.current{color:#75d58b;background:#16341f}.descriptor-status.outdated{color:#ffd166;background:#3a2f13}.http-detail-head{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #292d34}.http-detail-meta{display:flex;gap:7px 16px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:#89909b}.http-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.http-detail-block{min-width:0;border:1px solid #292d34;border-radius:8px;background:#0a0c0f;padding:10px}.http-detail-block h4{margin:0}.http-detail-block pre{max-height:30vh}.http-detail-error{margin-top:12px;border-color:#68353a;background:#1d1012}.http-detail-raw{margin-top:12px}.http-detail-raw summary{cursor:pointer;color:#89909b}@media(max-width:1100px){.tool-detail-grid,.http-detail-grid{grid-template-columns:1fr}.tool-descriptor{position:static}}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.tool-command-preview{margin-top:3px;max-width:440px;color:#c5cad3;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.menu-icon{display:inline-block;width:22px;text-align:center}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-call-card{padding:0;overflow-x:hidden;overflow-y:auto;height:210px}.dashboard-call-table{margin:0;background:transparent}.dashboard-call-table thead{position:sticky;top:0;z-index:1;background:#181a1f}.dashboard-call-table tr{height:35px}.dashboard-call-table th,.dashboard-call-table td{padding:7px 9px}.dashboard-call-table tr[data-action=dashboard-tool-call]{cursor:pointer}.dashboard-call-table tr[data-action=dashboard-tool-call]:hover{background:#20242a}.dashboard-call-summary{max-width:720px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dashboard-call-recent{animation:dashboardCallFade var(--dashboard-call-ttl,5s) linear forwards}@keyframes dashboardCallFade{from{opacity:1}to{opacity:.18}}.progress-requested{color:#8fd3ff;white-space:nowrap}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout{grid-template-columns:1fr}.default-root-card{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){#app>aside{width:130px}main{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
+:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}#app>aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}#app>aside button{display:block;width:100%;text-align:left;margin:3px 0;background:transparent;border:0}#app>aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.notice-balloon{position:fixed;top:64px;right:16px;z-index:1900;max-width:min(520px,calc(100vw - 32px));padding:10px 12px;border:1px solid #7d3f47;border-radius:9px;background:#25191b;color:#ffb7bf;box-shadow:0 8px 28px #0008}.notice-balloon.info{border-color:#365a7d;background:#16202b;color:#a9d5ff}.notice-balloon.ok{border-color:#356849;background:#16241b;color:#9ce8b1}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.debug-toggle{font-weight:750;min-width:190px}.debug-toggle.enabled{background:#173f24;border-color:#347a49;color:#9ce8b1}.debug-toggle.disabled{background:#421d21;border-color:#7d3f47;color:#ffb7bf}.debug-toggle.enabled:hover{background:#20512f}.debug-toggle.disabled:hover{background:#53262b}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 18px 14px 28px;background:#111318}.detail-panel{border:1px solid #343944;border-left:3px solid #3984e8;border-radius:8px;background:#0d0f12;padding:14px 16px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.tool-detail-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:14px;align-items:start}.tool-detail-main{min-width:0}.tool-descriptor{min-width:0;position:sticky;top:10px;border:1px solid #343944;border-radius:8px;background:#111318;padding:12px}.tool-descriptor>.muted{margin-top:10px}.tool-descriptor p{margin:5px 0 10px;line-height:1.45}.tool-descriptor pre{margin:5px 0 10px;max-height:28vh}.descriptor-status{font-size:11px;font-weight:800;letter-spacing:.04em;padding:3px 6px;border-radius:5px}.descriptor-status.current{color:#75d58b;background:#16341f}.descriptor-status.outdated{color:#ffd166;background:#3a2f13}.http-detail-head{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #292d34}.http-detail-meta{display:flex;gap:7px 16px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:#89909b}.http-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.http-detail-block{min-width:0;border:1px solid #292d34;border-radius:8px;background:#0a0c0f;padding:10px}.http-detail-block h4{margin:0}.http-detail-block pre{max-height:30vh}.http-detail-error{margin-top:12px;border-color:#68353a;background:#1d1012}.http-detail-raw{margin-top:12px}.http-detail-raw summary{cursor:pointer;color:#89909b}@media(max-width:1100px){.tool-detail-grid,.http-detail-grid{grid-template-columns:1fr}.tool-descriptor{position:static}}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.tool-command-preview{margin-top:3px;max-width:440px;color:#c5cad3;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.http-session{white-space:nowrap}.workspace-label{margin-top:3px;color:#89909b;font-size:12px;font-weight:600}.menu-icon{display:inline-block;width:22px;text-align:center}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-call-card{padding:0;overflow:hidden;min-height:210px}.dashboard-call-table{margin:0;background:transparent}.dashboard-call-table thead{position:sticky;top:0;z-index:1;background:#181a1f}.dashboard-call-table tr{height:35px}.dashboard-call-table th,.dashboard-call-table td{padding:7px 9px}.dashboard-call-table tr[data-action=dashboard-tool-call]{cursor:pointer}.dashboard-call-table tr[data-action=dashboard-tool-call]:hover{background:#20242a}.dashboard-call-summary{max-width:720px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dashboard-call-recent{animation:dashboardCallFade var(--dashboard-call-ttl,5s) linear forwards}@keyframes dashboardCallFade{from{opacity:1}to{opacity:.18}}.progress-requested{color:#8fd3ff;white-space:nowrap}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout{grid-template-columns:1fr}.default-root-card{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){#app>aside{width:130px}main{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
 </style></head><body>
 <div id=app data-section=dashboard><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div><div class=status><span class=pending>starting…</span></div></header><main style="margin-left:0"><div class=card>Starting the local MrMCP UI…</div></main></div>
-<script nonce="${UI_SCRIPT_NONCE}">__MRMCP_BROWSER_JS__</script></body></html>`;
+<script nonce="${UI_SCRIPT_NONCE}">__MRMCP_BROWSER_JS__</script></body></html>` : "";
 
   function browserAppSource() {/*
 import { morphInner } from "/assets/morphlex.js";
@@ -6977,11 +7034,12 @@ listen(UI_RENDER_EVENT, event => {
 });
 */}
 
-  const BROWSER_JS = browserAppSource.toString().match(/\/\*([\s\S]*)\*\//)[1]
-    .replace('import { morphInner } from "/assets/morphlex.js";\n', "");
-  const GUI_BROWSER_JS = `${GUI_MORPHLEX_JS}\n${BROWSER_JS}`;
+  const BROWSER_JS = GUI_RUNTIME
+    ? browserAppSource.toString().match(/\/\*([\s\S]*)\*\//)[1].replace('import { morphInner } from "/assets/morphlex.js";\n', "")
+    : "";
+  const GUI_BROWSER_JS = GUI_RUNTIME ? `${GUI_MORPHLEX_JS}\n${BROWSER_JS}` : "";
   const PAGE_TEMPLATE = UI_TEMPLATE;
-  function ui() { return eta.renderString(PAGE_TEMPLATE, {}).replace("__MRMCP_BROWSER_JS__", GUI_BROWSER_JS); }
+  function ui() { return GUI_RUNTIME ? eta.renderString(PAGE_TEMPLATE, {}).replace("__MRMCP_BROWSER_JS__", GUI_BROWSER_JS) : ""; }
   restoreAcmeBackoff();
   await detectPublicIp().catch(error => setCfg("tls_last_error", [
     getCfg("tls_last_error", ""), String(error?.message || error),
@@ -7090,7 +7148,7 @@ async function stopBackendWorker(worker) {
 }
 async function desktop() {
   const { worker: backendWorker, payload, earlyMessages } = await spawnBackendWorker();
-  const { Tauriless } = await import("npm:@mefistofelix/tauriless@0.1.12");
+  const { Tauriless } = await import("npm:@mefistofelix/tauriless@0.1.13");
   const tauriless = new Tauriless(), pending = new Map();
   const nativeIcon = () => {
     const ico = Deno.readFileSync(join(ASSETS_DIR, "mrmcp.ico"));
@@ -7296,5 +7354,17 @@ async function desktop() {
   }
 }
 
-if (IS_BACKEND_WORKER || (import.meta.main && Deno.args.includes("--backend"))) await backend();
-else if (import.meta.main) { await desktop(); Deno.exit(0); }
+if (IS_BACKEND_WORKER) await backend();
+else if (import.meta.main) {
+  if (Deno.args[0] === "--add-workspace") {
+    if (Deno.args.length !== 3) {
+      console.error("Usage: mrmcp --add-workspace <name> <path>");
+      Deno.exit(2);
+    }
+    try { await backend({ addWorkspace: { name: Deno.args[1], path: Deno.args[2] } }); }
+    catch (error) { console.error(String(error?.message || error)); Deno.exit(1); }
+    Deno.exit(0);
+  }
+  if (Deno.args.includes("--backend")) await backend();
+  else { await desktop(); Deno.exit(0); }
+}
