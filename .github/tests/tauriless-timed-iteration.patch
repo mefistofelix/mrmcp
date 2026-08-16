@@ -135,7 +135,7 @@ index 0000000..c19be83
 +        };
 +
 +        match event {
-+            Event::MainEventsCleared => {
++            Event::MainEventsCleared | Event::RedrawEventsCleared => {
 +                *control_flow = if Instant::now() >= deadline {
 +                    ControlFlow::Exit
 +                } else {
