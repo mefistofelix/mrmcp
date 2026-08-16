@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "*.*.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing version tag to build and publish
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,9 +17,13 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
     steps:
       - name: Check out tag
         uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Set up Deno
         uses: denoland/setup-deno@v2
@@ -26,7 +36,7 @@ jobs:
           set -euo pipefail
           version="$(sed -n 's/^const VERSION = "\([^"]*\)";/\1/p' mrmcp.js)"
           test -n "$version"
-          test "$version" = "$GITHUB_REF_NAME"
+          test "$version" = "$RELEASE_TAG"
 
       - name: Check source
         run: deno check --minimum-dependency-age=0 mrmcp.js
@@ -83,11 +93,11 @@ jobs:
             dist/mrmcp-macos-x64
             dist/mrmcp-macos-arm64
           )
-          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "${files[@]}" --clobber
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
           else
-            gh release create "$GITHUB_REF_NAME" "${files[@]}" \
+            gh release create "$RELEASE_TAG" "${files[@]}" \
               --verify-tag \
-              --title "MrMCP $GITHUB_REF_NAME" \
+              --title "MrMCP $RELEASE_TAG" \
               --generate-notes
           fi
