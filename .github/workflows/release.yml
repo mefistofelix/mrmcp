@@ -80,11 +80,11 @@ jobs:
           - arch: x64
             runner: macos-15-intel
             target: x86_64-apple-darwin
-            asset: mrmcp-macos-x64.app.zip
+            asset: mrmcp-macos-x64.dmg
           - arch: arm64
             runner: macos-15
             target: aarch64-apple-darwin
-            asset: mrmcp-macos-arm64.app.zip
+            asset: mrmcp-macos-arm64.dmg
     runs-on: ${{ matrix.runner }}
     env:
       RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
@@ -164,17 +164,26 @@ jobs:
           codesign --force --sign - "$app"
           codesign --verify --deep --strict "$app"
 
-          ditto -c -k --sequesterRsrc --keepParent "$app" "dist/$MAC_ASSET"
+          dmg_root="dist/dmg-root"
+          mkdir -p "$dmg_root"
+          ditto "$app" "$dmg_root/MrMCP.app"
+          ln -s /Applications "$dmg_root/Applications"
+          hdiutil create -volname "MrMCP $RELEASE_TAG" -srcfolder "$dmg_root" -ov -format UDZO "dist/$MAC_ASSET"
+          hdiutil verify "dist/$MAC_ASSET"
 
-          verify="dist/verify"
+          verify="$RUNNER_TEMP/mrmcp-dmg"
           mkdir -p "$verify"
-          ditto -x -k "dist/$MAC_ASSET" "$verify"
+          hdiutil attach -readonly -nobrowse -mountpoint "$verify" "dist/$MAC_ASSET" >/dev/null
+          trap 'hdiutil detach "$verify" >/dev/null 2>&1 || true' EXIT
           plutil -lint "$verify/MrMCP.app/Contents/Info.plist"
           test -x "$verify/MrMCP.app/Contents/MacOS/MrMCP"
           test -f "$verify/MrMCP.app/Contents/Resources/MrMCP.icns"
+          test -L "$verify/Applications"
           codesign --verify --deep --strict "$verify/MrMCP.app"
+          hdiutil detach "$verify" >/dev/null
+          trap - EXIT
 
-      - name: Stage macOS app archive
+      - name: Stage macOS disk image
         uses: actions/upload-artifact@v4
         with:
           name: macos-${{ matrix.arch }}-release-asset
@@ -222,8 +231,8 @@ jobs:
           files=(
             dist/mrmcp-windows-x64.exe
             dist/mrmcp-linux-x64
-            dist/mrmcp-macos-x64.app.zip
-            dist/mrmcp-macos-arm64.app.zip
+            dist/mrmcp-macos-x64.dmg
+            dist/mrmcp-macos-arm64.dmg
           )
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release delete-asset "$RELEASE_TAG" mrmcp-macos-x64 --yes >/dev/null 2>&1 || true

@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.103
+# MrMCP 0.10.104
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a local Tauriless administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit Session `context_handle` capabilities.
 
@@ -24,7 +24,7 @@ The desktop window uses Tauriless through a pinned literal dynamic Deno import i
 - `commands.yaml` — editable extra-command catalog. Source mode reads this root file directly; portable standalone builds materialize the embedded first-run template beside the executable, while the macOS `.app` build stores it under `~/Library/Application Support/MrMCP/` so the application bundle stays immutable.
 - `README.md` — user and operator documentation.
 - `AGENTS.md` — implementation invariants and release checks.
-- `.github/workflows/release.yml` — tag-driven release workflow. Windows x64 and Linux x64 remain standalone binary assets; macOS x64 and Apple Silicon are built natively as Finder-launchable `MrMCP.app` bundles and published as `.app.zip` archives.
+- `.github/workflows/release.yml` — tag-driven release workflow. Windows x64 and Linux x64 remain standalone binary assets; macOS x64 and Apple Silicon are built natively as Finder-launchable `MrMCP.app` bundles and published inside `.dmg` disk images.
 - `.github/workflows/test-macos.yml` — native macOS GUI smoke test on GitHub-hosted Intel and Apple Silicon runners; it runs on relevant `main` pushes, pull requests or manual dispatch, builds and launches MrMCP, and fails if the real WebView bootstrap exits or reaches its 10-second timeout.
 - `assets/` — static WebView/build assets: `morphlex.js`, SVG/PNG branding, Windows ICO and administration screenshots.
 
@@ -80,10 +80,10 @@ Pushing a version tag matching `mrmcp.js` `VERSION` runs `.github/workflows/rele
 
 - `mrmcp-windows-x64.exe`
 - `mrmcp-linux-x64`
-- `mrmcp-macos-x64.app.zip`
-- `mrmcp-macos-arm64.app.zip`
+- `mrmcp-macos-x64.dmg`
+- `mrmcp-macos-arm64.dmg`
 
-Each macOS archive contains `MrMCP.app` with `Contents/MacOS/MrMCP`, `Contents/Info.plist` and `Contents/Resources/MrMCP.icns`. The workflow generates the `.icns` from the versioned MrMCP PNG, checks the executable bit and plist links, ad-hoc signs the bundle, verifies the signature, then archives it with macOS `ditto` so Finder bundle metadata and executable permissions survive the GitHub download. Extract the archive and open `MrMCP.app` from Finder; it may also be moved to `/Applications` because its writable state lives in Application Support rather than inside the bundle.
+Each macOS disk image contains `MrMCP.app` plus an `Applications` link for the normal drag-to-Applications Finder flow. `MrMCP.app` contains `Contents/MacOS/MrMCP`, `Contents/Info.plist` and `Contents/Resources/MrMCP.icns`. The workflow generates the `.icns` from the versioned MrMCP PNG, checks the executable bit and plist links, ad-hoc signs the bundle, verifies the signature, creates a compressed read-only DMG with native `hdiutil`, mounts that DMG again and revalidates the app before upload. Double-click the `.dmg` in Finder, then drag `MrMCP.app` to Applications or launch it directly from the mounted image.
 
 The current CI does not have an Apple Developer ID certificate/notarization credential. The ad-hoc signature validates the bundle itself, but a file carrying Internet quarantine can still trigger Gatekeeper on first launch. A completely warning-free first double-click after downloading from GitHub requires Developer ID signing plus Apple notarization; that is independent from the `.app` packaging.
 
@@ -340,6 +340,11 @@ Settings also provides **Clear Operational Data**. It preserves authentication s
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count and the live/recent five-second Tool Call table at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### 0.10.104
+
+- Replaced the macOS `.app.zip` release containers with native compressed `.dmg` disk images, each containing the signed `MrMCP.app` bundle plus an `Applications` link for the conventional Finder drag-install flow.
+- Added DMG creation, verification, mount-back validation and app signature checks to the native macOS release jobs.
 
 ### 0.10.103
 
