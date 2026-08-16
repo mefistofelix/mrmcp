@@ -9,12 +9,14 @@ on:
       - "mrmcp.js"
       - "commands.yaml"
       - "assets/**"
+      - ".github/tests/tauriless-macos-probe.js"
       - ".github/workflows/test-macos.yml"
   pull_request:
     paths:
       - "mrmcp.js"
       - "commands.yaml"
       - "assets/**"
+      - ".github/tests/tauriless-macos-probe.js"
       - ".github/workflows/test-macos.yml"
 
 permissions:
@@ -55,6 +57,15 @@ jobs:
 
       - name: Check source
         run: deno check --minimum-dependency-age=0 mrmcp.js
+
+      - name: Diagnose Tauriless asset bootstrap
+        shell: bash
+        run: |
+          set +e
+          deno run --minimum-dependency-age=0 --allow-ffi --allow-write .github/tests/tauriless-macos-probe.js
+          status=$?
+          set -e
+          echo "Tauriless probe exit: $status"
 
       - name: Build standalone
         shell: bash
