@@ -25,7 +25,7 @@ The desktop window uses Tauriless through a pinned literal dynamic Deno import i
 - `README.md` — user and operator documentation.
 - `AGENTS.md` — implementation invariants and release checks.
 - `.github/workflows/release.yml` — tag-driven release workflow that cross-compiles and publishes four standalone binaries: Windows x64, Linux x64, macOS x64 and macOS Apple Silicon (arm64).
-- `.github/workflows/test-macos.yml` — native macOS GUI smoke test on GitHub-hosted Intel and Apple Silicon runners; it builds and launches MrMCP and fails if the real WebView bootstrap exits or reaches its 10-second timeout.
+- `.github/workflows/test-macos.yml` — native macOS GUI smoke test on GitHub-hosted Intel and Apple Silicon runners; it runs on relevant `main` pushes, pull requests or manual dispatch, builds and launches MrMCP, and fails if the real WebView bootstrap exits or reaches its 10-second timeout.
 - `assets/` — static WebView/build assets: `morphlex.js`, SVG/PNG branding, Windows ICO and administration screenshots.
 
 ## Requirements and startup

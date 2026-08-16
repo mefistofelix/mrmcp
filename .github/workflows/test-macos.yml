@@ -2,6 +2,14 @@ name: Mac GUI Test
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "mrmcp.js"
+      - "commands.yaml"
+      - "assets/**"
+      - ".github/workflows/test-macos.yml"
   pull_request:
     paths:
       - "mrmcp.js"
