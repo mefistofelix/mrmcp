@@ -1,0 +1,153 @@
+diff --git a/tauriless/Cargo.toml b/tauriless/Cargo.toml
+index f9713c6..52618dc 100644
+--- a/tauriless/Cargo.toml
++++ b/tauriless/Cargo.toml
+@@ -24,6 +24,9 @@ tauri-plugin-store = "=2.4.4"
+ thiserror = "2.0"
+ sha2 = "0.10"
+ 
++[target.'cfg(target_os = "macos")'.dependencies]
++tauri-runtime-wry = "=2.11.4"
++
+ [target.'cfg(windows)'.dependencies]
+ windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Storage_EnhancedStorage", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem"] }
+ 
+diff --git a/tauriless/lib.rs b/tauriless/lib.rs
+index 905b711..a50d54b 100644
+--- a/tauriless/lib.rs
++++ b/tauriless/lib.rs
+@@ -6,6 +6,8 @@
+ 
+ mod asset_protocol;
+ mod event_subscriptions;
++#[cfg(target_os = "macos")]
++mod timed_iteration;
+ 
+ use std::{
+     cell::RefCell,
+@@ -113,6 +115,8 @@ pub struct Tauriless {
+     outbox: Outbox,
+     asset_protocol: asset_protocol::AssetProtocol,
+     event_subscriptions: event_subscriptions::SharedEventSubscriptions,
++    #[cfg(target_os = "macos")]
++    timed_iteration_deadline: timed_iteration::Deadline,
+     draining: bool,
+     drain_buffer: CString,
+ }
+@@ -125,6 +129,8 @@ impl Tauriless {
+             FORWARDED_EVENT_NAMES,
+         );
+         let asset_protocol = asset_protocol::AssetProtocol::new(Arc::clone(&outbox));
++        #[cfg(target_os = "macos")]
++        let timed_iteration_deadline = timed_iteration::new_deadline();
+ 
+         Ok(Self {
+             app: None,
+@@ -134,6 +140,8 @@ impl Tauriless {
+             outbox,
+             asset_protocol,
+             event_subscriptions,
++            #[cfg(target_os = "macos")]
++            timed_iteration_deadline,
+             draining: false,
+             drain_buffer: CString::default(),
+         })
+@@ -236,9 +244,13 @@ impl Tauriless {
+         self.draining = true;
+ 
+         if let Some(app) = self.app.as_mut() {
++            #[cfg(target_os = "macos")]
++            timed_iteration::arm(&self.timed_iteration_deadline, 16);
+             let outbox = Arc::clone(&self.outbox);
+             #[allow(deprecated)]
+             app.run_iteration(move |_app, event| collect_event(&outbox, event));
++            #[cfg(target_os = "macos")]
++            timed_iteration::clear(&self.timed_iteration_deadline);
+         }
+ 
+         let messages = std::mem::take(&mut *self.outbox.lock().expect("outbox mutex poisoned"));
+@@ -424,6 +436,8 @@ impl Tauriless {
+                 true
+             })
+             .build(context)?;
++        #[cfg(target_os = "macos")]
++        app.wry_plugin(timed_iteration::Builder(Arc::clone(&self.timed_iteration_deadline)));
+ 
+         // Complete Tauri setup without creating a bootstrap window or webview.
+         let setup_outbox = Arc::clone(&self.outbox);
+diff --git a/tauriless/timed_iteration.rs b/tauriless/timed_iteration.rs
+new file mode 100644
+index 0000000..c19be83
+--- /dev/null
++++ b/tauriless/timed_iteration.rs
+@@ -0,0 +1,70 @@
++use std::{sync::{Arc, Mutex}, time::{Duration, Instant}};
++
++use tauri::EventLoopMessage;
++use tauri_runtime_wry::{
++    tao::{
++        event::{Event, StartCause},
++        event_loop::{ControlFlow, EventLoopProxy as TaoEventLoopProxy, EventLoopWindowTarget},
++    },
++    Context, EventLoopIterationContext, Message, Plugin, PluginBuilder, WebContextStore,
++};
++
++pub type Deadline = Arc<Mutex<Option<Instant>>>;
++
++pub fn new_deadline() -> Deadline {
++    Arc::new(Mutex::new(None))
++}
++
++pub fn arm(deadline: &Deadline, millis: u64) {
++    *deadline.lock().expect("timed iteration mutex poisoned") =
++        Some(Instant::now() + Duration::from_millis(millis));
++}
++
++pub fn clear(deadline: &Deadline) {
++    *deadline.lock().expect("timed iteration mutex poisoned") = None;
++}
++
++pub struct Builder(pub Deadline);
++pub struct TimedIteration {
++    deadline: Deadline,
++}
++
++impl PluginBuilder<EventLoopMessage> for Builder {
++    type Plugin = TimedIteration;
++
++    fn build(self, _context: Context<EventLoopMessage>) -> Self::Plugin {
++        TimedIteration { deadline: self.0 }
++    }
++}
++
++impl Plugin<EventLoopMessage> for TimedIteration {
++    fn on_event(
++        &mut self,
++        event: &Event<Message<EventLoopMessage>>,
++        _event_loop: &EventLoopWindowTarget<Message<EventLoopMessage>>,
++        _proxy: &TaoEventLoopProxy<Message<EventLoopMessage>>,
++        control_flow: &mut ControlFlow,
++        _context: EventLoopIterationContext<'_, EventLoopMessage>,
++        _web_context: &WebContextStore,
++    ) -> bool {
++        let Some(deadline) = *self.deadline.lock().expect("timed iteration mutex poisoned") else {
++            return false;
++        };
++
++        match event {
++            Event::MainEventsCleared => {
++                *control_flow = if Instant::now() >= deadline {
++                    ControlFlow::Exit
++                } else {
++                    ControlFlow::WaitUntil(deadline)
++                };
++                true
++            }
++            Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
++                *control_flow = ControlFlow::Exit;
++                true
++            }
++            _ => false,
++        }
++    }
++}
