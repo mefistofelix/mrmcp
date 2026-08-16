@@ -15,7 +15,8 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  build-portable:
+    name: Build Windows and Linux
     runs-on: ubuntu-latest
     env:
       RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
@@ -52,22 +53,6 @@ jobs:
           --output dist/mrmcp-linux-x64
           mrmcp.js
 
-      - name: Build macOS x64
-        run: >-
-          deno compile --minimum-dependency-age=0 -A --unstable-ffi
-          --target x86_64-apple-darwin
-          --include assets --include commands.yaml
-          --output dist/mrmcp-macos-x64
-          mrmcp.js
-
-      - name: Build macOS arm64
-        run: >-
-          deno compile --minimum-dependency-age=0 -A --unstable-ffi
-          --target aarch64-apple-darwin
-          --include assets --include commands.yaml
-          --output dist/mrmcp-macos-arm64
-          mrmcp.js
-
       - name: Build Windows x64
         run: >-
           deno compile --minimum-dependency-age=0 -A --unstable-ffi
@@ -77,6 +62,152 @@ jobs:
           --output dist/mrmcp-windows-x64.exe
           mrmcp.js
 
+      - name: Stage Windows and Linux assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-release-assets
+          path: |
+            dist/mrmcp-windows-x64.exe
+            dist/mrmcp-linux-x64
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS ${{ matrix.arch }} app
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: mrmcp-macos-x64.app.zip
+          - arch: arm64
+            runner: macos-15
+            target: aarch64-apple-darwin
+            asset: mrmcp-macos-arm64.app.zip
+    runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+      TARGET: ${{ matrix.target }}
+      MAC_ASSET: ${{ matrix.asset }}
+    steps:
+      - name: Check out tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.9.5
+
+      - name: Verify version matches tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^const VERSION = "\([^"]*\)";/\1/p' mrmcp.js)"
+          test -n "$version"
+          test "$version" = "$RELEASE_TAG"
+
+      - name: Build MrMCP.app
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="dist/MrMCP.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+
+          deno compile --minimum-dependency-age=0 -A --unstable-ffi \
+            --target "$TARGET" \
+            --include assets --include commands.yaml \
+            --output "$app/Contents/MacOS/MrMCP" \
+            mrmcp.js
+          chmod 755 "$app/Contents/MacOS/MrMCP"
+
+          iconset="dist/MrMCP.iconset"
+          mkdir -p "$iconset"
+          for size in 16 32 128 256 512; do
+            double=$((size * 2))
+            sips -s format png -z "$size" "$size" assets/mrmcp-logo.png \
+              --out "$iconset/icon_${size}x${size}.png" >/dev/null
+            sips -s format png -z "$double" "$double" assets/mrmcp-logo.png \
+              --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+          done
+          iconutil -c icns "$iconset" -o "$app/Contents/Resources/MrMCP.icns"
+
+          cat > "$app/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleDisplayName</key><string>MrMCP</string>
+            <key>CFBundleExecutable</key><string>MrMCP</string>
+            <key>CFBundleIconFile</key><string>MrMCP.icns</string>
+            <key>CFBundleIdentifier</key><string>com.mefistofelix.mrmcp</string>
+            <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+            <key>CFBundleName</key><string>MrMCP</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>${RELEASE_TAG}</string>
+            <key>CFBundleVersion</key><string>${RELEASE_TAG}</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+
+          plutil -lint "$app/Contents/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "MrMCP"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app/Contents/Info.plist")" = "MrMCP.icns"
+          test -x "$app/Contents/MacOS/MrMCP"
+          test -f "$app/Contents/Resources/MrMCP.icns"
+          file "$app/Contents/MacOS/MrMCP"
+
+          xattr -cr "$app"
+          codesign --force --sign - "$app"
+          codesign --verify --deep --strict "$app"
+
+          ditto -c -k --sequesterRsrc --keepParent "$app" "dist/$MAC_ASSET"
+
+          verify="dist/verify"
+          mkdir -p "$verify"
+          ditto -x -k "dist/$MAC_ASSET" "$verify"
+          plutil -lint "$verify/MrMCP.app/Contents/Info.plist"
+          test -x "$verify/MrMCP.app/Contents/MacOS/MrMCP"
+          test -f "$verify/MrMCP.app/Contents/Resources/MrMCP.icns"
+          codesign --verify --deep --strict "$verify/MrMCP.app"
+
+      - name: Stage macOS app archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}-release-asset
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs:
+      - build-portable
+      - build-macos
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+    steps:
+      - name: Download Windows and Linux assets
+        uses: actions/download-artifact@v4
+        with:
+          name: portable-release-assets
+          path: dist
+
+      - name: Download macOS x64 app
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-x64-release-asset
+          path: dist
+
+      - name: Download macOS arm64 app
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-arm64-release-asset
+          path: dist
+
       - name: Show checksums
         shell: bash
         run: sha256sum dist/*
@@ -84,16 +215,19 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
           files=(
             dist/mrmcp-windows-x64.exe
             dist/mrmcp-linux-x64
-            dist/mrmcp-macos-x64
-            dist/mrmcp-macos-arm64
+            dist/mrmcp-macos-x64.app.zip
+            dist/mrmcp-macos-arm64.app.zip
           )
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release delete-asset "$RELEASE_TAG" mrmcp-macos-x64 --yes >/dev/null 2>&1 || true
+            gh release delete-asset "$RELEASE_TAG" mrmcp-macos-arm64 --yes >/dev/null 2>&1 || true
             gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
           else
             gh release create "$RELEASE_TAG" "${files[@]}" \

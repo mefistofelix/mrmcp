@@ -1,6 +1,6 @@
 /*
-MrMCP 0.10.100 — Simplify WebView bootstrap for macOS compatibility.
-Runtime data: .mrmcp beside the script or standalone executable.
+MrMCP 0.10.101 — Package native macOS app bundles for Finder releases.
+Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
 GUI library: Tauriless, imported directly from npm by Deno.
@@ -22,7 +22,15 @@ const SELF = new URL(import.meta.url);
 const IS_BACKEND_WORKER = globalThis.name === "mrmcp-backend";
 const MODULE_DIR = dirname(fileURLToPath(SELF));
 const ASSETS_DIR = join(MODULE_DIR, "assets");
-const APP_DIR = Deno.build.standalone ? dirname(Deno.execPath()) : MODULE_DIR;
+const STANDALONE_DIR = Deno.build.standalone ? dirname(Deno.execPath()) : "";
+const MACOS_APP_BUNDLE = Deno.build.standalone && Deno.build.os === "darwin" &&
+  basename(dirname(STANDALONE_DIR)) === "Contents" && extname(dirname(dirname(STANDALONE_DIR))).toLowerCase() === ".app";
+const macosAppDataDir = () => {
+  const home = Deno.env.get("HOME");
+  if (!home) throw new Error("HOME is required to run the macOS app bundle");
+  return join(home, "Library", "Application Support", "MrMCP");
+};
+const APP_DIR = MACOS_APP_BUNDLE ? macosAppDataDir() : Deno.build.standalone ? STANDALONE_DIR : MODULE_DIR;
 const COMMANDS_TEMPLATE_PATH = join(MODULE_DIR, "commands.yaml");
 const COMMANDS_PATH = join(APP_DIR, "commands.yaml");
 const PORT_FALLBACK_STEP = 50;
@@ -41,7 +49,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.100";
+const VERSION = "0.10.101";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;
@@ -355,6 +363,7 @@ const JS_KERNEL_SOURCE = jsKernelWorkerSource.toString().match(/\/\*([\s\S]*)\*\
 // Backend lifecycle, persistence and network services.
 async function backend() {
   if (Deno.build.standalone) {
+    await Deno.mkdir(APP_DIR, { recursive: true });
     try { await Deno.lstat(COMMANDS_PATH); }
     catch (error) {
       if (!(error instanceof Deno.errors.NotFound)) throw error;

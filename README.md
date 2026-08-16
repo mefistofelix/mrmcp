@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.100
+# MrMCP 0.10.101
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a local Tauriless administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit Session `context_handle` capabilities.
 
@@ -21,10 +21,10 @@ The desktop window uses Tauriless through a pinned literal dynamic Deno import i
 ## Project files
 
 - `mrmcp.js` — backend, MCP endpoint, SQLite schema, administration UI and desktop launcher.
-- `commands.yaml` — editable extra-command catalog. Source mode reads this root file directly; standalone builds embed it as the first-run template and materialize it beside `mrmcp.exe` only when no physical `commands.yaml` exists.
+- `commands.yaml` — editable extra-command catalog. Source mode reads this root file directly; portable standalone builds materialize the embedded first-run template beside the executable, while the macOS `.app` build stores it under `~/Library/Application Support/MrMCP/` so the application bundle stays immutable.
 - `README.md` — user and operator documentation.
 - `AGENTS.md` — implementation invariants and release checks.
-- `.github/workflows/release.yml` — tag-driven release workflow that cross-compiles and publishes four standalone binaries: Windows x64, Linux x64, macOS x64 and macOS Apple Silicon (arm64).
+- `.github/workflows/release.yml` — tag-driven release workflow. Windows x64 and Linux x64 remain standalone binary assets; macOS x64 and Apple Silicon are built natively as Finder-launchable `MrMCP.app` bundles and published as `.app.zip` archives.
 - `.github/workflows/test-macos.yml` — native macOS GUI smoke test on GitHub-hosted Intel and Apple Silicon runners; it runs on relevant `main` pushes, pull requests or manual dispatch, builds and launches MrMCP, and fails if the real WebView bootstrap exits or reaches its 10-second timeout.
 - `assets/` — static WebView/build assets: `morphlex.js`, SVG/PNG branding, Windows ICO and administration screenshots.
 
@@ -56,7 +56,7 @@ Public listener ports are runtime-resolved without changing configuration. If HT
 
 Port fallback only resolves listener collisions; it does not isolate application data. Parallel MrMCP instances intended for testing should be run from separate program directories so each has its own `.mrmcp` data directory and editable `commands.yaml`.
 
-The local GUI does not expose `/assets/...` routes. Its small CSS, Morphlex bootstrap and logo data are delivered inside the Tauriless local asset response. MCP `serverInfo` still advertises the MrMCP PNG logo at `${publicBase()}/mrmcp-icon.png`; that exact read-only HTTPS path is intentionally public so remote clients can fetch the icon. With `deno run`, source assets come from the repository `assets/` directory. Standalone builds embed that directory with `deno compile --include assets`, so the local GUI and public icon still use the same versioned files. `commands.yaml` is not a WebView asset: compile it separately with `--include commands.yaml`; on first standalone backend startup, MrMCP copies the embedded template beside the executable only if no editable physical `commands.yaml` exists there.
+The local GUI does not expose `/assets/...` routes. Its small CSS, Morphlex bootstrap and logo data are delivered inside the Tauriless local asset response. MCP `serverInfo` still advertises the MrMCP PNG logo at `${publicBase()}/mrmcp-icon.png`; that exact read-only HTTPS path is intentionally public so remote clients can fetch the icon. With `deno run`, source assets come from the repository `assets/` directory. Standalone builds embed that directory with `deno compile --include assets`, so the local GUI and public icon still use the same versioned files. `commands.yaml` is not a WebView asset: compile it separately with `--include commands.yaml`. Portable standalone builds materialize the first-run template beside the executable; a packaged macOS `.app` instead uses `~/Library/Application Support/MrMCP/commands.yaml` and `~/Library/Application Support/MrMCP/.mrmcp/`, keeping mutable state outside the signed application bundle.
 
 Windows standalone build:
 
@@ -68,13 +68,16 @@ deno compile -A --unstable-ffi --no-terminal --include assets --include commands
 
 ### Release binaries
 
-Pushing a version tag matching `mrmcp.js` `VERSION` (for example `0.10.98`) runs `.github/workflows/release.yml` with Deno 2.9.5. The workflow checks the source, cross-compiles from one GitHub Linux runner, creates or updates the GitHub Release, and uploads exactly these project-built assets:
+Pushing a version tag matching `mrmcp.js` `VERSION` runs `.github/workflows/release.yml` with Deno 2.9.5. Windows and Linux are built on Linux; each macOS architecture is built on its matching native GitHub macOS runner so the release can create and validate a real Apple application bundle. The GitHub Release contains exactly these project-built assets:
 
 - `mrmcp-windows-x64.exe`
 - `mrmcp-linux-x64`
-- `mrmcp-macos-x64`
+- `mrmcp-macos-x64.app.zip`
+- `mrmcp-macos-arm64.app.zip`
 
-All three embed `assets/` and `commands.yaml`; the Windows target additionally keeps `--no-terminal` and the MrMCP ICO. Tauriless 0.1.11 currently ships native desktop bindings for `win32-x64`, `linux-x64` and `darwin-x64`, so the macOS release is x64; Apple Silicon Macs require Rosetta 2 for this build.
+Each macOS archive contains `MrMCP.app` with `Contents/MacOS/MrMCP`, `Contents/Info.plist` and `Contents/Resources/MrMCP.icns`. The workflow generates the `.icns` from the versioned MrMCP PNG, checks the executable bit and plist links, ad-hoc signs the bundle, verifies the signature, then archives it with macOS `ditto` so Finder bundle metadata and executable permissions survive the GitHub download. Extract the archive and open `MrMCP.app` from Finder; it may also be moved to `/Applications` because its writable state lives in Application Support rather than inside the bundle.
+
+The current CI does not have an Apple Developer ID certificate/notarization credential. The ad-hoc signature validates the bundle itself, but a file carrying Internet quarantine can still trigger Gatekeeper on first launch. A completely warning-free first double-click after downloading from GitHub requires Developer ID signing plus Apple notarization; that is independent from the `.app` packaging.
 
 ## MCP 2026-07-28 and stateless operation
 
@@ -330,8 +333,9 @@ Both maintenance actions use the same Promise barrier, not an application queue:
 
 ## Development changelog
 
-### Unreleased
+### 0.10.101
 
+- Changed macOS release artifacts from raw executables to native x64/arm64 `MrMCP.app` bundles inside `.app.zip` archives, with `Info.plist`, generated `.icns`, executable permissions, ad-hoc code signing and structural validation on native macOS runners. Packaged apps keep `commands.yaml` and `.mrmcp` under `~/Library/Application Support/MrMCP/` so runtime writes never modify the application bundle.
 - Added a separate GitHub Actions macOS GUI smoke-test workflow. It runs natively on `macos-15-intel` and Apple Silicon `macos-15`, builds the matching standalone executable, launches the real Tauriless WebView, waits beyond MrMCP's 10-second bootstrap deadline and fails with the captured process log if the application exits or reports a WebView bootstrap timeout.
 
 ### 0.10.100
