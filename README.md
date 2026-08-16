@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.98
+# MrMCP 0.10.99
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a local Tauriless administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit Session `context_handle` capabilities.
 
@@ -16,7 +16,7 @@ Named Workspaces and their Sessions are managed in one drag-and-drop view, with 
 
 ![MrMCP Workspaces and Sessions view](./assets/mrmcp-screenshot2.png)
 
-The desktop window uses Tauriless through the pinned direct Deno import `import { Tauriless } from "npm:@mefistofelix/tauriless@0.1.12";`. Desktop mode keeps one OS process: Tauriless runs on the main OS thread with a ~16 ms Deno drain timer while the backend runs in a Deno Worker/isolate in the same `mrmcp.exe`. MrMCP has no hand-written FFI wrapper, vendored Tauriless native binaries, Node.js application, npm project, CLI scaffold, Rust/Tauri scaffold or Neutralinojs runtime.
+The desktop window uses Tauriless through a pinned literal dynamic Deno import inside `desktop()`: `await import("npm:@mefistofelix/tauriless@0.1.12")`. The backend Worker never evaluates Tauriless, because its module opens the native library eagerly with `Deno.dlopen`; this keeps the native bridge loaded only once in the process and avoids duplicate Objective-C class registration on macOS. Desktop mode keeps one OS process: Tauriless runs on the main OS thread with a ~16 ms Deno drain timer while the backend runs in a Deno Worker/isolate in the same executable. MrMCP has no hand-written FFI wrapper, vendored Tauriless native binaries, Node.js application, npm project, CLI scaffold, Rust/Tauri scaffold or Neutralinojs runtime.
 
 ## Project files
 
@@ -328,6 +328,10 @@ Settings also provides **Clear Operational Data**. It preserves authentication s
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count and the live/recent five-second Tool Call table at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### 0.10.99
+
+- Load Tauriless lazily only in the desktop/main isolate instead of importing it at module top level. The backend Worker therefore never executes Tauriless' eager `Deno.dlopen`, preventing the same macOS dylib from being mapped twice and registering duplicate Objective-C classes such as `NotificationCenterDelegate`.
 
 ### 0.10.98
 
