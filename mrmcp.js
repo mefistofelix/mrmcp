@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.102 — Update Tauriless and complete headless/log/dashboard improvements.
+MrMCP 0.10.103 — Validate Tauriless 0.1.13 with native macOS GUI smoke tests.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -66,7 +66,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.102";
+const VERSION = "0.10.103";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;

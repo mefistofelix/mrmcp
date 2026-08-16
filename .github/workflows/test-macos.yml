@@ -9,24 +9,12 @@ on:
       - "mrmcp.js"
       - "commands.yaml"
       - "assets/**"
-      - ".github/tests/tauriless-macos-probe.js"
-      - ".github/tests/tauriless-probe-scheme.patch"
-      - ".github/tests/tauriless-probe-sync.patch"
-      - ".github/tests/tauriless-probe-resize.patch"
-      - ".github/tests/tauriless-run-loop-probe.rs"
-      - ".github/tests/tauriless-timed-iteration.patch"
       - ".github/workflows/test-macos.yml"
   pull_request:
     paths:
       - "mrmcp.js"
       - "commands.yaml"
       - "assets/**"
-      - ".github/tests/tauriless-macos-probe.js"
-      - ".github/tests/tauriless-probe-scheme.patch"
-      - ".github/tests/tauriless-probe-sync.patch"
-      - ".github/tests/tauriless-probe-resize.patch"
-      - ".github/tests/tauriless-run-loop-probe.rs"
-      - ".github/tests/tauriless-timed-iteration.patch"
       - ".github/workflows/test-macos.yml"
 
 permissions:
@@ -34,20 +22,23 @@ permissions:
 
 jobs:
   gui-bootstrap:
-    name: macOS Apple Silicon
-    runs-on: macos-15
-    timeout-minutes: 30
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Intel
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - name: macOS Apple Silicon
+            runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
 
     steps:
       - name: Check out source
         uses: actions/checkout@v4
-
-      - name: Check out Tauriless source
-        uses: actions/checkout@v4
-        with:
-          repository: mefistofelix/tauriless
-          ref: main
-          path: tauriless-src
 
       - name: Set up Deno
         uses: denoland/setup-deno@v2
@@ -62,22 +53,52 @@ jobs:
           uname -a
           uname -m
 
-      - name: Build timed run_iteration Tauriless
+      - name: Check source
+        run: deno check --minimum-dependency-age=0 mrmcp.js
+
+      - name: Build standalone
+        shell: bash
+        run: >-
+          deno compile --minimum-dependency-age=0 -A --unstable-ffi
+          --target ${{ matrix.target }}
+          --include assets --include commands.yaml
+          --output mrmcp-test
+          mrmcp.js
+
+      - name: Test WebView bootstrap
         shell: bash
         run: |
           set -euo pipefail
-          git -C tauriless-src apply "$GITHUB_WORKSPACE/.github/tests/tauriless-timed-iteration.patch"
-          cargo build --release --manifest-path tauriless-src/tauriless/Cargo.toml
-          file tauriless-src/tauriless/target/release/libtauriless.dylib
+          log="$RUNNER_TEMP/mrmcp.log"
+          ./mrmcp-test >"$log" 2>&1 &
+          pid=$!
 
-      - name: Test timed asset bootstrap
-        shell: bash
-        env:
-          TAURILESS_LIBRARY_PATH: ${{ github.workspace }}/tauriless-src/tauriless/target/release/libtauriless.dylib
-        run: |
-          set +e
-          deno run --minimum-dependency-age=0 --allow-env --allow-ffi --allow-write .github/tests/tauriless-macos-probe.js
-          status=$?
-          set -e
-          echo "Timed iteration probe exit: $status"
-          test "$status" -eq 0
+          cleanup() {
+            if kill -0 "$pid" 2>/dev/null; then
+              kill "$pid" 2>/dev/null || true
+              sleep 1
+              kill -9 "$pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          for second in $(seq 1 15); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              set +e
+              wait "$pid"
+              status=$?
+              set -e
+              echo "MrMCP exited during GUI bootstrap with status $status"
+              cat "$log"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          if grep -Fq "Tauriless WebView input bootstrap timed out" "$log"; then
+            cat "$log"
+            exit 1
+          fi
+
+          echo "MrMCP remained alive past the 10 s WebView bootstrap deadline."
+          cat "$log"

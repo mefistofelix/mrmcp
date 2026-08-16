@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.102
+# MrMCP 0.10.103
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a local Tauriless administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit Session `context_handle` capabilities.
 
@@ -340,6 +340,10 @@ Settings also provides **Clear Operational Data**. It preserves authentication s
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count and the live/recent five-second Tool Call table at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### 0.10.103
+
+- Restored the independent macOS GUI smoke test after the Tauriless run-loop diagnostics: CI now compiles and launches the actual MrMCP standalone with Tauriless `0.1.13` on both Intel and Apple Silicon, requiring it to remain alive beyond the WebView bootstrap deadline.
 
 ### 0.10.102
 
