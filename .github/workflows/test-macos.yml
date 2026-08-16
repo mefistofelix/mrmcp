@@ -13,6 +13,7 @@ on:
       - ".github/tests/tauriless-probe-scheme.patch"
       - ".github/tests/tauriless-probe-sync.patch"
       - ".github/tests/tauriless-probe-resize.patch"
+      - ".github/tests/tauriless-run-loop-probe.rs"
       - ".github/workflows/test-macos.yml"
   pull_request:
     paths:
@@ -23,6 +24,7 @@ on:
       - ".github/tests/tauriless-probe-scheme.patch"
       - ".github/tests/tauriless-probe-sync.patch"
       - ".github/tests/tauriless-probe-resize.patch"
+      - ".github/tests/tauriless-run-loop-probe.rs"
       - ".github/workflows/test-macos.yml"
 
 permissions:
@@ -91,3 +93,33 @@ jobs:
           status=$?
           set -e
           echo "HTTPS navigation probe exit: $status"
+
+      - name: Test native Tauri run loop
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tauriless-src/tauriless/examples
+          cp .github/tests/tauriless-run-loop-probe.rs tauriless-src/tauriless/examples/run_loop_probe.rs
+          cargo build --release --manifest-path tauriless-src/tauriless/Cargo.toml --example run_loop_probe
+
+          log="$RUNNER_TEMP/run-loop-probe.log"
+          tauriless-src/tauriless/target/release/examples/run_loop_probe >"$log" 2>&1 &
+          pid=$!
+          status=124
+          for second in $(seq 1 10); do
+            if ! kill -0 "$pid" 2>/dev/null; then
+              set +e
+              wait "$pid"
+              status=$?
+              set -e
+              break
+            fi
+            sleep 1
+          done
+          if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            sleep 1
+            kill -9 "$pid" 2>/dev/null || true
+          fi
+          cat "$log"
+          echo "Native run-loop probe exit: $status"
