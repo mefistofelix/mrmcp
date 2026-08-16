@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.97 — Remove horizontal overflow from the Dashboard Active Tool Calls panel.
+MrMCP 0.10.98 — Release four standalone platform binaries and add Apple Silicon support.
 Runtime data: .mrmcp beside the script or standalone executable.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -17,7 +17,7 @@ import { isIP } from "node:net";
 import { Eta } from "jsr:@bgub/eta@4.6.0";
 import { parse as parseYaml, stringify as stringifyYaml } from "jsr:@std/yaml@1.1.2";
 import { contentType as mediaContentType, typeByExtension } from "jsr:@std/media-types@1.1.0";
-import { Tauriless } from "npm:@mefistofelix/tauriless@0.1.11";
+import { Tauriless } from "npm:@mefistofelix/tauriless@0.1.12";
 
 const SELF = new URL(import.meta.url);
 const IS_BACKEND_WORKER = globalThis.name === "mrmcp-backend";
@@ -42,7 +42,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.97";
+const VERSION = "0.10.98";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;

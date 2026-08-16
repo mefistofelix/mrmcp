@@ -4,5 +4,8 @@
 !/AGENTS.md
 !/mrmcp.js
 !/commands.yaml
+!/.github/
+!/.github/workflows/
+!/.github/workflows/release.yml
 !/assets/
 !/assets/**

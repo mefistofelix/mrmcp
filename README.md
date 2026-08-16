@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.95
+# MrMCP 0.10.98
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated MCP endpoint at `/mcp`, a local Tauriless administration interface, filesystem and text-editing tools, an extra-command catalog, managed processes, a persistent JavaScript worker, OAuth and Basic authentication, TLS automation, and explicit Session `context_handle` capabilities.
 
@@ -16,7 +16,7 @@ Named Workspaces and their Sessions are managed in one drag-and-drop view, with 
 
 ![MrMCP Workspaces and Sessions view](./assets/mrmcp-screenshot2.png)
 
-The desktop window uses Tauriless through the direct Deno import `import { Tauriless } from "npm:@mefistofelix/tauriless";`. Desktop mode keeps one OS process: Tauriless runs on the main OS thread with a ~16 ms Deno drain timer while the backend runs in a Deno Worker/isolate in the same `mrmcp.exe`. MrMCP has no hand-written FFI wrapper, vendored Tauriless native binaries, Node.js application, npm project, CLI scaffold, Rust/Tauri scaffold or Neutralinojs runtime.
+The desktop window uses Tauriless through the pinned direct Deno import `import { Tauriless } from "npm:@mefistofelix/tauriless@0.1.12";`. Desktop mode keeps one OS process: Tauriless runs on the main OS thread with a ~16 ms Deno drain timer while the backend runs in a Deno Worker/isolate in the same `mrmcp.exe`. MrMCP has no hand-written FFI wrapper, vendored Tauriless native binaries, Node.js application, npm project, CLI scaffold, Rust/Tauri scaffold or Neutralinojs runtime.
 
 ## Project files
 
@@ -24,6 +24,7 @@ The desktop window uses Tauriless through the direct Deno import `import { Tauri
 - `commands.yaml` — editable extra-command catalog. Source mode reads this root file directly; standalone builds embed it as the first-run template and materialize it beside `mrmcp.exe` only when no physical `commands.yaml` exists.
 - `README.md` — user and operator documentation.
 - `AGENTS.md` — implementation invariants and release checks.
+- `.github/workflows/release.yml` — tag-driven release workflow that cross-compiles and publishes four standalone binaries: Windows x64, Linux x64, macOS x64 and macOS Apple Silicon (arm64).
 - `assets/` — static WebView/build assets: `morphlex.js`, SVG/PNG branding, Windows ICO and administration screenshots.
 
 ## Requirements and startup
@@ -63,6 +64,16 @@ deno compile -A --unstable-ffi --no-terminal --include assets --include commands
 ```
 
 `--no-terminal` makes the Windows standalone executable a GUI application, so launching `mrmcp.exe` opens the WebView without an additional console window. Source-mode `deno run` remains a normal terminal process for development and diagnostics.
+
+### Release binaries
+
+Pushing a version tag matching `mrmcp.js` `VERSION` (for example `0.10.98`) runs `.github/workflows/release.yml` with Deno 2.9.5. The workflow checks the source, cross-compiles from one GitHub Linux runner, creates or updates the GitHub Release, and uploads exactly these project-built assets:
+
+- `mrmcp-windows-x64.exe`
+- `mrmcp-linux-x64`
+- `mrmcp-macos-x64`
+
+All three embed `assets/` and `commands.yaml`; the Windows target additionally keeps `--no-terminal` and the MrMCP ICO. Tauriless 0.1.11 currently ships native desktop bindings for `win32-x64`, `linux-x64` and `darwin-x64`, so the macOS release is x64; Apple Silicon Macs require Rosetta 2 for this build.
 
 ## MCP 2026-07-28 and stateless operation
 
@@ -317,6 +328,11 @@ Settings also provides **Clear Operational Data**. It preserves authentication s
 Both maintenance actions use the same Promise barrier, not an application queue: new Tool Calls remain waiting, already in-flight Tool Calls finish, maintenance runs, then all waiting Tool Calls continue. Their dialogs are confirmation-only and close immediately after Confirm; completion does not open another dialog. Only the action button that was confirmed shows a spinner and live `N in flight · M waiting` progress; once in-flight reaches zero it shows the maintenance operation running while retaining the waiting count, then returns to its normal label. The Dashboard also shows the current Tool Calls In Flight count and the live/recent five-second Tool Call table at all times. Managed processes already detached from a completed `exec_start` Tool Call do not delay maintenance. Clear Operational Data does not delete certificates, commands or trash contents; Empty Trash only removes trash contents.
 
 ## Development changelog
+
+### 0.10.98
+
+- Added a tag-driven GitHub Actions release workflow that verifies the tag against `VERSION`, uses Deno 2.9.5 and publishes exactly four standalone executables: Windows x64, Linux x64, macOS x64 and macOS arm64.
+- Updated the pinned desktop dependency to Tauriless `0.1.12`, whose package includes the new `darwin-arm64` native bridge required for Apple Silicon. Release CI explicitly disables Deno's default 24-hour minimum dependency age so a newly published pinned Tauriless release can be built immediately.
 
 ### 0.10.97
 
