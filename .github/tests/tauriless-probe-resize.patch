@@ -1,5 +1,5 @@
 diff --git a/tauriless/lib.rs b/tauriless/lib.rs
-index 905b711..4c4c6b5 100644
+index 905b711..ad438b3 100644
 --- a/tauriless/lib.rs
 +++ b/tauriless/lib.rs
 @@ -57,6 +57,7 @@ const FORWARDED_EVENT_NAMES: &[&str] = &[
@@ -10,16 +10,17 @@ index 905b711..4c4c6b5 100644
  const SET_APP_USER_MODEL_ID_COMMAND: &str = "tauriless:set-app-user-model-id";
  const DEFAULT_IDENTIFIER: &str = "Tauriless";
  
-@@ -189,6 +190,22 @@ impl Tauriless {
+@@ -189,6 +190,23 @@ impl Tauriless {
              return self.create_webview(request);
          }
  
 +        if request.cmd == FORCE_RESIZE_COMMAND {
 +            let webviews = self.app()?.webview_windows();
 +            let webview = select_webview(webviews, request.webview.as_deref())?;
-+            let size = webview.inner_size()?;
++            let window = webview.window();
++            let size = window.inner_size()?;
 +            let resized = tauri::PhysicalSize::new(size.width.saturating_add(1), size.height);
-+            let outcome = webview
++            let outcome = window
 +                .set_size(resized)
 +                .map(|_| json!({
 +                  "width": resized.width,
@@ -33,7 +34,7 @@ index 905b711..4c4c6b5 100644
          if self.app.is_none() {
              return Err(Error::Request(format!(
                  "no webview exists; the first command must be `{CREATE_WEBVIEW_WINDOW_COMMAND}`"
-@@ -351,6 +368,23 @@ impl Tauriless {
+@@ -351,6 +369,23 @@ impl Tauriless {
              builder = builder.data_directory(data_directory.clone());
          }
  
