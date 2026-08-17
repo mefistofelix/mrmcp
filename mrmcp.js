@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.107 — Restore macOS tray, close interception, and notifications.
+MrMCP 0.10.108 — Request macOS notification permission before delivery.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -66,7 +66,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.107";
+const VERSION = "0.10.108";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;
@@ -7199,7 +7199,7 @@ async function desktop() {
     }
     return { rgba: Array.from(rgba), width, height };
   };
-  let nextId = 1, drainTimer = null, windowVisibilityTimer = null, closed = false, webviewMessagesReady = false, notificationsReady = false, windowRenderVisible = false, resolveClosed, resolveWebviewReady;
+  let nextId = 1, drainTimer = null, windowVisibilityTimer = null, notificationPermission = null, closed = false, webviewMessagesReady = false, notificationsReady = false, windowRenderVisible = false, resolveClosed, resolveWebviewReady;
   const workerMessageQueue = [], notificationQueue = [];
   const channel = () => `__CHANNEL__:${crypto.getRandomValues(new Uint32Array(1))[0]}`;
   const windowClosed = new Promise(resolve => { resolveClosed = resolve; });
@@ -7247,9 +7247,15 @@ async function desktop() {
     if (await request("plugin:window|is_minimized", { label: "main" })) return showWindow();
     return await request("plugin:window|is_visible", { label: "main" }) ? hideWindow() : showWindow();
   };
-  const notify = message => request("plugin:notification|notify", { options: {
-    title: String(message.title || "Notification").slice(0, 160), body: String(message.body || "").slice(0, 500),
-  } });
+  const notificationAllowed = () => notificationPermission ??= Deno.build.os !== "darwin" ? Promise.resolve(true) : (async () =>
+    await request("plugin:notification|is_permission_granted") ||
+    await request("plugin:notification|request_permission") === "granted")();
+  const notify = async message => {
+    if (!await notificationAllowed()) return;
+    return request("plugin:notification|notify", { options: {
+      title: String(message.title || "Notification").slice(0, 160), body: String(message.body || "").slice(0, 500),
+    } });
+  };
   const handleWorkerMessage = data => {
     if (data?.type === "ui-render") {
       if (!windowRenderVisible) return;
@@ -7343,10 +7349,10 @@ async function desktop() {
       id: "mrmcp-tray", menu: [menuRid, "Menu"], icon: nativeIcon(),
       tooltip: `MrMCP ${VERSION}`, showMenuOnLeftClick: false, iconAsTemplate: Deno.build.os === "darwin",
     }, handler: channel() });
+    await showWindow();
     notificationsReady = true;
     for (const message of notificationQueue.splice(0))
       void notify(message).catch(error => console.error("MrMCP notification failed", error));
-    await showWindow();
     await windowClosed;
   } finally {
     backendWorker.removeEventListener("message", onWorkerMessage);
