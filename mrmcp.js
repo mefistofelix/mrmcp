@@ -7150,7 +7150,7 @@ async function stopBackendWorker(worker) {
 }
 async function desktop() {
   const { worker: backendWorker, payload, earlyMessages } = await spawnBackendWorker();
-  const { Tauriless } = await import("npm:@mefistofelix/tauriless@0.1.14");
+  const { Tauriless } = await import("npm:@mefistofelix/tauriless@0.1.15");
   const tauriless = new Tauriless(), pending = new Map();
   const nativeIcon = () => {
     const ico = Deno.readFileSync(join(ASSETS_DIR, "mrmcp.ico"));
@@ -7318,11 +7318,8 @@ async function desktop() {
         resolveClosed();
       }
     }, 16);
-    if (Deno.build.os === "darwin") await request("tauriless:set-app-identifier", {
-      identifier: "com.mefistofelix.mrmcp",
-    });
-    if (Deno.build.os === "windows") await request("tauriless:set-app-user-model-id", {
-      appId: Deno.execPath(), name: "MrMCP",
+    await request("tauriless:set-app-user-model-id", {
+      appId: "com.mefistofelix.mrmcp", name: "MrMCP",
     });
     for (const event of [
       "tauri://move", "tauri://scale-change", "tauri://theme-changed", "tauri://window-created", "tauri://webview-created",
