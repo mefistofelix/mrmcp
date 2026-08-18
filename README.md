@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.109
+# MrMCP 0.10.110
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated `/mcp` endpoint, Workspace-scoped Sessions, filesystem and process tools, OAuth/Basic authentication, TLS automation, and a local Tauriless administration UI.
 
@@ -83,7 +83,7 @@ Commands and execution:
 - `exec`, `exec_start`, `exec_attach`, `exec_write`, `exec_kill`, `exec_list`, `exec_status`
 - `js`, `js_add_node_module_dir`, `js_reset`
 
-Filesystem removal is reversible: MrMCP exposes trash/restore tools instead of a permanent delete tool.
+Filesystem removal is reversible: MrMCP exposes trash/restore tools instead of a permanent delete tool. All Workspaces share the single MrMCP-managed `APP_DIR/.mrmcp/trash/` store; MrMCP never creates `.mrmcp` metadata directories inside named Workspaces.
 
 Persistent processes use the integer `exec_id` returned by `exec_start`; follow-up process tools require the same Session `context_handle`.
 

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.110
+
+- Fixed Workspace trash storage so MrMCP has exactly one trash location at `APP_DIR/.mrmcp/trash/`; named Workspaces no longer receive `.mrmcp/trash` directories. Trash manifests retain absolute original paths, restore remains scoped to the originating Workspace, and cross-volume trash/restore falls back from rename to copy+remove with rollback.
+- Updated Dashboard Trash and Empty Trash to read and clear only the single global MrMCP trash store.
+
 ## 0.10.109
 
 - Unified `publish_file` and `publish_html` persistence under `.mrmcp/publish/` with one shared `published` metadata table. File snapshots use `<id>-<original filename including extension>` and retain the exact source path/name plus physical and exposed filenames; HTML snapshots use `<id>.html`; both retain the call-time Session id. Added a Published GUI with type/Session/size filters, native OS opening, per-item deletion and Clear All. Publications survive source deletion and server restarts and are persistent by default unless explicit expiry or one-time semantics are requested.

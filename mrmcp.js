@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.109 — Add Published management and Desktop Workspace creation.
+MrMCP 0.10.110 — Centralize Workspace trash under MrMCP data.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -88,7 +88,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.109";
+const VERSION = "0.10.110";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;
@@ -412,6 +412,7 @@ async function backend({ addWorkspace = null } = {}) {
     }
   }
   const DATA = join(APP_DIR, ".mrmcp");
+  const TRASH_ROOT = join(DATA, "trash");
   const TLS_DATA = DATA;
   const DB_PATH = join(DATA, "mrmcp.sqlite");
   const CERT_PATH = join(TLS_DATA, "fullchain.pem");
@@ -2419,6 +2420,20 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       await Deno.copyFile(from, to);
     }
   }
+  async function moveRecursive(from, to) {
+    await Deno.mkdir(dirname(to), { recursive: true });
+    try { await Deno.rename(from, to); }
+    catch (error) {
+      if (!(error instanceof Deno.errors.NotSupported) && error?.code !== "EXDEV") throw error;
+      try {
+        await copyRecursive(from, to);
+        await Deno.remove(from, { recursive: true });
+      } catch (copyError) {
+        await Deno.remove(to, { recursive: true }).catch(() => {});
+        throw copyError;
+      }
+    }
+  }
 
   // Session context handles are globally unique bearer capabilities over the stateless MCP transport.
   // Each Session has exactly one current Workspace; workspace id 0 is the program-folder fallback.
@@ -2429,33 +2444,24 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     id: 0, server_id: p.id, name: "Program folder", path: APP_DIR, enabled: 1, fallback: true,
   });
   const configuredRootPath = configuredWorkspacePath;
-  async function emptyManagedTrash(p) {
+  async function emptyManagedTrash() {
     return await withToolCallsDrained("trash", async () => {
-      const roots = [APP_DIR, ...all("SELECT path FROM roots WHERE server_id=? ORDER BY id", p.id).map(row => configuredRootPath(row.path))];
-      const unique = new Map();
-      for (const root of roots) unique.set(Deno.build.os === "windows" ? resolve(root).toLowerCase() : resolve(root), resolve(root));
       const result = { trash_roots: 0, entries_removed: 0, failures: [] };
-      for (const root of unique.values()) {
-        const trashRoot = join(root, ".mrmcp", "trash");
-        let stat;
-        try { stat = await Deno.stat(trashRoot); }
-        catch (error) {
-          if (error instanceof Deno.errors.NotFound) continue;
-          result.failures.push(`${trashRoot}: ${String(error?.message || error)}`);
-          continue;
-        }
-        if (!stat.isDirectory) {
-          result.failures.push(`${trashRoot}: not a directory`);
-          continue;
-        }
-        result.trash_roots++;
-        try {
-          for await (const entry of Deno.readDir(trashRoot)) {
-            await Deno.remove(join(trashRoot, entry.name), { recursive: true });
-            result.entries_removed++;
-          }
-        } catch (error) {
-          result.failures.push(`${trashRoot}: ${String(error?.message || error)}`);
+      let stat;
+      try { stat = await Deno.stat(TRASH_ROOT); }
+      catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) result.failures.push(`${TRASH_ROOT}: ${String(error?.message || error)}`);
+      }
+      if (stat) {
+        if (!stat.isDirectory) result.failures.push(`${TRASH_ROOT}: not a directory`);
+        else {
+          result.trash_roots = 1;
+          try {
+            for await (const entry of Deno.readDir(TRASH_ROOT)) {
+              await Deno.remove(join(TRASH_ROOT, entry.name), { recursive: true });
+              result.entries_removed++;
+            }
+          } catch (error) { result.failures.push(`${TRASH_ROOT}: ${String(error?.message || error)}`); }
         }
       }
       emitUiChange(["dashboard"], "trash-empty");
@@ -3145,7 +3151,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       copy_path: ["Copy a file or directory recursively.", { properties: { from: { type: "string" }, to: { type: "string" }, ...contextInput }, required: ["from", "to"] }],
       move_path: ["Move or rename a path.", { properties: { from: { type: "string" }, to: { type: "string" }, ...contextInput }, required: ["from", "to"] }],
       trash_paths: [
-        "Move files or directories selected by explicit Workspace-relative paths and/or one glob into a reversible .mrmcp/trash action. Each call creates one timestamped action directory plus a sibling JSON manifest; use untrash_action with the returned action_id to restore the whole action.",
+        "Move files or directories selected by explicit Workspace-relative paths and/or one glob into MrMCP's single reversible .mrmcp/trash store beside the application data. Workspaces never receive their own .mrmcp directory. Each call creates one timestamped action directory plus a sibling JSON manifest; use untrash_action from the originating Workspace with the returned action_id to restore the whole action.",
         { anyOf: [{ required: ["paths"] }, { required: ["glob"] }], properties: {
           paths: { type: "array", minItems: 1, maxItems: 200, items: { type: "string" } },
           glob: { type: "string" }, ...contextInput,
@@ -4490,8 +4496,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     }
     if (name === "trash_paths" || name === "untrash_action") {
       const rootReal = await Deno.realPath(selection.root.path);
-      const metadataRoot = join(rootReal, ".mrmcp");
-      const trashRoot = join(metadataRoot, "trash");
+      const metadataRoot = resolve(DATA);
+      const trashRoot = resolve(TRASH_ROOT);
       const exists = async path => {
         try { await Deno.lstat(path); return true; }
         catch (error) { if (error instanceof Deno.errors.NotFound) return false; throw error; }
@@ -4503,8 +4509,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
           const target = await resolvePath(raw);
           if (!await exists(target.path)) throw new Error(`Path not found: ${raw}`);
           if (resolve(target.path) === resolve(rootReal)) throw new Error("Cannot trash the current Workspace");
-          if (resolve(target.path) === resolve(metadataRoot) || within(metadataRoot, target.path))
-            throw new Error("Cannot trash .mrmcp metadata");
+          if (resolve(target.path) === metadataRoot || within(metadataRoot, target.path))
+            throw new Error("Cannot trash MrMCP metadata");
           candidates.push(target);
         };
         for (const raw of args.paths || []) await addCandidate(raw);
@@ -4514,7 +4520,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
           async function visit(dir) {
             for await (const entry of Deno.readDir(dir)) {
               const absolute = join(dir, entry.name), display = slash(absolute);
-              if (display === ".mrmcp" || display.startsWith(".mrmcp/")) continue;
+              if (resolve(absolute) === metadataRoot || within(metadataRoot, absolute)) continue;
               const matched = match.test(display);
               if (matched) await addCandidate(display);
               if (entry.isDirectory && !matched) await visit(absolute);
@@ -4548,27 +4554,26 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         const trashRootExisted = await exists(trashRoot), moved = [];
         try {
           await Deno.mkdir(actionDir, { recursive: true });
-          for (const target of selected) {
-            const destination = join(actionDir, ...target.display.split("/"));
-            await Deno.mkdir(dirname(destination), { recursive: true });
-            await Deno.rename(target.path, destination);
+          for (const [index, target] of selected.entries()) {
+            const destination = join(actionDir, `${index}-${basename(target.path)}`);
+            await moveRecursive(target.path, destination);
             moved.push({ source: target.path, destination });
           }
           await Deno.writeTextFile(manifestPath, JSON.stringify({
             action_id: actionId,
             created_at: new Date().toISOString(),
-            paths: selected.map(target => target.display),
+            paths: selected.map(target => resolve(target.path)),
           }, null, 2) + "\n");
         } catch (error) {
-          for (const item of moved.reverse()) await Deno.rename(item.destination, item.source).catch(() => {});
+          for (const item of moved.reverse()) await moveRecursive(item.destination, item.source).catch(() => {});
           await Deno.remove(actionDir, { recursive: true }).catch(() => {});
           if (!trashRootExisted) await Deno.remove(trashRoot).catch(() => {});
           throw error;
         }
         return {
           action_id: actionId,
-          trash_path: `.mrmcp/trash/${actionId}`,
-          manifest_path: `.mrmcp/trash/${actionId}.json`,
+          trash_path: actionDir,
+          manifest_path: manifestPath,
           paths: selected.map(target => target.display),
         };
       }
@@ -4576,25 +4581,25 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       if (!/^\d{8}-\d{6}(?:-\d+)?$/.test(actionId)) throw new Error("Invalid trash action_id");
       const actionDir = join(trashRoot, actionId), manifestPath = join(trashRoot, `${actionId}.json`);
       const manifest = JSON.parse(await Deno.readTextFile(manifestPath));
-      const paths = Array.isArray(manifest.paths) ? manifest.paths.map(String) : [];
+      const paths = Array.isArray(manifest.paths) ? manifest.paths.map(path => resolve(String(path))) : [];
       if (!paths.length) throw new Error("Trash action contains no paths");
       const items = [];
-      for (const display of paths) {
-        const source = resolve(actionDir, ...display.replaceAll("\\", "/").split("/"));
-        if (!within(actionDir, source) || !await exists(source)) throw new Error(`Trashed path is unavailable: ${display}`);
-        const target = await resolvePath(display);
-        if (await exists(target.path)) throw new Error(`Restore target already exists: ${display}`);
-        if (!await exists(dirname(target.path))) throw new Error(`Restore parent is unavailable: ${display}`);
-        items.push({ source, target: target.path, display });
+      for (const [index, target] of paths.entries()) {
+        if (!within(rootReal, target)) throw new Error("Trash action belongs to another Workspace");
+        const source = join(actionDir, `${index}-${basename(target)}`);
+        if (!within(actionDir, source) || !await exists(source)) throw new Error(`Trashed path is unavailable: ${target}`);
+        if (await exists(target)) throw new Error(`Restore target already exists: ${target}`);
+        if (!await exists(dirname(target))) throw new Error(`Restore parent is unavailable: ${target}`);
+        items.push({ source, target });
       }
       const restored = [];
       try {
         for (const item of items) {
-          await Deno.rename(item.source, item.target);
+          await moveRecursive(item.source, item.target);
           restored.push(item);
         }
       } catch (error) {
-        for (const item of restored.reverse()) await Deno.rename(item.target, item.source).catch(() => {});
+        for (const item of restored.reverse()) await moveRecursive(item.target, item.source).catch(() => {});
         throw error;
       }
       await Deno.remove(actionDir, { recursive: true });
@@ -5739,22 +5744,17 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       (SELECT MAX(x.created_at) FROM contexts x WHERE x.oauth_client_id=c.client_id) last_session_at
       FROM oauth_clients c ORDER BY c.created_at DESC`);
 
-  function liveTrashProjection(p) {
-    const roots = [APP_DIR, ...all("SELECT path FROM roots WHERE server_id=? ORDER BY id", p.id).map(row => configuredRootPath(row.path))];
-    const unique = new Map(), actions = [];
-    for (const root of roots) unique.set(Deno.build.os === "windows" ? resolve(root).toLowerCase() : resolve(root), resolve(root));
-    for (const root of unique.values()) {
-      const trashRoot = join(root, ".mrmcp", "trash");
-      try {
-        for (const entry of Deno.readDirSync(trashRoot)) {
-          if (!entry.isDirectory || !/^\d{8}-\d{6}(?:-\d+)?$/.test(entry.name)) continue;
-          const trashPath = join(trashRoot, entry.name);
-          let lastAt = 0;
-          try { lastAt = Deno.statSync(trashPath).mtime?.getTime() || 0; } catch {}
-          actions.push({ action_id: entry.name, trash_path: trashPath, last_at: lastAt });
-        }
-      } catch {}
-    }
+  function liveTrashProjection() {
+    const actions = [];
+    try {
+      for (const entry of Deno.readDirSync(TRASH_ROOT)) {
+        if (!entry.isDirectory || !/^\d{8}-\d{6}(?:-\d+)?$/.test(entry.name)) continue;
+        const trashPath = join(TRASH_ROOT, entry.name);
+        let lastAt = 0;
+        try { lastAt = Deno.statSync(trashPath).mtime?.getTime() || 0; } catch {}
+        actions.push({ action_id: entry.name, trash_path: trashPath, last_at: lastAt });
+      }
+    } catch {}
     actions.sort((a, b) => b.last_at - a.last_at || b.action_id.localeCompare(a.action_id));
     const latest = actions[0];
     return latest
@@ -5777,8 +5777,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         ORDER BY id DESC LIMIT 1`, p.id, `\"action_id\":\"${actionId}\"`);
       relativeTrashPath = String(parseJson(original?.resolved_json || "", {})?.trash_path || "");
     }
-    if (!relativeTrashPath && actionId) relativeTrashPath = `.mrmcp/trash/${actionId}`;
-    const trashPath = row.root_path && relativeTrashPath
+    if (!relativeTrashPath && actionId) relativeTrashPath = join(TRASH_ROOT, actionId);
+    const trashPath = isAbsolute(relativeTrashPath) ? relativeTrashPath : row.root_path && relativeTrashPath
       ? join(String(row.root_path), ...relativeTrashPath.replaceAll("\\", "/").split("/"))
       : relativeTrashPath;
     return {
@@ -5842,7 +5842,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         total_requests: one("SELECT value n FROM metrics WHERE name='requests'")?.n || 0,
       };
       result.trash_activity = {
-        trash: liveTrashProjection(p),
+        trash: liveTrashProjection(),
         untrash: trashActivityProjection(p, "untrash_action"),
       };
     }
@@ -6571,7 +6571,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         uiConfirm("Clear Operational Data", "Delete Tool Calls, process history, HTTP logs, published snapshots and reset request metrics? Authentication, Sessions, Workspaces, settings and registered tools are preserved. Workspace files, certificates, commands and trash are not touched.", "clear-database");
         return;
       case "empty-trash":
-        uiConfirm("Empty Trash", "Permanently delete all contents of .mrmcp/trash under the program folder and every configured Workspace? This cannot be undone.", "empty-trash");
+        uiConfirm("Empty Trash", "Permanently delete all contents of MrMCP's single .mrmcp/trash store? This cannot be undone.", "empty-trash");
         return;
       case "detect-ip":
         await uiInternalApi("/api/network/detect", { method: "POST" });
@@ -6861,7 +6861,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       catch (error) { return json({ error: String(error?.message || error) }, 500); }
     }
     if (u.pathname === "/api/trash/empty" && req.method === "POST") {
-      try { return json(await emptyManagedTrash(serverConfig())); }
+      try { return json(await emptyManagedTrash()); }
       catch (error) { return json({ error: String(error?.message || error) }, 500); }
     }
     if (u.pathname === "/api/network/detect" && req.method === "POST") {
