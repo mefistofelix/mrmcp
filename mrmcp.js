@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.108 — Request macOS notification permission before delivery.
+MrMCP 0.10.109 — Add Published management and Desktop Workspace creation.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -15,6 +15,7 @@ import { spawn as nodeSpawn } from "node:child_process";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isIP } from "node:net";
+import { userInfo } from "node:os";
 import { Eta } from "jsr:@bgub/eta@4.6.0";
 import { parse as parseYaml, stringify as stringifyYaml } from "jsr:@std/yaml@1.1.2";
 import { contentType as mediaContentType, typeByExtension } from "jsr:@std/media-types@1.1.0";
@@ -34,6 +35,27 @@ const macosAppDataDir = () => {
 };
 const APP_DIR = MACOS_APP_BUNDLE ? macosAppDataDir() : Deno.build.standalone ? STANDALONE_DIR : MODULE_DIR;
 const configuredWorkspacePath = value => resolve(APP_DIR, String(value || "."));
+const nativeHomeDir = () => {
+  const home = String(userInfo().homedir || "").trim();
+  if (!home) throw new Error("Unable to resolve the current user's home directory from the operating system.");
+  return resolve(home);
+};
+async function desktopDirectory() {
+  const home = nativeHomeDir();
+  if (Deno.build.os === "linux") {
+    try {
+      const text = await Deno.readTextFile(join(home, ".config", "user-dirs.dirs"));
+      const match = text.match(/^\s*XDG_DESKTOP_DIR\s*=\s*"([^"]*)"/m);
+      if (match) {
+        const value = match[1].replaceAll("${HOME}", home).replaceAll("$HOME", home);
+        if (value) return resolve(value);
+      }
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw new Error("Unable to resolve Desktop directory.");
+    }
+  }
+  return join(home, "Desktop");
+}
 const validWorkspaceName = name => {
   const value = String(name || "").trim();
   return value.length >= 1 && value.length <= 128 && !/[\/\\\x00-\x1f\x7f]/.test(value);
@@ -53,7 +75,7 @@ const COMMANDS_PATH = join(APP_DIR, "commands.yaml");
 const PORT_FALLBACK_STEP = 50;
 const UI_INPUT_EVENT = "tauriless://webview-message", UI_RENDER_EVENT = "mrmcp://ui-render";
 const BASE_TOOLS = [
-  "list_workspaces", "open_workspace", "read_file", "read_files", "write_file", "write_files",
+  "list_workspaces", "create_workspace", "open_workspace", "read_file", "read_files", "write_file", "write_files",
   "edit", "replace", "glob", "grep",
   "file_info", "create_directory", "copy_path", "move_path", "trash_paths", "untrash_action",
   "publish_file", "publish_html", "list_commands", "query_tool_calls", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
@@ -66,7 +88,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.108";
+const VERSION = "0.10.109";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;
@@ -75,8 +97,8 @@ const CONTEXT_HANDLE_OUTPUT_DESCRIPTION = "Opaque capability identifying a persi
 const CONTEXT_HANDLE_RULE = "Requires the exact Session context_handle returned by open_workspace.";
 const MCP_UI_EXTENSION = "io.modelcontextprotocol/ui";
 const MCP_UI_MIME_TYPE = "text/html;profile=mcp-app";
-const FILE_PREVIEW_UI_URI = "ui://mrmcp/file-preview-v4.html";
-const HTML_PREVIEW_UI_URI = "ui://mrmcp/html-preview-v1.html";
+const FILE_PREVIEW_UI_URI = "ui://mrmcp/file-preview-v5.html";
+const HTML_PREVIEW_UI_URI = "ui://mrmcp/html-preview-v2.html";
 const enc = new TextEncoder(), dec = new TextDecoder();
 
 const stringResponse = (body, status, type, headers = {}) => {
@@ -409,6 +431,7 @@ async function backend({ addWorkspace = null } = {}) {
   };
   const BIN_DIR = join(DATA, "bin");
   const TEMP_DIR = join(DATA, "tmp");
+  const PUBLISH_DIR = join(DATA, "publish");
   Deno.mkdirSync(DATA, { recursive: true });
   if (!addWorkspace) {
     Deno.mkdirSync(BIN_DIR, { recursive: true });
@@ -416,13 +439,14 @@ async function backend({ addWorkspace = null } = {}) {
       if (!(error instanceof Deno.errors.NotFound)) throw error;
     });
     Deno.mkdirSync(TEMP_DIR, { recursive: true });
+    Deno.mkdirSync(PUBLISH_DIR, { recursive: true });
   }
   const db = new DatabaseSync(DB_PATH);
   let uiRevision = 0, uiRenderConnected = false, uiRenderVisible = false, uiRenderVisibilityEpoch = 0;
   const deliverUiRender = payload => {
     if (IS_BACKEND_WORKER) self.postMessage({ type: "ui-render", payload });
   };
-  const UI_SECTIONS = new Set(["dashboard", "sessions", "logs", "roots", "commands", "debug", "oauth", "settings", "help"]);
+  const UI_SECTIONS = new Set(["dashboard", "sessions", "logs", "published", "roots", "commands", "debug", "oauth", "settings", "help"]);
   const uiState = {
     currentSection: "dashboard",
     scrollBySection: { dashboard: [0, 0] },
@@ -435,6 +459,7 @@ async function backend({ addWorkspace = null } = {}) {
     commands: { page: 1, query: "", pageSize: 25, includeMissing: true },
     sessions: { oauthClientId: "" },
     logs: { page: 1, query: "", context: "", status: "", pageSize: 25, openRowId: "", selfTest: null },
+    published: { page: 1, kind: "", context: "", size: "" },
     debug: { query: "", method: "", status: "", openRowId: "" },
   };
   let uiRenderTimer = null, uiLogFilterTimer = null, uiNoticeTimer = null, uiRenderRunning = false, uiRenderQueued = false;
@@ -542,6 +567,7 @@ async function backend({ addWorkspace = null } = {}) {
     if (/\broots\b/.test(statement)) ["roots", "sessions", "dashboard"].forEach(scope => scopes.add(scope));
     if (/\bdebug_logs\b/.test(statement)) scopes.add("debug");
     if (/\bprocess_runs\b/.test(statement)) ["logs", "dashboard"].forEach(scope => scopes.add(scope));
+    if (/\bpublished\b/.test(statement)) scopes.add("published");
     if (/\bcustom_tools\b/.test(statement)) ["commands", "dashboard", "endpoints"].forEach(scope => scopes.add(scope));
     if (/\boauth_(?:clients|tokens|refresh_tokens|codes)\b/.test(statement)) ["oauth", "dashboard"].forEach(scope => scopes.add(scope));
     if (/\bserver_config\b/.test(statement)) ["dashboard", "endpoints", "settings", "oauth"].forEach(scope => scopes.add(scope));
@@ -722,17 +748,29 @@ async function backend({ addWorkspace = null } = {}) {
       error TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS process_runs_time ON process_runs(started_at DESC);
-    CREATE TABLE IF NOT EXISTS published_html(
+    CREATE TABLE IF NOT EXISTS published(
       id TEXT PRIMARY KEY,
       server_id INTEGER NOT NULL,
       context_handle TEXT NOT NULL DEFAULT '',
+      context_id INTEGER NOT NULL DEFAULT 0,
+      kind TEXT NOT NULL,
+      source_path TEXT NOT NULL DEFAULT '',
+      source_filename TEXT NOT NULL DEFAULT '',
+      published_name TEXT NOT NULL,
+      filename TEXT NOT NULL DEFAULT '',
+      mime_type TEXT NOT NULL DEFAULT '',
+      size INTEGER NOT NULL DEFAULT 0,
       title TEXT NOT NULL DEFAULT '',
-      html TEXT NOT NULL,
       height INTEGER NOT NULL DEFAULT 600,
+      expires_at INTEGER NOT NULL DEFAULT 0,
+      one_time INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL,
       FOREIGN KEY(server_id) REFERENCES server_config(id) ON DELETE CASCADE
     );
-    CREATE INDEX IF NOT EXISTS published_html_time ON published_html(created_at DESC);
+    CREATE INDEX IF NOT EXISTS published_expiry ON published(expires_at);
+    CREATE INDEX IF NOT EXISTS published_time ON published(created_at DESC);
+    CREATE INDEX IF NOT EXISTS published_context ON published(context_id,created_at DESC);
+    CREATE INDEX IF NOT EXISTS published_kind ON published(kind,created_at DESC);
     CREATE TABLE IF NOT EXISTS metrics(
       name TEXT PRIMARY KEY,
       value INTEGER NOT NULL DEFAULT 0
@@ -865,7 +903,7 @@ async function backend({ addWorkspace = null } = {}) {
     tool_call_transport: ["log_id", "progress_requested"],
     debug_log_workspaces: ["debug_log_id", "context_id", "root_id", "root_name", "root_path"],
     oauth_refresh_tokens: ["token_hash", "client_id", "server_id", "resource", "scope", "last_used_at"],
-    published_html: ["id", "server_id", "context_handle", "title", "html", "height", "created_at"],
+    published: ["id", "server_id", "context_handle", "context_id", "kind", "source_path", "source_filename", "published_name", "filename", "mime_type", "size", "title", "height", "expires_at", "one_time", "created_at"],
   };
   const schemaErrors = [];
   for (const [table, columns] of Object.entries(requiredSchema)) {
@@ -928,7 +966,7 @@ async function backend({ addWorkspace = null } = {}) {
     "MrMCP", 1, Date.now(),
   );
   const processes = new Map(), jsKernels = new Map(), activeCallControls = new Map(),
-    oauthConsents = new Map(), rateBuckets = new Map(), downloadTokens = new Map();
+    oauthConsents = new Map(), rateBuckets = new Map();
   let toolCallGate = null, toolCallsIdle = Promise.resolve(), resolveToolCallsIdle = null,
     maintenanceAction = "", maintenancePhase = "", waitingToolCalls = 0,
     headerActivityTimer = null, dashboardToolCallTimer = null;
@@ -937,7 +975,7 @@ async function backend({ addWorkspace = null } = {}) {
     active: !!toolCallGate, action: maintenanceAction, phase: maintenancePhase,
     in_flight: activeCallControls.size, waiting: waitingToolCalls,
   });
-  const emitMaintenance = () => emitUiChange(["dashboard", "settings"], "maintenance");
+  const emitMaintenance = () => emitUiChange(["dashboard", "settings", "logs", "sessions", "roots", "oauth"], "maintenance");
   const emitToolCallActivity = () => emitUiChange(["state"], "tool-call-activity");
   function toolCallLogPage(id, pageSize = uiState.logs.pageSize) {
     const row = one("SELECT id,started_at FROM logs WHERE id=?", Math.max(0, Number(id) || 0));
@@ -1033,24 +1071,36 @@ async function backend({ addWorkspace = null } = {}) {
       emitMaintenance();
     }
   }
-  async function clearOperationalDatabase() {
-    return await withToolCallsDrained("database", () => {
-      const cleared = {
-        tool_calls: one("SELECT COUNT(*) n FROM logs")?.n || 0,
-        process_runs: one("SELECT COUNT(*) n FROM process_runs")?.n || 0,
-        http_logs: one("SELECT COUNT(*) n FROM debug_logs")?.n || 0,
-        published_html: one("SELECT COUNT(*) n FROM published_html")?.n || 0,
-        requests: one("SELECT value n FROM metrics WHERE name='requests'")?.n || 0,
-      };
+  function deleteToolCallRecords() {
+    const cleared = {
+      tool_calls: one("SELECT COUNT(*) n FROM logs")?.n || 0,
+      process_runs: one("SELECT COUNT(*) n FROM process_runs")?.n || 0,
+    };
+    db.prepare("DELETE FROM tool_call_descriptors").run();
+    db.prepare("DELETE FROM tool_call_transport").run();
+    if (fts) db.prepare("DELETE FROM logs_fts").run();
+    db.prepare("DELETE FROM process_runs").run();
+    db.prepare("DELETE FROM logs").run();
+    return cleared;
+  }
+  function deleteDebugLogRecords() {
+    const count = one("SELECT COUNT(*) n FROM debug_logs")?.n || 0;
+    db.prepare("DELETE FROM debug_log_workspaces").run();
+    db.prepare("DELETE FROM debug_logs").run();
+    db.prepare("DELETE FROM sqlite_sequence WHERE name='debug_logs'").run();
+    return count;
+  }
+  function resetToolCallUi() {
+    uiState.logs.page = 1;
+    uiState.logs.openRowId = "";
+    uiState.logs.selfTest = null;
+  }
+  async function clearToolCalls() {
+    return await withToolCallsDrained("tool-calls", () => {
       db.exec("BEGIN IMMEDIATE");
+      let cleared;
       try {
-        db.prepare("DELETE FROM logs").run();
-        if (fts) db.prepare("DELETE FROM logs_fts").run();
-        db.prepare("DELETE FROM process_runs").run();
-        db.prepare("DELETE FROM debug_logs").run();
-        db.prepare("DELETE FROM published_html").run();
-        db.prepare("UPDATE metrics SET value=0").run();
-        db.prepare("DELETE FROM sqlite_sequence WHERE name='debug_logs'").run();
+        cleared = deleteToolCallRecords();
         db.exec("COMMIT");
       } catch (error) {
         db.exec("ROLLBACK");
@@ -1058,11 +1108,98 @@ async function backend({ addWorkspace = null } = {}) {
       }
       for (const [id, record] of processes)
         if (!["starting", "running"].includes(record.status)) processes.delete(id);
-      uiState.logs.page = 1;
-      uiState.logs.openRowId = "";
-      uiState.logs.selfTest = null;
+      resetToolCallUi();
+      emitUiChange(["dashboard", "logs", "sessions", "roots", "settings"], "tool-calls-clear");
+      return { ok: true, cleared };
+    });
+  }
+  async function clearSessions() {
+    return await withToolCallsDrained("sessions", async () => {
+      const p = serverConfig(), rows = all("SELECT id,handle FROM contexts WHERE server_id=?", p.id);
+      const handles = new Set(rows.map(row => row.handle));
+      for (const record of processes.values())
+        if (record.persistent && handles.has(record.context_handle) && ["starting", "running"].includes(record.status))
+          await terminateProcess(record, "SIGTERM", "user");
+      run("DELETE FROM contexts WHERE server_id=?", p.id);
+      for (const key of [...jsKernels.keys()])
+        if (key.startsWith(`${p.id}:`)) destroyJsKernel(key, "sessions cleared");
+      uiState.sessions.oauthClientId = "";
+      uiState.logs.context = "";
+      emitUiChange(["dashboard", "sessions", "roots", "logs", "oauth"], "sessions-clear");
+      return { ok: true, cleared: rows.length };
+    });
+  }
+  function clearWorkspaces() {
+    const p = serverConfig(), count = one("SELECT COUNT(*) n FROM roots WHERE server_id=?", p.id)?.n || 0;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      run("UPDATE contexts SET root_id=0,updated_at=? WHERE server_id=?", Date.now(), p.id);
+      run("DELETE FROM roots WHERE server_id=?", p.id);
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+    emitUiChange(["dashboard", "sessions", "roots"], "workspaces-clear");
+    return { ok: true, cleared: count };
+  }
+  function clearOAuthClients() {
+    const count = one("SELECT COUNT(*) n FROM oauth_clients")?.n || 0;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      db.prepare("DELETE FROM oauth_tokens").run();
+      db.prepare("DELETE FROM oauth_refresh_tokens").run();
+      db.prepare("DELETE FROM oauth_codes").run();
+      db.prepare("DELETE FROM oauth_clients").run();
+      db.exec("COMMIT");
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+    oauthConsents.clear();
+    emitUiChange(["dashboard", "oauth", "sessions"], "clients-clear");
+    return { ok: true, cleared: count };
+  }
+  async function clearOperationalDatabase() {
+    return await withToolCallsDrained("database", async () => {
+      const cleared = {
+        tool_calls: one("SELECT COUNT(*) n FROM logs")?.n || 0,
+        process_runs: one("SELECT COUNT(*) n FROM process_runs")?.n || 0,
+        http_logs: one("SELECT COUNT(*) n FROM debug_logs")?.n || 0,
+        published: one("SELECT COUNT(*) n FROM published")?.n || 0,
+        requests: one("SELECT value n FROM metrics WHERE name='requests'")?.n || 0,
+      };
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        deleteToolCallRecords();
+        deleteDebugLogRecords();
+        db.prepare("DELETE FROM published").run();
+        db.prepare("UPDATE metrics SET value=0").run();
+        db.exec("COMMIT");
+      } catch (error) {
+        db.exec("ROLLBACK");
+        throw error;
+      }
+      await Deno.remove(PUBLISH_DIR, { recursive: true }).catch(error => {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+      });
+      Deno.mkdirSync(PUBLISH_DIR, { recursive: true });
+      for (const [id, record] of processes)
+        if (!["starting", "running"].includes(record.status)) processes.delete(id);
+      resetToolCallUi();
       uiState.debug.openRowId = "";
-      emitUiChange(["dashboard", "logs", "debug", "settings"], "database-clear");
+      emitUiChange(["dashboard", "logs", "published", "debug", "sessions", "roots", "settings"], "database-clear");
+      return { ok: true, cleared };
+    });
+  }
+  async function clearPublished() {
+    return await withToolCallsDrained("published", async () => {
+      const cleared = one("SELECT COUNT(*) n FROM published")?.n || 0;
+      await Deno.remove(PUBLISH_DIR, { recursive: true }).catch(error => {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+      });
+      Deno.mkdirSync(PUBLISH_DIR, { recursive: true });
+      run("DELETE FROM published");
       return { ok: true, cleared };
     });
   }
@@ -1071,7 +1208,7 @@ async function backend({ addWorkspace = null } = {}) {
   let shuttingDown = false, mcpHttpServer, mcpHttpsServer;
   let mcpHttpActive = false, mcpTlsActive = false, mcpTlsKind = "none";
   let mcpTlsValid = false, mcpTlsTrusted = false, mcpTlsInfo = null;
-  let mcpListenError = "", renewalTimer, processCleanupTimer, downloadCleanupTimer;
+  let mcpListenError = "", renewalTimer, processCleanupTimer, publishCleanupTimer;
   const listenerFallbacks = () => [
     mcpHttpActive && mcpHttpPort !== HTTP_PORT ? `HTTP ${HTTP_PORT}→${mcpHttpPort}` : "",
     mcpTlsActive && mcpHttpsPort !== HTTPS_PORT ? `HTTPS ${HTTPS_PORT}→${mcpHttpsPort}` : "",
@@ -1132,7 +1269,7 @@ async function backend({ addWorkspace = null } = {}) {
     uri: FILE_PREVIEW_UI_URI,
     name: "mrmcp_file_preview",
     title: "MrMCP file preview",
-    description: "Sandboxed MCP App used by publish_file. It reads the temporary HTTPS URL from structuredContent, renders image files with a normal img element, and offers an Open File action for other MIME types.",
+    description: "Sandboxed MCP App used by publish_file. It reads the published HTTPS URL from structuredContent, renders image files with a normal img element, and offers an Open File action for other MIME types.",
     mimeType: MCP_UI_MIME_TYPE,
     _meta: filePreviewUiMeta(),
   });
@@ -1254,10 +1391,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     fileStage.style.display = 'none';
     image.removeAttribute('src');
     showError('');
-    if (!uri) {
-      showError('publish_file did not provide the temporary HTTPS URL required by this widget.');
-      return;
-    }
+    if (!uri) return;
     if (currentIsImage) {
       image.alt = filename;
       imageOpen.href = uri;
@@ -1287,7 +1421,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
   image.addEventListener('load', function () { showError(''); });
   image.addEventListener('error', function () {
     imageStage.style.display = 'none';
-    showError('Unable to load the published image. The temporary URL may have expired; call publish_file again.');
+    showError('Unable to load the published image. The publication may have expired or been cleared; call publish_file again.');
   });
 
   window.addEventListener('message', function (event) {
@@ -1303,13 +1437,17 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     if (message.method === 'ui/notifications/tool-result') render(message.params);
     if (message.method === 'ui/notifications/host-context-changed') applyHostContext(message.params);
   }, { passive: true });
+  window.addEventListener('openai:set_globals', function (event) {
+    var globals = event.detail && event.detail.globals;
+    if (globals && Object.prototype.hasOwnProperty.call(globals, 'toolOutput')) render(globals.toolOutput);
+  }, { passive: true });
 
   var openai = typeof window !== 'undefined' ? window.openai : undefined;
   if (openai && openai.toolOutput) render(openai.toolOutput);
 
   request('ui/initialize', {
     protocolVersion: '2026-01-26',
-    appInfo: { name: 'mrmcp-file-preview', version: '1.3.0' },
+    appInfo: { name: 'mrmcp-file-preview', version: '1.4.0' },
     appCapabilities: { availableDisplayModes: ['inline', 'fullscreen'] }
   }, 3000).then(function (result) {
     applyHostContext(result && result.hostContext);
@@ -1434,10 +1572,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     frame.style.display = 'none';
     bar.style.display = 'none';
     frame.removeAttribute('src');
-    if (!uri) {
-      showError('publish_html did not provide the persisted HTML URL required by this widget.');
-      return;
-    }
+    if (!uri) return;
     title.textContent = label;
     frame.title = label;
     frame.style.height = height + 'px';
@@ -1469,13 +1604,17 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     if (message.method === 'ui/notifications/tool-result') render(message.params);
     if (message.method === 'ui/notifications/host-context-changed') applyHostContext(message.params);
   }, { passive: true });
+  window.addEventListener('openai:set_globals', function (event) {
+    var globals = event.detail && event.detail.globals;
+    if (globals && Object.prototype.hasOwnProperty.call(globals, 'toolOutput')) render(globals.toolOutput);
+  }, { passive: true });
 
   var openai = typeof window !== 'undefined' ? window.openai : undefined;
   if (openai && openai.toolOutput) render(openai.toolOutput);
 
   request('ui/initialize', {
     protocolVersion: '2026-01-26',
-    appInfo: { name: 'mrmcp-html-preview', version: '1.0.0' },
+    appInfo: { name: 'mrmcp-html-preview', version: '1.1.0' },
     appCapabilities: { availableDisplayModes: ['inline', 'fullscreen'] }
   }, 3000).then(function (result) {
     applyHostContext(result && result.hostContext);
@@ -1531,21 +1670,51 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     return name && name !== "." && name !== ".." ? name.slice(0, 240) : "download";
   };
   const boundedExpirySeconds = value => {
-    const seconds = Number(value ?? 86400);
-    return Number.isFinite(seconds) ? Math.max(30, Math.min(seconds, 604800)) : 86400;
+    if (value == null) return null;
+    const seconds = Number(value);
+    return Number.isFinite(seconds) ? Math.max(30, Math.min(seconds, 604800)) : null;
   };
   const downloadUrl = (token, filename) => `${publicBase()}/download/${token}/${encodeURIComponent(filename)}`;
   const publishedHtmlUrl = id => `${publicBase()}/published-html/${encodeURIComponent(id)}`;
-  async function cleanupDownloadRecord(token, record, removeFile = false) {
-    if (downloadTokens.get(token) === record) downloadTokens.delete(token);
-    if (removeFile && record?.delete_after) await Deno.remove(record.path).catch(() => {});
+  const publishedPath = name => join(PUBLISH_DIR, name);
+  const publishedFileName = (id, sourceFilename) => {
+    const rawExtension = extname(sourceFilename), rawStem = basename(sourceFilename, rawExtension);
+    const extension = rawExtension.replace(/[\u0000-\u001f\u007f<>:\"|?*\/\\]/g, "_");
+    const stem = rawStem.replace(/[\u0000-\u001f\u007f<>:\"|?*\/\\]/g, "_").trim() || "file";
+    const maxStem = Math.max(1, 240 - id.length - 1 - extension.length);
+    return `${id}-${stem.slice(0, maxStem)}${extension}`;
+  };
+  async function cleanupPublished(id, strict = false) {
+    const record = one("SELECT published_name FROM published WHERE id=?", id);
+    if (!record) return false;
+    if (record.published_name) {
+      try { await Deno.remove(publishedPath(record.published_name)); }
+      catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) {
+          if (strict) throw error;
+          return false;
+        }
+      }
+    }
+    run("DELETE FROM published WHERE id=?", id);
+    return true;
   }
-  async function expireDownloadTokens(now = Date.now()) {
-    for (const [token, record] of downloadTokens)
-      if (record.expires_at <= now) await cleanupDownloadRecord(token, record, true);
+  async function openPublished(id) {
+    const record = one("SELECT published_name FROM published WHERE id=?", id);
+    if (!record?.published_name) throw new Error("Published item not found");
+    const root = await Deno.realPath(PUBLISH_DIR), path = await Deno.realPath(publishedPath(record.published_name));
+    if (!within(root, path) || !(await Deno.stat(path)).isFile) throw new Error("Published payload not found");
+    if (!IS_BACKEND_WORKER) throw new Error("Native file opening is available only in the desktop UI");
+    self.postMessage({ type: "os-open-path", path });
   }
-  async function cleanupAllDownloadTokens() {
-    await Promise.allSettled([...downloadTokens].map(([token, record]) => cleanupDownloadRecord(token, record, true)));
+  async function expirePublished(now = Date.now()) {
+    for (const record of all("SELECT id FROM published WHERE expires_at>0 AND expires_at<=?", now))
+      await cleanupPublished(record.id);
+  }
+  async function cleanupPublishedOrphans() {
+    const live = new Set(all("SELECT published_name FROM published").map(record => String(record.published_name)));
+    for await (const entry of Deno.readDir(PUBLISH_DIR))
+      if (entry.isFile && !live.has(entry.name)) await Deno.remove(join(PUBLISH_DIR, entry.name)).catch(() => {});
   }
   async function publishPath(path, options = {}) {
     const allowedRoot = await Deno.realPath(options.allowed_root || dirname(path));
@@ -1553,21 +1722,29 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     if (!within(allowedRoot, realPath)) throw new Error("Published file resolves outside its allowed root");
     const stat = await Deno.stat(realPath);
     if (!stat.isFile) throw new Error("Only regular files can be published");
-    const filename = safeDownloadName(options.filename || basename(realPath));
-    const mimeType = String(options.mime_type || inferredMimeType(filename)).trim() || "application/octet-stream";
+    const sourceFilename = basename(realPath);
+    const filename = safeDownloadName(options.filename || sourceFilename);
+    const mimeType = String(options.mime_type || inferredMimeType(sourceFilename)).trim() || "application/octet-stream";
     if (/[^\x20-\x7e]/.test(mimeType) || !/^[^\s\/]+\/[^\s]+$/.test(mimeType))
       throw new Error("Invalid MIME type");
-    const token = randomToken(32);
-    const expiresAt = Date.now() + boundedExpirySeconds(options.expires_in) * 1000;
-    const record = {
-      path: realPath, allowed_root: allowedRoot, filename, mime_type: mimeType, size: stat.size,
-      expires_at: expiresAt, one_time: options.one_time === true, delete_after: options.delete_after === true,
-    };
-    downloadTokens.set(token, record);
+    const id = randomToken(32), publishedName = publishedFileName(id, sourceFilename), snapshotPath = publishedPath(publishedName);
+    await Deno.copyFile(realPath, snapshotPath);
+    const snapshotStat = await Deno.stat(snapshotPath), seconds = boundedExpirySeconds(options.expires_in);
+    const expiresAt = seconds == null ? 0 : Date.now() + seconds * 1000, createdAt = Date.now();
+    try {
+      run(`INSERT INTO published(id,server_id,context_handle,context_id,kind,source_path,source_filename,published_name,filename,mime_type,size,title,height,expires_at,one_time,created_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        id, options.server_id, options.context_handle || "", Number(options.context_id || 0), "file", realPath, sourceFilename, publishedName,
+        filename, mimeType, snapshotStat.size, "", 0, expiresAt, +(options.one_time === true), createdAt,
+      );
+    } catch (error) {
+      await Deno.remove(snapshotPath).catch(() => {});
+      throw error;
+    }
     return {
-      filename, mime_type: mimeType, size: stat.size,
-      uri: downloadUrl(token, filename),
-      expires_at: new Date(expiresAt).toISOString(), one_time: record.one_time,
+      filename, mime_type: mimeType, size: snapshotStat.size,
+      uri: downloadUrl(id, filename),
+      expires_at: expiresAt ? new Date(expiresAt).toISOString() : null, one_time: options.one_time === true,
     };
   }
 
@@ -1576,14 +1753,20 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const disposition = mode === "inline" ? "inline" : "attachment";
     return `${disposition}; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
   };
-  function publishedHtmlResponse(req, u) {
+  async function publishedHtmlResponse(req, u) {
     const match = u.pathname.match(/^\/published-html\/(html_[A-Za-z0-9_-]{24,})$/);
     if (!match || !["GET", "HEAD"].includes(req.method))
       return text("Not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
-    const record = one("SELECT html FROM published_html WHERE id=?", match[1]);
+    const record = one("SELECT * FROM published WHERE id=? AND kind='html'", match[1]);
     if (!record) return text("Not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
+    const data = await Deno.readFile(publishedPath(record.published_name)).catch(() => null);
+    if (!data) {
+      await cleanupPublished(record.id);
+      return text("Not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
+    }
     const headers = {
       "content-type": "text/html; charset=utf-8",
+      "content-length": String(data.byteLength),
       "cache-control": "no-store, max-age=0",
       "x-content-type-options": "nosniff",
       "cross-origin-resource-policy": "cross-origin",
@@ -1591,27 +1774,27 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     };
     return req.method === "HEAD"
       ? new Response(null, { status: 200, headers })
-      : new Response(record.html, { status: 200, headers });
+      : new Response(data, { status: 200, headers });
   }
   async function downloadResponse(req, u) {
     const match = u.pathname.match(/^\/download\/([A-Za-z0-9_-]{40,})\/([^/]+)$/);
     if (!match || !["GET", "HEAD"].includes(req.method))
       return text("Not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
-    const token = match[1], record = downloadTokens.get(token);
-    if (!record || record.expires_at <= Date.now()) {
-      if (record) await cleanupDownloadRecord(token, record, true);
+    const token = match[1], record = one("SELECT * FROM published WHERE id=? AND kind='file'", token);
+    if (!record || (record.expires_at > 0 && record.expires_at <= Date.now())) {
+      if (record) await cleanupPublished(token);
       return text("Download expired or not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
     }
     let requestedName;
     try { requestedName = decodeURIComponent(match[2]); } catch { requestedName = ""; }
     if (requestedName !== record.filename)
       return text("Not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
-    const allowedRoot = await Deno.realPath(record.allowed_root).catch(() => null);
-    const realPath = await Deno.realPath(record.path).catch(() => null);
+    const allowedRoot = await Deno.realPath(PUBLISH_DIR).catch(() => null);
+    const realPath = await Deno.realPath(publishedPath(record.published_name)).catch(() => null);
     const stat = realPath && allowedRoot && within(allowedRoot, realPath)
       ? await Deno.stat(realPath).catch(() => null) : null;
     if (!stat?.isFile) {
-      await cleanupDownloadRecord(token, record, true);
+      await cleanupPublished(token);
       return text("File not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
     }
     const inlinePreview = isInlinePreviewMime(record.mime_type);
@@ -1631,7 +1814,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     };
     if (req.method === "HEAD") return new Response(null, { status: 200, headers });
     const file = await Deno.open(realPath, { read: true });
-    if (record.one_time) downloadTokens.delete(token);
+    if (record.one_time) run("DELETE FROM published WHERE id=?", token);
     const reader = file.readable.getReader();
     let finished = false;
     const finish = async () => {
@@ -1639,7 +1822,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       finished = true;
       try { reader.releaseLock(); } catch {}
       try { file.close(); } catch {}
-      if (record.one_time && record.delete_after) await Deno.remove(record.path).catch(() => {});
+      if (record.one_time) await Deno.remove(publishedPath(record.published_name)).catch(() => {});
     };
     const stream = new ReadableStream({
       async pull(controller) {
@@ -2289,10 +2472,52 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       ? "Workspace name already exists."
       : "";
   };
+  const createdWorkspaceNameWarning = name => {
+    const value = String(name || "").trim(), warning = workspaceNameWarning(value);
+    if (warning) return warning;
+    if (value === "." || value === ".." || /[<>:\"|?*]/.test(value))
+      return "Workspace name cannot be used as a Desktop folder name.";
+    if (Deno.build.os === "windows" && (/[ .]$/.test(value) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(value)))
+      return "Workspace name cannot be used as a Windows folder name.";
+    return "";
+  };
   const rootPathKey = value => {
     const path = configuredRootPath(value);
     return Deno.build.os === "windows" ? path.toLowerCase() : path;
   };
+  async function createDesktopWorkspace(p, name) {
+    const value = String(name || "").trim(), warning = createdWorkspaceNameWarning(value);
+    if (warning) throw new Error(warning);
+    const desktop = await desktopDirectory();
+    let desktopStat;
+    try { desktopStat = await Deno.stat(desktop); }
+    catch (error) {
+      if (error instanceof Deno.errors.NotFound) throw new Error("Desktop directory does not exist.");
+      throw new Error("Unable to access Desktop directory.");
+    }
+    if (!desktopStat.isDirectory) throw new Error("Desktop path is not a directory.");
+    const path = join(desktop, value), pathKey = rootPathKey(path);
+    const registered = all("SELECT name,path FROM roots WHERE server_id=?", p.id)
+      .find(root => rootPathKey(root.path) === pathKey);
+    if (registered) throw new Error(`Workspace folder is already registered by Workspace '${registered.name}'.`);
+    try {
+      await Deno.lstat(path);
+      throw new Error("Desktop folder already exists.");
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) {
+        if (error?.message === "Desktop folder already exists.") throw error;
+        throw new Error("Unable to inspect Desktop target.");
+      }
+    }
+    try { await Deno.mkdir(path); }
+    catch (error) {
+      if (error instanceof Deno.errors.AlreadyExists) throw new Error("Desktop folder already exists.");
+      throw new Error("Unable to create Desktop folder.");
+    }
+    run("INSERT INTO roots(server_id,name,path,enabled,created_at) VALUES(?,?,?,?,?)", p.id, value, path, 1, Date.now());
+    emitUiChange(["dashboard", "roots"], "workspace-created");
+    return { created: true };
+  }
   async function addDroppedRoots(paths) {
     const p = serverConfig(), roots = all("SELECT name,path FROM roots ORDER BY id");
     const rootByPath = new Map(roots.map(root => [rootPathKey(root.path), String(root.name || "")]));
@@ -2739,6 +2964,10 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       type: "string", minLength: 1, maxLength: 128,
       description: "Name of the enabled Workspace to open. Any enabled Workspace name may be supplied; the value is validated when the tool runs. The selected Session is attached to this Workspace immediately.",
     };
+    const createdWorkspaceNameInput = {
+      type: "string", minLength: 1, maxLength: 128,
+      description: "Name of the new Workspace. MrMCP derives and manages its Desktop directory internally; no path is accepted or returned by create_workspace.",
+    };
     const contextInput = {
       context_handle: {
         type: "string", minLength: 12, maxLength: 256,
@@ -2800,6 +3029,10 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       list_workspaces: [
         "List the names of all enabled Workspaces that may be passed to open_workspace. This tool does not require a Session.",
         { properties: {} },
+      ],
+      create_workspace: [
+        "Create a new empty Workspace directory on the current user's Desktop and register it as an enabled Workspace. Pass only the Workspace name; MrMCP resolves the Desktop and final path internally. The operation fails before creation if the Workspace name or final path is already registered, and fails if the target directory already exists. This tool does not require a Session.",
+        { properties: { name: createdWorkspaceNameInput }, required: ["name"] },
       ],
       open_workspace: [
         "Open the named Workspace and return the Session context_handle to use afterward. Pass current_context_handle to move an existing active Session to that Workspace without changing its handle. If current_context_handle is omitted, empty, unknown or expired, a new Session is created instead. The result includes workspace_name, cwd and agent_guidance_path. Read agent_guidance_path when non-null, then pass the returned context_handle unchanged to every later tool.",
@@ -2923,16 +3156,16 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         { properties: { action_id: { type: "string" }, ...contextInput }, required: ["action_id"] },
       ],
       publish_file: [
-        "Present an existing file to the user through the attached MCP App widget. This is the supported ChatGPT presentation path: the server puts a temporary HTTPS URL in structuredContent and the widget renders image/* through an HTML img element or shows an Open File action for other MIME types. Do not read/Base64-encode the file and do not try to construct inline or resource_link preview modes; simply call publish_file after creating the file.",
+        "Present an existing file to the user through the attached MCP App widget. The server snapshots the file into persistent private publish storage and returns an HTTPS URL in structuredContent; the publication survives server restarts and later changes or deletion of the Workspace source. The widget renders image/* through an HTML img element or shows an Open File action for other MIME types. Omit expires_in for a persistent publication, or set it only when explicit expiry is desired. Do not read/Base64-encode the file and do not construct alternate preview payloads; simply call publish_file after creating the file.",
         { properties: {
           path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" },
-          expires_in: { type: "integer", minimum: 30, maximum: 604800, default: 86400 },
+          expires_in: { type: "integer", minimum: 30, maximum: 604800, description: "Optional lifetime in seconds. Omit for a persistent publication that survives restarts." },
           one_time: { type: "boolean", default: false },
           ...contextInput,
         }, required: ["path"] },
       ],
       publish_html: [
-        "Render arbitrary interactive HTML through the attached MCP App widget. The HTML is persisted in SQLite and remains available after server restarts; the widget loads its persistent HTTPS URL inside a nested sandboxed iframe that allows scripts, forms, modals and popup links but deliberately omits allow-same-origin, so the document cannot access the MCP App or host DOM and origin-dependent storage/cookie APIs may be unavailable. Prefer self-contained HTML/CSS/JavaScript for portable results. Remote images, fonts, scripts, modules, fetch/WebSocket calls and other network dependencies may work when the current host/browser permits them, but are host/CSP dependent and normal browser CORS still applies, so do not assume they are portable. The whole MCP request, including HTML and JSON, is limited by the server's 2 MiB request-body limit.",
+        "Render arbitrary interactive HTML through the attached MCP App widget. The HTML is snapshotted into the same persistent .mrmcp/publish storage used by publish_file, with metadata in the shared published table, so it remains available after server restarts. The widget loads its persistent HTTPS URL inside a nested sandboxed iframe that allows scripts, forms, modals and popup links but deliberately omits allow-same-origin, so the document cannot access the MCP App or host DOM and origin-dependent storage/cookie APIs may be unavailable. Prefer self-contained HTML/CSS/JavaScript for portable results. Remote images, fonts, scripts, modules, fetch/WebSocket calls and other network dependencies may work when the current host/browser permits them, but are host/CSP dependent and normal browser CORS still applies, so do not assume they are portable. The whole MCP request, including HTML and JSON, is limited by the server's 2 MiB request-body limit.",
         { properties: {
           html: { type: "string", minLength: 1 },
           title: { type: "string", default: "Interactive HTML", maxLength: 200 },
@@ -3026,7 +3259,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const sessionlessOutputSchema = (properties = {}) => ({
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       type: "object", additionalProperties: false,
-      properties,
+      properties, required: Object.keys(properties),
     });
     const textMetadata = {
       encoding: { type: "string" }, bom: { type: "boolean" }, line_endings: { type: "string" },
@@ -3045,6 +3278,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     };
     const outputSchemas = {
       list_workspaces: sessionlessOutputSchema({ workspaces: stringArray }),
+      create_workspace: sessionlessOutputSchema({ created: { type: "boolean" } }),
       open_workspace: outputSchema({
         workspace_name: { type: "string", description: "Unique Workspace name selected for the returned Session." },
         cwd: { type: "string", description: "Absolute path of the selected Workspace." },
@@ -3067,7 +3301,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       move_path: outputSchema({ from: { type: "string" }, to: { type: "string" } }),
       trash_paths: outputSchema({ action_id: { type: "string" }, trash_path: { type: "string" }, manifest_path: { type: "string" }, paths: stringArray }),
       untrash_action: outputSchema({ action_id: { type: "string" }, paths: stringArray }),
-      publish_file: outputSchema({ path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" }, size: { type: "integer" }, uri: { type: "string", description: "Temporary HTTPS URL consumed by the attached MCP App widget." }, expires_at: { type: "string" }, one_time: { type: "boolean" } }),
+      publish_file: outputSchema({ path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" }, size: { type: "integer" }, uri: { type: "string", description: "HTTPS URL consumed by the attached MCP App widget; persistent unless explicit expiry or one-time semantics were requested." }, expires_at: nullableString, one_time: { type: "boolean" } }),
       publish_html: outputSchema({ id: { type: "string" }, title: { type: "string" }, uri: { type: "string", description: "Persistent HTTPS URL loaded by the attached MCP App widget." }, height: { type: "integer" }, created_at: { type: "string" } }),
       list_commands: outputSchema({ query: { type: "string" }, page: { type: "integer" }, page_size: { type: "integer" }, total: { type: "integer" }, pages: { type: "integer" }, has_more: { type: "boolean" }, bin_directory: { type: "string" }, config_file: { type: "string" }, path_precedence: { type: "string" }, invocation: { type: "object", additionalProperties: true }, commands: objectArray }),
       query_tool_calls: outputSchema({ calls: objectArray }),
@@ -3099,7 +3333,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const processOutputSchema = outputSchema(processProperties);
 
     const titles = {
-      list_workspaces: "List Workspaces", open_workspace: "Open Workspace", read_file: "Read", read_files: "Read batch",
+      list_workspaces: "List Workspaces", create_workspace: "Create Workspace", open_workspace: "Open Workspace", read_file: "Read", read_files: "Read batch",
       write_file: "Write", write_files: "Write batch", edit: "Edit", replace: "Replace",
       glob: "Glob", grep: "Grep", trash_paths: "Trash paths", untrash_action: "Restore trash action",
       publish_file: "Publish File", publish_html: "Publish HTML", list_commands: "Command Catalog", query_tool_calls: "Query Tool Calls",
@@ -3122,7 +3356,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       required: [...new Set([...(value.required || []), "context_handle"])],
     });
     const tools = [...available].filter(name => defs[name]).map(name => {
-      const requiresContext = !["list_workspaces", "open_workspace"].includes(name);
+      const requiresContext = !["list_workspaces", "create_workspace", "open_workspace"].includes(name);
       return {
         name,
         title: titles[name] || name.replaceAll("_", " ").replace(/\b\w/g, value => value.toUpperCase()),
@@ -3169,12 +3403,13 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     else {
       if (tool.outputSchema.type !== "object") errors.push("outputSchema.type must be object");
       if (tool.outputSchema.additionalProperties !== false) errors.push("outputSchema.additionalProperties must be false");
-      if (tool.name !== "list_workspaces" && !tool.outputSchema.required?.includes("context_handle"))
+      if (!["list_workspaces", "create_workspace"].includes(tool.name) && !tool.outputSchema.required?.includes("context_handle"))
         errors.push("outputSchema missing required context_handle");
-      if (tool.name === "list_workspaces" && tool.outputSchema.properties?.context_handle)
-        errors.push("list_workspaces output must not expose context_handle");
+      if (["list_workspaces", "create_workspace"].includes(tool.name) && tool.outputSchema.properties?.context_handle)
+        errors.push(`${tool.name} output must not expose context_handle`);
       const expectedOutputs = {
         list_workspaces: ["workspaces"],
+        create_workspace: ["created"],
         open_workspace: ["workspace_name", "cwd", "agent_guidance_path"],
         query_tool_calls: ["calls"],
         publish_html: ["id", "title", "uri", "height", "created_at"],
@@ -3196,13 +3431,14 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       if (tool.inputSchema?.properties?.context_handle) errors.push("open_workspace must not accept context_handle");
       if (!tool.inputSchema?.properties?.current_context_handle) errors.push("open_workspace missing optional current_context_handle");
       if (tool.inputSchema?.required?.includes("current_context_handle")) errors.push("open_workspace current_context_handle must be optional");
-    } else if (tool.name === "list_workspaces") {
-      if (tool.inputSchema?.properties?.context_handle) errors.push("list_workspaces must not accept context_handle");
+    } else if (["list_workspaces", "create_workspace"].includes(tool.name)) {
+      if (tool.inputSchema?.properties?.context_handle) errors.push(`${tool.name} must not accept context_handle`);
     } else {
       if (!tool.inputSchema?.properties?.context_handle) errors.push("inputSchema missing context_handle");
       if (!tool.inputSchema?.required?.includes("context_handle")) errors.push("inputSchema context_handle must be required");
     }
     const expectedInputs = {
+      create_workspace: ["name"],
       open_workspace: ["name", "current_context_handle"],
       glob: ["exclude", "include_hidden", "include_dependencies", "limit"],
       grep: ["exclude", "regex", "case_sensitive", "include_hidden", "include_dependencies", "max_file_bytes", "encoding", "context_before", "context_after", "output_mode", "max_results"],
@@ -3245,6 +3481,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       uiErrors.push("file UI must not embed Base64/data URLs");
     if (!filePreviewAppHtml().includes("structured.uri") || !htmlPreviewAppHtml().includes("structured.uri"))
       uiErrors.push("UI structuredContent URL handling missing");
+    if (!filePreviewAppHtml().includes("openai:set_globals") || !htmlPreviewAppHtml().includes("openai:set_globals"))
+      uiErrors.push("UI ChatGPT global-update bridge missing");
     if (!htmlPreviewAppHtml().includes("sandbox=\"allow-scripts") || htmlPreviewAppHtml().includes("allow-same-origin"))
       uiErrors.push("publish_html nested iframe sandbox is invalid");
     if (!htmlPreviewUiMeta().ui?.csp?.frameDomains?.includes(publicOrigin()))
@@ -3907,7 +4145,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       if (consent.expires_at < now) oauthConsents.delete(token);
     for (const [key, bucket] of rateBuckets)
       if (now - bucket.started > 2 * 60 * 1000) rateBuckets.delete(key);
-    expireDownloadTokens(now).catch(() => {});
+    expirePublished(now).catch(() => {});
   }
   function activeProcesses(contextHandle, limit = 50) {
     const handle = String(contextHandle || "");
@@ -3975,6 +4213,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     if (name === "list_workspaces") return {
       workspaces: all("SELECT name FROM roots WHERE server_id=? AND enabled=1 ORDER BY name", p.id).map(row => row.name),
     };
+    if (name === "create_workspace") return await createDesktopWorkspace(p, args.name);
     if (name === "open_workspace") return await workspaceInfo(selection);
     if (!selection?.context || !selection?.root) throw new Error("Session Workspace selection is missing");
     const resolvePath = path => resolveWorkspacePath(selection, path);
@@ -4367,7 +4606,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       const result = await publishPath(target.path, {
         filename: args.filename || basename(target.path), mime_type: args.mime_type,
         expires_in: args.expires_in, one_time: args.one_time,
-        allowed_root: target.root.path,
+        allowed_root: target.root.path, server_id: p.id, context_handle: args.context_handle,
+        context_id: selection.context.id,
       });
       return { path: target.display, ...result };
     }
@@ -4376,9 +4616,19 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       if (!html.trim()) throw new Error("html must not be empty");
       const title = String(args.title || "Interactive HTML").trim().slice(0, 200) || "Interactive HTML";
       const height = Math.max(120, Math.min(Number(args.height || 600), 2000));
-      const id = `html_${randomToken(24)}`, createdAt = Date.now();
-      run(`INSERT INTO published_html(id,server_id,context_handle,title,html,height,created_at)
-        VALUES(?,?,?,?,?,?,?)`, id, p.id, args.context_handle, title, html, height, createdAt);
+      const id = `html_${randomToken(24)}`, publishedName = `${id}.html`, createdAt = Date.now(), snapshotPath = publishedPath(publishedName);
+      await Deno.writeTextFile(snapshotPath, html, { createNew: true });
+      const size = (await Deno.stat(snapshotPath)).size;
+      try {
+        run(`INSERT INTO published(id,server_id,context_handle,context_id,kind,source_path,source_filename,published_name,filename,mime_type,size,title,height,expires_at,one_time,created_at)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          id, p.id, args.context_handle, Number(selection.context.id || 0), "html", "", "", publishedName, publishedName, "text/html; charset=utf-8", size,
+          title, height, 0, 0, createdAt,
+        );
+      } catch (error) {
+        await Deno.remove(snapshotPath).catch(() => {});
+        throw error;
+      }
       return { id, title, uri: publishedHtmlUrl(id), height, created_at: new Date(createdAt).toISOString() };
     }
     if (name === "list_commands") return await commandCatalog({ ...args, admin: false, include_missing: false });
@@ -4570,7 +4820,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         : JSON.stringify(publicLogResult, null, 2);
       const stderr = typeof publicLogResult.stderr === "string" ? publicLogResult.stderr : "";
       const status = publicResult.success === false ? "failed" : "completed";
-      const includeContext = name !== "list_workspaces";
+      const includeContext = !["list_workspaces", "create_workspace"].includes(name);
       const envelope = includeContext ? contextEnvelope(callInfo.contextHandle) : {};
       const structuredContent = { ...publicResult, ...envelope };
       const full = typeof publicResult.content === "string"
@@ -4594,7 +4844,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       return toolResult;
     } catch (error) {
       const message = String(error?.stack || error);
-      const includeContext = name !== "list_workspaces";
+      const includeContext = !["list_workspaces", "create_workspace"].includes(name);
       const envelope = includeContext ? contextEnvelope(callInfo.contextHandle) : {};
       const structuredContent = { error: String(error?.message || error), ...envelope };
       const text = includeContext
@@ -4936,7 +5186,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   async function mcpHandler(req, info, transport = "http") {
     const u = new URL(req.url);
     if (u.pathname.startsWith("/download/")) return await downloadResponse(req, u);
-    if (u.pathname.startsWith("/published-html/")) return publishedHtmlResponse(req, u);
+    if (u.pathname.startsWith("/published-html/")) return await publishedHtmlResponse(req, u);
     if (transport === "https" && req.method === "GET" && u.pathname === "/mrmcp-icon.png")
       return await staticAssetResponse("/assets/mrmcp-logo.png");
     if (u.pathname === "/.well-known/oauth-authorization-server" ||
@@ -5189,7 +5439,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 
     const serverInfoMeta = { "io.modelcontextprotocol/serverInfo": mcpServerInfo() };
     const instructions = fullAccess
-      ? "Use list_workspaces when you need to discover the enabled Workspace names, then call open_workspace with the desired name. If you already have the current Session handle, pass it as current_context_handle to move that same Session to the Workspace; if it is omitted, empty, unknown or expired, open_workspace creates a new Session. The result includes workspace_name, absolute cwd and agent_guidance_path; when that path is non-null, read and follow the referenced AGENTS.md before repository work. Pass the returned context_handle unchanged on every later Session-bound tool call. " +
+      ? "Use list_workspaces when you need to discover enabled Workspace names. Use create_workspace with only a name when you need a new empty Workspace; MrMCP creates and registers its Desktop directory internally, then call open_workspace with that same name. If you already have the current Session handle, pass it as current_context_handle to move that same Session to the Workspace; if it is omitted, empty, unknown or expired, open_workspace creates a new Session. The result includes workspace_name, absolute cwd and agent_guidance_path; when that path is non-null, read and follow the referenced AGENTS.md before repository work. Pass the returned context_handle unchanged on every later Session-bound tool call. " +
         "Use read_file/read_files, glob, grep, edit and replace directly for file inspection, discovery, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. " +
         "Use list_commands before other command-line work and invoke returned logical_name values directly through exec.program without PATH probes. " +
         "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; cancelling/disconnecting exec terminates its child. For persistent or interactive work, call exec_start; it immediately returns exec_id, which is the stable integer Tool Call id of that start. Pass that exec_id together with the same context_handle to exec_attach, exec_write, exec_kill or exec_status; ids from other Sessions are inaccessible. exec_list shows only currently running persistent executions in this Session. exec_status is the non-consuming way to inspect running or recently completed/killed executions and optionally retrieve all output or a tail. exec_attach with progressToken streams unread backlog plus live output through progress until process exit and then returns that complete unread transcript; without progressToken it long-polls and returns at most 16 KiB of unread output plus remaining_bytes, so call it repeatedly to drain buffered output and call it again with remaining_bytes=0/status=running to wait for future output. Disconnecting exec_attach only detaches and never kills the persistent process. " +
@@ -5282,7 +5532,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
             const toolArgs = { ...rawToolArgs };
             const invokeTool = async requestStream => {
               let toolResult;
-              if (x.params.name === "list_workspaces") {
+              if (["list_workspaces", "create_workspace"].includes(x.params.name)) {
                 toolResult = await callTool(
                   p, x.params.name, toolArgs,
                   { authKind: auth.kind, contextHandle: "", selection: null, descriptor, requestStream, progressRequested },
@@ -5564,7 +5814,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   // The UI asks for only the active section. Database projections are evaluated lazily so
   // inactive pages do not query their tables during Eta -> Morphlex rerenders.
   const state = (section = "all") => {
-    const valid = new Set(["all", "dashboard", "sessions", "logs", "roots", "commands", "debug", "oauth", "settings", "help"]);
+    const valid = new Set(["all", "dashboard", "sessions", "logs", "published", "roots", "commands", "debug", "oauth", "settings", "help"]);
     section = valid.has(section) ? section : "dashboard";
     const p = serverConfig();
     if (!p) throw new Error("MrMCP server configuration is missing");
@@ -5598,6 +5848,27 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     }
     if (["all", "oauth"].includes(section)) result.oauth_clients = oauthProjection();
     return result;
+  };
+  const publishedAdminProjection = (serverId, current = {}) => {
+    const conditions = ["server_id=?"], values = [serverId];
+    const kind = ["file", "html"].includes(String(current.kind || "")) ? String(current.kind) : "";
+    const contextId = Math.max(0, Number(current.context) || 0);
+    const size = ["small", "medium", "large", "huge"].includes(String(current.size || "")) ? String(current.size) : "";
+    if (kind) { conditions.push("kind=?"); values.push(kind); }
+    if (contextId) { conditions.push("context_id=?"); values.push(contextId); }
+    if (size === "small") conditions.push("size<1048576");
+    else if (size === "medium") conditions.push("size>=1048576 AND size<10485760");
+    else if (size === "large") conditions.push("size>=10485760 AND size<104857600");
+    else if (size === "huge") conditions.push("size>=104857600");
+    const where = conditions.join(" AND "), pageSize = 25;
+    const total = Number(one(`SELECT COUNT(*) n FROM published WHERE ${where}`, ...values)?.n || 0);
+    const pages = Math.max(1, Math.ceil(total / pageSize));
+    const page = Math.min(pages, Math.max(1, Number(current.page) || 1)), offset = (page - 1) * pageSize;
+    const rows = all(`SELECT id,context_id,kind,source_path,source_filename,published_name,filename,mime_type,size,title,height,expires_at,one_time,created_at
+      FROM published WHERE ${where} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`, ...values, pageSize, offset);
+    const sessions = all("SELECT DISTINCT context_id FROM published WHERE server_id=? AND context_id>0 ORDER BY context_id DESC", serverId)
+      .map(row => Number(row.context_id));
+    return { rows, total, page, pages, page_size: pageSize, sessions, kind, context: contextId || "", size };
   };
 
   async function restartMcp() {
@@ -5662,16 +5933,17 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   }
 
   const fragmentTemplates = GUI_RUNTIME ? {
-    sidebar: `<? const current=it.data?.state?.currentSection||"dashboard",items=[["dashboard","🏠","Dashboard"],["oauth","🔐","Clients"],["sessions","💬","Sessions"],["roots","📁","Workspaces"],["logs","🛠️","Tool Calls"],["commands","🧰","Commands"],["debug","🐞","HTTP Log"],["settings","⚙️","Settings"],["help","❓","Help"]]; items.forEach(([id,icon,label])=>{ ?><button data-page="<?= id ?>" class="<?= current===id?'nav-active':'' ?>"<?= current===id?' aria-current=page':'' ?>><span class=menu-icon><?= icon ?></span><?= label ?></button><? }) ?>`,
+    sidebar: `<? const current=it.data?.state?.currentSection||"dashboard",items=[["dashboard","🏠","Dashboard"],["oauth","🔐","Clients"],["sessions","💬","Sessions"],["roots","📁","Workspaces"],["logs","🛠️","Tool Calls"],["published","📦","Published"],["commands","🧰","Commands"],["debug","🐞","HTTP Log"],["settings","⚙️","Settings"],["help","❓","Help"]]; items.forEach(([id,icon,label])=>{ ?><button data-page="<?= id ?>" class="<?= current===id?'nav-active':'' ?>"<?= current===id?' aria-current=page':'' ?>><span class=menu-icon><?= icon ?></span><?= label ?></button><? }) ?>`,
     view: `<? const s=it.data?.state||{},section=s.currentSection||"dashboard",settings=s.settings||{}; ?>
 <? if(section==="dashboard"){ ?><section id=dashboard class=page><div class=row><h2 class=grow>🏠 Dashboard</h2><span class=muted>Runtime · activity · endpoints</span></div><div id=cards class=grid></div><div class=row><h3 class=grow>🛠️ Active Tool Calls</h3><span class=muted>Live · finished calls remain for 5s</span></div><div id=activeToolCalls></div><div id=trashActivity class=grid></div><div class=dashboard-grid><div><h3>🌐 Server</h3><div id=endpoints></div></div><div><h3>🔒 TLS and Connectivity</h3><div id=tlsStatus></div></div></div></section>
-<? } else if(section==="sessions"){ ?><section id=sessions class=page><div class=row><h2 class=grow>💬 Sessions</h2><span class=muted>Live updates</span></div><p class=muted>Persistent MCP Sessions. Each Session is attached to a <b>📁 Workspace</b>.</p><? if(s.sessions?.oauthClientId){ ?><div class=row><span class=muted>OAuth filter</span><code><?= s.sessions.oauthClientId ?></code><button class=small data-action=clear-session-oauth>✕ Clear</button></div><? } ?><div class=card><b>Client Continuity</b><p class=muted>ChatGPT may create a new Session after model or thinking changes. Client/auth/User-Agent metadata is best effort.</p></div><div id=contextList></div></section>
-<? } else if(section==="roots"){ ?><section id=roots class=page><div class=row><h2 class=grow>📁 Workspaces</h2><button class=primary data-action=new-root>➕ Add Workspace</button></div><p class=muted>Workspace names are unique. Drag Sessions to change where future Tool Calls run; running processes stay in their original folder.</p><div id=rootList></div></section>
+<? } else if(section==="sessions"){ ?><section id=sessions class=page><div class=row><h2 class=grow>💬 Sessions</h2><span class=muted>Live updates</span><button class=danger data-action=clear-sessions<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Persistent MCP Sessions. Each Session is attached to a <b>📁 Workspace</b>.</p><? if(s.sessions?.oauthClientId){ ?><div class=row><span class=muted>OAuth filter</span><code><?= s.sessions.oauthClientId ?></code><button class=small data-action=clear-session-oauth>✕ Clear</button></div><? } ?><div class=card><b>Client Continuity</b><p class=muted>ChatGPT may create a new Session after model or thinking changes. Client/auth/User-Agent metadata is best effort.</p></div><div id=contextList></div></section>
+<? } else if(section==="roots"){ ?><section id=roots class=page><div class=row><h2 class=grow>📁 Workspaces</h2><button class=primary data-action=new-root>➕ Add Workspace</button><button class=danger data-action=clear-workspaces<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Workspace names are unique. Drag Sessions to change where future Tool Calls run; running processes stay in their original folder.</p><div id=rootList></div></section>
 <? } else if(section==="commands"){ const c=s.commands||{}; ?><section id=commands class=page><div class=row><h2 class=grow>🧰 Extra Commands</h2><button data-action=download-all-commands>⬇️ Download All</button><button class=primary data-action=new-command>➕ Register Command</button></div><p class=muted><code>commands.yaml</code> defines catalog entries. Executables in <code>.mrmcp/bin</code> appear automatically.</p><div class=row><input id=commandQuery class=grow placeholder="Search name, path or description…" value="<?= c.query||'' ?>"><label class=small><input id=commandIncludeMissing type=checkbox<?= c.includeMissing!==false?' checked':'' ?>> Show Unavailable</label><select id=commandPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(c.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-commands>🔎 Search</button></div><div id=commandList></div></section>
-<? } else if(section==="logs"){ const l=s.logs||{}; ?><section id=logs class=page><h2>🛠️ Tool Calls</h2><p class=muted>Click a row for details. Terminate active work from Actions.</p><div class=row><input id=logQuery class=grow placeholder="Search input, output, errors…" value="<?= l.query||'' ?>"><select id=logContext><option value="">All sessions</option><? (s.contextValues||[]).forEach(v=>{ ?><option value="<?= v.pk ?>"<?= String(l.context||"")===String(v.pk)?" selected":"" ?>>#<?= v.pk ?></option><? }) ?></select><select id=logStatus class="<?= l.status||'' ?>"><option value="">All states</option><? ['completed','failed','invalid','running'].forEach(v=>{ ?><option class="<?= v ?>" value="<?= v ?>"<?= l.status===v?' selected':'' ?>><?= v ?></option><? }) ?></select><select id=logPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(l.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=clear-log-filters>🧹 Clear Filters</button></div><? if(l.selfTest){ ?><div id=logSelfTest class=card><div class=row><h3 class=grow>🧪 MCP Self-Test</h3><button class=small data-action=copy-detail data-target=logDetail>📋 Copy JSON</button><button class=small data-action=close-self-test>✕ Close</button></div><pre id=logDetail><?= it.pretty(l.selfTest) ?></pre></div><? } ?><div id=logList></div></section>
+<? } else if(section==="logs"){ const l=s.logs||{}; ?><section id=logs class=page><div class=row><h2 class=grow>🛠️ Tool Calls</h2><button class=danger data-action=clear-tool-calls<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Click a row for details. Terminate active work from Actions.</p><div class=row><input id=logQuery class=grow placeholder="Search input, output, errors…" value="<?= l.query||'' ?>"><select id=logContext><option value="">All sessions</option><? (s.contextValues||[]).forEach(v=>{ ?><option value="<?= v.pk ?>"<?= String(l.context||"")===String(v.pk)?" selected":"" ?>>#<?= v.pk ?></option><? }) ?></select><select id=logStatus class="<?= l.status||'' ?>"><option value="">All states</option><? ['completed','failed','invalid','running'].forEach(v=>{ ?><option class="<?= v ?>" value="<?= v ?>"<?= l.status===v?' selected':'' ?>><?= v ?></option><? }) ?></select><select id=logPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(l.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=clear-log-filters>🧹 Clear Filters</button></div><? if(l.selfTest){ ?><div id=logSelfTest class=card><div class=row><h3 class=grow>🧪 MCP Self-Test</h3><button class=small data-action=copy-detail data-target=logDetail>📋 Copy JSON</button><button class=small data-action=close-self-test>✕ Close</button></div><pre id=logDetail><?= it.pretty(l.selfTest) ?></pre></div><? } ?><div id=logList></div></section>
+<? } else if(section==="published"){ ?><section id=published class=page><div class=row><h2 class=grow>📦 Published</h2><button class=danger data-action=clear-published<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear All</button></div><p class=muted>Persistent snapshots created by <code>publish_file</code> and <code>publish_html</code>. Open a payload with its system default application or delete the publication and snapshot together.</p><div id=publishedList></div></section>
 <? } else if(section==="debug"){ const d=s.debug||{},enabled=!!s.debug?.enabled; ?><section id=debug class=page><div class=row><h2 class=grow>🐞 HTTP Debug Log</h2><button class="debug-toggle <?= enabled?'enabled':'disabled' ?>" data-action=toggle-debug-settings aria-pressed="<?= enabled?'true':'false' ?>"><?= enabled?"🟢 Logging ON · Disable":"🔴 Logging OFF · Enable" ?></button><button class=danger data-action=clear-debug>🗑️ Clear</button></div><p class=muted>Off by default. Secrets are redacted. Disabling stops new records but keeps stored data visible. Click a row for request JSON.</p><div class=row><input id=debugQuery class=grow placeholder="Search URL, headers, body or errors…" value="<?= d.query||'' ?>"><select id=debugMethod><option value="">All methods</option><? ['GET','POST','OPTIONS'].forEach(v=>{ ?><option<?= d.method===v?' selected':'' ?>><?= v ?></option><? }) ?></select><input id=debugStatus type=number placeholder="Status" value="<?= d.status||'' ?>"><button data-action=load-debug>🔎 Search</button></div><div id=debugList></div></section>
-<? } else if(section==="oauth"){ ?><section id=oauth class=page><h2>🔐 OAuth Clients</h2><div id=oauthList></div></section>
-<? } else if(section==="settings"){ ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><div class=grid><div class=card><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div><div class=card><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><p class=muted>Off: child <code>PATH</code> contains only <code>.mrmcp/bin</code>. Other environment variables are unchanged.</p></div><div class=card><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published HTML and metrics. Keeps auth, Sessions, Workspaces, settings, tools and files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></section>
+<? } else if(section==="oauth"){ ?><section id=oauth class=page><div class=row><h2 class=grow>🔐 OAuth Clients</h2><button class=danger data-action=clear-clients<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><div id=oauthList></div></section>
+<? } else if(section==="settings"){ ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><div class=settings-layout><div class=settings-main><div class=card><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><p class=muted>Off: child <code>PATH</code> contains only <code>.mrmcp/bin</code>. Other environment variables are unchanged.</p></div><div class=card><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
 <? } else if(section==="help"){ ?><section id=help class=page><h2>❓ Help</h2><div class=card><h3>Connect ChatGPT Web</h3><ol><li>Make sure the Dashboard shows a trusted HTTPS certificate. ChatGPT needs a remote HTTPS MCP endpoint; use <code><?= settings.external_base_url ? settings.external_base_url + "/mcp" : "https://your-host/mcp" ?></code>.</li><li>In ChatGPT Web, enable Developer mode. In managed workspaces the current path is <b>Workspace settings → Permissions &amp; Roles → Connected Data Developer mode / Create custom MCP connectors</b>. Authorized users may also find the toggle under <b>Settings → Apps → Advanced Settings</b>.</li><li>Create a custom app from <b>Workspace settings → Apps → Create</b> or <b>Settings → Apps → Create</b>, enter the MrMCP endpoint, choose the offered authentication method, then select <b>Scan Tools</b>.</li><li>If OAuth is enabled in MrMCP, complete the authorization prompt. After the tool scan completes, create the app and select it from a new ChatGPT conversation.</li></ol></div><div class=card><h3>Authentication</h3><p>For ChatGPT, OAuth is the preferred MrMCP setup because ChatGPT can discover the authorization metadata, complete consent, and keep refresh-token connectivity. MrMCP also supports Basic authentication for MCP clients that offer it. Authentication grants access to the server; the <code>context_handle</code> selects persistent context state after authentication.</p></div><div class=card><h3>Write Access</h3><p>MrMCP does not maintain a separate read/write allowlist: every authenticated client receives every published tool. ChatGPT controls whether write/modify actions are usable through the app's permissions and action controls. As of this build, OpenAI documents full MCP write/modify support for Business, Enterprise and Edu; Pro custom MCP access is limited to read/fetch, and availability may change. Test write tools in Developer mode first. Where available, use <b>Workspace settings → Apps → Configure Actions / Action control</b> to enable the required actions. ChatGPT may still ask for confirmation before a write.</p></div><div class=card><h3>Using MrMCP in a Chat</h3><ol><li>Start a new chat and select the MrMCP app from the tools/apps menu.</li><li>If needed, call <code>list_workspaces</code> to discover the enabled Workspace names, then call <code>open_workspace</code> with the desired <code>name</code>. When continuing an existing Session, also pass its handle as <code>current_context_handle</code>; MrMCP moves that same Session to the Workspace. If the handle is omitted, empty, unknown or expired, a new Session is created.</li><li>The result already includes <code>workspace_name</code>, absolute <code>cwd</code> and <code>agent_guidance_path</code>. Read that file when non-null, then reuse the returned <code>context_handle</code> on later Session-bound calls. The Workspaces page can also move Sessions manually.</li><li>If you change ChatGPT model or thinking level, the MCP context may be recreated even inside the same conversation. Check the Sessions page if continuity matters.</li></ol><p class=muted>ChatGPT UI labels and plan availability can change. Current OpenAI references: <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt" target=_blank rel=noopener>Developer mode and MCP apps in ChatGPT</a> · <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt" target=_blank rel=noopener>Apps in ChatGPT</a>.</p></div></section><? } ?>`,
     dialogs: `<? const dialog=it.data?.state?.dialog; ?><? if(dialog){ ?><div id=dialogOverlay class=dialog-overlay><? if(dialog.kind==="root"){ const r=dialog.data||{}; ?><dialog id=rootDialog open data-managed-dialog=root><form id=rootForm><input id=rid type=hidden value="<?= r.id||'' ?>"><h2>📁 Workspace</h2><div class=row><label class=grow>Workspace name</label><? if(r.name_warning){ ?><span class=field-warning>⚠ <?= r.name_warning ?></span><? } ?></div><input id=rname value="<?= r.name||'' ?>"><div class=row><label class=grow>Directory path</label><? if(r.path_warning){ ?><span class=field-warning>⚠ <?= r.path_warning ?></span><? } else if(!r.path_checked){ ?><span class=muted>Leave the field to validate the directory.</span><? } ?></div><input id=rpath placeholder="C:\\projects\\my-workspace, /srv/my-workspace or ./project" value="<?= r.path||'' ?>"><div class=muted>Relative to the program folder.</div><label><input id=renabled type=checkbox<?= r.enabled!==false?' checked':'' ?>> Enabled</label><? if(r.form_warning){ ?><div class=field-warning>⚠ <?= r.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (r.name_warning||r.path_warning||!r.path_checked||r.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="command"){ const c=dialog.data||{}; ?><dialog id=commandDialog open data-managed-dialog=command><form id=commandForm><input id=coldName type=hidden value="<?= c.registered?c.name:'' ?>"><h2>🧰 Command Catalog Entry</h2><div class=row><label class=grow>Logical name</label><? if(c.name_warning){ ?><span class=field-warning>⚠ <?= c.name_warning ?></span><? } ?></div><input id=cname value="<?= c.name||'' ?>"><div class=row><label class=grow>Path below .mrmcp/bin</label><? if(c.path_warning){ ?><span class="<?= c.path_error?'field-warning':'muted' ?>"><?= c.path_error?'⚠ ':'' ?><?= c.path_warning ?></span><? } else if(!c.path_checked){ ?><span class=muted>Leave the field to validate the path.</span><? } ?></div><input id=cpath placeholder="Optional; defaults to logical name; Windows suffix optional" value="<?= c.path||'' ?>"><label>Description for the agent</label><textarea id=cdescription placeholder="Optional: what it does and when the agent should use it."><?= c.description||'' ?></textarea><div class=row><label class=grow>Download URL</label><? if(c.download_warning){ ?><span class=field-warning>⚠ <?= c.download_warning ?></span><? } ?></div><input id=cdownloadUrl placeholder="https://example.com/tool" value="<?= c.download_url||'' ?>"><div class=row><label class=grow>Documentation URL</label><? if(c.documentation_warning){ ?><span class=field-warning>⚠ <?= c.documentation_warning ?></span><? } ?></div><input id=cdocumentationUrl placeholder="https://example.com/docs" value="<?= c.documentation_url||'' ?>"><? if(c.form_warning){ ?><div class=field-warning>⚠ <?= c.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (c.name_warning||c.path_error||!c.path_checked||c.download_warning||c.documentation_warning||c.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="confirm"){ ?><dialog id=confirmDialog open data-managed-dialog=confirm><h2>⚠️ <?= dialog.title||"Confirm Action" ?></h2><p><?= dialog.message||"Continue?" ?></p><p class=row><button class="primary danger" data-action=confirm-dialog>✓ Confirm</button><button data-action=close-dialog>✕ Cancel</button></p></dialog><? } ?></div><? } ?>`,
     status: `<? const d=it.data||{},s=d.settings||{},a=d.activity||{},bad=!!s.mcp_listen_error,warn=!!s.listener_fallback,recent=a.recent_sessions||[],inFlight=a.tool_calls_in_flight||0,errors=a.tool_calls_errors||0,invalid=a.tool_calls_invalid||0; ?><span class="status-group <?= d.live!=="connected"?(d.live==="reconnecting"?"pending":"failed"):(bad?"failed":(warn?"pending":"ok")) ?>"><?= d.live!=="connected"?(d.live==="reconnecting"?"🟡 reconnecting":"🔴 offline"):(bad?"🔴 listener error":(warn?"🟡 fallback":"🟢 live")) ?></span><span class="status-group status-link" data-action=header-settings title="HTTP / HTTPS effective listener ports; GUI uses local Tauriless assets">🔌 <span class=status-ports><?= s.mcp_http_active?s.mcp_http_port:"off" ?>/<?= s.mcp_https_active?s.mcp_https_port:"off" ?></span><? if(warn){ ?> <span class=pending>⚠</span><? } ?></span><span class=status-group title="Sessions with a Tool Call in the last <?= a.active_window_minutes||10 ?> minutes">💬 <span class="status-link <?= a.active_sessions?'ok':'muted' ?>" data-action=header-sessions><?= a.active_sessions||0 ?> active</span><? if(recent.length){ ?> · <span class=status-sessions><? recent.forEach((x,i)=>{ ?><?= i?" ":"" ?><span class=status-link data-action=session-tool-calls data-id="<?= x.id ?>">#<?= x.id ?>(<?= x.tool_calls ?>)</span><? }) ?></span><? } ?></span><span class=status-group title="Tool Calls in flight / total recorded / failed / invalid">🛠️ <span class="status-link <?= inFlight?'pending':'muted' ?>" data-action=header-tool-calls data-status=running><?= inFlight ?> in flight</span> · <span class="status-link status-total" data-action=header-tool-calls data-status=""><?= a.tool_calls_total||0 ?> total</span> · <span class="status-link <?= errors?'failed':'muted' ?>" data-action=header-tool-calls data-status=failed><?= errors ?> errors</span> · <span class="status-link <?= invalid?'invalid':'muted' ?>" data-action=header-tool-calls data-status=invalid><?= invalid ?> invalid</span></span>`,
@@ -5685,9 +5957,17 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     commands: `<? const d=it.data || {}, rows=d.commands || []; ?><div class=muted><?= d.total || 0 ?> command<?= d.total === 1 ? "" : "s" ?> · page <?= d.page || 1 ?>/<?= d.pages || 1 ?> · config <code><?= d.config_file || "" ?></code></div><table class=commands-table><tr><th>Name</th><th>Relative path</th><th class=command-description>Description</th><th>Links</th><th>Source</th><th>State</th><th class=command-action-cell></th></tr><? rows.forEach(c => { ?><tr><td><code><?= c.name ?></code></td><td><code><?= c.path ?></code></td><td class=command-description><?= c.description || "—" ?></td><td><? if (c.documentation_url) { ?><a href="<?= c.documentation_url ?>" target=_blank rel=noopener>📖 Docs</a><? } else { ?>—<? } ?></td><td><?= c.source ?></td><td class="<?= c.present && c.executable ? "ok" : "failed" ?>"><?= c.present ? (c.executable ? "✅ available" : "⚠️ not executable") : "❌ missing" ?></td><td class=command-action-cell><div class=command-actions><button data-action=edit-command data-name="<?= c.name ?>" data-path="<?= c.path ?>">✏️ Edit</button><? if (c.registered && c.download_url) { ?><button data-action=download-command data-name="<?= c.name ?>">⬇️ Download</button><? } ?><? if (c.registered) { ?><button class=danger data-action=delete-command data-name="<?= c.name ?>">🗑️ Delete</button><? } ?></div></td></tr><? }) ?></table><div class=row><button data-action=commands-prev<?= d.page <= 1 ? " disabled" : "" ?>>Previous</button><button data-action=commands-next<?= d.has_more ? "" : " disabled" ?>>Next</button></div>`,
     oauth: `<table class=oauth-table><tr><th>Client</th><th>Sessions</th><th>Tokens</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td class=oauth-client><b><?= c.name ?></b><div class=oauth-client-id title="<?= c.client_id ?>"><code><?= c.client_id ?></code></div><div class=oauth-meta><span class=muted>Created</span> <?= it.logdt(c.created_at) ?></div></td><td class=oauth-meta><div class=oauth-count><b><?= c.session_count||0 ?></b> total</div><div><span class=muted>First</span> <?= c.first_session_at ? it.logdt(c.first_session_at) : "—" ?></div><div><span class=muted>Last</span> <?= c.last_session_at ? it.logdt(c.last_session_at) : "—" ?></div></td><td><div class=oauth-tokens><div class=oauth-token><b><?= c.token_count||0 ?></b> <span>Access</span><div class=oauth-meta><span class=muted>Issued</span> <?= c.last_token_at ? it.logdt(c.last_token_at) : "—" ?></div></div><div class=oauth-token><b><?= c.refresh_token_count||0 ?></b> <span>Refresh</span><div class=oauth-meta><span class=muted>Used</span> <?= c.last_refresh_at ? it.logdt(c.last_refresh_at) : "—" ?></div></div></div></td><td class=oauth-actions><button class=small data-action=oauth-sessions data-id="<?= c.client_id ?>">💬 View Sessions</button><button class="small danger" data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> Available Tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,
-    logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=idcell><?= l.context_id ? "#"+l.context_id : "—" ?></td><td><code><?= l.tool ?></code><? if(l.call_preview){ ?><div class=tool-command-preview>↳ <?= l.call_preview ?></div><? } ?><? if(l.progress_requested){ ?><div class=progress-requested>📡 Progress requested</div><? } ?></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Kill</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><? if(x.progress_requested){ ?><span class=progress-requested>📡 Progress requested</span><? } ?><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><div class=tool-detail-grid><div class=tool-detail-main><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><? if(x.resolved_json){ ?><section class=json-detail><div class=row><b class=grow>Tool Return Value JSON</b><button class=small data-action=copy-detail data-target="tool-return-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-return-<?= l.id ?>"><?= it.prettyParsed(x.resolved_json) ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>MCP Result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div><aside class=tool-descriptor><div class=row><b class=grow>Agent Tool Definition</b><? if(x.tool_descriptor){ ?><span class="descriptor-status <?= x.tool_descriptor_matches_current?'current':'outdated' ?>"><?= x.tool_descriptor_matches_current?'CURRENT':'OUTDATED' ?></span><button class=small data-action=copy-detail data-target="tool-descriptor-<?= l.id ?>">📋 Copy JSON</button><? } ?></div><? if(x.tool_descriptor){ ?><pre id="tool-descriptor-<?= l.id ?>" hidden><?= it.pretty(x.tool_descriptor) ?></pre><? if(x.tool_descriptor.title){ ?><div class=muted>Title</div><div><?= x.tool_descriptor.title ?></div><? } ?><div class=muted>Description</div><p><?= x.tool_descriptor.description||"—" ?></p><div class=muted>Input Schema</div><pre><?= it.pretty(x.tool_descriptor.inputSchema||{}) ?></pre><div class=muted>Output Schema</div><pre><?= it.pretty(x.tool_descriptor.outputSchema||{}) ?></pre><? } else { ?><p class=muted>No descriptor snapshot was recorded for this call.</p><? } ?></aside></div></div></td></tr><? } }) ?></tbody></table>`,
+    logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=http-session><? if(l.context_id){ ?><div class=idcell>#<?= l.context_id ?></div><? if(l.root_id&&l.root_name){ ?><div class=workspace-label>📁 <?= l.root_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><code><?= l.tool ?></code><? if(l.call_preview){ ?><div class=tool-command-preview>↳ <?= l.call_preview ?></div><? } ?><? if(l.progress_requested){ ?><div class=progress-requested>📡 Progress requested</div><? } ?></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Kill</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><? if(x.progress_requested){ ?><span class=progress-requested>📡 Progress requested</span><? } ?><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><div class=tool-detail-grid><div class=tool-detail-main><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><? if(x.resolved_json){ ?><section class=json-detail><div class=row><b class=grow>Tool Return Value JSON</b><button class=small data-action=copy-detail data-target="tool-return-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-return-<?= l.id ?>"><?= it.prettyParsed(x.resolved_json) ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>MCP Result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div><aside class=tool-descriptor><div class=row><b class=grow>Agent Tool Definition</b><? if(x.tool_descriptor){ ?><span class="descriptor-status <?= x.tool_descriptor_matches_current?'current':'outdated' ?>"><?= x.tool_descriptor_matches_current?'CURRENT':'OUTDATED' ?></span><button class=small data-action=copy-detail data-target="tool-descriptor-<?= l.id ?>">📋 Copy JSON</button><? } ?></div><? if(x.tool_descriptor){ ?><pre id="tool-descriptor-<?= l.id ?>" hidden><?= it.pretty(x.tool_descriptor) ?></pre><? if(x.tool_descriptor.title){ ?><div class=muted>Title</div><div><?= x.tool_descriptor.title ?></div><? } ?><div class=muted>Description</div><p><?= x.tool_descriptor.description||"—" ?></p><div class=muted>Input Schema</div><pre><?= it.pretty(x.tool_descriptor.inputSchema||{}) ?></pre><div class=muted>Output Schema</div><pre><?= it.pretty(x.tool_descriptor.outputSchema||{}) ?></pre><? } else { ?><p class=muted>No descriptor snapshot was recorded for this call.</p><? } ?></aside></div></div></td></tr><? } }) ?></tbody></table>`,
+    published: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class=row><select id=publishedKind><option value="">All types</option><option value=file<?= d.kind==='file'?' selected':'' ?>>File</option><option value=html<?= d.kind==='html'?' selected':'' ?>>HTML</option></select><select id=publishedContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=publishedSize><option value="">All sizes</option><option value=small<?= d.size==='small'?' selected':'' ?>>&lt; 1 MB</option><option value=medium<?= d.size==='medium'?' selected':'' ?>>1–10 MB</option><option value=large<?= d.size==='large'?' selected':'' ?>>10–100 MB</option><option value=huge<?= d.size==='huge'?' selected':'' ?>>≥ 100 MB</option></select><button data-action=clear-published-filters>🧹 Clear Filters</button></div><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> publication<?= d.total===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Published Pages"><button class=page-button data-action=published-page data-published-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=published-page data-published-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=published-page data-published-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No published items match the current filters.</p></div><? } else { ?><table class=published-table><thead><tr><th>Created</th><th>ID</th><th>Type</th><th>Session</th><th>Published File</th><th>Size</th><th>Source</th><th></th></tr></thead><tbody><? rows.forEach(r=>{ ?><tr><td class=nowrap><?= it.logdt(r.created_at) ?></td><td class=context-id><code><?= r.id ?></code></td><td class=nowrap><?= r.kind==='html'?'🌐 HTML':'📄 File' ?><? if(r.one_time){ ?><div class=muted>one-time</div><? } else if(r.expires_at){ ?><div class=muted>expires <?= it.logdt(r.expires_at) ?></div><? } ?></td><td class=idcell><?= r.context_id?'#'+r.context_id:'—' ?></td><td><button class=published-open data-action=open-published data-id="<?= r.id ?>" title="Open with system default application"><code><?= r.published_name ?></code></button><? if(r.kind==='html'&&r.title){ ?><div class=published-file-meta><?= r.title ?></div><? } else if(r.filename&&r.filename!==r.source_filename){ ?><div class=published-file-meta>Download name: <?= r.filename ?></div><? } ?></td><td class=nowrap><?= it.bytes(r.size) ?></td><td class=published-source><? if(r.source_path){ ?><code><?= r.source_path ?></code><? } else { ?><span class=muted>Generated HTML</span><? } ?></td><td class=nowrap><button class="small danger" data-action=delete-published data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></tbody></table><? } ?>`,
     debug: `<? const d=it.data||{},rows=d.rows||[]; ?><p class="<?= d.enabled?'ok':'failed' ?>"><b><?= d.enabled?'● Recording enabled':'● Recording disabled' ?></b><? if(!d.enabled){ ?> · showing stored requests<? } ?></p><? if(!rows.length){ ?><p class=muted>No stored HTTP debug requests match the current filters.</p><? } else { ?><table><tr><th>ID</th><th>Time</th><th>Session</th><th>Client</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>IP</th><th>Error</th></tr><? rows.forEach(r => { ?><tr data-action=select-debug data-id="<?= r.id ?>" title="Click to expand"><td class=idcell>#<?= r.id ?></td><td class=nowrap><?= it.logdt(r.ts) ?></td><td class=http-session><? if(r.context_id){ ?><div class=idcell>#<?= r.context_id ?></div><? if(r.workspace_name){ ?><div class=workspace-label>📁 <?= r.workspace_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><? if(r.client_id){ ?><code><?= r.client_id ?></code><? } else { ?>—<? } ?></td><td><b><?= r.method ?></b></td><td><code><?= r.path ?></code></td><td class="<?= !r.status?'pending':(r.status>=400?'failed':'ok') ?>"><?= r.status||"…" ?></td><td><?= r.status ? r.duration_ms+"ms" : "in flight" ?></td><td class=nowrap><?= r.remote_addr||"—" ?><? if(r.remote_addr){ ?> (<?= r.remote_count||1 ?>)<? } ?></td><td><?= r.error_preview ?></td></tr><? if(String(d.openRowId||"")===String(r.id)&&d.openDetail){ const x=d.openDetail; ?><tr class=detail-row data-detail-kind=http data-detail-id="<?= r.id ?>"><td colspan=10><div class="detail-panel http-detail-panel"><div class="row http-detail-head"><div class=grow><b>HTTP Request #<?= r.id ?></b><div class=http-detail-meta><span><?= it.logdt(x.ts) ?></span><span><? if(x.context_id){ ?>Session #<?= x.context_id ?><? } else { ?>No Session<? } ?></span><? if(x.workspace_name){ ?><span>📁 <?= x.workspace_name ?></span><? } ?><span><? if(x.client_id){ ?>Client <code><?= x.client_id ?></code><? } else { ?>No client id<? } ?></span><span><?= x.remote_addr||"unknown IP" ?><? if(x.remote_addr){ ?> · <?= x.remote_count||1 ?> total request<?= Number(x.remote_count||1)===1?'':'s' ?><? } ?></span><span><?= x.status ? x.duration_ms+"ms" : "in flight" ?></span></div></div><button class=small data-action=copy-detail data-target="http-json-<?= r.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=http>✕ Close</button></div><div class=http-detail-grid><section class=http-detail-block><div class=row><h4 class=grow>→ Request</h4><b><?= x.method ?></b> <code><?= x.path ?></code></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.request_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.request_body||{}) ?></pre></section><section class=http-detail-block><div class=row><h4 class=grow>← Response</h4><b class="<?= !x.status?'pending':(x.status>=400?'failed':'ok') ?>"><?= x.status||"in flight" ?></b></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.response_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.response_body||{}) ?></pre></section></div><? if(x.error){ ?><section class="http-detail-block http-detail-error"><h4 class=failed>Error</h4><pre><?= x.error ?></pre></section><? } ?><details class=http-detail-raw><summary>Raw record</summary><pre id="http-json-<?= r.id ?>"><?= it.pretty(x) ?></pre></details></div></td></tr><? } }) ?></table><? } ?>`,
   } : {};
+  const fragmentBytes = value => {
+    const size = Math.max(0, Number(value) || 0);
+    if (size < 1024) return `${size} B`;
+    if (size < 1048576) return `${(size / 1024).toFixed(size < 10240 ? 1 : 0)} KB`;
+    if (size < 1073741824) return `${(size / 1048576).toFixed(size < 10485760 ? 1 : 0)} MB`;
+    return `${(size / 1073741824).toFixed(1)} GB`;
+  };
   const fragmentDate = value => {
     if (!value) return "";
     const date = new Date(value), now = new Date();
@@ -5772,7 +6052,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   async function renderEtaFragment(name, data) {
     if (!fragmentTemplates[name]) throw new Error(`Unknown UI fragment: ${name}`);
     const context = {
-      data, dt: fragmentDate, logdt: fragmentLogDate, pages: fragmentPageItems, endpointRows, terminal: fragmentTerminal,
+      data, dt: fragmentDate, logdt: fragmentLogDate, bytes: fragmentBytes, pages: fragmentPageItems, endpointRows, terminal: fragmentTerminal,
       pretty: value => JSON.stringify(value ?? null, null, 2),
       prettyParsed: value => {
         const parsed = typeof value === "string" ? parseJson(value, value) : value;
@@ -5838,7 +6118,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     viewState.maintenance = projection.maintenance;
     viewState.contextValues = projection.context_values || [];
     viewState.debug.enabled = !!projection.settings.debug_http_log;
-    const model = { section, projection, viewState, commandData: null, logData: null, debugData: null };
+    const model = { section, projection, viewState, commandData: null, logData: null, publishedData: null, debugData: null };
     if (section === "roots") {
       const rows = projection.root_assignments?.roots || [];
       const warnings = await Promise.all(rows.map(async root => [Number(root.id), await rootPathWarning(root.path)]));
@@ -5875,6 +6155,11 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       model.logData.openRowId = current.openRowId;
       viewState.logs.page = current.page;
       viewState.logs.openRowId = current.openRowId;
+    } else if (section === "published") {
+      const current = uiState.published;
+      model.publishedData = publishedAdminProjection(serverConfig().id, current);
+      current.page = model.publishedData.page;
+      viewState.published.page = current.page;
     } else if (section === "debug") {
       const current = uiState.debug;
       const query = new URLSearchParams({ q: current.query, method: current.method, status: current.status });
@@ -5921,6 +6206,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       view = fillUiMount(view, "commandList", await renderEtaFragment("commands", model.commandData || {}));
     } else if (section === "logs") {
       view = fillUiMount(view, "logList", await renderEtaFragment("logs", model.logData || {}));
+    } else if (section === "published") {
+      view = fillUiMount(view, "publishedList", await renderEtaFragment("published", model.publishedData || {}));
     } else if (section === "debug") {
       view = fillUiMount(view, "debugList", await renderEtaFragment("debug", model.debugData || {}));
     } else if (section === "oauth") {
@@ -5968,6 +6255,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   function uiUpdateDraft(id, value, checked) {
     const text = value == null ? "" : String(value);
     if (id === "logQuery") uiState.logs.query = text;
+    else if (id === "publishedKind") uiState.published.kind = text;
+    else if (id === "publishedContext") uiState.published.context = text;
+    else if (id === "publishedSize") uiState.published.size = text;
     else if (id === "debugQuery") uiState.debug.query = text;
     else if (id === "commandQuery") uiState.commands.query = text;
     else if (uiState.dialog?.kind === "root") {
@@ -6008,6 +6298,13 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     }
     if (failures.length) uiNotice(`Download errors:\n${failures.join("\n")}`);
   }
+  function uiStartMaintenance(promise, label) {
+    Promise.resolve(promise).then(result => {
+      const value = result?.cleared;
+      const count = typeof value === "number" ? ` · ${value} removed` : "";
+      uiNotice(`${label} completed${count}.`, "ok");
+    }).catch(error => uiNotice(`${label} failed: ${String(error?.message || error)}`));
+  }
   async function uiRunConfirmedAction(dialog) {
     const data = dialog?.data || {};
     switch (dialog?.confirmAction) {
@@ -6023,13 +6320,31 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       case "revoke-client":
         await uiInternalApi("/api/oauth/revoke-client", { method: "POST", body: { client_id: String(data.client_id || "") } });
         break;
+      case "delete-published":
+        if (!await cleanupPublished(String(data.id || ""), true)) throw new Error("Published item not found");
+        uiNotice("Published item deleted.", "ok");
+        break;
+      case "clear-published":
+        uiStartMaintenance(clearPublished(), "Clear Published");
+        break;
       case "clear-debug":
         await uiInternalApi("/api/debug/clear", { method: "POST" });
         uiState.debug.openRowId = "";
         break;
+      case "clear-tool-calls":
+        uiStartMaintenance(uiInternalApi("/api/logs/clear", { method: "POST" }), "Clear Tool Calls");
+        break;
+      case "clear-sessions":
+        uiStartMaintenance(uiInternalApi("/api/context/clear", { method: "POST" }), "Clear Sessions");
+        break;
+      case "clear-workspaces":
+        uiStartMaintenance(uiInternalApi("/api/roots/clear", { method: "POST" }), "Clear Workspaces");
+        break;
+      case "clear-clients":
+        uiStartMaintenance(uiInternalApi("/api/oauth/clear", { method: "POST" }), "Clear Clients");
+        break;
       case "clear-database":
-        uiInternalApi("/api/database/clear", { method: "POST" }).catch(error =>
-          console.error("Clear Operational Data failed", error));
+        uiStartMaintenance(uiInternalApi("/api/database/clear", { method: "POST" }), "Clear Operational Data");
         break;
       case "empty-trash":
         uiInternalApi("/api/trash/empty", { method: "POST" }).catch(error =>
@@ -6178,6 +6493,24 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       case "revoke-client":
         uiConfirm("Revoke OAuth Client", "Revoke this client and all of its tokens?", "revoke-client", { client_id: data.id });
         return;
+      case "open-published":
+        await openPublished(String(data.id || ""));
+        return;
+      case "delete-published":
+        uiConfirm("Delete Published Item", "Delete this publication and its snapshot file? This cannot be undone.", "delete-published", { id: data.id });
+        return;
+      case "clear-published":
+        uiConfirm("Clear Published", "Delete every published item and every snapshot in .mrmcp/publish/? This cannot be undone.", "clear-published");
+        return;
+      case "clear-published-filters":
+        uiState.published.kind = "";
+        uiState.published.context = "";
+        uiState.published.size = "";
+        uiState.published.page = 1;
+        break;
+      case "published-page":
+        uiState.published.page = Math.max(1, Number(data.publishedPage) || 1);
+        break;
       case "self-test":
         uiState.currentSection = "logs";
         uiState.logs.selfTest = await uiInternalApi("/api/mcp/self-test");
@@ -6222,8 +6555,20 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       case "clear-debug":
         uiConfirm("Clear HTTP Debug Log", "Delete all HTTP debug log rows?", "clear-debug");
         return;
+      case "clear-tool-calls":
+        uiConfirm("Clear Tool Calls", "Delete all Tool Call records, search rows, descriptor/transport metadata and persisted process history? Running persistent processes are left running. Tool Call IDs are never reset or reused.", "clear-tool-calls");
+        return;
+      case "clear-sessions":
+        uiConfirm("Clear Sessions", "Delete all Sessions? Running persistent processes belonging to those Sessions will be terminated. Tool Call history is preserved with its recorded Session and Workspace snapshots.", "clear-sessions");
+        return;
+      case "clear-workspaces":
+        uiConfirm("Clear Workspaces", "Delete all configured Workspaces? Existing Sessions will move to the program-folder fallback. Files and running processes are not changed.", "clear-workspaces");
+        return;
+      case "clear-clients":
+        uiConfirm("Clear OAuth Clients", "Delete all registered OAuth clients, authorization codes, access tokens and refresh tokens? Existing Sessions and Basic authentication are preserved.", "clear-clients");
+        return;
       case "clear-database":
-        uiConfirm("Clear Operational Data", "Delete Tool Calls, process history, HTTP logs, published HTML and reset request metrics? Authentication, Sessions, Workspaces, settings and registered tools are preserved. Files, certificates, commands and trash on disk are not touched.", "clear-database");
+        uiConfirm("Clear Operational Data", "Delete Tool Calls, process history, HTTP logs, published snapshots and reset request metrics? Authentication, Sessions, Workspaces, settings and registered tools are preserved. Workspace files, certificates, commands and trash are not touched.", "clear-database");
         return;
       case "empty-trash":
         uiConfirm("Empty Trash", "Permanently delete all contents of .mrmcp/trash under the program folder and every configured Workspace? This cannot be undone.", "empty-trash");
@@ -6384,6 +6729,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           if (id === "logContext") { uiState.logs.context = String(event.value || ""); uiState.logs.page = 1; }
           else if (id === "logStatus") { uiState.logs.status = String(event.value || ""); uiState.logs.page = 1; }
           else if (id === "logPageSize") { uiState.logs.pageSize = Number(event.value) || 25; uiState.logs.page = 1; }
+          else if (id === "publishedKind") { uiState.published.kind = String(event.value || ""); uiState.published.page = 1; }
+          else if (id === "publishedContext") { uiState.published.context = String(event.value || ""); uiState.published.page = 1; }
+          else if (id === "publishedSize") { uiState.published.size = String(event.value || ""); uiState.published.page = 1; }
           else if (id === "debugMethod") uiState.debug.method = String(event.value || "");
           else if (id === "debugStatus") uiState.debug.status = String(event.value || "");
           else if (id === "commandPageSize") { uiState.commands.pageSize = Number(event.value) || 25; uiState.commands.page = 1; }
@@ -6551,6 +6899,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       run("DELETE FROM roots WHERE id=?", root.id);
       return json({ ok: true });
     }
+    if (u.pathname === "/api/roots/clear" && req.method === "POST") {
+      try { return json(clearWorkspaces()); }
+      catch (error) { return json({ error: String(error?.message || error) }, 500); }
+    }
     if (u.pathname === "/api/context/select" && req.method === "POST") {
       const x = await bodyJson(req), p = serverConfig(), context = contextById(p, Number(x.id));
       if (!context) return json({ error: "Session not found" }, 404);
@@ -6563,6 +6915,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       for (const key of [...jsKernels.keys()])
         if (key.startsWith(`${p.id}:${context.handle}:`)) destroyJsKernel(key, "context deleted");
       return json({ ok: true });
+    }
+    if (u.pathname === "/api/context/clear" && req.method === "POST") {
+      try { return json(await clearSessions()); }
+      catch (error) { return json({ error: String(error?.message || error) }, 500); }
     }
     if (u.pathname === "/api/processes" && req.method === "GET") {
       return json({
@@ -6749,8 +7105,15 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       LEFT JOIN debug_log_workspaces w ON w.debug_log_id=d.id
       LEFT JOIN contexts c ON c.handle=d.context_handle`, Number(dm[1])) || { error: "Not found" });
     if (u.pathname === "/api/debug/clear" && req.method === "POST") {
-      run("DELETE FROM debug_logs");
-      return json({ ok: true });
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const cleared = deleteDebugLogRecords();
+        db.exec("COMMIT");
+        return json({ ok: true, cleared });
+      } catch (error) {
+        db.exec("ROLLBACK");
+        return json({ error: String(error?.message || error) }, 500);
+      }
     }
     if (u.pathname === "/api/logs" && req.method === "GET") {
       const p = serverConfig();
@@ -6766,7 +7129,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           total = one(`SELECT COUNT(*) n FROM logs_fts f JOIN logs l ON l.id=CAST(f.log_id AS INTEGER)
             WHERE logs_fts MATCH ? AND (?=0 OR l.context_id=?) AND (?='' OR l.status=?)`,
             q, contextId, contextId, status, status)?.n || 0;
-          rows = all(`SELECT l.id,l.started_at,l.completed_at,l.context_id,l.tool,l.status,l.duration_ms,l.input_json
+          rows = all(`SELECT l.id,l.started_at,l.completed_at,l.context_id,l.root_id,l.root_name,l.tool,l.status,l.duration_ms,l.input_json
             FROM logs_fts f JOIN logs l ON l.id=CAST(f.log_id AS INTEGER)
             WHERE logs_fts MATCH ? AND (?=0 OR l.context_id=?) AND (?='' OR l.status=?)
             ORDER BY l.started_at DESC,l.id DESC LIMIT ? OFFSET ?`,
@@ -6778,7 +7141,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         total = one(`SELECT COUNT(*) n FROM logs WHERE (?=0 OR context_id=?) AND (?='' OR status=?)
           AND (?='' OR CAST(context_id AS TEXT)||context_handle||tool||input_json||result_json||resolved_json||stdout||stderr||error LIKE ?)`,
           contextId, contextId, status, status, q, like)?.n || 0;
-        rows = all(`SELECT id,started_at,completed_at,context_id,tool,status,duration_ms,input_json FROM logs
+        rows = all(`SELECT id,started_at,completed_at,context_id,root_id,root_name,tool,status,duration_ms,input_json FROM logs
           WHERE (?=0 OR context_id=?) AND (?='' OR status=?)
           AND (?='' OR CAST(context_id AS TEXT)||context_handle||tool||input_json||result_json||resolved_json||stdout||stderr||error LIKE ?)
           ORDER BY started_at DESC,id DESC LIMIT ? OFFSET ?`,
@@ -6843,6 +7206,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       }
       return json({ ok: true });
     }
+    if (u.pathname === "/api/logs/clear" && req.method === "POST") {
+      try { return json(await clearToolCalls()); }
+      catch (error) { return json({ error: String(error?.message || error) }, 500); }
+    }
     if (u.pathname === "/api/oauth/revoke-client" && req.method === "POST") {
       const x = await bodyJson(req);
       run("DELETE FROM oauth_tokens WHERE client_id=?", x.client_id);
@@ -6850,6 +7217,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       run("DELETE FROM oauth_codes WHERE client_id=?", x.client_id);
       run("DELETE FROM oauth_clients WHERE client_id=?", x.client_id);
       return json({ ok: true });
+    }
+    if (u.pathname === "/api/oauth/clear" && req.method === "POST") {
+      try { return json(clearOAuthClients()); }
+      catch (error) { return json({ error: String(error?.message || error) }, 500); }
     }
     return json({ error: "Not found" }, 404);
   }
@@ -6866,7 +7237,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   const UI_TEMPLATE = GUI_RUNTIME ? String.raw`<!doctype html><html><head><meta charset=utf-8>
 <meta http-equiv="Content-Security-Policy" content="${UI_CSP}">
 <meta name=viewport content="width=device-width,initial-scale=1"><link rel=icon href="${GUI_LOGO_DATA_URL}"><title>MrMCP</title><style>
-:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}#app>aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}#app>aside button{display:block;width:100%;text-align:left;margin:3px 0;background:transparent;border:0}#app>aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.notice-balloon{position:fixed;top:64px;right:16px;z-index:1900;max-width:min(520px,calc(100vw - 32px));padding:10px 12px;border:1px solid #7d3f47;border-radius:9px;background:#25191b;color:#ffb7bf;box-shadow:0 8px 28px #0008}.notice-balloon.info{border-color:#365a7d;background:#16202b;color:#a9d5ff}.notice-balloon.ok{border-color:#356849;background:#16241b;color:#9ce8b1}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.debug-toggle{font-weight:750;min-width:190px}.debug-toggle.enabled{background:#173f24;border-color:#347a49;color:#9ce8b1}.debug-toggle.disabled{background:#421d21;border-color:#7d3f47;color:#ffb7bf}.debug-toggle.enabled:hover{background:#20512f}.debug-toggle.disabled:hover{background:#53262b}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 18px 14px 28px;background:#111318}.detail-panel{border:1px solid #343944;border-left:3px solid #3984e8;border-radius:8px;background:#0d0f12;padding:14px 16px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.tool-detail-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:14px;align-items:start}.tool-detail-main{min-width:0}.tool-descriptor{min-width:0;position:sticky;top:10px;border:1px solid #343944;border-radius:8px;background:#111318;padding:12px}.tool-descriptor>.muted{margin-top:10px}.tool-descriptor p{margin:5px 0 10px;line-height:1.45}.tool-descriptor pre{margin:5px 0 10px;max-height:28vh}.descriptor-status{font-size:11px;font-weight:800;letter-spacing:.04em;padding:3px 6px;border-radius:5px}.descriptor-status.current{color:#75d58b;background:#16341f}.descriptor-status.outdated{color:#ffd166;background:#3a2f13}.http-detail-head{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #292d34}.http-detail-meta{display:flex;gap:7px 16px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:#89909b}.http-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.http-detail-block{min-width:0;border:1px solid #292d34;border-radius:8px;background:#0a0c0f;padding:10px}.http-detail-block h4{margin:0}.http-detail-block pre{max-height:30vh}.http-detail-error{margin-top:12px;border-color:#68353a;background:#1d1012}.http-detail-raw{margin-top:12px}.http-detail-raw summary{cursor:pointer;color:#89909b}@media(max-width:1100px){.tool-detail-grid,.http-detail-grid{grid-template-columns:1fr}.tool-descriptor{position:static}}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.tool-command-preview{margin-top:3px;max-width:440px;color:#c5cad3;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.http-session{white-space:nowrap}.workspace-label{margin-top:3px;color:#89909b;font-size:12px;font-weight:600}.menu-icon{display:inline-block;width:22px;text-align:center}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-call-card{padding:0;overflow:hidden;min-height:210px}.dashboard-call-table{margin:0;background:transparent}.dashboard-call-table thead{position:sticky;top:0;z-index:1;background:#181a1f}.dashboard-call-table tr{height:35px}.dashboard-call-table th,.dashboard-call-table td{padding:7px 9px}.dashboard-call-table tr[data-action=dashboard-tool-call]{cursor:pointer}.dashboard-call-table tr[data-action=dashboard-tool-call]:hover{background:#20242a}.dashboard-call-summary{max-width:720px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dashboard-call-recent{animation:dashboardCallFade var(--dashboard-call-ttl,5s) linear forwards}@keyframes dashboardCallFade{from{opacity:1}to{opacity:.18}}.progress-requested{color:#8fd3ff;white-space:nowrap}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout{grid-template-columns:1fr}.default-root-card{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){#app>aside{width:130px}main{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
+:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}#app>aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}#app>aside button{display:block;width:100%;text-align:left;margin:3px 0;background:transparent;border:0}#app>aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.notice-balloon{position:fixed;top:64px;right:16px;z-index:1900;max-width:min(520px,calc(100vw - 32px));padding:10px 12px;border:1px solid #7d3f47;border-radius:9px;background:#25191b;color:#ffb7bf;box-shadow:0 8px 28px #0008}.notice-balloon.info{border-color:#365a7d;background:#16202b;color:#a9d5ff}.notice-balloon.ok{border-color:#356849;background:#16241b;color:#9ce8b1}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.debug-toggle{font-weight:750;min-width:190px}.debug-toggle.enabled{background:#173f24;border-color:#347a49;color:#9ce8b1}.debug-toggle.disabled{background:#421d21;border-color:#7d3f47;color:#ffb7bf}.debug-toggle.enabled:hover{background:#20512f}.debug-toggle.disabled:hover{background:#53262b}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.settings-layout{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(300px,.75fr);gap:14px;align-items:start}.settings-main,.settings-side{min-width:0}.settings-side{position:sticky;top:70px}.settings-layout .card h3{margin-top:0}.settings-main input:not([type=checkbox]){width:100%}.settings-main textarea{min-height:96px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 18px 14px 28px;background:#111318}.detail-panel{border:1px solid #343944;border-left:3px solid #3984e8;border-radius:8px;background:#0d0f12;padding:14px 16px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.tool-detail-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:14px;align-items:start}.tool-detail-main{min-width:0}.tool-descriptor{min-width:0;position:sticky;top:10px;border:1px solid #343944;border-radius:8px;background:#111318;padding:12px}.tool-descriptor>.muted{margin-top:10px}.tool-descriptor p{margin:5px 0 10px;line-height:1.45}.tool-descriptor pre{margin:5px 0 10px;max-height:28vh}.descriptor-status{font-size:11px;font-weight:800;letter-spacing:.04em;padding:3px 6px;border-radius:5px}.descriptor-status.current{color:#75d58b;background:#16341f}.descriptor-status.outdated{color:#ffd166;background:#3a2f13}.http-detail-head{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #292d34}.http-detail-meta{display:flex;gap:7px 16px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:#89909b}.http-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.http-detail-block{min-width:0;border:1px solid #292d34;border-radius:8px;background:#0a0c0f;padding:10px}.http-detail-block h4{margin:0}.http-detail-block pre{max-height:30vh}.http-detail-error{margin-top:12px;border-color:#68353a;background:#1d1012}.http-detail-raw{margin-top:12px}.http-detail-raw summary{cursor:pointer;color:#89909b}@media(max-width:1100px){.tool-detail-grid,.http-detail-grid{grid-template-columns:1fr}.tool-descriptor{position:static}}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.tool-command-preview{margin-top:3px;max-width:440px;color:#c5cad3;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.http-session{white-space:nowrap}.workspace-label{margin-top:3px;color:#89909b;font-size:12px;font-weight:600}.menu-icon{display:inline-block;width:22px;text-align:center}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-call-card{padding:0;overflow:hidden;min-height:210px}.dashboard-call-table{margin:0;background:transparent}.dashboard-call-table thead{position:sticky;top:0;z-index:1;background:#181a1f}.dashboard-call-table tr{height:35px}.dashboard-call-table th,.dashboard-call-table td{padding:7px 9px}.dashboard-call-table tr[data-action=dashboard-tool-call]{cursor:pointer}.dashboard-call-table tr[data-action=dashboard-tool-call]:hover{background:#20242a}.dashboard-call-summary{max-width:720px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dashboard-call-recent{animation:dashboardCallFade var(--dashboard-call-ttl,5s) linear forwards}@keyframes dashboardCallFade{from{opacity:1}to{opacity:.18}}.progress-requested{color:#8fd3ff;white-space:nowrap}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}.published-table{table-layout:auto}.published-table .context-id{max-width:230px}.published-open{max-width:360px;padding:0;border:0;background:transparent;text-align:left;color:#9ecbff;overflow-wrap:anywhere}.published-open:hover{background:transparent;text-decoration:underline}.published-file-meta{margin-top:3px;color:#89909b;font-size:12px}.published-source{max-width:420px;overflow-wrap:anywhere}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout,.settings-layout{grid-template-columns:1fr}.default-root-card,.settings-side{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){#app>aside{width:130px}main{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
 </style></head><body>
 <div id=app data-section=dashboard><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div><div class=status><span class=pending>starting…</span></div></header><main style="margin-left:0"><div class=card>Starting the local MrMCP UI…</div></main></div>
 <script nonce="${UI_SCRIPT_NONCE}">__MRMCP_BROWSER_JS__</script></body></html>` : "";
@@ -7050,7 +7421,9 @@ listen(UI_RENDER_EVENT, event => {
   automaticRenewal().catch(() => {});
   renewalTimer = setInterval(automaticRenewal, 60 * 60 * 1000);
   processCleanupTimer = setInterval(maintenance, 60 * 60 * 1000);
-  downloadCleanupTimer = setInterval(() => expireDownloadTokens().catch(() => {}), 60 * 1000);
+  await expirePublished();
+  await cleanupPublishedOrphans();
+  publishCleanupTimer = setInterval(() => expirePublished().catch(() => {}), 60 * 1000);
   const readyPayload = {
     type: "ready",
     gui: IS_BACKEND_WORKER ? "index.html" : null,
@@ -7066,7 +7439,7 @@ listen(UI_RENDER_EVENT, event => {
     activeCallControls.clear();
     if (renewalTimer) clearInterval(renewalTimer);
     if (processCleanupTimer) clearInterval(processCleanupTimer);
-    if (downloadCleanupTimer) clearInterval(downloadCleanupTimer);
+    if (publishCleanupTimer) clearInterval(publishCleanupTimer);
     if (uiLogFilterTimer) clearTimeout(uiLogFilterTimer);
     if (uiNoticeTimer) clearTimeout(uiNoticeTimer);
     if (headerActivityTimer) clearTimeout(headerActivityTimer);
@@ -7082,7 +7455,6 @@ listen(UI_RENDER_EVENT, event => {
       sleep(3000),
     ]);
     await Promise.allSettled([mcpHttpServer?.shutdown(), mcpHttpsServer?.shutdown()]);
-    await cleanupAllDownloadTokens();
     db.close();
   };
   if (IS_BACKEND_WORKER) {
@@ -7263,6 +7635,9 @@ async function desktop() {
     } else if (data?.type === "os-notification") {
       if (!notificationsReady) notificationQueue.push(data);
       else void notify(data).catch(error => console.error("MrMCP notification failed", error));
+    } else if (data?.type === "os-open-path") {
+      void request("plugin:opener|open_path", { path: String(data.path || ""), with: null })
+        .catch(error => console.error("MrMCP published file open failed", error));
     }
   };
   const queueOrHandleWorkerMessage = data => {

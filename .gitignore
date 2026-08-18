@@ -1,6 +1,7 @@
 /*
 !/.gitignore
 !/README.md
+!/CHANGELOG.md
 !/AGENTS.md
 !/mrmcp.js
 !/commands.yaml
