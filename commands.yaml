@@ -1,4 +1,9 @@
 commands:
+  - logical_name: robost
+    path: rpa
+    description: "Desktop automation (RPA) in Rust — robust, scriptable"
+    download_url: https://github.com/kent-tokyo/robost/releases/download/v0.1.2/rpa-x86_64-windows.zip
+    documentation_url: https://kent-tokyo.github.io/robost/steps/control_flow/
   - logical_name: ast-grep
     description: "AST-based structural code search, linting and rewriting CLI for syntax-aware queries and transformations."
     download_url: https://github.com/ast-grep/ast-grep/releases/latest/download/app-x86_64-pc-windows-msvc.zip
@@ -61,10 +66,10 @@ commands:
       # ]
       # ///
 
-      Matplotlib example producing an image and returning it through the same exec call:
-      {"program":"uv","args":["run","-"],"stdin":"# /// script\n# dependencies = [\"matplotlib\"]\n# ///\n\nimport matplotlib.pyplot as plt\n\nx = [1, 2, 3, 4]\ny = [1, 4, 9, 16]\nplt.plot(x, y, marker=\"o\")\nplt.title(\"Example chart\")\nplt.xlabel(\"x\")\nplt.ylabel(\"y\")\nplt.tight_layout()\nplt.savefig(\"chart.png\", dpi=160, bbox_inches=\"tight\")\n","return_files":["chart.png"]}
+      Matplotlib example producing an image:
+      {"program":"uv","args":["run","-"],"stdin":"# /// script\n# dependencies = [\"matplotlib\"]\n# ///\n\nimport matplotlib.pyplot as plt\n\nx = [1, 2, 3, 4]\ny = [1, 4, 9, 16]\nplt.plot(x, y, marker=\"o\")\nplt.title(\"Example chart\")\nplt.xlabel(\"x\")\nplt.ylabel(\"y\")\nplt.tight_layout()\nplt.savefig(\"chart.png\", dpi=160, bbox_inches=\"tight\")\n"}
 
-      When Python creates an image, chart, PDF or other user-facing file, set exec.return_files to the generated paths so MrMCP returns them as MCP content; do not manually Base64-encode or read binary outputs as text.
+      When Python creates an image, chart, PDF or other user-facing file, let the command write it normally and then call publish_file with that path; do not manually Base64-encode or read binary outputs as text.
     download_url: https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip
     documentation_url: https://docs.astral.sh/uv/
   - logical_name: sqlite3
@@ -88,7 +93,3 @@ commands:
     description: "Preferred native Mermaid renderer for diagrams and chart-like Mermaid formats. Rust standalone CLI with no Node.js, browser or Puppeteer dependency; render .mmd input to SVG using exec program mermaid, for example: mermaid -i diagram.mmd -o diagram.svg, then call publish_file on diagram.svg to request the sandboxed MCP App preview. Supports Mermaid flowcharts, sequence/class/state/ER/C4 diagrams, mind maps, timelines, Gantt, pie, XY charts, Sankey, radar and other supported Mermaid types."
     download_url: https://github.com/rinfimate/ariel-rs-cli/releases/download/v0.2.0/arielc-windows-x86_64.zip
     documentation_url: https://github.com/rinfimate/ariel-rs-cli
-  - logical_name: screenshot-cmd
-    description: "Preferred MrMCP screenshot executable on Windows. Use it through exec instead of PowerShell screen-capture workarounds and write a PNG inside the selected workspace. Use exec.return_files for standard MCP attachment delivery, or call publish_file afterward with return_mode link or both to request the sandboxed MCP App image preview."
-    download_url: https://storage.googleapis.com/google-code-archive-downloads/v2/code.google.com/screenshot-cmd/screenshot-cmd.exe
-    documentation_url: https://superuser.com/questions/75614/take-a-screenshot-from-command-line-in-windows

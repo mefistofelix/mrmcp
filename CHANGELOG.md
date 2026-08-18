@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.113
+
+- Reworked the desktop UI transport so noisy browser state is coalesced only before crossing the Tauri bridge: text input is debounced/merged in the WebView, scroll and focus updates are latest-wins while pending, semantic events remain ordered barriers, and Deno processes every received envelope sequentially. Rendering now uses generations to abandon stale Eta work, serializes main-thread delivery to one in-flight plus one newest pending render, rejects stale revisions in the WebView, and relies on unmodified Morphlex `preserveChanges: true` so active edits and caret position survive unrelated live morphs.
+- Added the session-scoped `discover_commands` catalog with ordered YAML metadata, an Agent Discovery toggle, compact Commands filtering/pagination, the Robost desktop-automation entry, and updated command guidance to publish generated files explicitly through `publish_file`.
+- Added a dedicated Tool/command filter before generic Tool Call search. Managed-process rows persist/index `process_runs.log_id`, allowing `exec*` calls to resolve back to the originating executable/catalog command; current-schema startup now ensures that column before queries use it, fixing the `no such column: pr.log_id` administration crash.
+- Changed Published bulk cleanup to confirmed **Clear Matching** across the complete filtered result set and added fresh per-instance MCP App View resource URIs for descriptor/resource cache busting while keeping canonical URIs internally.
+- Updated the pinned desktop runtime to Tauriless `0.1.17`; its npm package was verified to contain the Windows x64, Linux x64, macOS x64 and macOS arm64 native bridges required by release CI.
+
 ## 0.10.112
 
 - Isolated each `publish_file` / `publish_html` MCP App View to the standard `ui/notifications/tool-result` channel, pinned the first publication identity mounted by a widget, removed ChatGPT-global `toolOutput` fallbacks and legacy `openai/*` tool metadata, and made `resources/read` independent of contextual `Mcp-Name` values. Widget resource URIs were bumped to invalidate cached markup.

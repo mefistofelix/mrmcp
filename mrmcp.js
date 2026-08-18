@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.112 — Isolate MCP App publication results and relationships.
+MrMCP 0.10.113 — Harden GUI rendering, command discovery and Tool Call filtering.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -78,17 +78,17 @@ const BASE_TOOLS = [
   "list_workspaces", "create_workspace", "open_workspace", "read_file", "read_files", "write_file", "write_files",
   "edit", "replace", "glob", "grep",
   "file_info", "create_directory", "copy_path", "move_path", "trash_paths", "untrash_action",
-  "publish_file", "publish_html", "list_commands", "query_tool_calls", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
+  "publish_file", "publish_html", "discover_commands", "query_tool_calls", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
   "js", "js_add_node_module_dir", "js_reset",
 ];
 const READ_TOOLS = new Set([
   "list_workspaces", "read_file", "read_files", "glob", "grep",
-  "file_info", "list_commands", "query_tool_calls", "exec_attach", "exec_list", "exec_status",
+  "file_info", "discover_commands", "query_tool_calls", "exec_attach", "exec_list", "exec_status",
 ]);
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.112";
+const VERSION = "0.10.113";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;
@@ -125,6 +125,8 @@ const uid = () => crypto.randomUUID();
 const b64url = bytes => btoa(String.fromCharCode(...bytes))
   .replaceAll("+", "-").replaceAll("/", "_").replaceAll("=", "");
 const randomToken = (n = 32) => b64url(crypto.getRandomValues(new Uint8Array(n)));
+const freshUiResourceUri = base => `${base}?instance=${randomToken(12)}`;
+const matchesUiResourceUri = (uri, base) => uri === base || uri.startsWith(`${base}?instance=`);
 const sha256 = async value => b64url(new Uint8Array(
   await crypto.subtle.digest("SHA-256", value instanceof Uint8Array ? value : enc.encode(String(value))),
 ));
@@ -456,15 +458,16 @@ async function backend({ addWorkspace = null } = {}) {
     dialog: null,
     notice: null,
     settingsDraft: null,
-    lastInputSequence: 0,
-    commands: { page: 1, query: "", pageSize: 25, includeMissing: true },
+    commands: { page: 1, query: "", pageSize: 5, filter: "" },
     sessions: { oauthClientId: "" },
-    logs: { page: 1, query: "", context: "", status: "", pageSize: 25, openRowId: "", selfTest: null },
+    logs: { page: 1, toolQuery: "", query: "", context: "", status: "", pageSize: 25, openRowId: "", selfTest: null },
     published: { page: 1, kind: "", context: "", size: "" },
     debug: { query: "", method: "", status: "", openRowId: "" },
   };
   let uiRenderTimer = null, uiLogFilterTimer = null, uiNoticeTimer = null, uiRenderRunning = false, uiRenderQueued = false;
-  let uiInputChain = Promise.resolve(), uiInputDepth = 0, uiInputRenderDelay = null;
+  let uiRenderGeneration = 0, uiRenderReason = "change";
+  let uiInputRunning = false, uiInputDepth = 0, uiInputRenderDelay = null;
+  const uiInputQueue = [];
   const normalizedUiScopes = scopes => [...new Set((Array.isArray(scopes) ? scopes : [scopes])
     .map(String).map(value => value.trim()).filter(Boolean))];
   function uiScopesAffectCurrent(scopes) {
@@ -494,6 +497,8 @@ async function backend({ addWorkspace = null } = {}) {
   function queueUiRender(reason = "change", delay = 18) {
     if (!GUI_RUNTIME) return;
     uiRenderQueued = true;
+    uiRenderGeneration += 1;
+    uiRenderReason = reason;
     if (uiInputDepth) {
       const value = Math.max(0, Number(delay) || 0);
       uiInputRenderDelay = uiInputRenderDelay == null ? value : Math.min(uiInputRenderDelay, value);
@@ -515,7 +520,7 @@ async function backend({ addWorkspace = null } = {}) {
           revision: ++uiRevision,
           html: `<div id="app" data-section="${htmlEscape(uiState.currentSection)}"><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div></header><main style="margin-left:0"><div class="card tls-alert"><h2>UI Render Failed</h2><pre>${message}</pre></div></main></div>`,
           section: uiState.currentSection,
-          scroll: [0, 0], focus: null, ack: uiState.lastInputSequence,
+          scroll: [0, 0], focus: null,
           reason: "render-error", at: Date.now(),
         });
       });
@@ -532,9 +537,14 @@ async function backend({ addWorkspace = null } = {}) {
           uiRenderQueued = true;
           break;
         }
-        const visibilityEpoch = uiRenderVisibilityEpoch, scrollTarget = uiState.scrollTarget;
-        const html = await renderUiDocument();
-        if (!uiRenderVisible || visibilityEpoch !== uiRenderVisibilityEpoch) {
+        const generation = uiRenderGeneration, visibilityEpoch = uiRenderVisibilityEpoch, scrollTarget = uiState.scrollTarget;
+        let html;
+        try { html = await renderUiDocument(generation); }
+        catch (error) {
+          if (error === UI_RENDER_STALE || generation !== uiRenderGeneration) { uiRenderQueued = true; continue; }
+          throw error;
+        }
+        if (!uiRenderVisible || visibilityEpoch !== uiRenderVisibilityEpoch || generation !== uiRenderGeneration) {
           uiRenderQueued = true;
           if (uiRenderVisible) continue;
           break;
@@ -546,8 +556,7 @@ async function backend({ addWorkspace = null } = {}) {
           scroll: uiState.scrollBySection[uiState.currentSection] || [0, 0],
           scroll_target: scrollTarget,
           focus: uiState.focus,
-          ack: uiState.lastInputSequence,
-          reason,
+          reason: uiRenderReason,
           at: Date.now(),
         });
         if (scrollTarget && uiState.scrollTarget === scrollTarget) uiState.scrollTarget = "";
@@ -572,7 +581,7 @@ async function backend({ addWorkspace = null } = {}) {
     if (/\bcustom_tools\b/.test(statement)) ["commands", "dashboard", "endpoints"].forEach(scope => scopes.add(scope));
     if (/\boauth_(?:clients|tokens|refresh_tokens|codes)\b/.test(statement)) ["oauth", "dashboard"].forEach(scope => scopes.add(scope));
     if (/\bserver_config\b/.test(statement)) ["dashboard", "endpoints", "settings", "oauth"].forEach(scope => scopes.add(scope));
-    if (/\bconfig\b/.test(statement)) ["dashboard", "settings", "debug", "tls", "endpoints"].forEach(scope => scopes.add(scope));
+    if (/\bconfig\b/.test(statement)) ["dashboard", "settings", "commands", "debug", "tls", "endpoints"].forEach(scope => scopes.add(scope));
     if (/\bmetrics\b/.test(statement)) scopes.add("dashboard");
     return [...scopes];
   }
@@ -728,6 +737,7 @@ async function backend({ addWorkspace = null } = {}) {
     CREATE INDEX IF NOT EXISTS contexts_root ON contexts(server_id,root_id);
     CREATE TABLE IF NOT EXISTS process_runs(
       id TEXT PRIMARY KEY,
+      log_id INTEGER NOT NULL DEFAULT 0,
       pid INTEGER,
       server_id INTEGER NOT NULL,
       server_name TEXT NOT NULL,
@@ -799,6 +809,9 @@ async function backend({ addWorkspace = null } = {}) {
       value INTEGER NOT NULL DEFAULT 0
     );
   `);
+  const processRunColumns = new Set(db.prepare("PRAGMA table_info(process_runs)").all().map(column => column.name));
+  if (!processRunColumns.has("log_id")) db.exec("ALTER TABLE process_runs ADD COLUMN log_id INTEGER NOT NULL DEFAULT 0");
+  db.exec("CREATE INDEX IF NOT EXISTS process_runs_log ON process_runs(log_id)");
   const publishedColumns = new Set(db.prepare("PRAGMA table_info(published)").all().map(column => column.name));
   if (!publishedColumns.has("content_key")) db.exec("ALTER TABLE published ADD COLUMN content_key TEXT NOT NULL DEFAULT ''");
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS published_content_key ON published(server_id,content_key) WHERE content_key<>''");
@@ -928,7 +941,7 @@ async function backend({ addWorkspace = null } = {}) {
     server_config: ["oauth", "basic_enabled", "basic_username", "basic_secret_enc"],
     roots: ["server_id", "name", "path", "enabled"],
     contexts: ["id", "handle", "server_id", "root_id", "created_at", "updated_at", "last_active_at", "protocol_version", "auth_kind", "oauth_client_id", "client_name", "user_agent"],
-    process_runs: ["context_id", "context_handle", "root_id", "root_name", "root_path", "stdout_tail", "stderr_tail"],
+    process_runs: ["log_id", "context_id", "context_handle", "root_id", "root_name", "root_path", "stdout_tail", "stderr_tail"],
     logs: ["id", "server_name", "tool", "status", "input_json", "context_id", "context_handle", "root_id", "root_name", "root_path"],
     tool_call_descriptors: ["log_id", "descriptor_json"],
     tool_call_transport: ["log_id", "progress_requested"],
@@ -986,7 +999,7 @@ async function backend({ addWorkspace = null } = {}) {
     ["tls_last_request_at", "0"], ["tls_last_request_status", ""], ["tls_last_request_valid", "0"],
     ["tls_next_attempt_at", "0"], ["tls_rate_limit_reset_at", "0"], ["tls_renewal_due_at", "0"],
     ["tls_self_signed_created_at", "0"], ["debug_http_log", "0"],
-    ["inherit_system_path", "1"],
+    ["inherit_system_path", "1"], ["command_discovery_enabled", "1"],
   ]) if (!one("SELECT 1 FROM config WHERE key=?", k)) setCfg(k, v);
   setCfg("tls_cert_path", CERT_PATH);
   setCfg("tls_key_path", KEY_PATH);
@@ -1224,14 +1237,12 @@ async function backend({ addWorkspace = null } = {}) {
       return { ok: true, cleared };
     });
   }
-  async function clearPublished() {
+  async function clearPublished(filters = {}) {
     return await withToolCallsDrained("published", async () => {
-      const cleared = one("SELECT COUNT(*) n FROM published")?.n || 0;
-      await Deno.remove(PUBLISH_DIR, { recursive: true }).catch(error => {
-        if (!(error instanceof Deno.errors.NotFound)) throw error;
-      });
-      Deno.mkdirSync(PUBLISH_DIR, { recursive: true });
-      run("DELETE FROM published");
+      const { where, values } = publishedAdminFilter(serverConfig().id, filters);
+      const rows = all(`SELECT p.id FROM published p WHERE ${where} ORDER BY p.id`, ...values);
+      let cleared = 0;
+      for (const row of rows) if (await cleanupPublished(String(row.id), true)) cleared += 1;
       return { ok: true, cleared };
     });
   }
@@ -1297,8 +1308,8 @@ async function backend({ addWorkspace = null } = {}) {
       csp: { resourceDomains: [publicOrigin()] },
     },
   });
-  const filePreviewResource = () => ({
-    uri: FILE_PREVIEW_UI_URI,
+  const filePreviewResource = (uri = FILE_PREVIEW_UI_URI) => ({
+    uri,
     name: "mrmcp_file_preview",
     title: "MrMCP file preview",
     description: "Sandboxed MCP App used by publish_file. It reads the published HTTPS URL from structuredContent, renders image files with a normal img element, and offers an Open File action for other MIME types.",
@@ -1506,8 +1517,8 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
       csp: { frameDomains: [publicOrigin()] },
     },
   });
-  const htmlPreviewResource = () => ({
-    uri: HTML_PREVIEW_UI_URI,
+  const htmlPreviewResource = (uri = HTML_PREVIEW_UI_URI) => ({
+    uri,
     name: "mrmcp_html_preview",
     title: "MrMCP HTML preview",
     description: "Sandboxed MCP App used by publish_html. It loads the persisted HTML URL returned in structuredContent inside a nested sandboxed iframe.",
@@ -3034,49 +3045,50 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     }
     return rows;
   }
-  async function commandCatalog({
-    query = "", page = 1, page_size = 25, include_missing = false, admin = false,
-  } = {}) {
+  async function commandRows({ include_missing = false, admin = false } = {}) {
     const registered = await Promise.all((await readCommandConfig()).map(commandRow));
     const names = new Set(registered.map(row => row.name.toLowerCase()));
     const paths = new Set(registered.flatMap(row => [row.path, row.resolved_path]).filter(Boolean).map(path => path.toLowerCase()));
     const automatic = (await automaticCommands()).filter(
       row => !names.has(row.name.toLowerCase()) && !paths.has(row.path.toLowerCase()),
-    );
-    let rows = [...registered, ...automatic];
-    rows = admin
-      ? rows.filter(row => include_missing || (row.present && row.executable))
-      : rows.filter(row => row.present && row.executable);
+    ).sort((a, b) => a.name.localeCompare(b.name));
+    return admin
+      ? [...registered, ...automatic].filter(row => include_missing || (row.present && row.executable))
+      : [...registered, ...automatic].filter(row => row.present && row.executable);
+  }
+  async function commandCatalog({
+    query = "", page = 1, page_size = 5, include_missing = false, admin = false, filter = "",
+  } = {}) {
+    let rows = await commandRows({ include_missing, admin });
     const needle = String(query).trim().toLowerCase();
     rows = rows.filter(row =>
       !needle || `${row.name}\n${row.path}\n${row.description}\n${row.download_url || ""}\n${row.documentation_url || ""}`.toLowerCase().includes(needle)
-    ).sort((a, b) =>
-      a.name.localeCompare(b.name) ||
-      Number(b.registered) - Number(a.registered)
     );
+    filter = ["available", "unavailable", "yaml", "disk"].includes(String(filter)) ? String(filter) : "";
+    if (filter === "available") rows = rows.filter(row => row.present && row.executable);
+    else if (filter === "unavailable") rows = rows.filter(row => !row.present || !row.executable);
+    else if (filter === "yaml") rows = rows.filter(row => row.registered);
+    else if (filter === "disk") rows = rows.filter(row => !row.registered);
     page = Math.max(1, Number(page) || 1);
-    page_size = Math.max(1, Math.min(Number(page_size) || 25, 100));
+    page_size = Math.max(1, Math.min(Number(page_size) || 5, 100));
     const total = rows.length, start = (page - 1) * page_size;
     return {
-      query: String(query),
-      page,
-      page_size,
-      total,
+      query: String(query), filter, page, page_size, total,
       pages: Math.max(1, Math.ceil(total / page_size)),
       has_more: start + page_size < total,
       bin_directory: BIN_DIR,
       config_file: COMMANDS_PATH,
-      path_precedence: "MrMCP resolves catalog logical names before normal platform PATH lookup; catalog entries override automatic first-level commands and nested paths require catalog entries",
-      invocation: {
-        rule: "Every returned commands[].logical_name is already present, executable, and directly callable as exec.program. Do not probe it with where.exe, which, Get-Command, or a filesystem search.",
-        example: { tool: "exec", input: { program: "<logical_name>", args: [] } },
-      },
-      commands: rows.slice(start, start + page_size).map(row => ({
-        ...row,
+      discovery_enabled: getCfg("command_discovery_enabled", "1") === "1",
+      commands: rows.slice(start, start + page_size),
+    };
+  }
+  async function discoverCommands() {
+    if (getCfg("command_discovery_enabled", "1") !== "1") return { commands: [] };
+    return {
+      commands: (await commandRows()).map(row => ({
         logical_name: row.logical_name || row.name,
-        exec_program: row.logical_name || row.name,
-        directly_invokable: true,
-        path_lookup_required: false,
+        description: row.description || "",
+        ...(row.documentation_url ? { documentation_url: row.documentation_url } : {}),
       })),
     };
   }
@@ -3098,9 +3110,11 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
 
 
   // Compact descriptors reduce token use while preserving invocation semantics.
-  function serverTools(p, fullAccess = true) {
+  function serverTools(p, fullAccess = true, freshUiResources = false) {
     if (!fullAccess) return [];
     const available = new Set(BASE_TOOLS);
+    const fileUiResourceUri = freshUiResources ? freshUiResourceUri(FILE_PREVIEW_UI_URI) : FILE_PREVIEW_UI_URI;
+    const htmlUiResourceUri = freshUiResources ? freshUiResourceUri(HTML_PREVIEW_UI_URI) : HTML_PREVIEW_UI_URI;
     const workspaceNameInput = {
       type: "string", minLength: 1, maxLength: 128,
       description: "Name of the enabled Workspace to open. Any enabled Workspace name may be supplied; the value is validated when the tool runs. The selected Session is attached to this Workspace immediately.",
@@ -3145,7 +3159,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const execInput = {
       program: {
         type: "string",
-        description: "Executable path or logical_name returned by list_commands. Invoke catalog names directly without PATH probes.",
+        description: "Executable path or logical_name returned by discover_commands. MrMCP resolves catalog logical names before normal platform PATH lookup; invoke them directly without PATH probes.",
       },
       args: {
         type: "array", items: { type: "string" }, default: [],
@@ -3312,12 +3326,9 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
           ...contextInput,
         }, required: ["html"] },
       ],
-      list_commands: [
-        "Discover installed extra commands by name or purpose. Every returned logical_name is directly callable as exec.program without PATH probes.",
-        { properties: {
-          query: { type: "string", default: "" }, page: { type: "integer", minimum: 1, default: 1 },
-          page_size: { type: "integer", minimum: 1, maximum: 100, default: 25 }, ...contextInput,
-        } },
+      discover_commands: [
+        "Read the complete catalog of extra executable commands intentionally made available to the agent. Call this proactively whenever a task might benefit from capabilities beyond MrMCP's built-in tools, before inventing a workaround, assuming a utility is unavailable, or choosing a generic alternative. When a listed command fits the task, prefer it: its presence reflects an explicit user choice. The whole available catalog is returned in one call with descriptions and documentation links, so normally call it once per Session and reuse what you learned; there is no search or pagination, which also avoids failures from guessed or misspelled command names. If the operator globally disables command discovery, this tool returns an empty commands array. Every returned logical_name is directly callable as exec.program. MrMCP resolves catalog logical names before normal platform PATH lookup; do not probe PATH or search the filesystem first.",
+        { properties: { ...contextInput } },
       ],
       query_tool_calls: [
         "Query tool-call history that actually reached the server for this exact context_handle. Filters may be combined. query is a case-insensitive literal substring search across the complete stored log record; tool and status are exact filters; before_id pages backward by stable log id. Use this to diagnose tool behavior or distinguish server-side failures from requests blocked before MCP dispatch; an upstream-blocked request cannot appear here.",
@@ -3442,7 +3453,17 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       untrash_action: outputSchema({ action_id: { type: "string" }, paths: stringArray }),
       publish_file: outputSchema({ id: { type: "string" }, content_id: { type: "string" }, path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" }, size: { type: "integer" }, uri: { type: "string", description: "Persistent HTTPS URL consumed by the attached MCP App widget; publications never expire automatically." } }),
       publish_html: outputSchema({ id: { type: "string" }, content_id: { type: "string" }, title: { type: "string" }, uri: { type: "string", description: "Persistent HTTPS URL loaded by the attached MCP App widget." }, height: { type: "integer" }, created_at: { type: "string" } }),
-      list_commands: outputSchema({ query: { type: "string" }, page: { type: "integer" }, page_size: { type: "integer" }, total: { type: "integer" }, pages: { type: "integer" }, has_more: { type: "boolean" }, bin_directory: { type: "string" }, config_file: { type: "string" }, path_precedence: { type: "string" }, invocation: { type: "object", additionalProperties: true }, commands: objectArray }),
+      discover_commands: outputSchema({ commands: {
+        type: "array", items: {
+          type: "object", additionalProperties: false,
+          properties: {
+            logical_name: { type: "string", description: "Pass this value directly as exec.program." },
+            description: { type: "string" },
+            documentation_url: { type: "string" },
+          },
+          required: ["logical_name", "description"],
+        },
+      } }),
       query_tool_calls: outputSchema({ calls: objectArray }),
       exec: outputSchema(processProperties),
       exec_start: outputSchema({
@@ -3475,7 +3496,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       list_workspaces: "List Workspaces", create_workspace: "Create Workspace", open_workspace: "Open Workspace", read_file: "Read", read_files: "Read batch",
       write_file: "Write", write_files: "Write batch", edit: "Edit", replace: "Replace",
       glob: "Glob", grep: "Grep", trash_paths: "Trash paths", untrash_action: "Restore trash action",
-      publish_file: "Publish File", publish_html: "Publish HTML", list_commands: "Command Catalog", query_tool_calls: "Query Tool Calls",
+      publish_file: "Publish File", publish_html: "Publish HTML", discover_commands: "Discover Commands", query_tool_calls: "Query Tool Calls",
       exec: "Run Command", exec_start: "Start Persistent Command", exec_attach: "Attach Process Output", exec_write: "Write Stdin",
       exec_kill: "Terminate Process", exec_list: "List Processes", exec_status: "Process Status", js: "JavaScript Kernel",
       js_add_node_module_dir: "Add Module Directory", js_reset: "Reset JavaScript Kernel",
@@ -3504,9 +3525,9 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         outputSchema: outputSchemas[name] || genericOutputSchema,
         annotations: annotations(name),
         ...(name === "publish_file" ? { _meta: {
-          ui: { resourceUri: FILE_PREVIEW_UI_URI },
+          ui: { resourceUri: fileUiResourceUri },
         } } : name === "publish_html" ? { _meta: {
-          ui: { resourceUri: HTML_PREVIEW_UI_URI },
+          ui: { resourceUri: htmlUiResourceUri },
         } } : {}),
       };
     });
@@ -3607,7 +3628,15 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const fileResource = filePreviewResource(), htmlResource = htmlPreviewResource();
     const publishTool = tools.find(tool => tool.name === "publish_file");
     const publishHtmlTool = tools.find(tool => tool.name === "publish_html");
+    const freshToolsA = serverTools(p, true, true), freshToolsB = serverTools(p, true, true);
+    const freshFileA = freshToolsA.find(tool => tool.name === "publish_file")?._meta?.ui?.resourceUri || "";
+    const freshFileB = freshToolsB.find(tool => tool.name === "publish_file")?._meta?.ui?.resourceUri || "";
+    const freshHtmlA = freshToolsA.find(tool => tool.name === "publish_html")?._meta?.ui?.resourceUri || "";
+    const freshHtmlB = freshToolsB.find(tool => tool.name === "publish_html")?._meta?.ui?.resourceUri || "";
     const uiErrors = [];
+    if (!matchesUiResourceUri(freshFileA, FILE_PREVIEW_UI_URI) || freshFileA === FILE_PREVIEW_UI_URI || freshFileA === freshFileB ||
+        !matchesUiResourceUri(freshHtmlA, HTML_PREVIEW_UI_URI) || freshHtmlA === HTML_PREVIEW_UI_URI || freshHtmlA === freshHtmlB)
+      uiErrors.push("fresh UI resource URI generation failed");
     if (fileResource.uri !== FILE_PREVIEW_UI_URI || htmlResource.uri !== HTML_PREVIEW_UI_URI)
       uiErrors.push("unexpected UI resource URI");
     if (fileResource.mimeType !== MCP_UI_MIME_TYPE || htmlResource.mimeType !== MCP_UI_MIME_TYPE)
@@ -4131,9 +4160,9 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       execution.setCancel?.((signal, source = "user") => terminateProcess(rec, signal, source), { process_id: rec.id, kind: "process" });
       execution.onDisconnect?.(() => terminateProcess(rec, "SIGTERM", "client"));
     }
-    run(`INSERT INTO process_runs(id,pid,server_id,server_name,context_id,context_handle,root_id,root_name,root_path,
-      command_json,cwd,status,started_at,timeout_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-      rec.id, rec.pid, p.id, "mcp", rec.context_id, rec.context_handle, rec.root_id, rec.root_name, rec.root_path,
+    run(`INSERT INTO process_runs(id,log_id,pid,server_id,server_name,context_id,context_handle,root_id,root_name,root_path,
+      command_json,cwd,status,started_at,timeout_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      rec.id, rec.log_id, rec.pid, p.id, "mcp", rec.context_id, rec.context_handle, rec.root_id, rec.root_name, rec.root_path,
       rec.command_json, rec.cwd_display, rec.status, rec.started_at, timeout);
     const stdoutPump = pumpProcess(child.stdout, rec, "stdout"), stderrPump = pumpProcess(child.stderr, rec, "stderr");
     rec.done = child.status.then(async status => {
@@ -4767,7 +4796,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         context_id: selection.context.id, root_id: selection.root.id, root_name: selection.root.name, root_path: selection.root.path,
       });
     }
-    if (name === "list_commands") return await commandCatalog({ ...args, admin: false, include_missing: false });
+    if (name === "discover_commands") return await discoverCommands();
     if (name === "query_tool_calls") {
       const limit = Math.max(1, Math.min(Number(args.limit || 10), 50));
       const conditions = ["context_handle=?", "id<>?"];
@@ -4964,7 +4993,12 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         : JSON.stringify(structuredContent, null, 2);
       const max = 1024 * 1024, rendered = full.length > max
         ? full.slice(0, max) + `\n\n[truncated; full output in log ${id}]` : full;
-      const toolResult = { content: [{ type: "text", text: rendered }], structuredContent, isError: status !== "completed" };
+      const resultUiResourceUri = name === "publish_file" ? freshUiResourceUri(FILE_PREVIEW_UI_URI)
+        : name === "publish_html" ? freshUiResourceUri(HTML_PREVIEW_UI_URI) : "";
+      const toolResult = {
+        content: [{ type: "text", text: rendered }], structuredContent, isError: status !== "completed",
+        ...(resultUiResourceUri ? { _meta: { ui: { resourceUri: resultUiResourceUri } } } : {}),
+      };
       updateLog(id, {
         completed_at: Date.now(), duration_ms: Date.now() - started, status,
         resolved_json: JSON.stringify(publicLogResult), stdout, stderr,
@@ -5577,7 +5611,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const instructions = fullAccess
       ? "Use list_workspaces when you need to discover enabled Workspace names. Use create_workspace with only a name when you need a new empty Workspace; MrMCP creates and registers its Desktop directory internally, then call open_workspace with that same name. If you already have the current Session handle, pass it as current_context_handle to move that same Session to the Workspace; if it is omitted, empty, unknown or expired, open_workspace creates a new Session. The result includes workspace_name, absolute cwd and agent_guidance_path; when that path is non-null, read and follow the referenced AGENTS.md before repository work. Pass the returned context_handle unchanged on every later Session-bound tool call. " +
         "Use read_file/read_files, glob, grep, edit and replace directly for file inspection, discovery, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. " +
-        "Use list_commands before other command-line work and invoke returned logical_name values directly through exec.program without PATH probes. " +
+        "When work may benefit from command-line capability beyond the structured tools, call discover_commands proactively before inventing workarounds or assuming a utility is unavailable. It returns the complete user-chosen available command catalog in one call; prefer a listed command when it fits, remember the catalog for the Session, and invoke its logical_name directly through exec.program without PATH probes. " +
         "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; cancelling/disconnecting exec terminates its child. For persistent or interactive work, call exec_start; it immediately returns exec_id, which is the stable integer Tool Call id of that start. Pass that exec_id together with the same context_handle to exec_attach, exec_write, exec_kill or exec_status; ids from other Sessions are inaccessible. exec_list shows only currently running persistent executions in this Session. exec_status is the non-consuming way to inspect running or recently completed/killed executions and optionally retrieve all output or a tail. exec_attach with progressToken streams unread backlog plus live output through progress until process exit and then returns that complete unread transcript; without progressToken it long-polls and returns at most 16 KiB of unread output plus remaining_bytes, so call it repeatedly to drain buffered output and call it again with remaining_bytes=0/status=running to wait for future output. Disconnecting exec_attach only detaches and never kills the persistent process. " +
         "Use publish_file to present existing files through its MCP App widget, and publish_html when an interactive self-contained HTML/CSS/JavaScript visualization is more appropriate. " +
         "Every authenticated client can invoke every published tool; context_handle is the bearer capability selecting the persistent Session and its current Workspace."
@@ -5601,13 +5635,16 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       } else if (x.method === "ping") {
         r.result = { resultType: "complete", _meta: serverInfoMeta };
       } else if (x.method === "tools/list") {
-        const tools = serverTools(p, fullAccess);
+        const tools = serverTools(p, fullAccess, true);
         r.result = {
           resultType: "complete", tools, ttlMs: 0,
           cacheScope: "private", _meta: serverInfoMeta,
         };
       } else if (x.method === "resources/list") {
-        const resources = fullAccess ? [filePreviewResource(), htmlPreviewResource()] : [];
+        const resources = fullAccess ? [
+          filePreviewResource(freshUiResourceUri(FILE_PREVIEW_UI_URI)),
+          htmlPreviewResource(freshUiResourceUri(HTML_PREVIEW_UI_URI)),
+        ] : [];
         r.result = {
           resultType: "complete", resources, ttlMs: 0,
           cacheScope: "private", _meta: serverInfoMeta,
@@ -5618,10 +5655,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           responseStatus = 403;
         } else {
           const resourceUri = String(x.params?.uri || "");
-          const resource = resourceUri === FILE_PREVIEW_UI_URI
-            ? { uri: FILE_PREVIEW_UI_URI, text: filePreviewAppHtml(), _meta: filePreviewUiMeta() }
-            : resourceUri === HTML_PREVIEW_UI_URI
-            ? { uri: HTML_PREVIEW_UI_URI, text: htmlPreviewAppHtml(), _meta: htmlPreviewUiMeta() }
+          const resource = matchesUiResourceUri(resourceUri, FILE_PREVIEW_UI_URI)
+            ? { uri: resourceUri, text: filePreviewAppHtml(), _meta: filePreviewUiMeta() }
+            : matchesUiResourceUri(resourceUri, HTML_PREVIEW_UI_URI)
+            ? { uri: resourceUri, text: htmlPreviewAppHtml(), _meta: htmlPreviewUiMeta() }
             : null;
           if (!resource) {
             r.error = { code: -32002, message: `Resource not found: ${resourceUri}` };
@@ -5980,7 +6017,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     if (["all", "oauth"].includes(section)) result.oauth_clients = oauthProjection();
     return result;
   };
-  const publishedAdminProjection = (serverId, current = {}) => {
+  const publishedAdminFilter = (serverId, current = {}) => {
     const conditions = ["p.server_id=?"], values = [serverId];
     const kind = ["file", "html"].includes(String(current.kind || "")) ? String(current.kind) : "";
     const contextId = Math.max(0, Number(current.context) || 0);
@@ -5994,7 +6031,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     else if (size === "medium") conditions.push("p.size>=1048576 AND p.size<10485760");
     else if (size === "large") conditions.push("p.size>=10485760 AND p.size<104857600");
     else if (size === "huge") conditions.push("p.size>=104857600");
-    const where = conditions.join(" AND "), pageSize = 25;
+    return { where: conditions.join(" AND "), values, kind, context: contextId || "", size };
+  };
+  const publishedAdminProjection = (serverId, current = {}) => {
+    const { where, values, kind, context, size } = publishedAdminFilter(serverId, current), pageSize = 25;
     const total = Number(one(`SELECT COUNT(*) n FROM published p WHERE ${where}`, ...values)?.n || 0);
     const pages = Math.max(1, Math.ceil(total / pageSize));
     const page = Math.min(pages, Math.max(1, Number(current.page) || 1)), offset = (page - 1) * pageSize;
@@ -6016,7 +6056,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const sessions = all(`SELECT context_id FROM published WHERE server_id=? AND context_id>0
       UNION SELECT u.context_id FROM published_uses u JOIN published p ON p.id=u.published_id WHERE p.server_id=? AND u.context_id>0
       ORDER BY context_id DESC`, serverId, serverId).map(row => Number(row.context_id));
-    return { rows, total, page, pages, page_size: pageSize, sessions, kind, context: contextId || "", size };
+    return { rows, total, page, pages, page_size: pageSize, sessions, kind, context, size };
   };
 
   async function restartMcp() {
@@ -6086,9 +6126,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 <? if(section==="dashboard"){ ?><section id=dashboard class=page><div class=row><h2 class=grow>🏠 Dashboard</h2><span class=muted>Runtime · activity · endpoints</span></div><div id=cards class=grid></div><div class=row><h3 class=grow>🛠️ Active Tool Calls</h3><span class=muted>Live · finished calls remain for 5s</span></div><div id=activeToolCalls></div><div id=trashActivity class=grid></div><div class=dashboard-grid><div><h3>🌐 Server</h3><div id=endpoints></div></div><div><h3>🔒 TLS and Connectivity</h3><div id=tlsStatus></div></div></div></section>
 <? } else if(section==="sessions"){ ?><section id=sessions class=page><div class=row><h2 class=grow>💬 Sessions</h2><span class=muted>Live updates</span><button class=danger data-action=clear-sessions<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Persistent MCP Sessions. Each Session is attached to a <b>📁 Workspace</b>.</p><? if(s.sessions?.oauthClientId){ ?><div class=row><span class=muted>OAuth filter</span><code><?= s.sessions.oauthClientId ?></code><button class=small data-action=clear-session-oauth>✕ Clear</button></div><? } ?><div class=card><b>Client Continuity</b><p class=muted>ChatGPT may create a new Session after model or thinking changes. Client/auth/User-Agent metadata is best effort.</p></div><div id=contextList></div></section>
 <? } else if(section==="roots"){ ?><section id=roots class=page><div class=row><h2 class=grow>📁 Workspaces</h2><button class=primary data-action=new-root>➕ Add Workspace</button><button class=danger data-action=clear-workspaces<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Workspace names are unique. Drag Sessions to change where future Tool Calls run; running processes stay in their original folder.</p><div id=rootList></div></section>
-<? } else if(section==="commands"){ const c=s.commands||{}; ?><section id=commands class=page><div class=row><h2 class=grow>🧰 Extra Commands</h2><button data-action=download-all-commands>⬇️ Download All</button><button class=primary data-action=new-command>➕ Register Command</button></div><p class=muted><code>commands.yaml</code> defines catalog entries. Executables in <code>.mrmcp/bin</code> appear automatically.</p><div class=row><input id=commandQuery class=grow placeholder="Search name, path or description…" value="<?= c.query||'' ?>"><label class=small><input id=commandIncludeMissing type=checkbox<?= c.includeMissing!==false?' checked':'' ?>> Show Unavailable</label><select id=commandPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(c.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-commands>🔎 Search</button></div><div id=commandList></div></section>
-<? } else if(section==="logs"){ const l=s.logs||{}; ?><section id=logs class=page><div class=row><h2 class=grow>🛠️ Tool Calls</h2><button class=danger data-action=clear-tool-calls<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Click a row for details. Terminate active work from Actions.</p><div class=row><input id=logQuery class=grow placeholder="Search input, output, errors…" value="<?= l.query||'' ?>"><select id=logContext><option value="">All sessions</option><? (s.contextValues||[]).forEach(v=>{ ?><option value="<?= v.pk ?>"<?= String(l.context||"")===String(v.pk)?" selected":"" ?>>#<?= v.pk ?></option><? }) ?></select><select id=logStatus class="<?= l.status||'' ?>"><option value="">All states</option><? ['completed','failed','invalid','running'].forEach(v=>{ ?><option class="<?= v ?>" value="<?= v ?>"<?= l.status===v?' selected':'' ?>><?= v ?></option><? }) ?></select><select id=logPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(l.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=clear-log-filters>🧹 Clear Filters</button></div><? if(l.selfTest){ ?><div id=logSelfTest class=card><div class=row><h3 class=grow>🧪 MCP Self-Test</h3><button class=small data-action=copy-detail data-target=logDetail>📋 Copy JSON</button><button class=small data-action=close-self-test>✕ Close</button></div><pre id=logDetail><?= it.pretty(l.selfTest) ?></pre></div><? } ?><div id=logList></div></section>
-<? } else if(section==="published"){ ?><section id=published class=page><div class=row><h2 class=grow>📦 Published</h2><button class=danger data-action=clear-published<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear All</button></div><p class=muted>Deduplicated persistent snapshots created by <code>publish_file</code> and <code>publish_html</code>. One resource may have references from multiple Sessions and Workspaces.</p><div id=publishedList></div></section>
+<? } else if(section==="commands"){ const c=s.commands||{}, discoveryEnabled=c.discoveryEnabled!==false; ?><section id=commands class=page><div class=row><h2 class=grow>🧰 Extra Commands</h2><button class="<?= discoveryEnabled?'ok':'failed' ?>" data-action=toggle-command-discovery><?= discoveryEnabled?'🟢 Agent Discovery Enabled':'🔴 Agent Discovery Disabled' ?></button><button data-action=download-all-commands>⬇️ Download All</button><button class=primary data-action=new-command>➕ Register Command</button></div><p class=muted><code>commands.yaml</code> defines catalog entries. Executables in <code>.mrmcp/bin</code> appear automatically.</p><div class=row><input id=commandQuery class=grow placeholder="Search name, path or description…" value="<?= c.query||'' ?>"><select id=commandFilter><option value=""<?= !c.filter?' selected':'' ?>>All Commands</option><option value=available<?= c.filter==='available'?' selected':'' ?>>Available</option><option value=unavailable<?= c.filter==='unavailable'?' selected':'' ?>>Unavailable</option><option value=yaml<?= c.filter==='yaml'?' selected':'' ?>>YAML Metadata</option><option value=disk<?= c.filter==='disk'?' selected':'' ?>>Disk Only</option></select><select id=commandPageSize><? [5,10,25,50].forEach(n=>{ ?><option<?= Number(c.pageSize||5)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-commands>🔎 Search</button></div><div id=commandList></div></section>
+<? } else if(section==="logs"){ const l=s.logs||{}; ?><section id=logs class=page><div class=row><h2 class=grow>🛠️ Tool Calls</h2><button class=danger data-action=clear-tool-calls<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Click a row for details. Terminate active work from Actions.</p><div class=row><input id=logTool placeholder="Tool / command…" value="<?= l.toolQuery||'' ?>"><input id=logQuery class=grow placeholder="Search input, output, errors…" value="<?= l.query||'' ?>"><select id=logContext><option value="">All sessions</option><? (s.contextValues||[]).forEach(v=>{ ?><option value="<?= v.pk ?>"<?= String(l.context||"")===String(v.pk)?" selected":"" ?>>#<?= v.pk ?></option><? }) ?></select><select id=logStatus class="<?= l.status||'' ?>"><option value="">All states</option><? ['completed','failed','invalid','running'].forEach(v=>{ ?><option class="<?= v ?>" value="<?= v ?>"<?= l.status===v?' selected':'' ?>><?= v ?></option><? }) ?></select><select id=logPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(l.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=clear-log-filters>🧹 Clear Filters</button></div><? if(l.selfTest){ ?><div id=logSelfTest class=card><div class=row><h3 class=grow>🧪 MCP Self-Test</h3><button class=small data-action=copy-detail data-target=logDetail>📋 Copy JSON</button><button class=small data-action=close-self-test>✕ Close</button></div><pre id=logDetail><?= it.pretty(l.selfTest) ?></pre></div><? } ?><div id=logList></div></section>
+<? } else if(section==="published"){ ?><section id=published class=page><div class=row><h2 class=grow>📦 Published</h2><button class=danger data-action=clear-published<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear Matching</button></div><p class=muted>Deduplicated persistent snapshots created by <code>publish_file</code> and <code>publish_html</code>. One resource may have references from multiple Sessions and Workspaces.</p><div id=publishedList></div></section>
 <? } else if(section==="debug"){ const d=s.debug||{},enabled=!!s.debug?.enabled; ?><section id=debug class=page><div class=row><h2 class=grow>🐞 HTTP Debug Log</h2><button class="debug-toggle <?= enabled?'enabled':'disabled' ?>" data-action=toggle-debug-settings aria-pressed="<?= enabled?'true':'false' ?>"><?= enabled?"🟢 Logging ON · Disable":"🔴 Logging OFF · Enable" ?></button><button class=danger data-action=clear-debug>🗑️ Clear</button></div><p class=muted>Off by default. Secrets are redacted. Disabling stops new records but keeps stored data visible. Click a row for request JSON.</p><div class=row><input id=debugQuery class=grow placeholder="Search URL, headers, body or errors…" value="<?= d.query||'' ?>"><select id=debugMethod><option value="">All methods</option><? ['GET','POST','OPTIONS'].forEach(v=>{ ?><option<?= d.method===v?' selected':'' ?>><?= v ?></option><? }) ?></select><input id=debugStatus type=number placeholder="Status" value="<?= d.status||'' ?>"><button data-action=load-debug>🔎 Search</button></div><div id=debugList></div></section>
 <? } else if(section==="oauth"){ ?><section id=oauth class=page><div class=row><h2 class=grow>🔐 OAuth Clients</h2><button class=danger data-action=clear-clients<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><div id=oauthList></div></section>
 <? } else if(section==="settings"){ ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><div class=settings-layout><div class=settings-main><div class=card><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><p class=muted>Off: child <code>PATH</code> contains only <code>.mrmcp/bin</code>. Other environment variables are unchanged.</p></div><div class=card><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
@@ -6197,8 +6237,19 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     ["OAuth metadata", p.sslip_metadata_url], ["Local HTTPS", p.local_https_mcp_url],
     ["Basic URL", p.basic_url],
   ].map(([label, url]) => ({ label, url }));
-  async function renderEtaFragment(name, data) {
+  const UI_RENDER_STALE = Symbol("ui-render-stale");
+  function requireCurrentUiRender(generation) {
+    if (!uiRenderVisible || generation !== uiRenderGeneration) throw UI_RENDER_STALE;
+  }
+  async function currentUiRender(value, generation) {
+    requireCurrentUiRender(generation);
+    const result = await value;
+    requireCurrentUiRender(generation);
+    return result;
+  }
+  async function renderEtaFragment(name, data, generation) {
     if (!fragmentTemplates[name]) throw new Error(`Unknown UI fragment: ${name}`);
+    requireCurrentUiRender(generation);
     const context = {
       data, dt: fragmentDate, logdt: fragmentLogDate, bytes: fragmentBytes, pages: fragmentPageItems, endpointRows, terminal: fragmentTerminal,
       pretty: value => JSON.stringify(value ?? null, null, 2),
@@ -6207,9 +6258,11 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         return typeof parsed === "string" ? parsed : JSON.stringify(parsed ?? null, null, 2);
       },
     };
-    return typeof eta.renderStringAsync === "function"
+    const html = typeof eta.renderStringAsync === "function"
       ? await eta.renderStringAsync(fragmentTemplates[name], context)
       : eta.renderString(fragmentTemplates[name], context);
+    requireCurrentUiRender(generation);
+    return html;
   }
   async function uiInternalApi(path, { method = "GET", body } = {}) {
     const headers = new Headers();
@@ -6257,7 +6310,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     projected.save_disabled = Object.values(projected.field_warnings).some(Boolean);
     return projected;
   }
-  async function buildUiRenderModel() {
+  async function buildUiRenderModel(generation) {
+    requireCurrentUiRender(generation);
     const section = UI_SECTIONS.has(uiState.currentSection) ? uiState.currentSection : "dashboard";
     const projection = state(section);
     const viewState = structuredClone(uiState);
@@ -6269,35 +6323,36 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const model = { section, projection, viewState, commandData: null, logData: null, publishedData: null, debugData: null };
     if (section === "roots") {
       const rows = projection.root_assignments?.roots || [];
-      const warnings = await Promise.all(rows.map(async root => [Number(root.id), await rootPathWarning(root.path)]));
+      const warnings = await currentUiRender(Promise.all(rows.map(async root => [Number(root.id), await rootPathWarning(root.path)])), generation);
       const byId = new Map(warnings);
       for (const root of rows) root.path_warning = byId.get(Number(root.id)) || "";
     } else if (section === "sessions") {
       const roots = projection.roots || [];
-      const warnings = await Promise.all(roots.map(async root => [Number(root.id), await rootPathWarning(root.path)]));
+      const warnings = await currentUiRender(Promise.all(roots.map(async root => [Number(root.id), await rootPathWarning(root.path)])), generation);
       const byId = new Map(warnings);
       for (const context of projection.context_values || [])
         context.workspace_warning = context.fallback_workspace ? "" : (byId.get(Number(context.workspace_id)) || "");
     }
     if (section === "commands") {
       const current = uiState.commands;
-      model.commandData = await commandCatalog({
+      model.commandData = await currentUiRender(commandCatalog({
         query: current.query, page: current.page, page_size: current.pageSize,
-        include_missing: current.includeMissing, admin: true,
-      });
+        include_missing: true, admin: true, filter: current.filter,
+      }), generation);
       current.page = model.commandData.page;
       viewState.commands.page = current.page;
+      viewState.commands.discoveryEnabled = model.commandData.discovery_enabled;
     } else if (section === "logs") {
       const current = uiState.logs;
       const query = new URLSearchParams({
-        q: current.query, context: current.context, status: current.status,
+        tool: current.toolQuery, q: current.query, context: current.context, status: current.status,
         page: String(current.page), page_size: String(current.pageSize),
       });
-      model.logData = await uiInternalApi(`/api/logs?${query}`);
+      model.logData = await currentUiRender(uiInternalApi(`/api/logs?${query}`), generation);
       current.page = model.logData.page;
       if (current.openRowId) {
         if ((model.logData.rows || []).some(row => String(row.id) === String(current.openRowId)))
-          model.logData.openDetail = await uiInternalApi(`/api/logs/${encodeURIComponent(current.openRowId)}`);
+          model.logData.openDetail = await currentUiRender(uiInternalApi(`/api/logs/${encodeURIComponent(current.openRowId)}`), generation);
         else current.openRowId = "";
       }
       model.logData.openRowId = current.openRowId;
@@ -6311,26 +6366,27 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     } else if (section === "debug") {
       const current = uiState.debug;
       const query = new URLSearchParams({ q: current.query, method: current.method, status: current.status });
-      const rows = await uiInternalApi(`/api/debug?${query}`);
+      const rows = await currentUiRender(uiInternalApi(`/api/debug?${query}`), generation);
       model.debugData = { enabled: !!projection.settings.debug_http_log, rows, openRowId: current.openRowId };
       if (current.openRowId) {
         if ((rows || []).some(row => String(row.id) === String(current.openRowId)))
-          model.debugData.openDetail = await uiInternalApi(`/api/debug/${encodeURIComponent(current.openRowId)}`);
+          model.debugData.openDetail = await currentUiRender(uiInternalApi(`/api/debug/${encodeURIComponent(current.openRowId)}`), generation);
         else current.openRowId = "";
       }
       model.debugData.openRowId = current.openRowId;
       viewState.debug.openRowId = current.openRowId;
     }
+    requireCurrentUiRender(generation);
     return model;
   }
   function fillUiMount(html, id, inner) {
     const pattern = new RegExp(`<([A-Za-z][A-Za-z0-9-]*) id=${id}([^>]*)></\\1>`);
     return html.replace(pattern, (_match, tag, attributes) => `<${tag} id=${id}${attributes}>${inner}</${tag}>`);
   }
-  async function renderUiDocument() {
-    const model = await buildUiRenderModel();
+  async function renderUiDocument(generation) {
+    const model = await buildUiRenderModel(generation);
     const { section, projection, viewState } = model;
-    let view = await renderEtaFragment("view", { state: viewState });
+    let view = await renderEtaFragment("view", { state: viewState }, generation);
     if (section === "dashboard") {
       view = fillUiMount(view, "cards", await renderEtaFragment("cards", {
         sessions: projection.stats?.context_values || 0,
@@ -6339,36 +6395,35 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         tool_calls_in_flight: projection.stats?.in_flight || 0,
         failed_calls: projection.stats?.failures || 0,
         http_requests: projection.stats?.total_requests || 0,
-      }));
-      view = fillUiMount(view, "activeToolCalls", await renderEtaFragment("active_tool_calls", projection.active_tool_calls || []));
+      }, generation));
+      view = fillUiMount(view, "activeToolCalls", await renderEtaFragment("active_tool_calls", projection.active_tool_calls || [], generation));
       view = fillUiMount(view, "trashActivity", await renderEtaFragment("trash_activity", {
         ...(projection.trash_activity || {}), maintenance: projection.maintenance,
-      }));
-      view = fillUiMount(view, "endpoints", await renderEtaFragment("endpoints", projection.server || {}));
-      view = fillUiMount(view, "tlsStatus", await renderEtaFragment("tls", projection.settings));
+      }, generation));
+      view = fillUiMount(view, "endpoints", await renderEtaFragment("endpoints", projection.server || {}, generation));
+      view = fillUiMount(view, "tlsStatus", await renderEtaFragment("tls", projection.settings, generation));
     } else if (section === "sessions") {
-      view = fillUiMount(view, "contextList", await renderEtaFragment("context", { values: projection.context_values || [] }));
+      view = fillUiMount(view, "contextList", await renderEtaFragment("context", { values: projection.context_values || [] }, generation));
     } else if (section === "roots") {
-      view = fillUiMount(view, "rootList", await renderEtaFragment("roots", projection.root_assignments || {}));
+      view = fillUiMount(view, "rootList", await renderEtaFragment("roots", projection.root_assignments || {}, generation));
     } else if (section === "commands") {
-      view = fillUiMount(view, "commandList", await renderEtaFragment("commands", model.commandData || {}));
+      view = fillUiMount(view, "commandList", await renderEtaFragment("commands", model.commandData || {}, generation));
     } else if (section === "logs") {
-      view = fillUiMount(view, "logList", await renderEtaFragment("logs", model.logData || {}));
+      view = fillUiMount(view, "logList", await renderEtaFragment("logs", model.logData || {}, generation));
     } else if (section === "published") {
-      view = fillUiMount(view, "publishedList", await renderEtaFragment("published", model.publishedData || {}));
+      view = fillUiMount(view, "publishedList", await renderEtaFragment("published", model.publishedData || {}, generation));
     } else if (section === "debug") {
-      view = fillUiMount(view, "debugList", await renderEtaFragment("debug", model.debugData || {}));
+      view = fillUiMount(view, "debugList", await renderEtaFragment("debug", model.debugData || {}, generation));
     } else if (section === "oauth") {
-      view = fillUiMount(view, "oauthList", await renderEtaFragment("oauth", projection.oauth_clients || []));
+      view = fillUiMount(view, "oauthList", await renderEtaFragment("oauth", projection.oauth_clients || [], generation));
     }
-    const [sidebar, status, dialogs] = await Promise.all([
-      renderEtaFragment("sidebar", { state: viewState }),
-      renderEtaFragment("status", { settings: projection.settings, activity: projection.header_activity, live: "connected" }),
-      renderEtaFragment("dialogs", { state: viewState }),
-    ]);
+    const sidebar = await renderEtaFragment("sidebar", { state: viewState }, generation);
+    const status = await renderEtaFragment("status", { settings: projection.settings, activity: projection.header_activity, live: "connected" }, generation);
+    const dialogs = await renderEtaFragment("dialogs", { state: viewState }, generation);
     const notice = uiState.notice
       ? `<div id=uiNotice class="notice-balloon ${htmlEscape(uiState.notice.kind || "error")}">${htmlEscape(uiState.notice.message || "")}</div>`
       : "";
+    requireCurrentUiRender(generation);
     return `<div id="app" data-section="${htmlEscape(section)}"><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div><div id=uiStatus class=status>${status}</div></header>${notice}<aside><div id=sidebar>${sidebar}</div></aside><main><div id=mainView>${view}</div></main><div id=dialogHost>${dialogs}</div></div>`;
   }
 
@@ -6402,7 +6457,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   }
   function uiUpdateDraft(id, value, checked) {
     const text = value == null ? "" : String(value);
-    if (id === "logQuery") uiState.logs.query = text;
+    if (id === "logTool") uiState.logs.toolQuery = text;
+    else if (id === "logQuery") uiState.logs.query = text;
     else if (id === "publishedKind") uiState.published.kind = text;
     else if (id === "publishedContext") uiState.published.context = text;
     else if (id === "publishedSize") uiState.published.size = text;
@@ -6473,7 +6529,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         uiNotice("Published item deleted.", "ok");
         break;
       case "clear-published":
-        uiStartMaintenance(clearPublished(), "Clear Published");
+        uiStartMaintenance(clearPublished(data.filters || {}), "Clear Published");
         break;
       case "clear-debug":
         await uiInternalApi("/api/debug/clear", { method: "POST" });
@@ -6550,6 +6606,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         }
         uiState.currentSection = "logs";
         uiState.logs.context = "";
+        uiState.logs.toolQuery = "";
         uiState.logs.query = "";
         uiState.logs.status = "";
         uiState.logs.page = toolCallLogPage(id);
@@ -6563,6 +6620,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       case "header-tool-calls":
         uiState.currentSection = "logs";
         uiState.logs.context = "";
+        uiState.logs.toolQuery = "";
         uiState.logs.query = "";
         uiState.logs.status = ["running", "failed", "invalid"].includes(String(data.status || "")) ? String(data.status) : "";
         uiState.logs.page = 1;
@@ -6572,6 +6630,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       case "session-tool-calls":
         uiState.currentSection = "logs";
         uiState.logs.context = String(Number(data.id) || "");
+        uiState.logs.toolQuery = "";
         uiState.logs.query = "";
         uiState.logs.status = "";
         uiState.logs.page = 1;
@@ -6629,6 +6688,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         await uiDownloadAll(false);
         break;
       }
+      case "toggle-command-discovery":
+        setCfg("command_discovery_enabled", getCfg("command_discovery_enabled", "1") === "1" ? "0" : "1");
+        break;
       case "load-commands":
         uiState.commands.page = 1;
         break;
@@ -6647,9 +6709,17 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       case "delete-published":
         uiConfirm("Delete Published Item", "Delete this publication and its snapshot file? This cannot be undone.", "delete-published", { id: data.id });
         return;
-      case "clear-published":
-        uiConfirm("Clear Published", "Delete every published item and every snapshot in .mrmcp/publish/? This cannot be undone.", "clear-published");
+      case "clear-published": {
+        const filters = {
+          kind: uiState.published.kind, context: uiState.published.context, size: uiState.published.size,
+        };
+        const filtered = !!(filters.kind || filters.context || filters.size);
+        uiConfirm("Clear Published", filtered
+          ? "Delete every published item matching the current filters across all pages? This cannot be undone."
+          : "Delete every published item across all pages? This cannot be undone.",
+          "clear-published", { filters });
         return;
+      }
       case "clear-published-filters":
         uiState.published.kind = "";
         uiState.published.context = "";
@@ -6671,6 +6741,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         else uiState.debug.openRowId = "";
         break;
       case "clear-log-filters":
+        uiState.logs.toolQuery = "";
         uiState.logs.query = "";
         uiState.logs.context = "";
         uiState.logs.status = "";
@@ -6768,8 +6839,6 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     queueUiRender(`action:${action}`);
   }
   async function handleUiInput(message) {
-    const sequence = Math.max(0, Number(message?.sequence) || 0);
-    if (sequence) uiState.lastInputSequence = Math.max(uiState.lastInputSequence, sequence);
     const event = message?.event || message || {};
     uiFocusFromEvent(event);
     if (UI_SECTIONS.has(String(event.viewport?.section || "")))
@@ -6855,7 +6924,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
               renderDraft = true;
             }
             if (["externalUrl", "tlsEmail", "publicIpUrls", "sslipSuffix", "acmeDirectoryUrl"].includes(id)) renderDraft = true;
-            if (id === "logQuery") { uiState.logs.page = 1; filterLogs = true; }
+            if (["logTool", "logQuery"].includes(id)) { uiState.logs.page = 1; filterLogs = true; }
           }
           if (renderDraft) queueUiRender("input:draft", 40);
           if (filterLogs) {
@@ -6882,14 +6951,14 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           else if (id === "publishedSize") { uiState.published.size = String(event.value || ""); uiState.published.page = 1; }
           else if (id === "debugMethod") uiState.debug.method = String(event.value || "");
           else if (id === "debugStatus") uiState.debug.status = String(event.value || "");
-          else if (id === "commandPageSize") { uiState.commands.pageSize = Number(event.value) || 25; uiState.commands.page = 1; }
-          else if (id === "commandIncludeMissing") { uiState.commands.includeMissing = !!event.checked; uiState.commands.page = 1; }
+          else if (id === "commandPageSize") { uiState.commands.pageSize = Number(event.value) || 5; uiState.commands.page = 1; }
+          else if (id === "commandFilter") { uiState.commands.filter = String(event.value || ""); uiState.commands.page = 1; }
           else if (["rpath", "cpath"].includes(id)) return;
           queueUiRender(`change:${id}`);
           return;
         }
         case "enter":
-          if (event.id === "logQuery") {
+          if (["logTool", "logQuery"].includes(event.id)) {
             uiState.logs.page = 1;
             if (uiLogFilterTimer) clearTimeout(uiLogFilterTimer);
             uiLogFilterTimer = null;
@@ -6961,23 +7030,34 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     }
   }
 
-
-  function enqueueUiInput(message) {
-    uiRenderConnected = true;
-    uiInputChain = uiInputChain.then(async () => {
-      uiInputDepth += 1;
-      uiInputRenderDelay = null;
-      try { await handleUiInput(message); }
-      finally {
-        uiInputDepth -= 1;
-        const delay = uiInputRenderDelay ?? 0;
+  async function drainUiInputs() {
+    if (uiInputRunning) return;
+    uiInputRunning = true;
+    try {
+      while (uiInputQueue.length) {
+        const message = uiInputQueue.shift();
+        uiInputDepth += 1;
         uiInputRenderDelay = null;
-        if (uiRenderQueued) queueUiRender("input-complete", delay);
+        try { await handleUiInput(message); }
+        finally {
+          uiInputDepth -= 1;
+          const delay = uiInputRenderDelay ?? 0;
+          uiInputRenderDelay = null;
+          if (uiRenderQueued) queueUiRender("input-complete", delay);
+        }
       }
-    }).catch(error => {
+    } catch (error) {
       uiNotice(String(error?.message || error));
       queueUiRender("input-transport-error", 0);
-    });
+    } finally {
+      uiInputRunning = false;
+      if (uiInputQueue.length) void drainUiInputs();
+    }
+  }
+  function enqueueUiInput(message) {
+    uiRenderConnected = true;
+    uiInputQueue.push(message);
+    void drainUiInputs();
   }
 
   async function guiApi(req, u) {
@@ -7109,8 +7189,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     if (u.pathname === "/api/commands" && req.method === "GET") return json(await commandCatalog({
       query: u.searchParams.get("q") || "",
       page: u.searchParams.get("page") || 1,
-      page_size: u.searchParams.get("page_size") || 25,
+      page_size: u.searchParams.get("page_size") || 5,
       include_missing: u.searchParams.get("include_missing") !== "0",
+      filter: u.searchParams.get("filter") || "",
       admin: true,
     }));
     if (u.pathname === "/api/commands/save" && req.method === "POST") {
@@ -7134,7 +7215,6 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       if (rows.some(existing => existing.name.toLowerCase() === key && existing.name.toLowerCase() !== oldKey)) return json({ error: "Command name already exists" }, 409);
       const index = rows.findIndex(existing => existing.name.toLowerCase() === oldKey || (!old && existing.name.toLowerCase() === key));
       if (index >= 0) rows[index] = row; else rows.push(row);
-      rows.sort((a, b) => a.name.localeCompare(b.name));
       await writeCommandConfig(rows);
       emitUiChange(["commands", "dashboard", "endpoints"], "commands");
       return json({ ok: true, config_file: COMMANDS_PATH });
@@ -7265,6 +7345,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     }
     if (u.pathname === "/api/logs" && req.method === "GET") {
       const p = serverConfig();
+      const toolQuery = (u.searchParams.get("tool") || "").trim();
       const q = (u.searchParams.get("q") || "").trim();
       const contextId = Math.max(0, Number(u.searchParams.get("context")) || 0);
       const status = u.searchParams.get("status") || "";
@@ -7272,7 +7353,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       const pageSize = Math.max(10, Math.min(Number(u.searchParams.get("page_size")) || 25, 100));
       const offset = (page - 1) * pageSize;
       let rows, total;
-      if (q && fts) {
+      if (q && fts && !toolQuery) {
         try {
           total = one(`SELECT COUNT(*) n FROM logs_fts f JOIN logs l ON l.id=CAST(f.log_id AS INTEGER)
             WHERE logs_fts MATCH ? AND (?=0 OR l.context_id=?) AND (?='' OR l.status=?)`,
@@ -7285,15 +7366,26 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         } catch {}
       }
       if (!rows) {
-        const like = `%${q}%`;
-        total = one(`SELECT COUNT(*) n FROM logs WHERE (?=0 OR context_id=?) AND (?='' OR status=?)
-          AND (?='' OR CAST(context_id AS TEXT)||context_handle||tool||input_json||result_json||resolved_json||stdout||stderr||error LIKE ?)`,
-          contextId, contextId, status, status, q, like)?.n || 0;
-        rows = all(`SELECT id,started_at,completed_at,context_id,root_id,root_name,tool,status,duration_ms,input_json FROM logs
-          WHERE (?=0 OR context_id=?) AND (?='' OR status=?)
-          AND (?='' OR CAST(context_id AS TEXT)||context_handle||tool||input_json||result_json||resolved_json||stdout||stderr||error LIKE ?)
-          ORDER BY started_at DESC,id DESC LIMIT ? OFFSET ?`,
-          contextId, contextId, status, status, q, like, pageSize, offset);
+        const like = `%${q}%`, toolLike = `%${toolQuery}%`;
+        const toolFilter = `(?='' OR l.tool LIKE ? COLLATE NOCASE OR (
+          l.tool LIKE 'exec%' AND EXISTS (
+            SELECT 1 FROM process_runs pr
+            WHERE pr.log_id=CASE WHEN l.tool IN ('exec','exec_start') THEN l.id
+              ELSE COALESCE(CAST(json_extract(l.input_json,'$.exec_id') AS INTEGER),0) END
+              AND (COALESCE(json_extract(pr.command_json,'$.catalog_name'),'') LIKE ? COLLATE NOCASE
+                OR COALESCE(json_extract(pr.command_json,'$.program'),'') LIKE ? COLLATE NOCASE)
+          )
+        ))`;
+        total = one(`SELECT COUNT(*) n FROM logs l WHERE (?=0 OR l.context_id=?) AND (?='' OR l.status=?)
+          AND ${toolFilter}
+          AND (?='' OR COALESCE(CAST(l.context_id AS TEXT),'')||COALESCE(l.context_handle,'')||COALESCE(l.tool,'')||COALESCE(l.input_json,'')||COALESCE(l.result_json,'')||COALESCE(l.resolved_json,'')||COALESCE(l.stdout,'')||COALESCE(l.stderr,'')||COALESCE(l.error,'') LIKE ?)`,
+          contextId, contextId, status, status, toolQuery, toolLike, toolLike, toolLike, q, like)?.n || 0;
+        rows = all(`SELECT l.id,l.started_at,l.completed_at,l.context_id,l.root_id,l.root_name,l.tool,l.status,l.duration_ms,l.input_json FROM logs l
+          WHERE (?=0 OR l.context_id=?) AND (?='' OR l.status=?)
+          AND ${toolFilter}
+          AND (?='' OR COALESCE(CAST(l.context_id AS TEXT),'')||COALESCE(l.context_handle,'')||COALESCE(l.tool,'')||COALESCE(l.input_json,'')||COALESCE(l.result_json,'')||COALESCE(l.resolved_json,'')||COALESCE(l.stdout,'')||COALESCE(l.stderr,'')||COALESCE(l.error,'') LIKE ?)
+          ORDER BY l.started_at DESC,l.id DESC LIMIT ? OFFSET ?`,
+          contextId, contextId, status, status, toolQuery, toolLike, toolLike, toolLike, q, like, pageSize, offset);
       }
       const processByLog = new Map([...processes.values()]
         .filter(record => record.log_id && ["starting", "running"].includes(record.status))
@@ -7396,8 +7488,8 @@ const app = document.getElementById("app");
 const internals = window.__TAURI_INTERNALS__;
 const invoke = (command, payload = {}) => internals.invoke(command, payload);
 const UI_INPUT_EVENT = "tauriless://webview-message", UI_RENDER_EVENT = "mrmcp://ui-render";
-let scrollTimer = null, inputTimer = null, sequence = 0, lastSentSequence = 0;
-const pendingInputs = new Map();
+let scrollTimer = null, inputTimer = null, lastRenderRevision = 0, uiSendRunning = false;
+const pendingInputs = new Map(), uiSendQueue = [], SKIPPABLE_UI_SENDS = new Set(["inputs", "focus", "scroll"]);
 function focusState(element = document.activeElement) {
   if (!element?.id) return null;
   return {
@@ -7406,26 +7498,58 @@ function focusState(element = document.activeElement) {
     end: Number.isInteger(element.selectionEnd) ? element.selectionEnd : null,
   };
 }
+function mergeUiSend(previous, next) {
+  if (previous.event.type !== "inputs" || next.event.type !== "inputs") return next;
+  const items = new Map();
+  for (const envelope of [previous, next])
+    for (const item of Array.isArray(envelope.event.items) ? envelope.event.items : [])
+      if (item?.id) items.set(String(item.id), item);
+  return { ...next, event: { ...next.event, items: [...items.values()] } };
+}
+async function drainUiSends() {
+  if (uiSendRunning) return;
+  uiSendRunning = true;
+  try {
+    while (uiSendQueue.length) {
+      const entry = uiSendQueue.shift();
+      try {
+        await invoke("plugin:event|emit", { event: UI_INPUT_EVENT, payload: entry.envelope });
+        entry.waiters.forEach(({ resolve }) => resolve());
+      } catch (error) {
+        console.error("MrMCP input delivery failed", error);
+        entry.waiters.forEach(({ reject }) => reject(error));
+      }
+    }
+  } finally {
+    uiSendRunning = false;
+    if (uiSendQueue.length) void drainUiSends();
+  }
+}
 function sendRaw(event) {
-  const envelope = { sequence: ++sequence, event: {
+  const envelope = { event: {
     ...event,
     focus: event.focus === undefined ? focusState() : event.focus,
     viewport: { section: app.dataset.section || "dashboard", x: scrollX, y: scrollY },
   } };
-  lastSentSequence = envelope.sequence;
-  return invoke("plugin:event|emit", { event: UI_INPUT_EVENT, payload: envelope })
-    .catch(error => console.error("MrMCP input delivery failed", error));
+  const type = String(event.type || ""), last = uiSendQueue.at(-1);
+  return new Promise((resolve, reject) => {
+    if (SKIPPABLE_UI_SENDS.has(type) && String(last?.envelope?.event?.type || "") === type) {
+      last.envelope = mergeUiSend(last.envelope, envelope);
+      last.waiters.push({ resolve, reject });
+    } else uiSendQueue.push({ envelope, waiters: [{ resolve, reject }] });
+    void drainUiSends();
+  });
 }
-async function flushInputs() {
+function flushInputs() {
   if (inputTimer) { clearTimeout(inputTimer); inputTimer = null; }
-  if (!pendingInputs.size) return;
+  if (!pendingInputs.size) return Promise.resolve();
   const items = [...pendingInputs.values()];
   pendingInputs.clear();
-  await sendRaw({ type: "inputs", items });
+  return sendRaw({ type: "inputs", items });
 }
-async function send(event) {
-  if (event.type !== "inputs") await flushInputs();
-  return await sendRaw(event);
+function send(event) {
+  if (event.type !== "inputs") void flushInputs();
+  return sendRaw(event);
 }
 function queueInput(element) {
   pendingInputs.set(element.id, { id: element.id, value: element.value, checked: !!element.checked });
@@ -7446,15 +7570,19 @@ async function copyText(value) {
     document.execCommand("copy"); area.remove();
   }
 }
+const MORPH_OPTIONS = { preserveChanges: true };
 function applyRender(payload) {
-  const preserveChanges = Number(payload.ack || 0) < lastSentSequence;
-  morphInner(app, payload.html, { preserveChanges });
+  morphInner(app, payload.html, MORPH_OPTIONS);
   app.dataset.section = String(payload.section || "dashboard");
   const scroll = Array.isArray(payload.scroll) ? payload.scroll : [0, 0];
+  const revision = Math.max(0, Number(payload.revision) || 0);
   requestAnimationFrame(() => {
+    if (revision && revision !== lastRenderRevision) return;
     const scrollTarget = payload.scroll_target ? document.getElementById(String(payload.scroll_target)) : null;
     if (scrollTarget) scrollTarget.scrollIntoView({ block: "start" });
     else scrollTo(Number(scroll[0]) || 0, Number(scroll[1]) || 0);
+    const active = document.activeElement;
+    if (active?.matches?.("input,select,textarea") && active.isConnected && !active.disabled) return;
     const focus = payload.focus;
     const element = focus?.id ? document.getElementById(focus.id) : null;
     if (element) {
@@ -7537,7 +7665,7 @@ document.addEventListener("keydown", event => {
     send({ type: "action", action: "close-dialog", dataset: {}, values: {} });
     return;
   }
-  if (event.key !== "Enter" || !["logQuery", "debugQuery", "commandQuery"].includes(event.target.id)) return;
+  if (event.key !== "Enter" || !["logTool", "logQuery", "debugQuery", "commandQuery"].includes(event.target.id)) return;
   event.preventDefault();
   send({ type: "enter", id: event.target.id, value: event.target.value, focus: focusState(event.target) });
 });
@@ -7548,8 +7676,12 @@ addEventListener("scroll", () => {
   }), 80);
 }, { passive: true });
 listen(UI_RENDER_EVENT, event => {
-  try { applyRender(event.payload); }
-  catch (error) { console.error("MrMCP render failed", error); }
+  const payload = event.payload || {}, revision = Math.max(0, Number(payload.revision) || 0);
+  if (revision && revision <= lastRenderRevision) return;
+  try {
+    applyRender(payload);
+    if (revision) lastRenderRevision = revision;
+  } catch (error) { console.error("MrMCP render failed", error); }
 }).then(() => send({ type: "bootstrap" })).catch(error => {
   console.error("MrMCP UI bootstrap failed", error);
 });
@@ -7667,7 +7799,7 @@ async function stopBackendWorker(worker) {
 }
 async function desktop() {
   const { worker: backendWorker, payload, earlyMessages } = await spawnBackendWorker();
-  const { Tauriless } = await import("npm:@mefistofelix/tauriless@0.1.15");
+  const { Tauriless } = await import("npm:@mefistofelix/tauriless@0.1.17");
   const tauriless = new Tauriless(), pending = new Map();
   const nativeIcon = () => {
     const ico = Deno.readFileSync(join(ASSETS_DIR, "mrmcp.ico"));
@@ -7717,6 +7849,7 @@ async function desktop() {
     return { rgba: Array.from(rgba), width, height };
   };
   let nextId = 1, drainTimer = null, windowVisibilityTimer = null, notificationPermission = null, closed = false, webviewMessagesReady = false, notificationsReady = false, windowRenderVisible = false, resolveClosed, resolveWebviewReady;
+  let renderDeliveryRunning = false, pendingRenderPayload = null;
   const workerMessageQueue = [], notificationQueue = [];
   const channel = () => `__CHANNEL__:${crypto.getRandomValues(new Uint32Array(1))[0]}`;
   const windowClosed = new Promise(resolve => { resolveClosed = resolve; });
@@ -7730,10 +7863,28 @@ async function desktop() {
   const emitToWebview = (event, eventPayload) => request("plugin:event|emit_to", {
     target: { kind: "WebviewWindow", label: "main" }, event, payload: eventPayload,
   });
+  const deliverLatestRender = async payload => {
+    pendingRenderPayload = payload;
+    if (renderDeliveryRunning) return;
+    renderDeliveryRunning = true;
+    try {
+      while (pendingRenderPayload && windowRenderVisible) {
+        const next = pendingRenderPayload;
+        pendingRenderPayload = null;
+        await emitToWebview(UI_RENDER_EVENT, next);
+      }
+    } catch (error) {
+      console.error("MrMCP render delivery failed", error);
+    } finally {
+      renderDeliveryRunning = false;
+      if (pendingRenderPayload && windowRenderVisible) void deliverLatestRender(pendingRenderPayload);
+    }
+  };
   const publishRenderVisibility = visible => {
     const next = !!visible;
     if (windowRenderVisible === next) return;
     windowRenderVisible = next;
+    if (!next) pendingRenderPayload = null;
     backendWorker.postMessage({ type: "ui-visibility", visible: next });
   };
   const syncWindowRenderVisibility = async () => {
@@ -7776,7 +7927,7 @@ async function desktop() {
   const handleWorkerMessage = data => {
     if (data?.type === "ui-render") {
       if (!windowRenderVisible) return;
-      void emitToWebview(UI_RENDER_EVENT, data.payload).catch(error => console.error("MrMCP render delivery failed", error));
+      void deliverLatestRender(data.payload);
     } else if (data?.type === "os-notification") {
       if (!notificationsReady) notificationQueue.push(data);
       else void notify(data).catch(error => console.error("MrMCP notification failed", error));
@@ -7786,8 +7937,10 @@ async function desktop() {
     }
   };
   const queueOrHandleWorkerMessage = data => {
-    if (data?.type === "ui-render" && !webviewMessagesReady) workerMessageQueue.push(data);
-    else handleWorkerMessage(data);
+    if (data?.type === "ui-render" && !webviewMessagesReady) {
+      workerMessageQueue.length = 0;
+      workerMessageQueue.push(data);
+    } else handleWorkerMessage(data);
   };
   const onWorkerMessage = event => queueOrHandleWorkerMessage(event.data);
   backendWorker.addEventListener("message", onWorkerMessage);
