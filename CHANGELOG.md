@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.112
+
+- Isolated each `publish_file` / `publish_html` MCP App View to the standard `ui/notifications/tool-result` channel, pinned the first publication identity mounted by a widget, removed ChatGPT-global `toolOutput` fallbacks and legacy `openai/*` tool metadata, and made `resources/read` independent of contextual `Mcp-Name` values. Widget resource URIs were bumped to invalidate cached markup.
+- Changed `published_uses` from append-only publish-call history to one current relationship per published item + Session + call-time Workspace. Republishing in the same relationship updates display/source metadata and timestamp, while different Workspaces remain distinct references.
+- Made publication download capability tokens authoritative regardless of the presentational filename suffix, while still using a matching publication reference to select its MIME override when available.
+- Disabled MCP discovery/tool/resource caching with `ttlMs: 0` so clients observe current descriptors and versioned MCP App resources immediately.
+
 ## 0.10.111
 
 - Deduplicated `publish_file` and `publish_html` resources by deterministic content identity while retaining random public capability ids. Files use the requested fast fingerprint of size plus first, last and central 10-byte samples; HTML uses a full SHA-256 hash. Publication snapshot/dedup/registration is serialized through one shared chain.

@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.111 — Deduplicate publications and harden widget concurrency.
+MrMCP 0.10.112 — Isolate MCP App publication results and relationships.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -88,7 +88,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.111";
+const VERSION = "0.10.112";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;
@@ -97,8 +97,8 @@ const CONTEXT_HANDLE_OUTPUT_DESCRIPTION = "Opaque capability identifying a persi
 const CONTEXT_HANDLE_RULE = "Requires the exact Session context_handle returned by open_workspace.";
 const MCP_UI_EXTENSION = "io.modelcontextprotocol/ui";
 const MCP_UI_MIME_TYPE = "text/html;profile=mcp-app";
-const FILE_PREVIEW_UI_URI = "ui://mrmcp/file-preview-v8.html";
-const HTML_PREVIEW_UI_URI = "ui://mrmcp/html-preview-v5.html";
+const FILE_PREVIEW_UI_URI = "ui://mrmcp/file-preview-v9.html";
+const HTML_PREVIEW_UI_URI = "ui://mrmcp/html-preview-v6.html";
 const enc = new TextEncoder(), dec = new TextDecoder();
 
 const stringResponse = (body, status, type, headers = {}) => {
@@ -1369,6 +1369,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
   var currentMode = 'inline';
   var fullscreenAvailable = false;
   var currentIsImage = false;
+  var publicationId = '';
 
   function post(message) { window.parent.postMessage(message, '*'); }
   function notify(method, params) { post({ jsonrpc: '2.0', method: method, params: params || {} }); }
@@ -1416,6 +1417,9 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     var structured = result.structuredContent && typeof result.structuredContent === 'object'
       ? result.structuredContent : result;
     var uri = typeof structured.uri === 'string' ? structured.uri : '';
+    var id = String(structured.id || '');
+    if (publicationId && id && id !== publicationId) return;
+    if (uri && id) publicationId = id;
     var mime = String(structured.mime_type || '').toLowerCase();
     var filename = String(structured.filename || 'Published file');
     currentIsImage = mime.indexOf('image/') === 0;
@@ -1453,7 +1457,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
   image.addEventListener('load', function () { showError(''); });
   image.addEventListener('error', function () {
     imageStage.style.display = 'none';
-    showError('Unable to load the published image. The publication may have expired or been cleared; call publish_file again.');
+    showError('Unable to load the published image. The publication may have been cleared or the URL could not be loaded; call publish_file again.');
   });
 
   window.addEventListener('message', function (event) {
@@ -1469,25 +1473,16 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     if (message.method === 'ui/notifications/tool-result') render(message.params);
     if (message.method === 'ui/notifications/host-context-changed') applyHostContext(message.params);
   }, { passive: true });
-  window.addEventListener('openai:set_globals', function (event) {
-    var globals = event.detail && event.detail.globals;
-    if (globals && Object.prototype.hasOwnProperty.call(globals, 'toolOutput')) render(globals.toolOutput);
-  }, { passive: true });
-
-  var openai = typeof window !== 'undefined' ? window.openai : undefined;
-  if (openai && openai.toolOutput) render(openai.toolOutput);
 
   request('ui/initialize', {
     protocolVersion: '2026-01-26',
-    appInfo: { name: 'mrmcp-file-preview', version: '1.5.0' },
+    appInfo: { name: 'mrmcp-file-preview', version: '1.6.0' },
     appCapabilities: { availableDisplayModes: ['inline', 'fullscreen'] }
   }, 3000).then(function (result) {
     applyHostContext(result && result.hostContext);
     notify('ui/notifications/initialized', {});
-    if (openai && openai.toolOutput) render(openai.toolOutput);
   }).catch(function () {
     notify('ui/notifications/initialized', {});
-    if (openai && openai.toolOutput) render(openai.toolOutput);
   });
 
   if (typeof ResizeObserver === 'function') {
@@ -1559,6 +1554,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
   var nextId = Math.floor(Math.random() * 1073741823) + 1;
   var currentMode = 'inline';
   var fullscreenAvailable = false;
+  var publicationId = '';
 
   function post(message) { window.parent.postMessage(message, '*'); }
   function notify(method, params) { post({ jsonrpc: '2.0', method: method, params: params || {} }); }
@@ -1599,6 +1595,9 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     var structured = result.structuredContent && typeof result.structuredContent === 'object'
       ? result.structuredContent : result;
     var uri = typeof structured.uri === 'string' ? structured.uri : '';
+    var id = String(structured.id || '');
+    if (publicationId && id && id !== publicationId) return;
+    if (uri && id) publicationId = id;
     var label = String(structured.title || 'Interactive HTML');
     var height = Math.max(120, Math.min(Number(structured.height || 600), 2000));
     showError('');
@@ -1637,25 +1636,16 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     if (message.method === 'ui/notifications/tool-result') render(message.params);
     if (message.method === 'ui/notifications/host-context-changed') applyHostContext(message.params);
   }, { passive: true });
-  window.addEventListener('openai:set_globals', function (event) {
-    var globals = event.detail && event.detail.globals;
-    if (globals && Object.prototype.hasOwnProperty.call(globals, 'toolOutput')) render(globals.toolOutput);
-  }, { passive: true });
-
-  var openai = typeof window !== 'undefined' ? window.openai : undefined;
-  if (openai && openai.toolOutput) render(openai.toolOutput);
 
   request('ui/initialize', {
     protocolVersion: '2026-01-26',
-    appInfo: { name: 'mrmcp-html-preview', version: '1.2.0' },
+    appInfo: { name: 'mrmcp-html-preview', version: '1.3.0' },
     appCapabilities: { availableDisplayModes: ['inline', 'fullscreen'] }
   }, 3000).then(function (result) {
     applyHostContext(result && result.hostContext);
     notify('ui/notifications/initialized', {});
-    if (openai && openai.toolOutput) render(openai.toolOutput);
   }).catch(function () {
     notify('ui/notifications/initialized', {});
-    if (openai && openai.toolOutput) render(openai.toolOutput);
   });
 
   if (typeof ResizeObserver === 'function') {
@@ -1750,13 +1740,21 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     } finally { file.close(); }
   }
   const htmlContentKey = html => hashContent("html", [enc.encode(html)]);
-  const addPublishedUse = (publishedId, metadata) => run(`INSERT INTO published_uses(
+  const addPublishedUse = (publishedId, metadata) => {
+    const contextHandle = String(metadata.context_handle || ""), contextId = Number(metadata.context_id || 0), rootId = Number(metadata.root_id || 0);
+    const values = [
+      contextHandle, String(metadata.root_name || ""), String(metadata.root_path || ""), String(metadata.source_path || ""), String(metadata.source_filename || ""),
+      String(metadata.filename || ""), String(metadata.mime_type || ""), String(metadata.title || ""), Number(metadata.height || 0), Number(metadata.published_at || Date.now()),
+    ];
+    const existing = one(`SELECT id FROM published_uses
+      WHERE published_id=? AND context_id=? AND root_id=? ORDER BY id DESC LIMIT 1`, publishedId, contextId, rootId);
+    if (existing) return run(`UPDATE published_uses SET
+      context_handle=?,root_name=?,root_path=?,source_path=?,source_filename=?,filename=?,mime_type=?,title=?,height=?,published_at=?
+      WHERE id=?`, ...values, existing.id);
+    return run(`INSERT INTO published_uses(
       published_id,context_handle,context_id,root_id,root_name,root_path,source_path,source_filename,filename,mime_type,title,height,published_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-    publishedId, String(metadata.context_handle || ""), Number(metadata.context_id || 0), Number(metadata.root_id || 0),
-    String(metadata.root_name || ""), String(metadata.root_path || ""), String(metadata.source_path || ""), String(metadata.source_filename || ""),
-    String(metadata.filename || ""), String(metadata.mime_type || ""), String(metadata.title || ""), Number(metadata.height || 0), Number(metadata.published_at || Date.now()),
-  );
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, publishedId, contextHandle, contextId, rootId, ...values.slice(1));
+  };
   async function cleanupPublished(id, strict = false) {
     const record = one("SELECT published_name FROM published WHERE id=?", id);
     if (!record) return false;
@@ -1775,7 +1773,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
   async function openPublished(id) {
     const record = one("SELECT id,kind,filename FROM published WHERE id=?", id);
     if (!record) throw new Error("Published item not found");
-    const latest = one("SELECT filename FROM published_uses WHERE published_id=? ORDER BY id DESC LIMIT 1", id);
+    const latest = one("SELECT filename FROM published_uses WHERE published_id=? ORDER BY published_at DESC,id DESC LIMIT 1", id);
     const filename = latest?.filename || record.filename;
     const url = record.kind === "html" ? publishedHtmlUrl(record.id)
       : record.kind === "file" ? downloadUrl(record.id, filename) : "";
@@ -1926,9 +1924,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     let requestedName;
     try { requestedName = decodeURIComponent(match[2]); } catch { requestedName = ""; }
     const use = requestedName ? one(`SELECT filename,mime_type FROM published_uses
-      WHERE published_id=? AND filename=? ORDER BY id DESC LIMIT 1`, token, requestedName) : null;
-    if (!use && requestedName !== record.filename)
-      return text("Not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
+      WHERE published_id=? AND filename=? ORDER BY published_at DESC,id DESC LIMIT 1`, token, requestedName) : null;
     const effectiveMime = use?.mime_type || record.mime_type;
     const allowedRoot = await Deno.realPath(PUBLISH_DIR).catch(() => null);
     const realPath = await Deno.realPath(publishedPath(record.published_name)).catch(() => null);
@@ -3508,11 +3504,9 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         outputSchema: outputSchemas[name] || genericOutputSchema,
         annotations: annotations(name),
         ...(name === "publish_file" ? { _meta: {
-          ui: { resourceUri: FILE_PREVIEW_UI_URI }, "openai/outputTemplate": FILE_PREVIEW_UI_URI,
-          "openai/toolInvocation/invoking": "Preparing file preview…", "openai/toolInvocation/invoked": "File preview ready.",
+          ui: { resourceUri: FILE_PREVIEW_UI_URI },
         } } : name === "publish_html" ? { _meta: {
-          ui: { resourceUri: HTML_PREVIEW_UI_URI }, "openai/outputTemplate": HTML_PREVIEW_UI_URI,
-          "openai/toolInvocation/invoking": "Rendering HTML…", "openai/toolInvocation/invoked": "HTML ready.",
+          ui: { resourceUri: HTML_PREVIEW_UI_URI },
         } } : {}),
       };
     });
@@ -3624,8 +3618,11 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       uiErrors.push("file UI must not embed Base64/data URLs");
     if (!filePreviewAppHtml().includes("structured.uri") || !htmlPreviewAppHtml().includes("structured.uri"))
       uiErrors.push("UI structuredContent URL handling missing");
-    if (!filePreviewAppHtml().includes("openai:set_globals") || !htmlPreviewAppHtml().includes("openai:set_globals"))
-      uiErrors.push("UI ChatGPT global-update bridge missing");
+    if (!filePreviewAppHtml().includes("publicationId") || !htmlPreviewAppHtml().includes("publicationId"))
+      uiErrors.push("UI publication identity pinning missing");
+    if (filePreviewAppHtml().includes("openai:set_globals") || htmlPreviewAppHtml().includes("openai:set_globals") ||
+        filePreviewAppHtml().includes("openai.toolOutput") || htmlPreviewAppHtml().includes("openai.toolOutput"))
+      uiErrors.push("UI must not consume ChatGPT-global tool output");
     if (filePreviewAppHtml().includes("var nextId = 1;") || htmlPreviewAppHtml().includes("var nextId = 1;"))
       uiErrors.push("UI bridge request ids must not share a fixed initial value");
     if ((filePreviewAppHtml().match(/ui\/notifications\/initialized/g) || []).length < 2 ||
@@ -3636,9 +3633,10 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     if (!htmlPreviewUiMeta().ui?.csp?.frameDomains?.includes(publicOrigin()))
       uiErrors.push("publish_html frameDomains metadata missing public origin");
     if (publishTool?._meta?.ui?.resourceUri !== FILE_PREVIEW_UI_URI) uiErrors.push("publish_file UI metadata missing");
-    if (publishTool?._meta?.["openai/outputTemplate"] !== FILE_PREVIEW_UI_URI) uiErrors.push("publish_file output-template alias missing");
     if (publishHtmlTool?._meta?.ui?.resourceUri !== HTML_PREVIEW_UI_URI) uiErrors.push("publish_html UI metadata missing");
-    if (publishHtmlTool?._meta?.["openai/outputTemplate"] !== HTML_PREVIEW_UI_URI) uiErrors.push("publish_html output-template alias missing");
+    if (Object.keys(publishTool?._meta || {}).some(key => key.startsWith("openai/")) ||
+        Object.keys(publishHtmlTool?._meta || {}).some(key => key.startsWith("openai/")))
+      uiErrors.push("publish widgets must use only MCP Apps UI metadata");
     const serverInfo = mcpServerInfo();
     if (serverInfo.icons?.[0]?.src !== `${publicBase()}/mrmcp-icon.png` || serverInfo.icons?.[0]?.mimeType !== "image/png")
       uiErrors.push("serverInfo public icon metadata missing");
@@ -3655,13 +3653,13 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         supportedVersions: MCP_PROTOCOLS,
         capabilities: serverCapabilities(true),
         _meta: { "io.modelcontextprotocol/serverInfo": serverInfo },
-        ttlMs: 300000,
+        ttlMs: 0,
         cacheScope: "private",
       },
       modern_tools_list_result: {
         resultType: "complete",
         tools,
-        ttlMs: 300000,
+        ttlMs: 0,
         cacheScope: "private",
       },
       resources_list_result: { resources: [fileResource, htmlResource] },
@@ -3671,7 +3669,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
           { uri: FILE_PREVIEW_UI_URI, mimeType: MCP_UI_MIME_TYPE, text: filePreviewAppHtml(), _meta: filePreviewUiMeta() },
           { uri: HTML_PREVIEW_UI_URI, mimeType: MCP_UI_MIME_TYPE, text: htmlPreviewAppHtml(), _meta: htmlPreviewUiMeta() },
         ],
-        ttlMs: 300000,
+        ttlMs: 0,
         cacheScope: "private",
       },
     };
@@ -5558,9 +5556,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           requested: effectiveProtocol,
         }, true);
       }
-      if (x.method === "tools/call" || x.method === "resources/read") {
+      if (x.method === "tools/call") {
         const headerName = String(req.headers.get("mcp-name") || "");
-        const bodyName = String(x.method === "tools/call" ? x.params?.name : x.params?.uri || "");
+        const bodyName = String(x.params?.name || "");
         if (headerName && headerName !== bodyName) {
           return rpcError(200, -32020, "Mcp-Name header does not match the request body", {
             headerName,
@@ -5597,7 +5595,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           capabilities: serverCapabilities(fullAccess),
           _meta: serverInfoMeta,
           instructions,
-          ttlMs: 300000,
+          ttlMs: 0,
           cacheScope: "private",
         };
       } else if (x.method === "ping") {
@@ -5605,13 +5603,13 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       } else if (x.method === "tools/list") {
         const tools = serverTools(p, fullAccess);
         r.result = {
-          resultType: "complete", tools, ttlMs: 300000,
+          resultType: "complete", tools, ttlMs: 0,
           cacheScope: "private", _meta: serverInfoMeta,
         };
       } else if (x.method === "resources/list") {
         const resources = fullAccess ? [filePreviewResource(), htmlPreviewResource()] : [];
         r.result = {
-          resultType: "complete", resources, ttlMs: 300000,
+          resultType: "complete", resources, ttlMs: 0,
           cacheScope: "private", _meta: serverInfoMeta,
         };
       } else if (x.method === "resources/read") {
@@ -5631,7 +5629,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           } else {
             const resourceResult = { contents: [{ ...resource, mimeType: MCP_UI_MIME_TYPE }] };
             r.result = modernRequest
-              ? { resultType: "complete", ...resourceResult, ttlMs: 300000, cacheScope: "private", _meta: serverInfoMeta }
+              ? { resultType: "complete", ...resourceResult, ttlMs: 0, cacheScope: "private", _meta: serverInfoMeta }
               : resourceResult;
           }
         }
@@ -6003,18 +6001,17 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const rows = all(`SELECT p.id,p.content_key,p.context_id,p.root_id,p.root_name,p.root_path,p.kind,p.source_path,p.source_filename,p.published_name,p.filename,p.mime_type,p.size,p.title,p.height,p.created_at,p.request_count,p.last_request_at
       FROM published p WHERE ${where} ORDER BY p.created_at DESC,p.id DESC LIMIT ? OFFSET ?`, ...values, pageSize, offset);
     for (const row of rows) {
-      row.reference_count = Number(one("SELECT COUNT(*) n FROM published_uses WHERE published_id=?", row.id)?.n || 0);
-      row.references = all(`SELECT context_id,root_id,root_name,root_path,source_path,source_filename,filename,mime_type,title,height,
-          MAX(published_at) published_at,COUNT(*) publish_count
-        FROM published_uses WHERE published_id=?
-        GROUP BY context_id,root_id,root_name,root_path,source_path,source_filename,filename,mime_type,title,height
-        ORDER BY MAX(published_at) DESC`, row.id);
+      row.references = all(`SELECT u.context_id,u.root_id,u.root_name,u.root_path,u.source_path,u.source_filename,u.filename,u.mime_type,u.title,u.height,u.published_at
+        FROM published_uses u
+        WHERE u.published_id=? AND u.id=(SELECT MAX(u2.id) FROM published_uses u2
+          WHERE u2.published_id=u.published_id AND u2.context_id=u.context_id AND u2.root_id=u.root_id)
+        ORDER BY u.published_at DESC,u.id DESC`, row.id);
       if (!row.references.length && row.context_id) row.references = [{
         context_id: row.context_id, root_id: row.root_id, root_name: row.root_name, root_path: row.root_path,
         source_path: row.source_path, source_filename: row.source_filename, filename: row.filename, mime_type: row.mime_type,
         title: row.title, height: row.height, published_at: row.created_at,
       }];
-      row.reference_count = Math.max(row.reference_count, row.references.length);
+      row.reference_count = row.references.length;
     }
     const sessions = all(`SELECT context_id FROM published WHERE server_id=? AND context_id>0
       UNION SELECT u.context_id FROM published_uses u JOIN published p ON p.id=u.published_id WHERE p.server_id=? AND u.context_id>0
@@ -6109,7 +6106,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     oauth: `<table class=oauth-table><tr><th>Client</th><th>Sessions</th><th>Tokens</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td class=oauth-client><b><?= c.name ?></b><div class=oauth-client-id title="<?= c.client_id ?>"><code><?= c.client_id ?></code></div><div class=oauth-meta><span class=muted>Created</span> <?= it.logdt(c.created_at) ?></div></td><td class=oauth-meta><div class=oauth-count><b><?= c.session_count||0 ?></b> total</div><div><span class=muted>First</span> <?= c.first_session_at ? it.logdt(c.first_session_at) : "—" ?></div><div><span class=muted>Last</span> <?= c.last_session_at ? it.logdt(c.last_session_at) : "—" ?></div></td><td><div class=oauth-tokens><div class=oauth-token><b><?= c.token_count||0 ?></b> <span>Access</span><div class=oauth-meta><span class=muted>Issued</span> <?= c.last_token_at ? it.logdt(c.last_token_at) : "—" ?></div></div><div class=oauth-token><b><?= c.refresh_token_count||0 ?></b> <span>Refresh</span><div class=oauth-meta><span class=muted>Used</span> <?= c.last_refresh_at ? it.logdt(c.last_refresh_at) : "—" ?></div></div></div></td><td class=oauth-actions><button class=small data-action=oauth-sessions data-id="<?= c.client_id ?>">💬 View Sessions</button><button class="small danger" data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> Available Tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,
     logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=http-session><? if(l.context_id){ ?><div class=idcell>#<?= l.context_id ?></div><? if(l.root_id&&l.root_name){ ?><div class=workspace-label>📁 <?= l.root_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><code><?= l.tool ?></code><? if(l.call_preview){ ?><div class=tool-command-preview>↳ <?= l.call_preview ?></div><? } ?><? if(l.progress_requested){ ?><div class=progress-requested>📡 Progress requested</div><? } ?></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Kill</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><? if(x.progress_requested){ ?><span class=progress-requested>📡 Progress requested</span><? } ?><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><div class=tool-detail-grid><div class=tool-detail-main><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><? if(x.resolved_json){ ?><section class=json-detail><div class=row><b class=grow>Tool Return Value JSON</b><button class=small data-action=copy-detail data-target="tool-return-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-return-<?= l.id ?>"><?= it.prettyParsed(x.resolved_json) ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>MCP Result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div><aside class=tool-descriptor><div class=row><b class=grow>Agent Tool Definition</b><? if(x.tool_descriptor){ ?><span class="descriptor-status <?= x.tool_descriptor_matches_current?'current':'outdated' ?>"><?= x.tool_descriptor_matches_current?'CURRENT':'OUTDATED' ?></span><button class=small data-action=copy-detail data-target="tool-descriptor-<?= l.id ?>">📋 Copy JSON</button><? } ?></div><? if(x.tool_descriptor){ ?><pre id="tool-descriptor-<?= l.id ?>" hidden><?= it.pretty(x.tool_descriptor) ?></pre><? if(x.tool_descriptor.title){ ?><div class=muted>Title</div><div><?= x.tool_descriptor.title ?></div><? } ?><div class=muted>Description</div><p><?= x.tool_descriptor.description||"—" ?></p><div class=muted>Input Schema</div><pre><?= it.pretty(x.tool_descriptor.inputSchema||{}) ?></pre><div class=muted>Output Schema</div><pre><?= it.pretty(x.tool_descriptor.outputSchema||{}) ?></pre><? } else { ?><p class=muted>No descriptor snapshot was recorded for this call.</p><? } ?></aside></div></div></td></tr><? } }) ?></tbody></table>`,
-    published: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class=row><select id=publishedKind><option value="">All types</option><option value=file<?= d.kind==='file'?' selected':'' ?>>File</option><option value=html<?= d.kind==='html'?' selected':'' ?>>HTML</option></select><select id=publishedContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=publishedSize><option value="">All sizes</option><option value=small<?= d.size==='small'?' selected':'' ?>>&lt; 1 MB</option><option value=medium<?= d.size==='medium'?' selected':'' ?>>1–10 MB</option><option value=large<?= d.size==='large'?' selected':'' ?>>10–100 MB</option><option value=huge<?= d.size==='huge'?' selected':'' ?>>≥ 100 MB</option></select><button data-action=clear-published-filters>🧹 Clear Filters</button></div><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> publication<?= d.total===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Published Pages"><button class=page-button data-action=published-page data-published-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=published-page data-published-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=published-page data-published-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No published items match the current filters.</p></div><? } else { ?><table class=published-table><thead><tr><th>Created</th><th>ID</th><th>Type</th><th>Published By</th><th>Published File</th><th>Requests</th><th>Size</th><th>Source</th><th></th></tr></thead><tbody><? rows.forEach(r=>{ ?><tr><td class=nowrap><?= it.logdt(r.created_at) ?></td><td class=context-id><code><?= r.id ?></code><? if(r.content_key){ ?><div class=published-file-meta><?= r.content_key ?></div><? } ?></td><td class=nowrap><?= r.kind==='html'?'🌐 HTML':'📄 File' ?></td><td class=http-session><? const refs=r.references||[]; if(refs.length){ refs.forEach(u=>{ ?><div class=published-reference><span class=idcell>#<?= u.context_id ?></span><? if(u.root_name){ ?> <span class=workspace-label>📁 <?= u.root_name ?></span><? } ?><? if(Number(u.publish_count||0)>1){ ?> <span class=muted>×<?= u.publish_count ?></span><? } ?></div><? }); } else { ?>—<? } ?></td><td><button class=published-open data-action=open-published data-id="<?= r.id ?>" title="Open public URL in browser"><code><?= r.published_name ?></code></button><? if(r.kind==='html'&&r.title){ ?><div class=published-file-meta><?= r.title ?></div><? } else if(r.filename&&r.filename!==r.source_filename){ ?><div class=published-file-meta>Download name: <?= r.filename ?></div><? } ?></td><td class=nowrap><b><?= r.request_count||0 ?></b><? if(r.last_request_at){ ?><div class=published-file-meta>last <?= it.logdt(r.last_request_at) ?></div><? } ?></td><td class=nowrap><?= it.bytes(r.size) ?></td><td class=published-source><? const latest=(r.references||[])[0]; if(latest?.source_path){ ?><code><?= latest.source_path ?></code><? } else if(r.source_path){ ?><code><?= r.source_path ?></code><? } else { ?><span class=muted>Generated HTML</span><? } ?><? if((r.reference_count||0)>1){ ?><div class=published-file-meta><?= r.reference_count ?> publish calls</div><? } ?></td><td class=nowrap><button class="small danger" data-action=delete-published data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></tbody></table><? } ?>`,
+    published: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class=row><select id=publishedKind><option value="">All types</option><option value=file<?= d.kind==='file'?' selected':'' ?>>File</option><option value=html<?= d.kind==='html'?' selected':'' ?>>HTML</option></select><select id=publishedContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=publishedSize><option value="">All sizes</option><option value=small<?= d.size==='small'?' selected':'' ?>>&lt; 1 MB</option><option value=medium<?= d.size==='medium'?' selected':'' ?>>1–10 MB</option><option value=large<?= d.size==='large'?' selected':'' ?>>10–100 MB</option><option value=huge<?= d.size==='huge'?' selected':'' ?>>≥ 100 MB</option></select><button data-action=clear-published-filters>🧹 Clear Filters</button></div><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> publication<?= d.total===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Published Pages"><button class=page-button data-action=published-page data-published-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=published-page data-published-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=published-page data-published-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No published items match the current filters.</p></div><? } else { ?><table class=published-table><thead><tr><th>Created</th><th>ID</th><th>Type</th><th>Published By</th><th>Published File</th><th>Requests</th><th>Size</th><th>Source</th><th></th></tr></thead><tbody><? rows.forEach(r=>{ ?><tr><td class=nowrap><?= it.logdt(r.created_at) ?></td><td class=context-id><code><?= r.id ?></code><? if(r.content_key){ ?><div class=published-file-meta><?= r.content_key ?></div><? } ?></td><td class=nowrap><?= r.kind==='html'?'🌐 HTML':'📄 File' ?></td><td class=http-session><? const refs=r.references||[]; if(refs.length){ refs.forEach(u=>{ ?><div class=published-reference><span class=idcell>#<?= u.context_id ?></span><? if(u.root_name){ ?> <span class=workspace-label>📁 <?= u.root_name ?></span><? } ?></div><? }); } else { ?>—<? } ?></td><td><button class=published-open data-action=open-published data-id="<?= r.id ?>" title="Open public URL in browser"><code><?= r.published_name ?></code></button><? if(r.kind==='html'&&r.title){ ?><div class=published-file-meta><?= r.title ?></div><? } else if(r.filename&&r.filename!==r.source_filename){ ?><div class=published-file-meta>Download name: <?= r.filename ?></div><? } ?></td><td class=nowrap><b><?= r.request_count||0 ?></b><? if(r.last_request_at){ ?><div class=published-file-meta>last <?= it.logdt(r.last_request_at) ?></div><? } ?></td><td class=nowrap><?= it.bytes(r.size) ?></td><td class=published-source><? const latest=(r.references||[])[0]; if(latest?.source_path){ ?><code><?= latest.source_path ?></code><? } else if(r.source_path){ ?><code><?= r.source_path ?></code><? } else { ?><span class=muted>Generated HTML</span><? } ?><? if((r.reference_count||0)>1){ ?><div class=published-file-meta><?= r.reference_count ?> references</div><? } ?></td><td class=nowrap><button class="small danger" data-action=delete-published data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></tbody></table><? } ?>`,
     debug: `<? const d=it.data||{},rows=d.rows||[]; ?><p class="<?= d.enabled?'ok':'failed' ?>"><b><?= d.enabled?'● Recording enabled':'● Recording disabled' ?></b><? if(!d.enabled){ ?> · showing stored requests<? } ?></p><? if(!rows.length){ ?><p class=muted>No stored HTTP debug requests match the current filters.</p><? } else { ?><table><tr><th>ID</th><th>Time</th><th>Session</th><th>Client</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>IP</th><th>Error</th></tr><? rows.forEach(r => { ?><tr data-action=select-debug data-id="<?= r.id ?>" title="Click to expand"><td class=idcell>#<?= r.id ?></td><td class=nowrap><?= it.logdt(r.ts) ?></td><td class=http-session><? if(r.context_id){ ?><div class=idcell>#<?= r.context_id ?></div><? if(r.workspace_name){ ?><div class=workspace-label>📁 <?= r.workspace_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><? if(r.client_id){ ?><code><?= r.client_id ?></code><? } else { ?>—<? } ?></td><td><b><?= r.method ?></b></td><td><code><?= r.path ?></code></td><td class="<?= !r.status?'pending':(r.status>=400?'failed':'ok') ?>"><?= r.status||"…" ?></td><td><?= r.status ? r.duration_ms+"ms" : "in flight" ?></td><td class=nowrap><?= r.remote_addr||"—" ?><? if(r.remote_addr){ ?> (<?= r.remote_count||1 ?>)<? } ?></td><td><?= r.error_preview ?></td></tr><? if(String(d.openRowId||"")===String(r.id)&&d.openDetail){ const x=d.openDetail; ?><tr class=detail-row data-detail-kind=http data-detail-id="<?= r.id ?>"><td colspan=10><div class="detail-panel http-detail-panel"><div class="row http-detail-head"><div class=grow><b>HTTP Request #<?= r.id ?></b><div class=http-detail-meta><span><?= it.logdt(x.ts) ?></span><span><? if(x.context_id){ ?>Session #<?= x.context_id ?><? } else { ?>No Session<? } ?></span><? if(x.workspace_name){ ?><span>📁 <?= x.workspace_name ?></span><? } ?><span><? if(x.client_id){ ?>Client <code><?= x.client_id ?></code><? } else { ?>No client id<? } ?></span><span><?= x.remote_addr||"unknown IP" ?><? if(x.remote_addr){ ?> · <?= x.remote_count||1 ?> total request<?= Number(x.remote_count||1)===1?'':'s' ?><? } ?></span><span><?= x.status ? x.duration_ms+"ms" : "in flight" ?></span></div></div><button class=small data-action=copy-detail data-target="http-json-<?= r.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=http>✕ Close</button></div><div class=http-detail-grid><section class=http-detail-block><div class=row><h4 class=grow>→ Request</h4><b><?= x.method ?></b> <code><?= x.path ?></code></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.request_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.request_body||{}) ?></pre></section><section class=http-detail-block><div class=row><h4 class=grow>← Response</h4><b class="<?= !x.status?'pending':(x.status>=400?'failed':'ok') ?>"><?= x.status||"in flight" ?></b></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.response_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.response_body||{}) ?></pre></section></div><? if(x.error){ ?><section class="http-detail-block http-detail-error"><h4 class=failed>Error</h4><pre><?= x.error ?></pre></section><? } ?><details class=http-detail-raw><summary>Raw record</summary><pre id="http-json-<?= r.id ?>"><?= it.pretty(x) ?></pre></details></div></td></tr><? } }) ?></table><? } ?>`,
   } : {};
   const fragmentBytes = value => {
