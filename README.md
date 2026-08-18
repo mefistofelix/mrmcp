@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.110
+# MrMCP 0.10.111
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated `/mcp` endpoint, Workspace-scoped Sessions, filesystem and process tools, OAuth/Basic authentication, TLS automation, and a local Tauriless administration UI.
 
@@ -20,7 +20,7 @@ MrMCP is a stateless Model Context Protocol server implemented in Deno. It expos
 - Automatic TLS/certificate handling.
 - Tool Call and optional HTTP diagnostic logs, with confirmed page-level Clear actions for Tool Calls, Sessions, Workspaces, OAuth Clients and HTTP history.
 - Local desktop UI with system tray and native notifications.
-- `publish_file` and `publish_html` MCP App presentation helpers with persistent `.mrmcp/publish/` snapshots (`<id>-<original filename>` for files, `<id>.html` for generated HTML) plus a local Published manager for filtering, native opening and deletion.
+- `publish_file` and `publish_html` MCP App presentation helpers with persistent deduplicated `.mrmcp/publish/` snapshots, serialized publication writes, multi-Workspace publication references and a local Published manager for filtering, native opening and deletion.
 
 ## Requirements
 

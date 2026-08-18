@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.110 — Centralize Workspace trash under MrMCP data.
+MrMCP 0.10.111 — Deduplicate publications and harden widget concurrency.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -8,7 +8,7 @@ GUI library: Tauriless, imported directly from npm by Deno.
 */
 
 import { DatabaseSync } from "node:sqlite";
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { inflateRawSync, inflateSync } from "node:zlib";
 import { Readable, Writable } from "node:stream";
 import { spawn as nodeSpawn } from "node:child_process";
@@ -88,7 +88,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.110";
+const VERSION = "0.10.111";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;
@@ -97,8 +97,8 @@ const CONTEXT_HANDLE_OUTPUT_DESCRIPTION = "Opaque capability identifying a persi
 const CONTEXT_HANDLE_RULE = "Requires the exact Session context_handle returned by open_workspace.";
 const MCP_UI_EXTENSION = "io.modelcontextprotocol/ui";
 const MCP_UI_MIME_TYPE = "text/html;profile=mcp-app";
-const FILE_PREVIEW_UI_URI = "ui://mrmcp/file-preview-v5.html";
-const HTML_PREVIEW_UI_URI = "ui://mrmcp/html-preview-v2.html";
+const FILE_PREVIEW_UI_URI = "ui://mrmcp/file-preview-v8.html";
+const HTML_PREVIEW_UI_URI = "ui://mrmcp/html-preview-v5.html";
 const enc = new TextEncoder(), dec = new TextDecoder();
 
 const stringResponse = (body, status, type, headers = {}) => {
@@ -568,7 +568,7 @@ async function backend({ addWorkspace = null } = {}) {
     if (/\broots\b/.test(statement)) ["roots", "sessions", "dashboard"].forEach(scope => scopes.add(scope));
     if (/\bdebug_logs\b/.test(statement)) scopes.add("debug");
     if (/\bprocess_runs\b/.test(statement)) ["logs", "dashboard"].forEach(scope => scopes.add(scope));
-    if (/\bpublished\b/.test(statement)) scopes.add("published");
+    if (/\bpublished(?:_uses)?\b/.test(statement)) scopes.add("published");
     if (/\bcustom_tools\b/.test(statement)) ["commands", "dashboard", "endpoints"].forEach(scope => scopes.add(scope));
     if (/\boauth_(?:clients|tokens|refresh_tokens|codes)\b/.test(statement)) ["oauth", "dashboard"].forEach(scope => scopes.add(scope));
     if (/\bserver_config\b/.test(statement)) ["dashboard", "endpoints", "settings", "oauth"].forEach(scope => scopes.add(scope));
@@ -752,8 +752,12 @@ async function backend({ addWorkspace = null } = {}) {
     CREATE TABLE IF NOT EXISTS published(
       id TEXT PRIMARY KEY,
       server_id INTEGER NOT NULL,
+      content_key TEXT NOT NULL DEFAULT '',
       context_handle TEXT NOT NULL DEFAULT '',
       context_id INTEGER NOT NULL DEFAULT 0,
+      root_id INTEGER NOT NULL DEFAULT 0,
+      root_name TEXT NOT NULL DEFAULT '',
+      root_path TEXT NOT NULL DEFAULT '',
       kind TEXT NOT NULL,
       source_path TEXT NOT NULL DEFAULT '',
       source_filename TEXT NOT NULL DEFAULT '',
@@ -763,20 +767,46 @@ async function backend({ addWorkspace = null } = {}) {
       size INTEGER NOT NULL DEFAULT 0,
       title TEXT NOT NULL DEFAULT '',
       height INTEGER NOT NULL DEFAULT 600,
-      expires_at INTEGER NOT NULL DEFAULT 0,
-      one_time INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL,
+      request_count INTEGER NOT NULL DEFAULT 0,
+      last_request_at INTEGER NOT NULL DEFAULT 0,
       FOREIGN KEY(server_id) REFERENCES server_config(id) ON DELETE CASCADE
     );
-    CREATE INDEX IF NOT EXISTS published_expiry ON published(expires_at);
     CREATE INDEX IF NOT EXISTS published_time ON published(created_at DESC);
     CREATE INDEX IF NOT EXISTS published_context ON published(context_id,created_at DESC);
     CREATE INDEX IF NOT EXISTS published_kind ON published(kind,created_at DESC);
+    CREATE TABLE IF NOT EXISTS published_uses(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      published_id TEXT NOT NULL,
+      context_handle TEXT NOT NULL DEFAULT '',
+      context_id INTEGER NOT NULL DEFAULT 0,
+      root_id INTEGER NOT NULL DEFAULT 0,
+      root_name TEXT NOT NULL DEFAULT '',
+      root_path TEXT NOT NULL DEFAULT '',
+      source_path TEXT NOT NULL DEFAULT '',
+      source_filename TEXT NOT NULL DEFAULT '',
+      filename TEXT NOT NULL DEFAULT '',
+      mime_type TEXT NOT NULL DEFAULT '',
+      title TEXT NOT NULL DEFAULT '',
+      height INTEGER NOT NULL DEFAULT 0,
+      published_at INTEGER NOT NULL,
+      FOREIGN KEY(published_id) REFERENCES published(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS published_uses_publication ON published_uses(published_id,published_at DESC);
+    CREATE INDEX IF NOT EXISTS published_uses_context ON published_uses(context_id,published_at DESC);
     CREATE TABLE IF NOT EXISTS metrics(
       name TEXT PRIMARY KEY,
       value INTEGER NOT NULL DEFAULT 0
     );
   `);
+  const publishedColumns = new Set(db.prepare("PRAGMA table_info(published)").all().map(column => column.name));
+  if (!publishedColumns.has("content_key")) db.exec("ALTER TABLE published ADD COLUMN content_key TEXT NOT NULL DEFAULT ''");
+  db.exec("CREATE UNIQUE INDEX IF NOT EXISTS published_content_key ON published(server_id,content_key) WHERE content_key<>''");
+  if (!publishedColumns.has("request_count")) db.exec("ALTER TABLE published ADD COLUMN request_count INTEGER NOT NULL DEFAULT 0");
+  if (!publishedColumns.has("last_request_at")) db.exec("ALTER TABLE published ADD COLUMN last_request_at INTEGER NOT NULL DEFAULT 0");
+  if (!publishedColumns.has("root_id")) db.exec("ALTER TABLE published ADD COLUMN root_id INTEGER NOT NULL DEFAULT 0");
+  if (!publishedColumns.has("root_name")) db.exec("ALTER TABLE published ADD COLUMN root_name TEXT NOT NULL DEFAULT ''");
+  if (!publishedColumns.has("root_path")) db.exec("ALTER TABLE published ADD COLUMN root_path TEXT NOT NULL DEFAULT ''");
   const one = (sql, ...args) => db.prepare(sql).get(...args);
   const all = (sql, ...args) => db.prepare(sql).all(...args);
   const run = (sql, ...args) => {
@@ -904,7 +934,8 @@ async function backend({ addWorkspace = null } = {}) {
     tool_call_transport: ["log_id", "progress_requested"],
     debug_log_workspaces: ["debug_log_id", "context_id", "root_id", "root_name", "root_path"],
     oauth_refresh_tokens: ["token_hash", "client_id", "server_id", "resource", "scope", "last_used_at"],
-    published: ["id", "server_id", "context_handle", "context_id", "kind", "source_path", "source_filename", "published_name", "filename", "mime_type", "size", "title", "height", "expires_at", "one_time", "created_at"],
+    published: ["id", "server_id", "content_key", "context_handle", "context_id", "root_id", "root_name", "root_path", "kind", "source_path", "source_filename", "published_name", "filename", "mime_type", "size", "title", "height", "created_at", "request_count", "last_request_at"],
+    published_uses: ["id", "published_id", "context_handle", "context_id", "root_id", "root_name", "root_path", "source_path", "source_filename", "filename", "mime_type", "title", "height", "published_at"],
   };
   const schemaErrors = [];
   for (const [table, columns] of Object.entries(requiredSchema)) {
@@ -1209,7 +1240,7 @@ async function backend({ addWorkspace = null } = {}) {
   let shuttingDown = false, mcpHttpServer, mcpHttpsServer;
   let mcpHttpActive = false, mcpTlsActive = false, mcpTlsKind = "none";
   let mcpTlsValid = false, mcpTlsTrusted = false, mcpTlsInfo = null;
-  let mcpListenError = "", renewalTimer, processCleanupTimer, publishCleanupTimer;
+  let mcpListenError = "", renewalTimer, processCleanupTimer;
   const listenerFallbacks = () => [
     mcpHttpActive && mcpHttpPort !== HTTP_PORT ? `HTTP ${HTTP_PORT}→${mcpHttpPort}` : "",
     mcpTlsActive && mcpHttpsPort !== HTTPS_PORT ? `HTTPS ${HTTPS_PORT}→${mcpHttpsPort}` : "",
@@ -1334,7 +1365,7 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
   var fullscreen = document.getElementById('fullscreen');
   var error = document.getElementById('error');
   var pending = new Map();
-  var nextId = 1;
+  var nextId = Math.floor(Math.random() * 1073741823) + 1;
   var currentMode = 'inline';
   var fullscreenAvailable = false;
   var currentIsImage = false;
@@ -1448,13 +1479,14 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
 
   request('ui/initialize', {
     protocolVersion: '2026-01-26',
-    appInfo: { name: 'mrmcp-file-preview', version: '1.4.0' },
+    appInfo: { name: 'mrmcp-file-preview', version: '1.5.0' },
     appCapabilities: { availableDisplayModes: ['inline', 'fullscreen'] }
   }, 3000).then(function (result) {
     applyHostContext(result && result.hostContext);
     notify('ui/notifications/initialized', {});
     if (openai && openai.toolOutput) render(openai.toolOutput);
   }).catch(function () {
+    notify('ui/notifications/initialized', {});
     if (openai && openai.toolOutput) render(openai.toolOutput);
   });
 
@@ -1524,7 +1556,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
   var fullscreen = document.getElementById('fullscreen');
   var error = document.getElementById('error');
   var pending = new Map();
-  var nextId = 1;
+  var nextId = Math.floor(Math.random() * 1073741823) + 1;
   var currentMode = 'inline';
   var fullscreenAvailable = false;
 
@@ -1615,13 +1647,14 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
 
   request('ui/initialize', {
     protocolVersion: '2026-01-26',
-    appInfo: { name: 'mrmcp-html-preview', version: '1.1.0' },
+    appInfo: { name: 'mrmcp-html-preview', version: '1.2.0' },
     appCapabilities: { availableDisplayModes: ['inline', 'fullscreen'] }
   }, 3000).then(function (result) {
     applyHostContext(result && result.hostContext);
     notify('ui/notifications/initialized', {});
     if (openai && openai.toolOutput) render(openai.toolOutput);
   }).catch(function () {
+    notify('ui/notifications/initialized', {});
     if (openai && openai.toolOutput) render(openai.toolOutput);
   });
 
@@ -1670,11 +1703,6 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const name = basename(String(value || "download")).replace(/[\u0000-\u001f\u007f<>:\"|?*\/\\]/g, "_").trim();
     return name && name !== "." && name !== ".." ? name.slice(0, 240) : "download";
   };
-  const boundedExpirySeconds = value => {
-    if (value == null) return null;
-    const seconds = Number(value);
-    return Number.isFinite(seconds) ? Math.max(30, Math.min(seconds, 604800)) : null;
-  };
   const downloadUrl = (token, filename) => `${publicBase()}/download/${token}/${encodeURIComponent(filename)}`;
   const publishedHtmlUrl = id => `${publicBase()}/published-html/${encodeURIComponent(id)}`;
   const publishedPath = name => join(PUBLISH_DIR, name);
@@ -1685,6 +1713,50 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const maxStem = Math.max(1, 240 - id.length - 1 - extension.length);
     return `${id}-${stem.slice(0, maxStem)}${extension}`;
   };
+  let publishSerial = Promise.resolve();
+  const serializePublish = work => {
+    const result = publishSerial.then(work, work);
+    publishSerial = result.then(() => undefined, () => undefined);
+    return result;
+  };
+  const hashContent = (prefix, parts) => {
+    const hash = createHash("sha256");
+    for (const part of parts) {
+      hash.update(part);
+      hash.update("\0");
+    }
+    return `${prefix}_${hash.digest("base64url")}`;
+  };
+  async function fileSlice(file, offset, length) {
+    if (!length) return new Uint8Array();
+    await file.seek(offset, Deno.SeekMode.Start);
+    const bytes = new Uint8Array(length);
+    let read = 0;
+    while (read < length) {
+      const n = await file.read(bytes.subarray(read));
+      if (n === null) break;
+      read += n;
+    }
+    return bytes.subarray(0, read);
+  }
+  async function fileContentKey(path, size) {
+    const file = await Deno.open(path, { read: true });
+    try {
+      const length = Math.min(10, size);
+      const first = await fileSlice(file, 0, length);
+      const last = await fileSlice(file, Math.max(0, size - length), length);
+      const middle = await fileSlice(file, Math.max(0, Math.floor((size - length) / 2)), length);
+      return hashContent("file", [String(size), first, last, middle]);
+    } finally { file.close(); }
+  }
+  const htmlContentKey = html => hashContent("html", [enc.encode(html)]);
+  const addPublishedUse = (publishedId, metadata) => run(`INSERT INTO published_uses(
+      published_id,context_handle,context_id,root_id,root_name,root_path,source_path,source_filename,filename,mime_type,title,height,published_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+    publishedId, String(metadata.context_handle || ""), Number(metadata.context_id || 0), Number(metadata.root_id || 0),
+    String(metadata.root_name || ""), String(metadata.root_path || ""), String(metadata.source_path || ""), String(metadata.source_filename || ""),
+    String(metadata.filename || ""), String(metadata.mime_type || ""), String(metadata.title || ""), Number(metadata.height || 0), Number(metadata.published_at || Date.now()),
+  );
   async function cleanupPublished(id, strict = false) {
     const record = one("SELECT published_name FROM published WHERE id=?", id);
     if (!record) return false;
@@ -1701,16 +1773,15 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     return true;
   }
   async function openPublished(id) {
-    const record = one("SELECT published_name FROM published WHERE id=?", id);
-    if (!record?.published_name) throw new Error("Published item not found");
-    const root = await Deno.realPath(PUBLISH_DIR), path = await Deno.realPath(publishedPath(record.published_name));
-    if (!within(root, path) || !(await Deno.stat(path)).isFile) throw new Error("Published payload not found");
-    if (!IS_BACKEND_WORKER) throw new Error("Native file opening is available only in the desktop UI");
-    self.postMessage({ type: "os-open-path", path });
-  }
-  async function expirePublished(now = Date.now()) {
-    for (const record of all("SELECT id FROM published WHERE expires_at>0 AND expires_at<=?", now))
-      await cleanupPublished(record.id);
+    const record = one("SELECT id,kind,filename FROM published WHERE id=?", id);
+    if (!record) throw new Error("Published item not found");
+    const latest = one("SELECT filename FROM published_uses WHERE published_id=? ORDER BY id DESC LIMIT 1", id);
+    const filename = latest?.filename || record.filename;
+    const url = record.kind === "html" ? publishedHtmlUrl(record.id)
+      : record.kind === "file" ? downloadUrl(record.id, filename) : "";
+    if (!url) throw new Error("Unsupported published item type");
+    if (!IS_BACKEND_WORKER) throw new Error("URL opening is available only in the desktop UI");
+    self.postMessage({ type: "os-open-url", url });
   }
   async function cleanupPublishedOrphans() {
     const live = new Set(all("SELECT published_name FROM published").map(record => String(record.published_name)));
@@ -1718,35 +1789,102 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       if (entry.isFile && !live.has(entry.name)) await Deno.remove(join(PUBLISH_DIR, entry.name)).catch(() => {});
   }
   async function publishPath(path, options = {}) {
-    const allowedRoot = await Deno.realPath(options.allowed_root || dirname(path));
-    const realPath = await Deno.realPath(path);
-    if (!within(allowedRoot, realPath)) throw new Error("Published file resolves outside its allowed root");
-    const stat = await Deno.stat(realPath);
-    if (!stat.isFile) throw new Error("Only regular files can be published");
-    const sourceFilename = basename(realPath);
-    const filename = safeDownloadName(options.filename || sourceFilename);
-    const mimeType = String(options.mime_type || inferredMimeType(sourceFilename)).trim() || "application/octet-stream";
-    if (/[^\x20-\x7e]/.test(mimeType) || !/^[^\s\/]+\/[^\s]+$/.test(mimeType))
-      throw new Error("Invalid MIME type");
-    const id = randomToken(32), publishedName = publishedFileName(id, sourceFilename), snapshotPath = publishedPath(publishedName);
-    await Deno.copyFile(realPath, snapshotPath);
-    const snapshotStat = await Deno.stat(snapshotPath), seconds = boundedExpirySeconds(options.expires_in);
-    const expiresAt = seconds == null ? 0 : Date.now() + seconds * 1000, createdAt = Date.now();
-    try {
-      run(`INSERT INTO published(id,server_id,context_handle,context_id,kind,source_path,source_filename,published_name,filename,mime_type,size,title,height,expires_at,one_time,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        id, options.server_id, options.context_handle || "", Number(options.context_id || 0), "file", realPath, sourceFilename, publishedName,
-        filename, mimeType, snapshotStat.size, "", 0, expiresAt, +(options.one_time === true), createdAt,
-      );
-    } catch (error) {
-      await Deno.remove(snapshotPath).catch(() => {});
-      throw error;
-    }
-    return {
-      filename, mime_type: mimeType, size: snapshotStat.size,
-      uri: downloadUrl(id, filename),
-      expires_at: expiresAt ? new Date(expiresAt).toISOString() : null, one_time: options.one_time === true,
-    };
+    return await serializePublish(async () => {
+      const allowedRoot = await Deno.realPath(options.allowed_root || dirname(path));
+      const realPath = await Deno.realPath(path);
+      if (!within(allowedRoot, realPath)) throw new Error("Published file resolves outside its allowed root");
+      const stat = await Deno.stat(realPath);
+      if (!stat.isFile) throw new Error("Only regular files can be published");
+      const sourceFilename = basename(realPath);
+      const filename = safeDownloadName(options.filename || sourceFilename);
+      const mimeType = String(options.mime_type || inferredMimeType(sourceFilename)).trim() || "application/octet-stream";
+      if (/[^\x20-\x7e]/.test(mimeType) || !/^[^\s\/]+\/[^\s]+$/.test(mimeType))
+        throw new Error("Invalid MIME type");
+      const contentKey = await fileContentKey(realPath, stat.size);
+      let record = one("SELECT * FROM published WHERE server_id=? AND content_key=? AND kind='file'", options.server_id, contentKey), created = false;
+      if (!record) {
+        const id = randomToken(32), publishedName = publishedFileName(id, sourceFilename), snapshotPath = publishedPath(publishedName), createdAt = Date.now();
+        await Deno.copyFile(realPath, snapshotPath);
+        const snapshotStat = await Deno.stat(snapshotPath);
+        if (snapshotStat.size !== stat.size || await fileContentKey(snapshotPath, snapshotStat.size) !== contentKey) {
+          await Deno.remove(snapshotPath).catch(() => {});
+          throw new Error("File changed while it was being published; retry the publication.");
+        }
+        try {
+          run(`INSERT INTO published(id,server_id,content_key,context_handle,context_id,root_id,root_name,root_path,kind,source_path,source_filename,published_name,filename,mime_type,size,title,height,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            id, options.server_id, contentKey, options.context_handle || "", Number(options.context_id || 0), Number(options.root_id || 0), String(options.root_name || ""), String(options.root_path || ""),
+            "file", realPath, sourceFilename, publishedName, filename, mimeType, snapshotStat.size, "", 0, createdAt,
+          );
+        } catch (error) {
+          await Deno.remove(snapshotPath).catch(() => {});
+          throw error;
+        }
+        record = one("SELECT * FROM published WHERE id=?", id);
+        created = true;
+      } else {
+        const snapshotPath = publishedPath(record.published_name);
+        const snapshotStat = await Deno.stat(snapshotPath).catch(() => null);
+        if (!snapshotStat?.isFile || snapshotStat.size !== stat.size || await fileContentKey(snapshotPath, snapshotStat.size) !== contentKey) {
+          await Deno.copyFile(realPath, snapshotPath);
+          const repaired = await Deno.stat(snapshotPath);
+          if (repaired.size !== stat.size || await fileContentKey(snapshotPath, repaired.size) !== contentKey)
+            throw new Error("File changed while it was being published; retry the publication.");
+        }
+      }
+      const publishedAt = Date.now();
+      try {
+        addPublishedUse(record.id, {
+          ...options, source_path: realPath, source_filename: sourceFilename, filename, mime_type: mimeType, published_at: publishedAt,
+        });
+      } catch (error) {
+        if (created) await cleanupPublished(record.id).catch(() => {});
+        throw error;
+      }
+      return {
+        id: record.id, content_id: contentKey, filename, mime_type: mimeType, size: Number(record.size || stat.size),
+        uri: downloadUrl(record.id, filename),
+      };
+    });
+  }
+  async function publishHtml(html, options = {}) {
+    return await serializePublish(async () => {
+      const contentKey = htmlContentKey(html);
+      let record = one("SELECT * FROM published WHERE server_id=? AND content_key=? AND kind='html'", options.server_id, contentKey), created = false;
+      if (!record) {
+        const id = `html_${randomToken(24)}`, publishedName = `${id}.html`, createdAt = Date.now(), snapshotPath = publishedPath(publishedName);
+        await Deno.writeTextFile(snapshotPath, html, { createNew: true });
+        const size = (await Deno.stat(snapshotPath)).size;
+        try {
+          run(`INSERT INTO published(id,server_id,content_key,context_handle,context_id,root_id,root_name,root_path,kind,source_path,source_filename,published_name,filename,mime_type,size,title,height,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            id, options.server_id, contentKey, options.context_handle || "", Number(options.context_id || 0), Number(options.root_id || 0), String(options.root_name || ""), String(options.root_path || ""),
+            "html", "", "", publishedName, publishedName, "text/html; charset=utf-8", size, String(options.title || ""), Number(options.height || 600), createdAt,
+          );
+        } catch (error) {
+          await Deno.remove(snapshotPath).catch(() => {});
+          throw error;
+        }
+        record = one("SELECT * FROM published WHERE id=?", id);
+        created = true;
+      } else {
+        const snapshotPath = publishedPath(record.published_name);
+        if (!(await Deno.stat(snapshotPath).catch(() => null))?.isFile) await Deno.writeTextFile(snapshotPath, html);
+      }
+      const publishedAt = Date.now();
+      try {
+        addPublishedUse(record.id, {
+          ...options, filename: record.filename, mime_type: "text/html; charset=utf-8", published_at: publishedAt,
+        });
+      } catch (error) {
+        if (created) await cleanupPublished(record.id).catch(() => {});
+        throw error;
+      }
+      return {
+        id: record.id, content_id: contentKey, title: String(options.title || "Interactive HTML"), uri: publishedHtmlUrl(record.id),
+        height: Number(options.height || 600), created_at: new Date(record.created_at).toISOString(),
+      };
+    });
   }
 
   const contentDisposition = (filename, mode = "attachment") => {
@@ -1765,6 +1903,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       await cleanupPublished(record.id);
       return text("Not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
     }
+    run("UPDATE published SET request_count=request_count+1,last_request_at=? WHERE id=?", Date.now(), record.id);
     const headers = {
       "content-type": "text/html; charset=utf-8",
       "content-length": String(data.byteLength),
@@ -1782,14 +1921,15 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     if (!match || !["GET", "HEAD"].includes(req.method))
       return text("Not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
     const token = match[1], record = one("SELECT * FROM published WHERE id=? AND kind='file'", token);
-    if (!record || (record.expires_at > 0 && record.expires_at <= Date.now())) {
-      if (record) await cleanupPublished(token);
-      return text("Download expired or not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
-    }
+    if (!record)
+      return text("Download not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
     let requestedName;
     try { requestedName = decodeURIComponent(match[2]); } catch { requestedName = ""; }
-    if (requestedName !== record.filename)
+    const use = requestedName ? one(`SELECT filename,mime_type FROM published_uses
+      WHERE published_id=? AND filename=? ORDER BY id DESC LIMIT 1`, token, requestedName) : null;
+    if (!use && requestedName !== record.filename)
       return text("Not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
+    const effectiveMime = use?.mime_type || record.mime_type;
     const allowedRoot = await Deno.realPath(PUBLISH_DIR).catch(() => null);
     const realPath = await Deno.realPath(publishedPath(record.published_name)).catch(() => null);
     const stat = realPath && allowedRoot && within(allowedRoot, realPath)
@@ -1798,12 +1938,13 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       await cleanupPublished(token);
       return text("File not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
     }
-    const inlinePreview = isInlinePreviewMime(record.mime_type);
-    const activeDocument = isActiveDocumentMime(record.mime_type);
+    run("UPDATE published SET request_count=request_count+1,last_request_at=? WHERE id=?", Date.now(), token);
+    const inlinePreview = isInlinePreviewMime(effectiveMime);
+    const activeDocument = isActiveDocumentMime(effectiveMime);
     const headers = {
-      "content-type": responseContentType(record.mime_type, record.filename),
+      "content-type": responseContentType(effectiveMime, requestedName || record.filename),
       "content-length": String(stat.size),
-      "content-disposition": contentDisposition(record.filename, inlinePreview ? "inline" : "attachment"),
+      "content-disposition": contentDisposition(requestedName || record.filename, inlinePreview ? "inline" : "attachment"),
       "cache-control": "no-store, max-age=0", "x-content-type-options": "nosniff",
       ...(inlinePreview ? {
         "access-control-allow-origin": "*",
@@ -1815,7 +1956,6 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     };
     if (req.method === "HEAD") return new Response(null, { status: 200, headers });
     const file = await Deno.open(realPath, { read: true });
-    if (record.one_time) run("DELETE FROM published WHERE id=?", token);
     const reader = file.readable.getReader();
     let finished = false;
     const finish = async () => {
@@ -1823,7 +1963,6 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       finished = true;
       try { reader.releaseLock(); } catch {}
       try { file.close(); } catch {}
-      if (record.one_time) await Deno.remove(publishedPath(record.published_name)).catch(() => {});
     };
     const stream = new ReadableStream({
       async pull(controller) {
@@ -3162,16 +3301,14 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         { properties: { action_id: { type: "string" }, ...contextInput }, required: ["action_id"] },
       ],
       publish_file: [
-        "Present an existing file to the user through the attached MCP App widget. The server snapshots the file into persistent private publish storage and returns an HTTPS URL in structuredContent; the publication survives server restarts and later changes or deletion of the Workspace source. The widget renders image/* through an HTML img element or shows an Open File action for other MIME types. Omit expires_in for a persistent publication, or set it only when explicit expiry is desired. Do not read/Base64-encode the file and do not construct alternate preview payloads; simply call publish_file after creating the file.",
+        "Present an existing file to the user through the attached MCP App widget. The server snapshots the file into persistent private publish storage, reusing an existing snapshot when the same fast content fingerprint was already published, and returns an HTTPS URL in structuredContent; publications never expire automatically and survive server restarts as well as later changes, moves or deletion of the Workspace source. The widget renders image/* through an HTML img element or shows an Open File action for other MIME types. Do not read/Base64-encode the file and do not construct alternate preview payloads; simply call publish_file after creating the file.",
         { properties: {
           path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" },
-          expires_in: { type: "integer", minimum: 30, maximum: 604800, description: "Optional lifetime in seconds. Omit for a persistent publication that survives restarts." },
-          one_time: { type: "boolean", default: false },
           ...contextInput,
         }, required: ["path"] },
       ],
       publish_html: [
-        "Render arbitrary interactive HTML through the attached MCP App widget. The HTML is snapshotted into the same persistent .mrmcp/publish storage used by publish_file, with metadata in the shared published table, so it remains available after server restarts. The widget loads its persistent HTTPS URL inside a nested sandboxed iframe that allows scripts, forms, modals and popup links but deliberately omits allow-same-origin, so the document cannot access the MCP App or host DOM and origin-dependent storage/cookie APIs may be unavailable. Prefer self-contained HTML/CSS/JavaScript for portable results. Remote images, fonts, scripts, modules, fetch/WebSocket calls and other network dependencies may work when the current host/browser permits them, but are host/CSP dependent and normal browser CORS still applies, so do not assume they are portable. The whole MCP request, including HTML and JSON, is limited by the server's 2 MiB request-body limit.",
+        "Render arbitrary interactive HTML through the attached MCP App widget. The HTML is content-hashed and snapshotted into the same persistent .mrmcp/publish storage used by publish_file; identical HTML reuses the existing snapshot while each publication retains its own Session/Workspace reference, so it remains available after server restarts. The widget loads its persistent HTTPS URL inside a nested sandboxed iframe that allows scripts, forms, modals and popup links but deliberately omits allow-same-origin, so the document cannot access the MCP App or host DOM and origin-dependent storage/cookie APIs may be unavailable. Prefer self-contained HTML/CSS/JavaScript for portable results. Remote images, fonts, scripts, modules, fetch/WebSocket calls and other network dependencies may work when the current host/browser permits them, but are host/CSP dependent and normal browser CORS still applies, so do not assume they are portable. The whole MCP request, including HTML and JSON, is limited by the server's 2 MiB request-body limit.",
         { properties: {
           html: { type: "string", minLength: 1 },
           title: { type: "string", default: "Interactive HTML", maxLength: 200 },
@@ -3307,8 +3444,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       move_path: outputSchema({ from: { type: "string" }, to: { type: "string" } }),
       trash_paths: outputSchema({ action_id: { type: "string" }, trash_path: { type: "string" }, manifest_path: { type: "string" }, paths: stringArray }),
       untrash_action: outputSchema({ action_id: { type: "string" }, paths: stringArray }),
-      publish_file: outputSchema({ path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" }, size: { type: "integer" }, uri: { type: "string", description: "HTTPS URL consumed by the attached MCP App widget; persistent unless explicit expiry or one-time semantics were requested." }, expires_at: nullableString, one_time: { type: "boolean" } }),
-      publish_html: outputSchema({ id: { type: "string" }, title: { type: "string" }, uri: { type: "string", description: "Persistent HTTPS URL loaded by the attached MCP App widget." }, height: { type: "integer" }, created_at: { type: "string" } }),
+      publish_file: outputSchema({ id: { type: "string" }, content_id: { type: "string" }, path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" }, size: { type: "integer" }, uri: { type: "string", description: "Persistent HTTPS URL consumed by the attached MCP App widget; publications never expire automatically." } }),
+      publish_html: outputSchema({ id: { type: "string" }, content_id: { type: "string" }, title: { type: "string" }, uri: { type: "string", description: "Persistent HTTPS URL loaded by the attached MCP App widget." }, height: { type: "integer" }, created_at: { type: "string" } }),
       list_commands: outputSchema({ query: { type: "string" }, page: { type: "integer" }, page_size: { type: "integer" }, total: { type: "integer" }, pages: { type: "integer" }, has_more: { type: "boolean" }, bin_directory: { type: "string" }, config_file: { type: "string" }, path_precedence: { type: "string" }, invocation: { type: "object", additionalProperties: true }, commands: objectArray }),
       query_tool_calls: outputSchema({ calls: objectArray }),
       exec: outputSchema(processProperties),
@@ -3489,6 +3626,11 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       uiErrors.push("UI structuredContent URL handling missing");
     if (!filePreviewAppHtml().includes("openai:set_globals") || !htmlPreviewAppHtml().includes("openai:set_globals"))
       uiErrors.push("UI ChatGPT global-update bridge missing");
+    if (filePreviewAppHtml().includes("var nextId = 1;") || htmlPreviewAppHtml().includes("var nextId = 1;"))
+      uiErrors.push("UI bridge request ids must not share a fixed initial value");
+    if ((filePreviewAppHtml().match(/ui\/notifications\/initialized/g) || []).length < 2 ||
+        (htmlPreviewAppHtml().match(/ui\/notifications\/initialized/g) || []).length < 2)
+      uiErrors.push("UI initialize-timeout recovery missing");
     if (!htmlPreviewAppHtml().includes("sandbox=\"allow-scripts") || htmlPreviewAppHtml().includes("allow-same-origin"))
       uiErrors.push("publish_html nested iframe sandbox is invalid");
     if (!htmlPreviewUiMeta().ui?.csp?.frameDomains?.includes(publicOrigin()))
@@ -3524,10 +3666,13 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       },
       resources_list_result: { resources: [fileResource, htmlResource] },
       resources_read_result: {
+        resultType: "complete",
         contents: [
           { uri: FILE_PREVIEW_UI_URI, mimeType: MCP_UI_MIME_TYPE, text: filePreviewAppHtml(), _meta: filePreviewUiMeta() },
           { uri: HTML_PREVIEW_UI_URI, mimeType: MCP_UI_MIME_TYPE, text: htmlPreviewAppHtml(), _meta: htmlPreviewUiMeta() },
         ],
+        ttlMs: 300000,
+        cacheScope: "private",
       },
     };
   }
@@ -4151,7 +4296,6 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       if (consent.expires_at < now) oauthConsents.delete(token);
     for (const [key, bucket] of rateBuckets)
       if (now - bucket.started > 2 * 60 * 1000) rateBuckets.delete(key);
-    expirePublished(now).catch(() => {});
   }
   function activeProcesses(contextHandle, limit = 50) {
     const handle = String(contextHandle || "");
@@ -4610,9 +4754,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       const target = await resolvePath(args.path);
       const result = await publishPath(target.path, {
         filename: args.filename || basename(target.path), mime_type: args.mime_type,
-        expires_in: args.expires_in, one_time: args.one_time,
         allowed_root: target.root.path, server_id: p.id, context_handle: args.context_handle,
-        context_id: selection.context.id,
+        context_id: selection.context.id, root_id: selection.root.id, root_name: selection.root.name, root_path: selection.root.path,
       });
       return { path: target.display, ...result };
     }
@@ -4621,20 +4764,10 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       if (!html.trim()) throw new Error("html must not be empty");
       const title = String(args.title || "Interactive HTML").trim().slice(0, 200) || "Interactive HTML";
       const height = Math.max(120, Math.min(Number(args.height || 600), 2000));
-      const id = `html_${randomToken(24)}`, publishedName = `${id}.html`, createdAt = Date.now(), snapshotPath = publishedPath(publishedName);
-      await Deno.writeTextFile(snapshotPath, html, { createNew: true });
-      const size = (await Deno.stat(snapshotPath)).size;
-      try {
-        run(`INSERT INTO published(id,server_id,context_handle,context_id,kind,source_path,source_filename,published_name,filename,mime_type,size,title,height,expires_at,one_time,created_at)
-          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-          id, p.id, args.context_handle, Number(selection.context.id || 0), "html", "", "", publishedName, publishedName, "text/html; charset=utf-8", size,
-          title, height, 0, 0, createdAt,
-        );
-      } catch (error) {
-        await Deno.remove(snapshotPath).catch(() => {});
-        throw error;
-      }
-      return { id, title, uri: publishedHtmlUrl(id), height, created_at: new Date(createdAt).toISOString() };
+      return await publishHtml(html, {
+        title, height, server_id: p.id, context_handle: args.context_handle,
+        context_id: selection.context.id, root_id: selection.root.id, root_name: selection.root.name, root_path: selection.root.path,
+      });
     }
     if (name === "list_commands") return await commandCatalog({ ...args, admin: false, include_missing: false });
     if (name === "query_tool_calls") {
@@ -5498,7 +5631,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           } else {
             const resourceResult = { contents: [{ ...resource, mimeType: MCP_UI_MIME_TYPE }] };
             r.result = modernRequest
-              ? { resultType: "complete", ...resourceResult, _meta: serverInfoMeta }
+              ? { resultType: "complete", ...resourceResult, ttlMs: 300000, cacheScope: "private", _meta: serverInfoMeta }
               : resourceResult;
           }
         }
@@ -5850,24 +5983,42 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     return result;
   };
   const publishedAdminProjection = (serverId, current = {}) => {
-    const conditions = ["server_id=?"], values = [serverId];
+    const conditions = ["p.server_id=?"], values = [serverId];
     const kind = ["file", "html"].includes(String(current.kind || "")) ? String(current.kind) : "";
     const contextId = Math.max(0, Number(current.context) || 0);
     const size = ["small", "medium", "large", "huge"].includes(String(current.size || "")) ? String(current.size) : "";
-    if (kind) { conditions.push("kind=?"); values.push(kind); }
-    if (contextId) { conditions.push("context_id=?"); values.push(contextId); }
-    if (size === "small") conditions.push("size<1048576");
-    else if (size === "medium") conditions.push("size>=1048576 AND size<10485760");
-    else if (size === "large") conditions.push("size>=10485760 AND size<104857600");
-    else if (size === "huge") conditions.push("size>=104857600");
+    if (kind) { conditions.push("p.kind=?"); values.push(kind); }
+    if (contextId) {
+      conditions.push("(p.context_id=? OR EXISTS(SELECT 1 FROM published_uses u WHERE u.published_id=p.id AND u.context_id=?))");
+      values.push(contextId, contextId);
+    }
+    if (size === "small") conditions.push("p.size<1048576");
+    else if (size === "medium") conditions.push("p.size>=1048576 AND p.size<10485760");
+    else if (size === "large") conditions.push("p.size>=10485760 AND p.size<104857600");
+    else if (size === "huge") conditions.push("p.size>=104857600");
     const where = conditions.join(" AND "), pageSize = 25;
-    const total = Number(one(`SELECT COUNT(*) n FROM published WHERE ${where}`, ...values)?.n || 0);
+    const total = Number(one(`SELECT COUNT(*) n FROM published p WHERE ${where}`, ...values)?.n || 0);
     const pages = Math.max(1, Math.ceil(total / pageSize));
     const page = Math.min(pages, Math.max(1, Number(current.page) || 1)), offset = (page - 1) * pageSize;
-    const rows = all(`SELECT id,context_id,kind,source_path,source_filename,published_name,filename,mime_type,size,title,height,expires_at,one_time,created_at
-      FROM published WHERE ${where} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?`, ...values, pageSize, offset);
-    const sessions = all("SELECT DISTINCT context_id FROM published WHERE server_id=? AND context_id>0 ORDER BY context_id DESC", serverId)
-      .map(row => Number(row.context_id));
+    const rows = all(`SELECT p.id,p.content_key,p.context_id,p.root_id,p.root_name,p.root_path,p.kind,p.source_path,p.source_filename,p.published_name,p.filename,p.mime_type,p.size,p.title,p.height,p.created_at,p.request_count,p.last_request_at
+      FROM published p WHERE ${where} ORDER BY p.created_at DESC,p.id DESC LIMIT ? OFFSET ?`, ...values, pageSize, offset);
+    for (const row of rows) {
+      row.reference_count = Number(one("SELECT COUNT(*) n FROM published_uses WHERE published_id=?", row.id)?.n || 0);
+      row.references = all(`SELECT context_id,root_id,root_name,root_path,source_path,source_filename,filename,mime_type,title,height,
+          MAX(published_at) published_at,COUNT(*) publish_count
+        FROM published_uses WHERE published_id=?
+        GROUP BY context_id,root_id,root_name,root_path,source_path,source_filename,filename,mime_type,title,height
+        ORDER BY MAX(published_at) DESC`, row.id);
+      if (!row.references.length && row.context_id) row.references = [{
+        context_id: row.context_id, root_id: row.root_id, root_name: row.root_name, root_path: row.root_path,
+        source_path: row.source_path, source_filename: row.source_filename, filename: row.filename, mime_type: row.mime_type,
+        title: row.title, height: row.height, published_at: row.created_at,
+      }];
+      row.reference_count = Math.max(row.reference_count, row.references.length);
+    }
+    const sessions = all(`SELECT context_id FROM published WHERE server_id=? AND context_id>0
+      UNION SELECT u.context_id FROM published_uses u JOIN published p ON p.id=u.published_id WHERE p.server_id=? AND u.context_id>0
+      ORDER BY context_id DESC`, serverId, serverId).map(row => Number(row.context_id));
     return { rows, total, page, pages, page_size: pageSize, sessions, kind, context: contextId || "", size };
   };
 
@@ -5940,7 +6091,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 <? } else if(section==="roots"){ ?><section id=roots class=page><div class=row><h2 class=grow>📁 Workspaces</h2><button class=primary data-action=new-root>➕ Add Workspace</button><button class=danger data-action=clear-workspaces<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Workspace names are unique. Drag Sessions to change where future Tool Calls run; running processes stay in their original folder.</p><div id=rootList></div></section>
 <? } else if(section==="commands"){ const c=s.commands||{}; ?><section id=commands class=page><div class=row><h2 class=grow>🧰 Extra Commands</h2><button data-action=download-all-commands>⬇️ Download All</button><button class=primary data-action=new-command>➕ Register Command</button></div><p class=muted><code>commands.yaml</code> defines catalog entries. Executables in <code>.mrmcp/bin</code> appear automatically.</p><div class=row><input id=commandQuery class=grow placeholder="Search name, path or description…" value="<?= c.query||'' ?>"><label class=small><input id=commandIncludeMissing type=checkbox<?= c.includeMissing!==false?' checked':'' ?>> Show Unavailable</label><select id=commandPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(c.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-commands>🔎 Search</button></div><div id=commandList></div></section>
 <? } else if(section==="logs"){ const l=s.logs||{}; ?><section id=logs class=page><div class=row><h2 class=grow>🛠️ Tool Calls</h2><button class=danger data-action=clear-tool-calls<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Click a row for details. Terminate active work from Actions.</p><div class=row><input id=logQuery class=grow placeholder="Search input, output, errors…" value="<?= l.query||'' ?>"><select id=logContext><option value="">All sessions</option><? (s.contextValues||[]).forEach(v=>{ ?><option value="<?= v.pk ?>"<?= String(l.context||"")===String(v.pk)?" selected":"" ?>>#<?= v.pk ?></option><? }) ?></select><select id=logStatus class="<?= l.status||'' ?>"><option value="">All states</option><? ['completed','failed','invalid','running'].forEach(v=>{ ?><option class="<?= v ?>" value="<?= v ?>"<?= l.status===v?' selected':'' ?>><?= v ?></option><? }) ?></select><select id=logPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(l.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=clear-log-filters>🧹 Clear Filters</button></div><? if(l.selfTest){ ?><div id=logSelfTest class=card><div class=row><h3 class=grow>🧪 MCP Self-Test</h3><button class=small data-action=copy-detail data-target=logDetail>📋 Copy JSON</button><button class=small data-action=close-self-test>✕ Close</button></div><pre id=logDetail><?= it.pretty(l.selfTest) ?></pre></div><? } ?><div id=logList></div></section>
-<? } else if(section==="published"){ ?><section id=published class=page><div class=row><h2 class=grow>📦 Published</h2><button class=danger data-action=clear-published<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear All</button></div><p class=muted>Persistent snapshots created by <code>publish_file</code> and <code>publish_html</code>. Open a payload with its system default application or delete the publication and snapshot together.</p><div id=publishedList></div></section>
+<? } else if(section==="published"){ ?><section id=published class=page><div class=row><h2 class=grow>📦 Published</h2><button class=danger data-action=clear-published<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear All</button></div><p class=muted>Deduplicated persistent snapshots created by <code>publish_file</code> and <code>publish_html</code>. One resource may have references from multiple Sessions and Workspaces.</p><div id=publishedList></div></section>
 <? } else if(section==="debug"){ const d=s.debug||{},enabled=!!s.debug?.enabled; ?><section id=debug class=page><div class=row><h2 class=grow>🐞 HTTP Debug Log</h2><button class="debug-toggle <?= enabled?'enabled':'disabled' ?>" data-action=toggle-debug-settings aria-pressed="<?= enabled?'true':'false' ?>"><?= enabled?"🟢 Logging ON · Disable":"🔴 Logging OFF · Enable" ?></button><button class=danger data-action=clear-debug>🗑️ Clear</button></div><p class=muted>Off by default. Secrets are redacted. Disabling stops new records but keeps stored data visible. Click a row for request JSON.</p><div class=row><input id=debugQuery class=grow placeholder="Search URL, headers, body or errors…" value="<?= d.query||'' ?>"><select id=debugMethod><option value="">All methods</option><? ['GET','POST','OPTIONS'].forEach(v=>{ ?><option<?= d.method===v?' selected':'' ?>><?= v ?></option><? }) ?></select><input id=debugStatus type=number placeholder="Status" value="<?= d.status||'' ?>"><button data-action=load-debug>🔎 Search</button></div><div id=debugList></div></section>
 <? } else if(section==="oauth"){ ?><section id=oauth class=page><div class=row><h2 class=grow>🔐 OAuth Clients</h2><button class=danger data-action=clear-clients<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><div id=oauthList></div></section>
 <? } else if(section==="settings"){ ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><div class=settings-layout><div class=settings-main><div class=card><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><p class=muted>Off: child <code>PATH</code> contains only <code>.mrmcp/bin</code>. Other environment variables are unchanged.</p></div><div class=card><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
@@ -5958,7 +6109,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     oauth: `<table class=oauth-table><tr><th>Client</th><th>Sessions</th><th>Tokens</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td class=oauth-client><b><?= c.name ?></b><div class=oauth-client-id title="<?= c.client_id ?>"><code><?= c.client_id ?></code></div><div class=oauth-meta><span class=muted>Created</span> <?= it.logdt(c.created_at) ?></div></td><td class=oauth-meta><div class=oauth-count><b><?= c.session_count||0 ?></b> total</div><div><span class=muted>First</span> <?= c.first_session_at ? it.logdt(c.first_session_at) : "—" ?></div><div><span class=muted>Last</span> <?= c.last_session_at ? it.logdt(c.last_session_at) : "—" ?></div></td><td><div class=oauth-tokens><div class=oauth-token><b><?= c.token_count||0 ?></b> <span>Access</span><div class=oauth-meta><span class=muted>Issued</span> <?= c.last_token_at ? it.logdt(c.last_token_at) : "—" ?></div></div><div class=oauth-token><b><?= c.refresh_token_count||0 ?></b> <span>Refresh</span><div class=oauth-meta><span class=muted>Used</span> <?= c.last_refresh_at ? it.logdt(c.last_refresh_at) : "—" ?></div></div></div></td><td class=oauth-actions><button class=small data-action=oauth-sessions data-id="<?= c.client_id ?>">💬 View Sessions</button><button class="small danger" data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> Available Tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,
     logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=http-session><? if(l.context_id){ ?><div class=idcell>#<?= l.context_id ?></div><? if(l.root_id&&l.root_name){ ?><div class=workspace-label>📁 <?= l.root_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><code><?= l.tool ?></code><? if(l.call_preview){ ?><div class=tool-command-preview>↳ <?= l.call_preview ?></div><? } ?><? if(l.progress_requested){ ?><div class=progress-requested>📡 Progress requested</div><? } ?></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Kill</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><? if(x.progress_requested){ ?><span class=progress-requested>📡 Progress requested</span><? } ?><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><div class=tool-detail-grid><div class=tool-detail-main><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><? if(x.resolved_json){ ?><section class=json-detail><div class=row><b class=grow>Tool Return Value JSON</b><button class=small data-action=copy-detail data-target="tool-return-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-return-<?= l.id ?>"><?= it.prettyParsed(x.resolved_json) ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>MCP Result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div><aside class=tool-descriptor><div class=row><b class=grow>Agent Tool Definition</b><? if(x.tool_descriptor){ ?><span class="descriptor-status <?= x.tool_descriptor_matches_current?'current':'outdated' ?>"><?= x.tool_descriptor_matches_current?'CURRENT':'OUTDATED' ?></span><button class=small data-action=copy-detail data-target="tool-descriptor-<?= l.id ?>">📋 Copy JSON</button><? } ?></div><? if(x.tool_descriptor){ ?><pre id="tool-descriptor-<?= l.id ?>" hidden><?= it.pretty(x.tool_descriptor) ?></pre><? if(x.tool_descriptor.title){ ?><div class=muted>Title</div><div><?= x.tool_descriptor.title ?></div><? } ?><div class=muted>Description</div><p><?= x.tool_descriptor.description||"—" ?></p><div class=muted>Input Schema</div><pre><?= it.pretty(x.tool_descriptor.inputSchema||{}) ?></pre><div class=muted>Output Schema</div><pre><?= it.pretty(x.tool_descriptor.outputSchema||{}) ?></pre><? } else { ?><p class=muted>No descriptor snapshot was recorded for this call.</p><? } ?></aside></div></div></td></tr><? } }) ?></tbody></table>`,
-    published: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class=row><select id=publishedKind><option value="">All types</option><option value=file<?= d.kind==='file'?' selected':'' ?>>File</option><option value=html<?= d.kind==='html'?' selected':'' ?>>HTML</option></select><select id=publishedContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=publishedSize><option value="">All sizes</option><option value=small<?= d.size==='small'?' selected':'' ?>>&lt; 1 MB</option><option value=medium<?= d.size==='medium'?' selected':'' ?>>1–10 MB</option><option value=large<?= d.size==='large'?' selected':'' ?>>10–100 MB</option><option value=huge<?= d.size==='huge'?' selected':'' ?>>≥ 100 MB</option></select><button data-action=clear-published-filters>🧹 Clear Filters</button></div><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> publication<?= d.total===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Published Pages"><button class=page-button data-action=published-page data-published-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=published-page data-published-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=published-page data-published-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No published items match the current filters.</p></div><? } else { ?><table class=published-table><thead><tr><th>Created</th><th>ID</th><th>Type</th><th>Session</th><th>Published File</th><th>Size</th><th>Source</th><th></th></tr></thead><tbody><? rows.forEach(r=>{ ?><tr><td class=nowrap><?= it.logdt(r.created_at) ?></td><td class=context-id><code><?= r.id ?></code></td><td class=nowrap><?= r.kind==='html'?'🌐 HTML':'📄 File' ?><? if(r.one_time){ ?><div class=muted>one-time</div><? } else if(r.expires_at){ ?><div class=muted>expires <?= it.logdt(r.expires_at) ?></div><? } ?></td><td class=idcell><?= r.context_id?'#'+r.context_id:'—' ?></td><td><button class=published-open data-action=open-published data-id="<?= r.id ?>" title="Open with system default application"><code><?= r.published_name ?></code></button><? if(r.kind==='html'&&r.title){ ?><div class=published-file-meta><?= r.title ?></div><? } else if(r.filename&&r.filename!==r.source_filename){ ?><div class=published-file-meta>Download name: <?= r.filename ?></div><? } ?></td><td class=nowrap><?= it.bytes(r.size) ?></td><td class=published-source><? if(r.source_path){ ?><code><?= r.source_path ?></code><? } else { ?><span class=muted>Generated HTML</span><? } ?></td><td class=nowrap><button class="small danger" data-action=delete-published data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></tbody></table><? } ?>`,
+    published: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class=row><select id=publishedKind><option value="">All types</option><option value=file<?= d.kind==='file'?' selected':'' ?>>File</option><option value=html<?= d.kind==='html'?' selected':'' ?>>HTML</option></select><select id=publishedContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=publishedSize><option value="">All sizes</option><option value=small<?= d.size==='small'?' selected':'' ?>>&lt; 1 MB</option><option value=medium<?= d.size==='medium'?' selected':'' ?>>1–10 MB</option><option value=large<?= d.size==='large'?' selected':'' ?>>10–100 MB</option><option value=huge<?= d.size==='huge'?' selected':'' ?>>≥ 100 MB</option></select><button data-action=clear-published-filters>🧹 Clear Filters</button></div><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> publication<?= d.total===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Published Pages"><button class=page-button data-action=published-page data-published-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=published-page data-published-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=published-page data-published-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No published items match the current filters.</p></div><? } else { ?><table class=published-table><thead><tr><th>Created</th><th>ID</th><th>Type</th><th>Published By</th><th>Published File</th><th>Requests</th><th>Size</th><th>Source</th><th></th></tr></thead><tbody><? rows.forEach(r=>{ ?><tr><td class=nowrap><?= it.logdt(r.created_at) ?></td><td class=context-id><code><?= r.id ?></code><? if(r.content_key){ ?><div class=published-file-meta><?= r.content_key ?></div><? } ?></td><td class=nowrap><?= r.kind==='html'?'🌐 HTML':'📄 File' ?></td><td class=http-session><? const refs=r.references||[]; if(refs.length){ refs.forEach(u=>{ ?><div class=published-reference><span class=idcell>#<?= u.context_id ?></span><? if(u.root_name){ ?> <span class=workspace-label>📁 <?= u.root_name ?></span><? } ?><? if(Number(u.publish_count||0)>1){ ?> <span class=muted>×<?= u.publish_count ?></span><? } ?></div><? }); } else { ?>—<? } ?></td><td><button class=published-open data-action=open-published data-id="<?= r.id ?>" title="Open public URL in browser"><code><?= r.published_name ?></code></button><? if(r.kind==='html'&&r.title){ ?><div class=published-file-meta><?= r.title ?></div><? } else if(r.filename&&r.filename!==r.source_filename){ ?><div class=published-file-meta>Download name: <?= r.filename ?></div><? } ?></td><td class=nowrap><b><?= r.request_count||0 ?></b><? if(r.last_request_at){ ?><div class=published-file-meta>last <?= it.logdt(r.last_request_at) ?></div><? } ?></td><td class=nowrap><?= it.bytes(r.size) ?></td><td class=published-source><? const latest=(r.references||[])[0]; if(latest?.source_path){ ?><code><?= latest.source_path ?></code><? } else if(r.source_path){ ?><code><?= r.source_path ?></code><? } else { ?><span class=muted>Generated HTML</span><? } ?><? if((r.reference_count||0)>1){ ?><div class=published-file-meta><?= r.reference_count ?> publish calls</div><? } ?></td><td class=nowrap><button class="small danger" data-action=delete-published data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></tbody></table><? } ?>`,
     debug: `<? const d=it.data||{},rows=d.rows||[]; ?><p class="<?= d.enabled?'ok':'failed' ?>"><b><?= d.enabled?'● Recording enabled':'● Recording disabled' ?></b><? if(!d.enabled){ ?> · showing stored requests<? } ?></p><? if(!rows.length){ ?><p class=muted>No stored HTTP debug requests match the current filters.</p><? } else { ?><table><tr><th>ID</th><th>Time</th><th>Session</th><th>Client</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>IP</th><th>Error</th></tr><? rows.forEach(r => { ?><tr data-action=select-debug data-id="<?= r.id ?>" title="Click to expand"><td class=idcell>#<?= r.id ?></td><td class=nowrap><?= it.logdt(r.ts) ?></td><td class=http-session><? if(r.context_id){ ?><div class=idcell>#<?= r.context_id ?></div><? if(r.workspace_name){ ?><div class=workspace-label>📁 <?= r.workspace_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><? if(r.client_id){ ?><code><?= r.client_id ?></code><? } else { ?>—<? } ?></td><td><b><?= r.method ?></b></td><td><code><?= r.path ?></code></td><td class="<?= !r.status?'pending':(r.status>=400?'failed':'ok') ?>"><?= r.status||"…" ?></td><td><?= r.status ? r.duration_ms+"ms" : "in flight" ?></td><td class=nowrap><?= r.remote_addr||"—" ?><? if(r.remote_addr){ ?> (<?= r.remote_count||1 ?>)<? } ?></td><td><?= r.error_preview ?></td></tr><? if(String(d.openRowId||"")===String(r.id)&&d.openDetail){ const x=d.openDetail; ?><tr class=detail-row data-detail-kind=http data-detail-id="<?= r.id ?>"><td colspan=10><div class="detail-panel http-detail-panel"><div class="row http-detail-head"><div class=grow><b>HTTP Request #<?= r.id ?></b><div class=http-detail-meta><span><?= it.logdt(x.ts) ?></span><span><? if(x.context_id){ ?>Session #<?= x.context_id ?><? } else { ?>No Session<? } ?></span><? if(x.workspace_name){ ?><span>📁 <?= x.workspace_name ?></span><? } ?><span><? if(x.client_id){ ?>Client <code><?= x.client_id ?></code><? } else { ?>No client id<? } ?></span><span><?= x.remote_addr||"unknown IP" ?><? if(x.remote_addr){ ?> · <?= x.remote_count||1 ?> total request<?= Number(x.remote_count||1)===1?'':'s' ?><? } ?></span><span><?= x.status ? x.duration_ms+"ms" : "in flight" ?></span></div></div><button class=small data-action=copy-detail data-target="http-json-<?= r.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=http>✕ Close</button></div><div class=http-detail-grid><section class=http-detail-block><div class=row><h4 class=grow>→ Request</h4><b><?= x.method ?></b> <code><?= x.path ?></code></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.request_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.request_body||{}) ?></pre></section><section class=http-detail-block><div class=row><h4 class=grow>← Response</h4><b class="<?= !x.status?'pending':(x.status>=400?'failed':'ok') ?>"><?= x.status||"in flight" ?></b></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.response_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.response_body||{}) ?></pre></section></div><? if(x.error){ ?><section class="http-detail-block http-detail-error"><h4 class=failed>Error</h4><pre><?= x.error ?></pre></section><? } ?><details class=http-detail-raw><summary>Raw record</summary><pre id="http-json-<?= r.id ?>"><?= it.pretty(x) ?></pre></details></div></td></tr><? } }) ?></table><? } ?>`,
   } : {};
   const fragmentBytes = value => {
@@ -7421,9 +7572,7 @@ listen(UI_RENDER_EVENT, event => {
   automaticRenewal().catch(() => {});
   renewalTimer = setInterval(automaticRenewal, 60 * 60 * 1000);
   processCleanupTimer = setInterval(maintenance, 60 * 60 * 1000);
-  await expirePublished();
   await cleanupPublishedOrphans();
-  publishCleanupTimer = setInterval(() => expirePublished().catch(() => {}), 60 * 1000);
   const readyPayload = {
     type: "ready",
     gui: IS_BACKEND_WORKER ? "index.html" : null,
@@ -7439,7 +7588,6 @@ listen(UI_RENDER_EVENT, event => {
     activeCallControls.clear();
     if (renewalTimer) clearInterval(renewalTimer);
     if (processCleanupTimer) clearInterval(processCleanupTimer);
-    if (publishCleanupTimer) clearInterval(publishCleanupTimer);
     if (uiLogFilterTimer) clearTimeout(uiLogFilterTimer);
     if (uiNoticeTimer) clearTimeout(uiNoticeTimer);
     if (headerActivityTimer) clearTimeout(headerActivityTimer);
@@ -7635,9 +7783,9 @@ async function desktop() {
     } else if (data?.type === "os-notification") {
       if (!notificationsReady) notificationQueue.push(data);
       else void notify(data).catch(error => console.error("MrMCP notification failed", error));
-    } else if (data?.type === "os-open-path") {
-      void request("plugin:opener|open_path", { path: String(data.path || ""), with: null })
-        .catch(error => console.error("MrMCP published file open failed", error));
+    } else if (data?.type === "os-open-url") {
+      void request("plugin:opener|open_url", { url: String(data.url || ""), with: null })
+        .catch(error => console.error("MrMCP published URL open failed", error));
     }
   };
   const queueOrHandleWorkerMessage = data => {

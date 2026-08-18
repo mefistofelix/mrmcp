@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.111
+
+- Deduplicated `publish_file` and `publish_html` resources by deterministic content identity while retaining random public capability ids. Files use the requested fast fingerprint of size plus first, last and central 10-byte samples; HTML uses a full SHA-256 hash. Publication snapshot/dedup/registration is serialized through one shared chain.
+- Added `published_uses` history so one deduplicated resource retains every call-time Session, Workspace, source and display reference. The Published UI now shows all associated Session/Workspace references, supports Session filtering across them, records request count/last request, and opens the persistent public URL.
+- Hardened simultaneous MCP App previews by randomizing per-widget JSON-RPC request-id bases and completing `ui/notifications/initialized` even after an initialize timeout, preventing concurrent image/HTML previews from remaining blank.
+- Removed automatic expiry and one-time publication semantics; published resources remain persistent until explicitly deleted or cleared.
+
 ## 0.10.110
 
 - Fixed Workspace trash storage so MrMCP has exactly one trash location at `APP_DIR/.mrmcp/trash/`; named Workspaces no longer receive `.mrmcp/trash` directories. Trash manifests retain absolute original paths, restore remains scoped to the originating Workspace, and cross-volume trash/restore falls back from rename to copy+remove with rollback.
