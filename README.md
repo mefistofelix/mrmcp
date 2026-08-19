@@ -60,7 +60,7 @@ MrMCP keeps transport state stateless. Persistent application state is selected 
 3. Reuse the returned `context_handle` on later Session-bound tools.
 4. To move the same Session, call `open_workspace(name, current_context_handle)`.
 
-`open_workspace` also returns the Workspace name, absolute working directory and optional `agent_guidance_path`. When that path is present, read and follow the Workspace-level `AGENTS.md` / `agents.md` before repository work.
+`open_workspace` also returns the Workspace name, absolute working directory and optional `agent_guidance_path`. Guidance resolution prefers Workspace-root `AGENTS.md` / `agents.md` and falls back to `CLAUDE.md` / `Claude.md` / `claude.md`; when the returned path is present, read and follow it before repository work.
 
 The administration UI displays Sessions with short numeric ids. The opaque `ctx_...` value remains the MCP bearer capability. A Session may move between Workspaces, while historical Tool Calls retain the Workspace snapshot captured when each call started.
 

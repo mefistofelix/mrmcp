@@ -2880,7 +2880,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
   }
   async function workspaceInfo(selection) {
     let agentGuidancePath = null;
-    for (const name of ["AGENTS.md", "agents.md"]) {
+    for (const name of ["AGENTS.md", "agents.md", "CLAUDE.md", "Claude.md", "claude.md"]) {
       const candidate = await resolveWorkspacePath(selection, name).catch(() => null);
       const stat = candidate ? await Deno.stat(candidate.path).catch(() => null) : null;
       if (stat?.isFile) {
@@ -3757,7 +3757,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         cwd: { type: "string", description: "Absolute path of the selected Workspace." },
         agent_guidance_path: {
           ...nullableString,
-          description: "Absolute Workspace-level AGENTS.md or agents.md path. When non-null, read and follow it before modifying files under this Workspace.",
+          description: "Absolute Workspace-level guidance path. Resolution prefers AGENTS.md/agents.md, then falls back to CLAUDE.md/Claude.md/claude.md. When non-null, read and follow it before modifying files under this Workspace.",
         },
       }),
       fs_glob: strictOutputSchema({ entries: fsArray(fsGlobEntry), next_after_path: nullableString, truncated: { type: "boolean" } }),
@@ -6069,7 +6069,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 
     const serverInfoMeta = { "io.modelcontextprotocol/serverInfo": mcpServerInfo() };
     const instructions = fullAccess
-      ? "Use list_workspaces when you need to discover enabled Workspace names. Use create_workspace with only a name when you need a new empty Workspace; MrMCP creates and registers its Desktop directory internally, then call open_workspace with that same name. If you already have the current Session handle, pass it as current_context_handle to move that same Session to the Workspace; if it is omitted, empty, unknown or expired, open_workspace creates a new Session. The result includes workspace_name, absolute cwd and agent_guidance_path; when that path is non-null, read and follow the referenced AGENTS.md before repository work. Pass the returned context_handle unchanged on every later Session-bound tool call. " +
+      ? "Use list_workspaces when you need to discover enabled Workspace names. Use create_workspace with only a name when you need a new empty Workspace; MrMCP creates and registers its Desktop directory internally, then call open_workspace with that same name. If you already have the current Session handle, pass it as current_context_handle to move that same Session to the Workspace; if it is omitted, empty, unknown or expired, open_workspace creates a new Session. The result includes workspace_name, absolute cwd and agent_guidance_path; when that path is non-null, read and follow that Workspace guidance file before repository work. MrMCP prefers AGENTS.md/agents.md and falls back to CLAUDE.md/Claude.md/claude.md. Pass the returned context_handle unchanged on every later Session-bound tool call. " +
         "Use fs_glob, fs_grep, fs_read, fs_navigate, fs_stat, fs_write and fs_edit directly for filesystem discovery, inspection, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. " +
         "When work may benefit from command-line capability beyond the structured tools, call discover_commands proactively before inventing workarounds or assuming a utility is unavailable. It returns the complete user-chosen available command catalog in one call; prefer a listed command when it fits, remember the catalog for the Session, and invoke its logical_name directly through exec.program without PATH probes. " +
         "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; cancelling/disconnecting exec terminates its child. For persistent or interactive work, call exec_start; it immediately returns exec_id, which is the stable integer Tool Call id of that start. Pass that exec_id together with the same context_handle to exec_attach, exec_write, exec_kill or exec_status; ids from other Sessions are inaccessible. exec_list shows only currently running persistent executions in this Session. exec_status is the non-consuming way to inspect running or recently completed/killed executions and optionally retrieve all output or a tail. exec_attach with progressToken streams unread backlog plus live output through progress until process exit and then returns that complete unread transcript; without progressToken it long-polls and returns at most 16 KiB of unread output plus remaining_bytes, so call it repeatedly to drain buffered output and call it again with remaining_bytes=0/status=running to wait for future output. Disconnecting exec_attach only detaches and never kills the persistent process. " +

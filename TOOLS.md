@@ -88,7 +88,7 @@ Arguments:
 - `name` — Workspace name.
 - `current_context_handle` — optional existing active Session capability. When valid, the same Session is moved to the selected Workspace. Otherwise a new Session is created.
 
-Returns `workspace_name`, absolute `cwd`, `agent_guidance_path` and `context_handle`.
+Returns `workspace_name`, absolute `cwd`, `agent_guidance_path` and `context_handle`. Guidance resolution checks only the Workspace root, preferring `AGENTS.md` / `agents.md` and then falling back to `CLAUDE.md` / `Claude.md` / `claude.md`.
 
 ---
 
