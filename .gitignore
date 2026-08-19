@@ -5,6 +5,7 @@
 !/AGENTS.md
 !/mrmcp.js
 !/commands.yaml
+!/guided_prompts.yaml
 !/.github/
 !/.github/workflows/
 !/.github/workflows/release.yml

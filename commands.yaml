@@ -1,9 +1,4 @@
 commands:
-  - logical_name: robost
-    path: rpa
-    description: "Desktop automation (RPA) in Rust — robust, scriptable"
-    download_url: https://github.com/kent-tokyo/robost/releases/download/v0.1.2/rpa-x86_64-windows.zip
-    documentation_url: https://kent-tokyo.github.io/robost/steps/control_flow/
   - logical_name: ast-grep
     description: "AST-based structural code search, linting and rewriting CLI for syntax-aware queries and transformations."
     download_url: https://github.com/ast-grep/ast-grep/releases/latest/download/app-x86_64-pc-windows-msvc.zip

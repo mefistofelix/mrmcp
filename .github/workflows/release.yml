@@ -49,7 +49,7 @@ jobs:
         run: >-
           deno compile --minimum-dependency-age=0 -A --unstable-ffi
           --target x86_64-unknown-linux-gnu
-          --include assets --include commands.yaml
+          --include assets --include commands.yaml --include guided_prompts.yaml
           --output dist/mrmcp-linux-x64
           mrmcp.js
 
@@ -58,7 +58,7 @@ jobs:
           deno compile --minimum-dependency-age=0 -A --unstable-ffi
           --target x86_64-pc-windows-msvc
           --no-terminal --icon assets/mrmcp.ico
-          --include assets --include commands.yaml
+          --include assets --include commands.yaml --include guided_prompts.yaml
           --output dist/mrmcp-windows-x64.exe
           mrmcp.js
 
@@ -118,7 +118,7 @@ jobs:
 
           deno compile --minimum-dependency-age=0 -A --unstable-ffi \
             --target "$TARGET" \
-            --include assets --include commands.yaml \
+            --include assets --include commands.yaml --include guided_prompts.yaml \
             --output "$app/Contents/MacOS/MrMCP" \
             mrmcp.js
           chmod 755 "$app/Contents/MacOS/MrMCP"

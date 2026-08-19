@@ -16,6 +16,7 @@ MrMCP is a stateless Model Context Protocol server implemented in Deno. It expos
 - Foreground and persistent processes with progress streaming when requested.
 - Persistent JavaScript kernels scoped to Session + Workspace.
 - Extra command catalog through `commands.yaml`.
+- User-managed MCP guided prompts through `guided_prompts.yaml`, with Eta templates and a built-in template/model help view.
 - OAuth and Basic authentication.
 - Automatic TLS/certificate handling.
 - Tool Call and optional HTTP diagnostic logs, with confirmed page-level Clear actions for Tool Calls, Sessions, Workspaces, OAuth Clients and HTTP history.
@@ -87,6 +88,10 @@ Filesystem removal is reversible: MrMCP exposes trash/restore tools instead of a
 
 Persistent processes use the integer `exec_id` returned by `exec_start`; follow-up process tools require the same Session `context_handle`.
 
+## Guided prompts
+
+`guided_prompts.yaml` is the authoritative guided-prompt catalog exposed through MCP `prompts/list` and `prompts/get`. The local Guided Prompts page creates, edits and deletes entries directly in that file. Templates use Eta and receive prompt arguments plus sanitized server/runtime context; when a prompt declares and receives a valid `context_handle`, the template also gets that Session and its current Workspace. The Guided Prompts page has a dedicated Template Help view with the YAML shape, Eta examples and model fields.
+
 ## Authentication and networking
 
 Authenticated OAuth or Basic clients receive the published tools; anonymous clients do not.
@@ -121,13 +126,14 @@ The macOS app is currently ad-hoc signed; warning-free first launch of an Intern
 
 - `mrmcp.js` — server, tools, SQLite, local UI and desktop launcher.
 - `commands.yaml` — editable extra-command catalog.
+- `guided_prompts.yaml` — editable MCP guided-prompt catalog and Eta templates.
 - `README.md` — current user/operator overview.
 - `CHANGELOG.md` — release history.
 - `AGENTS.md` — implementation invariants and release checks.
 - `.github/workflows/` — release and native macOS GUI test workflows.
 - `assets/` — Morphlex, branding, icons and screenshots.
 
-Runtime data lives under `.mrmcp`. Packaged macOS builds keep mutable state and `commands.yaml` under `~/Library/Application Support/MrMCP/` rather than inside the application bundle.
+Runtime data lives under `.mrmcp`. Packaged macOS builds keep mutable state, `commands.yaml` and `guided_prompts.yaml` under `~/Library/Application Support/MrMCP/` rather than inside the application bundle.
 
 ## Changelog
 

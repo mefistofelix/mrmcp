@@ -72,6 +72,8 @@ async function workspacePathWarning(value) {
 }
 const COMMANDS_TEMPLATE_PATH = join(MODULE_DIR, "commands.yaml");
 const COMMANDS_PATH = join(APP_DIR, "commands.yaml");
+const GUIDED_PROMPTS_TEMPLATE_PATH = join(MODULE_DIR, "guided_prompts.yaml");
+const GUIDED_PROMPTS_PATH = join(APP_DIR, "guided_prompts.yaml");
 const PORT_FALLBACK_STEP = 50;
 const UI_INPUT_EVENT = "tauriless://webview-message", UI_RENDER_EVENT = "mrmcp://ui-render";
 const BASE_TOOLS = [
@@ -405,12 +407,14 @@ const JS_KERNEL_SOURCE = jsKernelWorkerSource.toString().match(/\/\*([\s\S]*)\*\
 async function backend({ addWorkspace = null } = {}) {
   if (Deno.build.standalone && !addWorkspace) {
     await Deno.mkdir(APP_DIR, { recursive: true });
-    try { await Deno.lstat(COMMANDS_PATH); }
-    catch (error) {
-      if (!(error instanceof Deno.errors.NotFound)) throw error;
-      const source = await Deno.readTextFile(COMMANDS_TEMPLATE_PATH);
-      try { await Deno.writeTextFile(COMMANDS_PATH, source, { createNew: true }); }
-      catch (writeError) { if (!(writeError instanceof Deno.errors.AlreadyExists)) throw writeError; }
+    for (const [target, template] of [[COMMANDS_PATH, COMMANDS_TEMPLATE_PATH], [GUIDED_PROMPTS_PATH, GUIDED_PROMPTS_TEMPLATE_PATH]]) {
+      try { await Deno.lstat(target); }
+      catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+        const source = await Deno.readTextFile(template);
+        try { await Deno.writeTextFile(target, source, { createNew: true }); }
+        catch (writeError) { if (!(writeError instanceof Deno.errors.AlreadyExists)) throw writeError; }
+      }
     }
   }
   const DATA = join(APP_DIR, ".mrmcp");
@@ -449,7 +453,7 @@ async function backend({ addWorkspace = null } = {}) {
   const deliverUiRender = payload => {
     if (IS_BACKEND_WORKER) self.postMessage({ type: "ui-render", payload });
   };
-  const UI_SECTIONS = new Set(["dashboard", "sessions", "logs", "published", "roots", "commands", "debug", "oauth", "settings", "help"]);
+  const UI_SECTIONS = new Set(["dashboard", "sessions", "logs", "published", "roots", "commands", "prompts", "prompt_help", "debug", "oauth", "settings", "help"]);
   const uiState = {
     currentSection: "dashboard",
     scrollBySection: { dashboard: [0, 0] },
@@ -459,6 +463,7 @@ async function backend({ addWorkspace = null } = {}) {
     notice: null,
     settingsDraft: null,
     commands: { page: 1, query: "", pageSize: 5, filter: "" },
+    prompts: { page: 1, query: "", pageSize: 5 },
     sessions: { oauthClientId: "" },
     logs: { page: 1, toolQuery: "", query: "", context: "", status: "", pageSize: 25, openRowId: "", selfTest: null },
     published: { page: 1, kind: "", context: "", size: "" },
@@ -1297,6 +1302,7 @@ async function backend({ addWorkspace = null } = {}) {
   const metadataUrl = () => `${publicBase()}/.well-known/oauth-protected-resource/mcp`;
   const serverCapabilities = fullAccess => fullAccess ? {
     tools: { listChanged: false },
+    prompts: { listChanged: false },
     resources: { subscribe: false, listChanged: false },
     extensions: {
       [MCP_UI_EXTENSION]: { mimeTypes: [MCP_UI_MIME_TYPE] },
@@ -3007,6 +3013,133 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     if (Deno.build.os === "windows") await Deno.remove(COMMANDS_PATH).catch(e => { if (!(e instanceof Deno.errors.NotFound)) throw e; });
     await Deno.rename(temporary, COMMANDS_PATH);
   }
+  function normalizeGuidedPromptArgument(argument, promptName) {
+    if (!argument || typeof argument !== "object" || Array.isArray(argument))
+      throw new Error(`Each argument for ${promptName} must be an object`);
+    const name = String(argument.name || "").trim();
+    if (!/^[A-Za-z0-9_.+-]{1,128}$/.test(name)) throw new Error(`Invalid argument name for ${promptName}: ${name || "(empty)"}`);
+    return {
+      name,
+      ...(String(argument.title || "").trim() ? { title: String(argument.title).trim() } : {}),
+      ...(String(argument.description || "").trim() ? { description: String(argument.description).trim() } : {}),
+      ...(argument.required === true ? { required: true } : {}),
+    };
+  }
+  function normalizeGuidedPromptEntry(entry) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error("Each guided_prompts.yaml entry must be an object");
+    const name = String(entry.name || "").trim();
+    if (!/^[A-Za-z0-9_.+-]{1,128}$/.test(name)) throw new Error(`Invalid prompt name in guided_prompts.yaml: ${name || "(empty)"}`);
+    const args = Array.isArray(entry.arguments) ? entry.arguments.map(argument => normalizeGuidedPromptArgument(argument, name)) : [];
+    const argNames = new Set();
+    for (const argument of args) {
+      const key = argument.name.toLowerCase();
+      if (argNames.has(key)) throw new Error(`Duplicate argument ${argument.name} for prompt ${name}`);
+      argNames.add(key);
+    }
+    const template = String(entry.template || "");
+    if (!template.trim()) throw new Error(`Prompt ${name} requires a non-empty template`);
+    return {
+      name,
+      title: String(entry.title || "").trim(),
+      description: String(entry.description || "").trim(),
+      arguments: args,
+      template,
+    };
+  }
+  async function readGuidedPromptConfig() {
+    let source;
+    try { source = await Deno.readTextFile(GUIDED_PROMPTS_PATH); }
+    catch (e) {
+      if (!(e instanceof Deno.errors.NotFound)) throw e;
+      return [];
+    }
+    const document = parseYaml(source || "prompts: []", { schema: "core" });
+    if (!document || typeof document !== "object" || Array.isArray(document)) throw new Error("guided_prompts.yaml must contain a mapping");
+    if (!Array.isArray(document.prompts)) throw new Error("guided_prompts.yaml must contain a prompts array");
+    const rows = document.prompts.map(normalizeGuidedPromptEntry), names = new Set();
+    for (const row of rows) {
+      const key = row.name.toLowerCase();
+      if (names.has(key)) throw new Error(`Duplicate prompt name in guided_prompts.yaml: ${row.name}`);
+      names.add(key);
+    }
+    return rows;
+  }
+  async function writeGuidedPromptConfig(rows) {
+    const prompts = rows.map(row => ({
+      name: row.name,
+      ...(row.title ? { title: row.title } : {}),
+      ...(row.description ? { description: row.description } : {}),
+      ...(row.arguments?.length ? { arguments: row.arguments } : {}),
+      template: row.template,
+    }));
+    const temporary = `${GUIDED_PROMPTS_PATH}.${crypto.randomUUID()}.tmp`;
+    await Deno.writeTextFile(temporary, stringifyYaml({ prompts }, { lineWidth: -1 }));
+    if (Deno.build.os === "windows") await Deno.remove(GUIDED_PROMPTS_PATH).catch(e => { if (!(e instanceof Deno.errors.NotFound)) throw e; });
+    await Deno.rename(temporary, GUIDED_PROMPTS_PATH);
+  }
+  const guidedPromptDescriptor = row => ({
+    name: row.name,
+    ...(row.title ? { title: row.title } : {}),
+    ...(row.description ? { description: row.description } : {}),
+    ...(row.arguments.length ? { arguments: row.arguments } : {}),
+  });
+  async function guidedPromptCatalog({ query = "", page = 1, page_size = 5 } = {}) {
+    let rows = await readGuidedPromptConfig();
+    const needle = String(query).trim().toLowerCase();
+    rows = rows.filter(row => !needle || `${row.name}\n${row.title}\n${row.description}\n${row.arguments.map(x => `${x.name} ${x.description}`).join("\n")}`.toLowerCase().includes(needle));
+    page = Math.max(1, Number(page) || 1);
+    page_size = Math.max(1, Math.min(Number(page_size) || 5, 100));
+    const total = rows.length, start = (page - 1) * page_size;
+    return {
+      query: String(query), page, page_size, total,
+      pages: Math.max(1, Math.ceil(total / page_size)),
+      has_more: start + page_size < total,
+      config_file: GUIDED_PROMPTS_PATH,
+      prompts: rows.slice(start, start + page_size),
+    };
+  }
+  async function guidedPromptNameWarning(name, oldName = "") {
+    const value = String(name || "").trim(), previous = String(oldName || "").trim().toLowerCase();
+    if (!/^[A-Za-z0-9_.+-]{1,128}$/.test(value)) return "Prompt name must use only letters, numbers, _, ., + or -.";
+    return (await readGuidedPromptConfig()).some(row => row.name.toLowerCase() === value.toLowerCase() && row.name.toLowerCase() !== previous)
+      ? "Prompt name already exists." : "";
+  }
+  function parseGuidedPromptArguments(value, promptName = "prompt") {
+    const source = String(value || "").trim();
+    if (!source) return [];
+    const parsed = parseYaml(source, { schema: "core" });
+    if (!Array.isArray(parsed)) throw new Error("Arguments must be a YAML list.");
+    return parsed.map(argument => normalizeGuidedPromptArgument(argument, promptName));
+  }
+  const guidedPromptArgumentsText = args => args?.length ? stringifyYaml(args, { lineWidth: -1 }).trim() : "";
+  const GUIDED_PROMPTS_HELP_YAML = String.raw`prompts:
+  - name: project_review
+    title: Project review
+    description: Review the current project with an optional focus.
+    arguments:
+      - name: focus
+        title: Review focus
+        description: Area to focus on.
+        required: false
+      - name: context_handle
+        description: Optional MrMCP Session handle when Session/Workspace context is needed.
+        required: false
+    template: |
+      Review this project.
+      <% if (it.args.focus) { %>Focus on: <%= it.args.focus %>.<% } %>
+      <% if (it.workspace) { %>Workspace: <%= it.workspace.name %> at <%= it.workspace.path %>.<% } %>
+      Running on <%= it.runtime.os %>/<%= it.runtime.arch %> with MrMCP <%= it.server.version %>.`;
+  const GUIDED_PROMPTS_HELP_MODEL = JSON.stringify({
+    args: { focus: "string argument values supplied by the client" },
+    prompt: { name: "project_review", title: "Project review", description: "...", arguments: ["..."] },
+    session: "current Session snapshot when a valid context_handle argument is supplied; otherwise null",
+    workspace: "current Workspace when a valid context_handle argument is supplied; otherwise null",
+    workspaces: [{ id: 0, name: "fallback", path: "...", fallback: true }],
+    server: { name: "MrMCP", version: VERSION, public_base_url: "...", mcp_url: "...", protocol_version: MCP_MODERN_PROTOCOL, protocol_versions: MCP_PROTOCOLS },
+    client: { auth_kind: "oauth|basic|anonymous", client_id: "...", client_name: "...", user_agent: "..." },
+    request: { url: "...", method: "POST", transport: "http|https", remote_host: "..." },
+    runtime: { os: Deno.build.os, arch: Deno.build.arch, standalone: Deno.build.standalone, app_dir: APP_DIR, now: "ISO timestamp", now_ms: 0 },
+  }, null, 2);
   async function commandRow(row) {
     const configured = await binPath(row.path), target = await commandTarget(row.path);
     const stat = await Deno.stat(target.path).catch(() => null);
@@ -3147,7 +3280,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       type: "object", additionalProperties: false,
       properties: {
         old_text: { type: "string", description: "Exact text to replace in the document state produced by earlier edits." },
-        new_text: { type: "string" },
+        new_text: { type: "string", description: "Exact replacement text after JSON string decoding. Pass the intended decoded text; the tool performs no additional C/JavaScript-style escape decoding." },
         expected_occurrences: { type: "integer", minimum: 1, default: 1 },
       },
       required: ["old_text", "new_text"],
@@ -3253,7 +3386,10 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       replace: [
         "Preview or atomically apply repeated literal or regular-expression replacements across a file glob. Supports exclusions, hidden/dependency traversal, file-size limits and an exact expected replacement count. Prefer this over exec, js, uv or Python.",
         { properties: {
-          query: { type: "string" }, replacement: { type: "string" },
+          query: { type: "string" }, replacement: {
+            type: "string",
+            description: "Replacement text after JSON string decoding. Pass the intended decoded text, not a pre-escaped source representation: JSON \"\\n\" decodes to a newline, while JSON \"\\\\n\" decodes to literal backslash+n. The tool performs no additional C/JavaScript-style escape decoding. With regex=false the replacement is inserted literally, including $; with regex=true JavaScript replacement tokens such as $1 and $& are supported.",
+          },
           path: { type: "string", default: "." }, glob: { type: "string", default: "**/*" },
           exclude: { type: "array", items: { type: "string" }, default: [] },
           regex: { type: "boolean", default: false }, case_sensitive: { type: "boolean", default: true },
@@ -3395,6 +3531,25 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
 
     const nullableString = { anyOf: [{ type: "string" }, { type: "null" }] };
     const objectArray = { type: "array", items: { type: "object", additionalProperties: true } };
+    const editResultArray = {
+      type: "array", items: {
+        type: "object", additionalProperties: false,
+        properties: {
+          path: { type: "string" }, replacements: { type: "integer", minimum: 0 },
+          sha256: { type: "string" }, encoding: { type: "string" }, bom: { type: "boolean" }, line_endings: { type: "string" },
+          edits: { type: "array", items: {
+            type: "object", additionalProperties: false,
+            properties: {
+              index: { type: "integer", minimum: 1 },
+              expected_occurrences: { type: "integer", minimum: 1 },
+              occurrences: { type: "integer", minimum: 0, description: "Occurrences found and replaced in the evolving document state." },
+            },
+            required: ["index", "expected_occurrences", "occurrences"],
+          } },
+        },
+        required: ["path", "replacements", "sha256", "encoding", "bom", "line_endings", "edits"],
+      },
+    };
     const stringArray = { type: "array", items: { type: "string" } };
     const envelopeProperties = {
       context_handle: { type: "string", description: CONTEXT_HANDLE_OUTPUT_DESCRIPTION },
@@ -3441,7 +3596,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       read_files: outputSchema({ files: objectArray }),
       write_file: outputSchema({ path: { type: "string" }, bytes: { type: "integer" }, sha256: { type: "string" }, ...textMetadata }),
       write_files: outputSchema({ files: objectArray }),
-      edit: outputSchema({ files: objectArray, total_replacements: { type: "integer" } }),
+      edit: outputSchema({ files: editResultArray, total_replacements: { type: "integer" } }),
       replace: outputSchema({ dry_run: { type: "boolean" }, scanned_files: { type: "integer" }, total_replacements: { type: "integer" }, files: objectArray }),
       glob: outputSchema({ files: stringArray, truncated: { type: "boolean" } }),
       grep: outputSchema({ output_mode: { type: "string" }, scanned_files: { type: "integer" }, matched_files: { type: "integer" }, results: objectArray, truncated: { type: "boolean" } }),
@@ -4481,6 +4636,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         if (file.expected_sha256 && await sha256(document.bytes) !== file.expected_sha256)
           throw new Error(`${file.path}: file hash changed`);
         let current = document.text, replacements = 0;
+        const editResults = [];
         for (let index = 0; index < (file.edits || []).length; index++) {
           const edit = file.edits[index];
           const oldText = editNeedle(edit.old_text, document), newText = editNeedle(edit.new_text, document);
@@ -4491,9 +4647,10 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
             throw new Error(`${file.path}: edit ${index + 1} expected ${expected} occurrences, found ${count}`);
           current = current.split(oldText).join(newText);
           replacements += count;
+          editResults.push({ index: index + 1, expected_occurrences: expected, occurrences: count });
         }
         const output = encodeTextDocument(current, document, file);
-        changes.push({ target, before: document.bytes, output, replacements });
+        changes.push({ target, before: document.bytes, output, replacements, edits: editResults });
       }
       try { for (const change of changes) await Deno.writeFile(change.target.path, change.output.bytes); }
       catch (error) {
@@ -4505,7 +4662,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         files: await Promise.all(changes.map(async change => ({
           path: change.target.display, replacements: change.replacements,
           sha256: await fileHash(change.target.path), encoding: change.output.encoding,
-          bom: change.output.bom, line_endings: change.output.line_endings,
+          bom: change.output.bom, line_endings: change.output.line_endings, edits: change.edits,
         }))),
       };
     }
@@ -4543,9 +4700,13 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
             limitExceeded = true;
             break;
           }
+          const replacement = String(args.replacement);
+          const replaced = args.regex
+            ? document.text.replace(regex, replacement)
+            : document.text.replace(regex, () => replacement);
           changes.push({
             path, display: relativePath, before: document.bytes, matches,
-            output: encodeTextDocument(document.text.replace(regex, String(args.replacement)), document, args),
+            output: encodeTextDocument(replaced, document, args),
           });
         } catch {}
         if (limitExceeded) break;
@@ -5329,6 +5490,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     return { client, p, redirect, resource, scope, challenge };
   }
   const eta = new Eta({ tags: ["<?", "?>"], autoEscape: true, cache: true });
+  const promptEta = new Eta({ autoEscape: false, cache: false });
   const OAUTH_PAGE_TEMPLATE = `<? const d=it.data||{}; ?><!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><meta name=color-scheme content=dark><title><?= d.title ?> · MrMCP</title>
 <style>
 :root{color-scheme:dark;--bg:#101114;--card:#181a1f;--panel:#17191e;--text:#e8e8e8;--muted:#89909b;--line:#2c3037;--brand:#3984e8;--brand-soft:#202a3a;--approve:#15956f;--approve-hover:#10785b;--deny:#d95757;--deny-hover:#bf4747;--error:#ff8585;--error-bg:#241718;--error-line:#5b2d32;--shadow:0 24px 70px rgba(0,0,0,.42)}
@@ -5351,6 +5513,61 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   const oauthError = reason => oauthPage({
     title: "Authorization couldn't continue", error: reason, icon_url: mcpIconUrl(),
   });
+
+  async function renderGuidedPrompt(p, row, rawArgs, req, info, auth, transport, protocolVersion) {
+    const args = rawArgs == null ? {} : rawArgs;
+    if (!args || typeof args !== "object" || Array.isArray(args)) throw new Error("Prompt arguments must be an object");
+    const allowed = new Set(row.arguments.map(argument => argument.name));
+    for (const [name, value] of Object.entries(args)) {
+      if (!allowed.has(name)) throw new Error(`Unknown argument for ${row.name}: ${name}`);
+      if (typeof value !== "string") throw new Error(`Prompt argument ${name} must be a string`);
+    }
+    for (const argument of row.arguments)
+      if (argument.required && !Object.hasOwn(args, argument.name)) throw new Error(`Missing required argument: ${argument.name}`);
+
+    let session = null, workspace = null;
+    const contextHandle = typeof args.context_handle === "string" ? args.context_handle : "";
+    if (contextHandle) {
+      const context = contextByHandle(p, contextHandle);
+      if (!context || contextExpired(context)) throw new Error("Unknown or expired context_handle in prompt arguments");
+      session = contextSnapshot(p, context);
+      const root = selectedContextRoot(p, context);
+      workspace = { id: root.id, name: root.name, path: root.path, fallback: root.id === 0 };
+    }
+    const now = new Date();
+    const model = {
+      args,
+      prompt: guidedPromptDescriptor(row),
+      session,
+      workspace,
+      workspaces: [fallbackWorkspaceRoot(p), ...serverRoots(p).map(runtimeWorkspaceRoot)].map(root => ({
+        id: root.id, name: root.name, path: root.path, fallback: root.id === 0,
+      })),
+      server: {
+        name: "MrMCP", version: VERSION, public_base_url: publicBase(), mcp_url: mcpUrl(),
+        protocol_version: protocolVersion || MCP_MODERN_PROTOCOL, protocol_versions: MCP_PROTOCOLS,
+      },
+      client: {
+        auth_kind: auth.kind, client_id: auth.clientId || "", client_name: auth.clientName || "",
+        user_agent: req.headers.get("user-agent") || "",
+      },
+      request: {
+        url: req.url, method: req.method, transport,
+        remote_host: info?.remoteAddr?.hostname || "",
+      },
+      runtime: {
+        os: Deno.build.os, arch: Deno.build.arch, standalone: Deno.build.standalone,
+        app_dir: APP_DIR, now: now.toISOString(), now_ms: now.getTime(),
+      },
+    };
+    const text = typeof promptEta.renderStringAsync === "function"
+      ? await promptEta.renderStringAsync(row.template, model)
+      : promptEta.renderString(row.template, model);
+    return {
+      ...(row.description ? { description: row.description } : {}),
+      messages: [{ role: "user", content: { type: "text", text: String(text) } }],
+    };
+  }
 
   // OAuth discovery/authorization and MCP 2026-07-28 routing.
   async function mcpHandler(req, info, transport = "http") {
@@ -5640,6 +5857,36 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           resultType: "complete", tools, ttlMs: 0,
           cacheScope: "private", _meta: serverInfoMeta,
         };
+      } else if (x.method === "prompts/list") {
+        if (!fullAccess) {
+          r.error = { code: -32001, message: "Authentication required for prompt access" };
+          responseStatus = 403;
+        } else {
+          r.result = {
+            resultType: "complete", prompts: (await readGuidedPromptConfig()).map(guidedPromptDescriptor),
+            ttlMs: 0, cacheScope: "private", _meta: serverInfoMeta,
+          };
+        }
+      } else if (x.method === "prompts/get") {
+        if (!fullAccess) {
+          r.error = { code: -32001, message: "Authentication required for prompt access" };
+          responseStatus = 403;
+        } else {
+          const name = typeof x.params?.name === "string" ? x.params.name : "";
+          const row = (await readGuidedPromptConfig()).find(prompt => prompt.name === name);
+          if (!name || !row) r.error = { code: -32602, message: `Unknown prompt: ${name || "(missing)"}` };
+          else {
+            try {
+              r.result = {
+                resultType: "complete",
+                ...await renderGuidedPrompt(p, row, x.params?.arguments, req, info, auth, transport, observedProtocol),
+                ttlMs: 0, cacheScope: "private", _meta: serverInfoMeta,
+              };
+            } catch (error) {
+              r.error = { code: -32602, message: String(error?.message || error) };
+            }
+          }
+        }
       } else if (x.method === "resources/list") {
         const resources = fullAccess ? [
           filePreviewResource(freshUiResourceUri(FILE_PREVIEW_UI_URI)),
@@ -5982,7 +6229,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   // The UI asks for only the active section. Database projections are evaluated lazily so
   // inactive pages do not query their tables during Eta -> Morphlex rerenders.
   const state = (section = "all") => {
-    const valid = new Set(["all", "dashboard", "sessions", "logs", "published", "roots", "commands", "debug", "oauth", "settings", "help"]);
+    const valid = new Set(["all", "dashboard", "sessions", "logs", "published", "roots", "commands", "prompts", "prompt_help", "debug", "oauth", "settings", "help"]);
     section = valid.has(section) ? section : "dashboard";
     const p = serverConfig();
     if (!p) throw new Error("MrMCP server configuration is missing");
@@ -6121,19 +6368,21 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   }
 
   const fragmentTemplates = GUI_RUNTIME ? {
-    sidebar: `<? const current=it.data?.state?.currentSection||"dashboard",items=[["dashboard","🏠","Dashboard"],["oauth","🔐","Clients"],["sessions","💬","Sessions"],["roots","📁","Workspaces"],["logs","🛠️","Tool Calls"],["published","📦","Published"],["commands","🧰","Commands"],["debug","🐞","HTTP Log"],["settings","⚙️","Settings"],["help","❓","Help"]]; items.forEach(([id,icon,label])=>{ ?><button data-page="<?= id ?>" class="<?= current===id?'nav-active':'' ?>"<?= current===id?' aria-current=page':'' ?>><span class=menu-icon><?= icon ?></span><?= label ?></button><? }) ?>`,
+    sidebar: `<? const current=it.data?.state?.currentSection||"dashboard",items=[["dashboard","🏠","Dashboard"],["oauth","🔐","Clients"],["sessions","💬","Sessions"],["roots","📁","Workspaces"],["logs","🛠️","Tool Calls"],["published","📦","Published"],["commands","🧰","Commands"],["prompts","🧭","Guided Prompts"],["debug","🐞","HTTP Log"],["settings","⚙️","Settings"],["help","❓","Help"]]; items.forEach(([id,icon,label])=>{ ?><button data-page="<?= id ?>" class="<?= current===id?'nav-active':'' ?>"<?= current===id?' aria-current=page':'' ?>><span class=menu-icon><?= icon ?></span><?= label ?></button><? }) ?>`,
     view: `<? const s=it.data?.state||{},section=s.currentSection||"dashboard",settings=s.settings||{}; ?>
 <? if(section==="dashboard"){ ?><section id=dashboard class=page><div class=row><h2 class=grow>🏠 Dashboard</h2><span class=muted>Runtime · activity · endpoints</span></div><div id=cards class=grid></div><div class=row><h3 class=grow>🛠️ Active Tool Calls</h3><span class=muted>Live · finished calls remain for 5s</span></div><div id=activeToolCalls></div><div id=trashActivity class=grid></div><div class=dashboard-grid><div><h3>🌐 Server</h3><div id=endpoints></div></div><div><h3>🔒 TLS and Connectivity</h3><div id=tlsStatus></div></div></div></section>
 <? } else if(section==="sessions"){ ?><section id=sessions class=page><div class=row><h2 class=grow>💬 Sessions</h2><span class=muted>Live updates</span><button class=danger data-action=clear-sessions<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Persistent MCP Sessions. Each Session is attached to a <b>📁 Workspace</b>.</p><? if(s.sessions?.oauthClientId){ ?><div class=row><span class=muted>OAuth filter</span><code><?= s.sessions.oauthClientId ?></code><button class=small data-action=clear-session-oauth>✕ Clear</button></div><? } ?><div class=card><b>Client Continuity</b><p class=muted>ChatGPT may create a new Session after model or thinking changes. Client/auth/User-Agent metadata is best effort.</p></div><div id=contextList></div></section>
 <? } else if(section==="roots"){ ?><section id=roots class=page><div class=row><h2 class=grow>📁 Workspaces</h2><button class=primary data-action=new-root>➕ Add Workspace</button><button class=danger data-action=clear-workspaces<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Workspace names are unique. Drag Sessions to change where future Tool Calls run; running processes stay in their original folder.</p><div id=rootList></div></section>
 <? } else if(section==="commands"){ const c=s.commands||{}, discoveryEnabled=c.discoveryEnabled!==false; ?><section id=commands class=page><div class=row><h2 class=grow>🧰 Extra Commands</h2><button class="<?= discoveryEnabled?'ok':'failed' ?>" data-action=toggle-command-discovery><?= discoveryEnabled?'🟢 Agent Discovery Enabled':'🔴 Agent Discovery Disabled' ?></button><button data-action=download-all-commands>⬇️ Download All</button><button class=primary data-action=new-command>➕ Register Command</button></div><p class=muted><code>commands.yaml</code> defines catalog entries. Executables in <code>.mrmcp/bin</code> appear automatically.</p><div class=row><input id=commandQuery class=grow placeholder="Search name, path or description…" value="<?= c.query||'' ?>"><select id=commandFilter><option value=""<?= !c.filter?' selected':'' ?>>All Commands</option><option value=available<?= c.filter==='available'?' selected':'' ?>>Available</option><option value=unavailable<?= c.filter==='unavailable'?' selected':'' ?>>Unavailable</option><option value=yaml<?= c.filter==='yaml'?' selected':'' ?>>YAML Metadata</option><option value=disk<?= c.filter==='disk'?' selected':'' ?>>Disk Only</option></select><select id=commandPageSize><? [5,10,25,50].forEach(n=>{ ?><option<?= Number(c.pageSize||5)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-commands>🔎 Search</button></div><div id=commandList></div></section>
+<? } else if(section==="prompts"){ const p=s.prompts||{}; ?><section id=prompts class=page><div class=row><h2 class=grow>🧭 Guided Prompts</h2><button data-action=prompt-help>❓ Template Help</button><button class=primary data-action=new-prompt>➕ Add Prompt</button></div><p class=muted><code>guided_prompts.yaml</code> is authoritative. Entries are exposed through MCP <code>prompts/list</code> and rendered on demand through <code>prompts/get</code>.</p><div class=row><input id=promptQuery class=grow placeholder="Search name, title, description or arguments…" value="<?= p.query||'' ?>"><select id=promptPageSize><? [5,10,25,50].forEach(n=>{ ?><option<?= Number(p.pageSize||5)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-prompts>🔎 Search</button></div><div id=promptList></div></section>
+<? } else if(section==="prompt_help"){ const h=s.promptHelp||{}; ?><section id=prompt_help class=page><div class=row><h2 class=grow>🧭 Guided Prompt Templates</h2><button data-action=prompts-back>← Guided Prompts</button></div><div class=card><h3>YAML shape</h3><p><code>guided_prompts.yaml</code> contains a top-level <code>prompts</code> array. Prompt arguments are MCP string arguments with <code>name</code> plus optional <code>title</code>, <code>description</code> and <code>required</code>; <code>required</code> controls whether the client must supply them.</p><pre><?= h.yaml||'' ?></pre></div><div class=card><h3>Eta</h3><p>The <code>template</code> is rendered with Eta using standard tags and no HTML escaping. Read values with <code>&lt;%= it.args.focus %&gt;</code>, use normal JavaScript in <code>&lt;% ... %&gt;</code>, and branch on any model field. Templates are trusted local configuration and are not sandboxed.</p><pre><?= h.model||'' ?></pre></div><div class=card><h3>Session / Workspace context</h3><p><code>it.session</code> and <code>it.workspace</code> are populated only when the prompt declares a <code>context_handle</code> argument and the client supplies a valid active MrMCP Session handle. <code>it.workspaces</code> is always available and includes the fallback Workspace plus enabled named Workspaces.</p></div></section>
 <? } else if(section==="logs"){ const l=s.logs||{}; ?><section id=logs class=page><div class=row><h2 class=grow>🛠️ Tool Calls</h2><button class=danger data-action=clear-tool-calls<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Click a row for details. Terminate active work from Actions.</p><div class=row><input id=logTool placeholder="Tool / command…" value="<?= l.toolQuery||'' ?>"><input id=logQuery class=grow placeholder="Search input, output, errors…" value="<?= l.query||'' ?>"><select id=logContext><option value="">All sessions</option><? (s.contextValues||[]).forEach(v=>{ ?><option value="<?= v.pk ?>"<?= String(l.context||"")===String(v.pk)?" selected":"" ?>>#<?= v.pk ?></option><? }) ?></select><select id=logStatus class="<?= l.status||'' ?>"><option value="">All states</option><? ['completed','failed','invalid','running'].forEach(v=>{ ?><option class="<?= v ?>" value="<?= v ?>"<?= l.status===v?' selected':'' ?>><?= v ?></option><? }) ?></select><select id=logPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(l.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=clear-log-filters>🧹 Clear Filters</button></div><? if(l.selfTest){ ?><div id=logSelfTest class=card><div class=row><h3 class=grow>🧪 MCP Self-Test</h3><button class=small data-action=copy-detail data-target=logDetail>📋 Copy JSON</button><button class=small data-action=close-self-test>✕ Close</button></div><pre id=logDetail><?= it.pretty(l.selfTest) ?></pre></div><? } ?><div id=logList></div></section>
 <? } else if(section==="published"){ ?><section id=published class=page><div class=row><h2 class=grow>📦 Published</h2><button class=danger data-action=clear-published<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear Matching</button></div><p class=muted>Deduplicated persistent snapshots created by <code>publish_file</code> and <code>publish_html</code>. One resource may have references from multiple Sessions and Workspaces.</p><div id=publishedList></div></section>
 <? } else if(section==="debug"){ const d=s.debug||{},enabled=!!s.debug?.enabled; ?><section id=debug class=page><div class=row><h2 class=grow>🐞 HTTP Debug Log</h2><button class="debug-toggle <?= enabled?'enabled':'disabled' ?>" data-action=toggle-debug-settings aria-pressed="<?= enabled?'true':'false' ?>"><?= enabled?"🟢 Logging ON · Disable":"🔴 Logging OFF · Enable" ?></button><button class=danger data-action=clear-debug>🗑️ Clear</button></div><p class=muted>Off by default. Secrets are redacted. Disabling stops new records but keeps stored data visible. Click a row for request JSON.</p><div class=row><input id=debugQuery class=grow placeholder="Search URL, headers, body or errors…" value="<?= d.query||'' ?>"><select id=debugMethod><option value="">All methods</option><? ['GET','POST','OPTIONS'].forEach(v=>{ ?><option<?= d.method===v?' selected':'' ?>><?= v ?></option><? }) ?></select><input id=debugStatus type=number placeholder="Status" value="<?= d.status||'' ?>"><button data-action=load-debug>🔎 Search</button></div><div id=debugList></div></section>
 <? } else if(section==="oauth"){ ?><section id=oauth class=page><div class=row><h2 class=grow>🔐 OAuth Clients</h2><button class=danger data-action=clear-clients<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><div id=oauthList></div></section>
 <? } else if(section==="settings"){ ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><div class=settings-layout><div class=settings-main><div class=card><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><p class=muted>Off: child <code>PATH</code> contains only <code>.mrmcp/bin</code>. Other environment variables are unchanged.</p></div><div class=card><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
 <? } else if(section==="help"){ ?><section id=help class=page><h2>❓ Help</h2><div class=card><h3>Connect ChatGPT Web</h3><ol><li>Make sure the Dashboard shows a trusted HTTPS certificate. ChatGPT needs a remote HTTPS MCP endpoint; use <code><?= settings.external_base_url ? settings.external_base_url + "/mcp" : "https://your-host/mcp" ?></code>.</li><li>In ChatGPT Web, enable Developer mode. In managed workspaces the current path is <b>Workspace settings → Permissions &amp; Roles → Connected Data Developer mode / Create custom MCP connectors</b>. Authorized users may also find the toggle under <b>Settings → Apps → Advanced Settings</b>.</li><li>Create a custom app from <b>Workspace settings → Apps → Create</b> or <b>Settings → Apps → Create</b>, enter the MrMCP endpoint, choose the offered authentication method, then select <b>Scan Tools</b>.</li><li>If OAuth is enabled in MrMCP, complete the authorization prompt. After the tool scan completes, create the app and select it from a new ChatGPT conversation.</li></ol></div><div class=card><h3>Authentication</h3><p>For ChatGPT, OAuth is the preferred MrMCP setup because ChatGPT can discover the authorization metadata, complete consent, and keep refresh-token connectivity. MrMCP also supports Basic authentication for MCP clients that offer it. Authentication grants access to the server; the <code>context_handle</code> selects persistent context state after authentication.</p></div><div class=card><h3>Write Access</h3><p>MrMCP does not maintain a separate read/write allowlist: every authenticated client receives every published tool. ChatGPT controls whether write/modify actions are usable through the app's permissions and action controls. As of this build, OpenAI documents full MCP write/modify support for Business, Enterprise and Edu; Pro custom MCP access is limited to read/fetch, and availability may change. Test write tools in Developer mode first. Where available, use <b>Workspace settings → Apps → Configure Actions / Action control</b> to enable the required actions. ChatGPT may still ask for confirmation before a write.</p></div><div class=card><h3>Using MrMCP in a Chat</h3><ol><li>Start a new chat and select the MrMCP app from the tools/apps menu.</li><li>If needed, call <code>list_workspaces</code> to discover the enabled Workspace names, then call <code>open_workspace</code> with the desired <code>name</code>. When continuing an existing Session, also pass its handle as <code>current_context_handle</code>; MrMCP moves that same Session to the Workspace. If the handle is omitted, empty, unknown or expired, a new Session is created.</li><li>The result already includes <code>workspace_name</code>, absolute <code>cwd</code> and <code>agent_guidance_path</code>. Read that file when non-null, then reuse the returned <code>context_handle</code> on later Session-bound calls. The Workspaces page can also move Sessions manually.</li><li>If you change ChatGPT model or thinking level, the MCP context may be recreated even inside the same conversation. Check the Sessions page if continuity matters.</li></ol><p class=muted>ChatGPT UI labels and plan availability can change. Current OpenAI references: <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt" target=_blank rel=noopener>Developer mode and MCP apps in ChatGPT</a> · <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt" target=_blank rel=noopener>Apps in ChatGPT</a>.</p></div></section><? } ?>`,
-    dialogs: `<? const dialog=it.data?.state?.dialog; ?><? if(dialog){ ?><div id=dialogOverlay class=dialog-overlay><? if(dialog.kind==="root"){ const r=dialog.data||{}; ?><dialog id=rootDialog open data-managed-dialog=root><form id=rootForm><input id=rid type=hidden value="<?= r.id||'' ?>"><h2>📁 Workspace</h2><div class=row><label class=grow>Workspace name</label><? if(r.name_warning){ ?><span class=field-warning>⚠ <?= r.name_warning ?></span><? } ?></div><input id=rname value="<?= r.name||'' ?>"><div class=row><label class=grow>Directory path</label><? if(r.path_warning){ ?><span class=field-warning>⚠ <?= r.path_warning ?></span><? } else if(!r.path_checked){ ?><span class=muted>Leave the field to validate the directory.</span><? } ?></div><input id=rpath placeholder="C:\\projects\\my-workspace, /srv/my-workspace or ./project" value="<?= r.path||'' ?>"><div class=muted>Relative to the program folder.</div><label><input id=renabled type=checkbox<?= r.enabled!==false?' checked':'' ?>> Enabled</label><? if(r.form_warning){ ?><div class=field-warning>⚠ <?= r.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (r.name_warning||r.path_warning||!r.path_checked||r.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="command"){ const c=dialog.data||{}; ?><dialog id=commandDialog open data-managed-dialog=command><form id=commandForm><input id=coldName type=hidden value="<?= c.registered?c.name:'' ?>"><h2>🧰 Command Catalog Entry</h2><div class=row><label class=grow>Logical name</label><? if(c.name_warning){ ?><span class=field-warning>⚠ <?= c.name_warning ?></span><? } ?></div><input id=cname value="<?= c.name||'' ?>"><div class=row><label class=grow>Path below .mrmcp/bin</label><? if(c.path_warning){ ?><span class="<?= c.path_error?'field-warning':'muted' ?>"><?= c.path_error?'⚠ ':'' ?><?= c.path_warning ?></span><? } else if(!c.path_checked){ ?><span class=muted>Leave the field to validate the path.</span><? } ?></div><input id=cpath placeholder="Optional; defaults to logical name; Windows suffix optional" value="<?= c.path||'' ?>"><label>Description for the agent</label><textarea id=cdescription placeholder="Optional: what it does and when the agent should use it."><?= c.description||'' ?></textarea><div class=row><label class=grow>Download URL</label><? if(c.download_warning){ ?><span class=field-warning>⚠ <?= c.download_warning ?></span><? } ?></div><input id=cdownloadUrl placeholder="https://example.com/tool" value="<?= c.download_url||'' ?>"><div class=row><label class=grow>Documentation URL</label><? if(c.documentation_warning){ ?><span class=field-warning>⚠ <?= c.documentation_warning ?></span><? } ?></div><input id=cdocumentationUrl placeholder="https://example.com/docs" value="<?= c.documentation_url||'' ?>"><? if(c.form_warning){ ?><div class=field-warning>⚠ <?= c.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (c.name_warning||c.path_error||!c.path_checked||c.download_warning||c.documentation_warning||c.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="confirm"){ ?><dialog id=confirmDialog open data-managed-dialog=confirm><h2>⚠️ <?= dialog.title||"Confirm Action" ?></h2><p><?= dialog.message||"Continue?" ?></p><p class=row><button class="primary danger" data-action=confirm-dialog>✓ Confirm</button><button data-action=close-dialog>✕ Cancel</button></p></dialog><? } ?></div><? } ?>`,
+    dialogs: `<? const dialog=it.data?.state?.dialog; ?><? if(dialog){ ?><div id=dialogOverlay class=dialog-overlay><? if(dialog.kind==="root"){ const r=dialog.data||{}; ?><dialog id=rootDialog open data-managed-dialog=root><form id=rootForm><input id=rid type=hidden value="<?= r.id||'' ?>"><h2>📁 Workspace</h2><div class=row><label class=grow>Workspace name</label><? if(r.name_warning){ ?><span class=field-warning>⚠ <?= r.name_warning ?></span><? } ?></div><input id=rname value="<?= r.name||'' ?>"><div class=row><label class=grow>Directory path</label><? if(r.path_warning){ ?><span class=field-warning>⚠ <?= r.path_warning ?></span><? } else if(!r.path_checked){ ?><span class=muted>Leave the field to validate the directory.</span><? } ?></div><input id=rpath placeholder="C:\\projects\\my-workspace, /srv/my-workspace or ./project" value="<?= r.path||'' ?>"><div class=muted>Relative to the program folder.</div><label><input id=renabled type=checkbox<?= r.enabled!==false?' checked':'' ?>> Enabled</label><? if(r.form_warning){ ?><div class=field-warning>⚠ <?= r.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (r.name_warning||r.path_warning||!r.path_checked||r.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="command"){ const c=dialog.data||{}; ?><dialog id=commandDialog open data-managed-dialog=command><form id=commandForm><input id=coldName type=hidden value="<?= c.registered?c.name:'' ?>"><h2>🧰 Command Catalog Entry</h2><div class=row><label class=grow>Logical name</label><? if(c.name_warning){ ?><span class=field-warning>⚠ <?= c.name_warning ?></span><? } ?></div><input id=cname value="<?= c.name||'' ?>"><div class=row><label class=grow>Path below .mrmcp/bin</label><? if(c.path_warning){ ?><span class="<?= c.path_error?'field-warning':'muted' ?>"><?= c.path_error?'⚠ ':'' ?><?= c.path_warning ?></span><? } else if(!c.path_checked){ ?><span class=muted>Leave the field to validate the path.</span><? } ?></div><input id=cpath placeholder="Optional; defaults to logical name; Windows suffix optional" value="<?= c.path||'' ?>"><label>Description for the agent</label><textarea id=cdescription placeholder="Optional: what it does and when the agent should use it."><?= c.description||'' ?></textarea><div class=row><label class=grow>Download URL</label><? if(c.download_warning){ ?><span class=field-warning>⚠ <?= c.download_warning ?></span><? } ?></div><input id=cdownloadUrl placeholder="https://example.com/tool" value="<?= c.download_url||'' ?>"><div class=row><label class=grow>Documentation URL</label><? if(c.documentation_warning){ ?><span class=field-warning>⚠ <?= c.documentation_warning ?></span><? } ?></div><input id=cdocumentationUrl placeholder="https://example.com/docs" value="<?= c.documentation_url||'' ?>"><? if(c.form_warning){ ?><div class=field-warning>⚠ <?= c.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (c.name_warning||c.path_error||!c.path_checked||c.download_warning||c.documentation_warning||c.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="prompt"){ const p=dialog.data||{}; ?><dialog id=promptDialog open data-managed-dialog=prompt><form id=promptForm><input id=poldName type=hidden value="<?= p.old_name||'' ?>"><h2>🧭 Guided Prompt</h2><div class=row><label class=grow>Name</label><? if(p.name_warning){ ?><span class=field-warning>⚠ <?= p.name_warning ?></span><? } ?></div><input id=pname value="<?= p.name||'' ?>"><label>Title</label><input id=ptitle value="<?= p.title||'' ?>" placeholder="Human-readable title shown by MCP clients"><label>Description</label><textarea id=pdescription placeholder="What this guided prompt does."><?= p.description||'' ?></textarea><div class=row><label class=grow>Arguments · YAML list</label><? if(p.args_warning){ ?><span class=field-warning>⚠ <?= p.args_warning ?></span><? } ?></div><textarea id=parguments rows=8 placeholder="- name: focus&#10;  description: Area to focus on.&#10;  required: false"><?= p.arguments_text||'' ?></textarea><div class=row><label class=grow>Eta template</label><? if(p.template_warning){ ?><span class=field-warning>⚠ <?= p.template_warning ?></span><? } ?></div><textarea id=ptemplate rows=14 placeholder="Review the project. &lt;%= it.args.focus %&gt;"><?= p.template||'' ?></textarea><div class=muted>Standard Eta tags. Model documentation is available from Guided Prompts → Template Help.</div><? if(p.form_warning){ ?><div class=field-warning>⚠ <?= p.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (p.name_warning||p.args_warning||p.template_warning||p.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="confirm"){ ?><dialog id=confirmDialog open data-managed-dialog=confirm><h2>⚠️ <?= dialog.title||"Confirm Action" ?></h2><p><?= dialog.message||"Continue?" ?></p><p class=row><button class="primary danger" data-action=confirm-dialog>✓ Confirm</button><button data-action=close-dialog>✕ Cancel</button></p></dialog><? } ?></div><? } ?>`,
     status: `<? const d=it.data||{},s=d.settings||{},a=d.activity||{},bad=!!s.mcp_listen_error,warn=!!s.listener_fallback,recent=a.recent_sessions||[],inFlight=a.tool_calls_in_flight||0,errors=a.tool_calls_errors||0,invalid=a.tool_calls_invalid||0; ?><span class="status-group <?= d.live!=="connected"?(d.live==="reconnecting"?"pending":"failed"):(bad?"failed":(warn?"pending":"ok")) ?>"><?= d.live!=="connected"?(d.live==="reconnecting"?"🟡 reconnecting":"🔴 offline"):(bad?"🔴 listener error":(warn?"🟡 fallback":"🟢 live")) ?></span><span class="status-group status-link" data-action=header-settings title="HTTP / HTTPS effective listener ports; GUI uses local Tauriless assets">🔌 <span class=status-ports><?= s.mcp_http_active?s.mcp_http_port:"off" ?>/<?= s.mcp_https_active?s.mcp_https_port:"off" ?></span><? if(warn){ ?> <span class=pending>⚠</span><? } ?></span><span class=status-group title="Sessions with a Tool Call in the last <?= a.active_window_minutes||10 ?> minutes">💬 <span class="status-link <?= a.active_sessions?'ok':'muted' ?>" data-action=header-sessions><?= a.active_sessions||0 ?> active</span><? if(recent.length){ ?> · <span class=status-sessions><? recent.forEach((x,i)=>{ ?><?= i?" ":"" ?><span class=status-link data-action=session-tool-calls data-id="<?= x.id ?>">#<?= x.id ?>(<?= x.tool_calls ?>)</span><? }) ?></span><? } ?></span><span class=status-group title="Tool Calls in flight / total recorded / failed / invalid">🛠️ <span class="status-link <?= inFlight?'pending':'muted' ?>" data-action=header-tool-calls data-status=running><?= inFlight ?> in flight</span> · <span class="status-link status-total" data-action=header-tool-calls data-status=""><?= a.tool_calls_total||0 ?> total</span> · <span class="status-link <?= errors?'failed':'muted' ?>" data-action=header-tool-calls data-status=failed><?= errors ?> errors</span> · <span class="status-link <?= invalid?'invalid':'muted' ?>" data-action=header-tool-calls data-status=invalid><?= invalid ?> invalid</span></span>`,
     cards: `<? const meta={sessions:["💬","Sessions"],roots:["📁","Workspaces"],tool_calls:["🛠️","Tool Calls"],tool_calls_in_flight:["🛠️","Tool Calls In Flight"],failed_calls:["⚠️","Failed Calls"],http_requests:["🌐","HTTP Requests"]}; Object.entries(it.data || {}).forEach(([key,value]) => { const item=meta[key]||["•",key]; ?><div class=card><div class=muted><?= item[0] ?> <?= item[1] ?></div><strong style="font-size:24px"><?= value ?></strong></div><? }) ?>`,
     active_tool_calls: `<? const rows=it.data||[],icons={completed:"✅",failed:"❌",invalid:"◆",killed:"❌",timed_out:"❌",running:"⏳",received:"⏳"}; ?><div class="card dashboard-call-card"><table class=dashboard-call-table><thead><tr><th>State</th><th>Tool Call</th><th>Session</th><th>Time</th></tr></thead><tbody><? if(!rows.length){ ?><tr><td colspan=4 class=muted>No active Tool Calls.</td></tr><? } else { rows.forEach(l=>{ const ms=Number(l.elapsed_ms||0),elapsed=ms<1000?ms+"ms":(ms/1000).toFixed(ms<10000?1:0)+"s"; ?><tr data-action=dashboard-tool-call data-id="<?= l.id ?>" title="Open Tool Call #<?= l.id ?>" class="<?= l.active?'':'dashboard-call-recent' ?>"<? if(!l.active){ ?> style="--dashboard-call-ttl:<?= Math.max(50,Number(l.ttl_ms||0)) ?>ms"<? } ?>><td class="<?= l.active?'pending':l.status ?> nowrap"><?= icons[l.status]||"•" ?> <?= l.active?"running":l.status ?></td><td class=dashboard-call-summary><?= l.call_summary ?><? if(l.progress_requested){ ?> <span class=progress-requested>📡 progress</span><? } ?></td><td class=idcell><?= l.context_id?"#"+l.context_id:"—" ?></td><td class=nowrap><?= elapsed ?><? if(!l.active){ ?> <span class=muted>· done</span><? } ?></td></tr><? }) } ?></tbody></table></div>`,
@@ -6143,6 +6392,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     roots: `<? const d=it.data||{},rows=d.roots||[],defaults=d.default_sessions||[]; ?><div class=roots-layout><div class=roots-named><h3>📁 Workspaces</h3><? if(!rows.length){ ?><div class=card><p class=muted>No Workspaces registered.</p></div><? } ?><? rows.forEach(r => { ?><div class="card root-card<?= r.enabled?'':' root-disabled' ?>"<? if(r.enabled){ ?> data-root-drop="<?= r.id ?>"<? } ?>><div class=root-card-header><div class=grow><h3>📁 <?= r.name ?></h3><code class="<?= r.path_warning?'failed':'' ?>"<? if(r.path_warning){ ?> title="<?= r.path_warning ?>"<? } ?>><?= r.path ?></code></div><div class=command-actions><button class=small data-action=edit-root data-id="<?= r.id ?>">✏️ Edit</button><button class="small danger" data-action=delete-root data-id="<?= r.id ?>">🗑️ Delete</button></div></div><div class="<?= r.enabled?'ok':'muted' ?>"><?= r.enabled ? "enabled" : "disabled" ?></div><div class=root-session-list><? if(!r.enabled){ ?><div class=muted>Enable this Workspace to assign Sessions.</div><? } else if(!(r.sessions||[]).length){ ?><div class=root-drop-empty>Drop a Session here</div><? } ?><? (r.sessions||[]).forEach(v=>{ ?><div class=session-chip draggable=true data-session-drag data-session-id="<?= v.pk ?>" title="Drag Session #<?= v.pk ?>"><div class=session-chip-main><span>💬</span><b>#<?= v.pk ?></b><span class=grow><?= v.client_name ?></span></div><div class=session-chip-meta><span><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></span><span><span class=muted>Last Activity</span> <?= it.logdt(v.last_active_at) ?></span><span><span class=muted>Status</span> <span class="<?= v.expired?'failed':'ok' ?>"><?= v.expired?'expired':'active' ?></span></span><span><span class=muted>Tool Calls:</span> <?= v.tool_calls||0 ?></span></div></div><? }) ?></div></div><? }) ?></div><div class=roots-default><div class=row><h3 class=grow>💬 Sessions</h3><span class=muted>No Workspace assigned</span></div><div class="card default-root-card" data-root-drop="0"><p class=muted>Uses the program folder until assigned to a Workspace.</p><div class=root-session-list><? if(!defaults.length){ ?><div class=root-drop-empty>Drop a Session here to remove its Workspace association.</div><? } ?><? defaults.forEach(v=>{ ?><div class=session-chip draggable=true data-session-drag data-session-id="<?= v.pk ?>" title="Drag Session #<?= v.pk ?>"><div class=session-chip-main><span>💬</span><b>#<?= v.pk ?></b><span class=grow><?= v.client_name ?></span></div><div class=session-chip-meta><span><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></span><span><span class=muted>Last Activity</span> <?= it.logdt(v.last_active_at) ?></span><span><span class=muted>Status</span> <span class="<?= v.expired?'failed':'ok' ?>"><?= v.expired?'expired':'active' ?></span></span><span><span class=muted>Tool Calls:</span> <?= v.tool_calls||0 ?></span></div></div><? }) ?></div></div></div></div>`,
     context: `<? const d=it.data||{},values=d.values||[]; ?><? if (!values.length) { ?><p class=muted>No Sessions have been issued yet.</p><? } else { ?><table><tr><th>ID</th><th>Session Handle</th><th>Client / Auth</th><th>State / Protocol</th><th>Current Workspace</th><th>Activity</th><th>Tool Calls</th><th></th></tr><? values.forEach(v=>{ const ua=String(v.user_agent||""); ?><tr><td class=idcell>#<?= v.pk ?></td><td class=context-id><code><?= v.context_handle ?></code></td><td><b><?= v.client_name||"Unknown client" ?></b><br><span class=muted><?= v.auth_kind||"unknown auth" ?></span><? if(ua){ ?><div class=muted title="<?= ua ?>"><?= ua.slice(0,72) ?><?= ua.length>72?"…":"" ?></div><? } ?></td><td class=nowrap><b class="<?= v.expired ? 'failed' : 'ok' ?>"><?= v.expired ? "⌛ expired" : "🟢 active" ?></b><br><code><?= v.protocol_version||"unknown" ?></code></td><td><b><?= v.workspace_name ?></b><div class="<?= v.workspace_warning?'failed':'muted' ?>"<? if(v.workspace_warning){ ?> title="<?= v.workspace_warning ?>"<? } ?>><?= v.workspace_path ?></div></td><td class=context-dates><div><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></div><div><span class=muted>Updated</span> <?= it.logdt(v.updated_at) ?></div><div><span class=muted>Active</span> <?= it.logdt(v.last_active_at) ?></div><div><span class=muted>Expires</span> <?= it.logdt(v.expires_at) ?></div></td><td class=nowrap><?= v.tool_calls||0 ?> <button class=small data-action=session-tool-calls data-id="<?= v.pk ?>">🛠️ View Calls</button></td><td><button class=danger data-action=delete-context data-id="<?= v.pk ?>">🗑️ Delete</button></td></tr><? }) ?></table><? } ?>`,
     commands: `<? const d=it.data || {}, rows=d.commands || []; ?><div class=muted><?= d.total || 0 ?> command<?= d.total === 1 ? "" : "s" ?> · page <?= d.page || 1 ?>/<?= d.pages || 1 ?> · config <code><?= d.config_file || "" ?></code></div><table class=commands-table><tr><th>Name</th><th>Relative path</th><th class=command-description>Description</th><th>Links</th><th>Source</th><th>State</th><th class=command-action-cell></th></tr><? rows.forEach(c => { ?><tr><td><code><?= c.name ?></code></td><td><code><?= c.path ?></code></td><td class=command-description><?= c.description || "—" ?></td><td><? if (c.documentation_url) { ?><a href="<?= c.documentation_url ?>" target=_blank rel=noopener>📖 Docs</a><? } else { ?>—<? } ?></td><td><?= c.source ?></td><td class="<?= c.present && c.executable ? "ok" : "failed" ?>"><?= c.present ? (c.executable ? "✅ available" : "⚠️ not executable") : "❌ missing" ?></td><td class=command-action-cell><div class=command-actions><button data-action=edit-command data-name="<?= c.name ?>" data-path="<?= c.path ?>">✏️ Edit</button><? if (c.registered && c.download_url) { ?><button data-action=download-command data-name="<?= c.name ?>">⬇️ Download</button><? } ?><? if (c.registered) { ?><button class=danger data-action=delete-command data-name="<?= c.name ?>">🗑️ Delete</button><? } ?></div></td></tr><? }) ?></table><div class=row><button data-action=commands-prev<?= d.page <= 1 ? " disabled" : "" ?>>Previous</button><button data-action=commands-next<?= d.has_more ? "" : " disabled" ?>>Next</button></div>`,
+    prompts: `<? const d=it.data||{},rows=d.prompts||[]; ?><div class=muted><?= d.total||0 ?> prompt<?= d.total===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?> · config <code><?= d.config_file||'' ?></code></div><? if(!rows.length){ ?><div class=card><p class=muted>No guided prompts match the current search.</p></div><? } else { ?><table class=commands-table><tr><th>Name</th><th>Title</th><th class=command-description>Description</th><th>Arguments</th><th class=command-action-cell></th></tr><? rows.forEach(p=>{ ?><tr><td><code><?= p.name ?></code></td><td><?= p.title||'—' ?></td><td class=command-description><?= p.description||'—' ?></td><td><? if(p.arguments?.length){ p.arguments.forEach(a=>{ ?><div><code><?= a.name ?></code><? if(a.required){ ?> <b>required</b><? } ?></div><? }) } else { ?>—<? } ?></td><td class=command-action-cell><div class=command-actions><button data-action=edit-prompt data-name="<?= p.name ?>">✏️ Edit</button><button class=danger data-action=delete-prompt data-name="<?= p.name ?>">🗑️ Delete</button></div></td></tr><? }) ?></table><? } ?><div class=row><button data-action=prompts-prev<?= d.page<=1?' disabled':'' ?>>Previous</button><button data-action=prompts-next<?= d.has_more?'':' disabled' ?>>Next</button></div>`,
     oauth: `<table class=oauth-table><tr><th>Client</th><th>Sessions</th><th>Tokens</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td class=oauth-client><b><?= c.name ?></b><div class=oauth-client-id title="<?= c.client_id ?>"><code><?= c.client_id ?></code></div><div class=oauth-meta><span class=muted>Created</span> <?= it.logdt(c.created_at) ?></div></td><td class=oauth-meta><div class=oauth-count><b><?= c.session_count||0 ?></b> total</div><div><span class=muted>First</span> <?= c.first_session_at ? it.logdt(c.first_session_at) : "—" ?></div><div><span class=muted>Last</span> <?= c.last_session_at ? it.logdt(c.last_session_at) : "—" ?></div></td><td><div class=oauth-tokens><div class=oauth-token><b><?= c.token_count||0 ?></b> <span>Access</span><div class=oauth-meta><span class=muted>Issued</span> <?= c.last_token_at ? it.logdt(c.last_token_at) : "—" ?></div></div><div class=oauth-token><b><?= c.refresh_token_count||0 ?></b> <span>Refresh</span><div class=oauth-meta><span class=muted>Used</span> <?= c.last_refresh_at ? it.logdt(c.last_refresh_at) : "—" ?></div></div></div></td><td class=oauth-actions><button class=small data-action=oauth-sessions data-id="<?= c.client_id ?>">💬 View Sessions</button><button class="small danger" data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> Available Tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,
     logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=http-session><? if(l.context_id){ ?><div class=idcell>#<?= l.context_id ?></div><? if(l.root_id&&l.root_name){ ?><div class=workspace-label>📁 <?= l.root_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><code><?= l.tool ?></code><? if(l.call_preview){ ?><div class=tool-command-preview>↳ <?= l.call_preview ?></div><? } ?><? if(l.progress_requested){ ?><div class=progress-requested>📡 Progress requested</div><? } ?></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Kill</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><? if(x.progress_requested){ ?><span class=progress-requested>📡 Progress requested</span><? } ?><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><div class=tool-detail-grid><div class=tool-detail-main><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><? if(x.resolved_json){ ?><section class=json-detail><div class=row><b class=grow>Tool Return Value JSON</b><button class=small data-action=copy-detail data-target="tool-return-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-return-<?= l.id ?>"><?= it.prettyParsed(x.resolved_json) ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>MCP Result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div><aside class=tool-descriptor><div class=row><b class=grow>Agent Tool Definition</b><? if(x.tool_descriptor){ ?><span class="descriptor-status <?= x.tool_descriptor_matches_current?'current':'outdated' ?>"><?= x.tool_descriptor_matches_current?'CURRENT':'OUTDATED' ?></span><button class=small data-action=copy-detail data-target="tool-descriptor-<?= l.id ?>">📋 Copy JSON</button><? } ?></div><? if(x.tool_descriptor){ ?><pre id="tool-descriptor-<?= l.id ?>" hidden><?= it.pretty(x.tool_descriptor) ?></pre><? if(x.tool_descriptor.title){ ?><div class=muted>Title</div><div><?= x.tool_descriptor.title ?></div><? } ?><div class=muted>Description</div><p><?= x.tool_descriptor.description||"—" ?></p><div class=muted>Input Schema</div><pre><?= it.pretty(x.tool_descriptor.inputSchema||{}) ?></pre><div class=muted>Output Schema</div><pre><?= it.pretty(x.tool_descriptor.outputSchema||{}) ?></pre><? } else { ?><p class=muted>No descriptor snapshot was recorded for this call.</p><? } ?></aside></div></div></td></tr><? } }) ?></tbody></table>`,
@@ -6320,7 +6570,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     viewState.maintenance = projection.maintenance;
     viewState.contextValues = projection.context_values || [];
     viewState.debug.enabled = !!projection.settings.debug_http_log;
-    const model = { section, projection, viewState, commandData: null, logData: null, publishedData: null, debugData: null };
+    const model = { section, projection, viewState, commandData: null, promptData: null, logData: null, publishedData: null, debugData: null };
+    if (section === "prompt_help") viewState.promptHelp = { yaml: GUIDED_PROMPTS_HELP_YAML, model: GUIDED_PROMPTS_HELP_MODEL };
     if (section === "roots") {
       const rows = projection.root_assignments?.roots || [];
       const warnings = await currentUiRender(Promise.all(rows.map(async root => [Number(root.id), await rootPathWarning(root.path)])), generation);
@@ -6342,6 +6593,13 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       current.page = model.commandData.page;
       viewState.commands.page = current.page;
       viewState.commands.discoveryEnabled = model.commandData.discovery_enabled;
+    } else if (section === "prompts") {
+      const current = uiState.prompts;
+      model.promptData = await currentUiRender(guidedPromptCatalog({
+        query: current.query, page: current.page, page_size: current.pageSize,
+      }), generation);
+      current.page = model.promptData.page;
+      viewState.prompts.page = current.page;
     } else if (section === "logs") {
       const current = uiState.logs;
       const query = new URLSearchParams({
@@ -6408,6 +6666,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       view = fillUiMount(view, "rootList", await renderEtaFragment("roots", projection.root_assignments || {}, generation));
     } else if (section === "commands") {
       view = fillUiMount(view, "commandList", await renderEtaFragment("commands", model.commandData || {}, generation));
+    } else if (section === "prompts") {
+      view = fillUiMount(view, "promptList", await renderEtaFragment("prompts", model.promptData || {}, generation));
     } else if (section === "logs") {
       view = fillUiMount(view, "logList", await renderEtaFragment("logs", model.logData || {}, generation));
     } else if (section === "published") {
@@ -6464,6 +6724,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     else if (id === "publishedSize") uiState.published.size = text;
     else if (id === "debugQuery") uiState.debug.query = text;
     else if (id === "commandQuery") uiState.commands.query = text;
+    else if (id === "promptQuery") uiState.prompts.query = text;
     else if (uiState.dialog?.kind === "root") {
       const map = { rid: "id", rname: "name", rpath: "path", renabled: "enabled" };
       if (map[id]) uiState.dialog.data[map[id]] = id === "renabled" ? !!checked : text;
@@ -6471,6 +6732,12 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       const map = {
         coldName: "old_name", cname: "name", cpath: "path", cdescription: "description",
         cdownloadUrl: "download_url", cdocumentationUrl: "documentation_url",
+      };
+      if (map[id]) uiState.dialog.data[map[id]] = text;
+    } else if (uiState.dialog?.kind === "prompt") {
+      const map = {
+        poldName: "old_name", pname: "name", ptitle: "title", pdescription: "description",
+        parguments: "arguments_text", ptemplate: "template",
       };
       if (map[id]) uiState.dialog.data[map[id]] = text;
     }
@@ -6520,6 +6787,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         break;
       case "delete-command":
         await uiInternalApi("/api/commands/delete", { method: "POST", body: { name: String(data.name || "") } });
+        break;
+      case "delete-prompt":
+        await uiInternalApi("/api/prompts/delete", { method: "POST", body: { name: String(data.name || "") } });
         break;
       case "revoke-client":
         await uiInternalApi("/api/oauth/revoke-client", { method: "POST", body: { client_id: String(data.client_id || "") } });
@@ -6699,6 +6969,39 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         break;
       case "commands-next":
         uiState.commands.page += 1;
+        break;
+      case "new-prompt":
+        uiState.dialog = { kind: "prompt", data: {
+          name: "", title: "", description: "", arguments_text: "", template: "", old_name: "",
+          name_warning: "Prompt name is required.", args_warning: "", template_warning: "Template is required.", form_warning: "",
+        } };
+        break;
+      case "edit-prompt": {
+        const row = (await readGuidedPromptConfig()).find(prompt => prompt.name === String(data.name || ""));
+        if (!row) throw new Error("Guided prompt not found");
+        uiState.dialog = { kind: "prompt", data: {
+          ...row, old_name: row.name, arguments_text: guidedPromptArgumentsText(row.arguments),
+          name_warning: await guidedPromptNameWarning(row.name, row.name), args_warning: "", template_warning: "", form_warning: "",
+        } };
+        break;
+      }
+      case "delete-prompt":
+        uiConfirm("Delete Guided Prompt", `Delete ${data.name || "this prompt"} from guided_prompts.yaml?`, "delete-prompt", { name: data.name });
+        return;
+      case "prompt-help":
+        uiState.currentSection = "prompt_help";
+        break;
+      case "prompts-back":
+        uiState.currentSection = "prompts";
+        break;
+      case "load-prompts":
+        uiState.prompts.page = 1;
+        break;
+      case "prompts-prev":
+        uiState.prompts.page = Math.max(1, uiState.prompts.page - 1);
+        break;
+      case "prompts-next":
+        uiState.prompts.page += 1;
         break;
       case "revoke-client":
         uiConfirm("Revoke OAuth Client", "Revoke this client and all of its tokens?", "revoke-client", { client_id: data.id });
@@ -6893,6 +7196,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
             uiState.dialog.data.path_warning = warning;
             uiState.dialog.data.path_error = commandPathBlocksSave(warning);
             uiState.dialog.data.path_checked = true;
+          } else if (id === "parguments" && uiState.dialog?.kind === "prompt") {
+            try { parseGuidedPromptArguments(event.value, uiState.dialog.data.name || "prompt"); uiState.dialog.data.args_warning = ""; }
+            catch (error) { uiState.dialog.data.args_warning = String(error?.message || error); }
           }
           else return;
           queueUiRender(`blur:${id}`, 0);
@@ -6921,6 +7227,14 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
               }
               if (id === "cdownloadUrl") d.download_warning = httpUrlWarning(item.value, "Download URL");
               if (id === "cdocumentationUrl") d.documentation_warning = httpUrlWarning(item.value, "Documentation URL");
+              renderDraft = true;
+            }
+            if (uiState.dialog?.kind === "prompt" && ["pname", "ptitle", "pdescription", "parguments", "ptemplate"].includes(id)) {
+              const d = uiState.dialog.data;
+              d.form_warning = "";
+              if (id === "pname") d.name_warning = await guidedPromptNameWarning(item.value, d.old_name);
+              if (id === "parguments") d.args_warning = "";
+              if (id === "ptemplate") d.template_warning = String(item.value || "").trim() ? "" : "Template is required.";
               renderDraft = true;
             }
             if (["externalUrl", "tlsEmail", "publicIpUrls", "sslipSuffix", "acmeDirectoryUrl"].includes(id)) renderDraft = true;
@@ -6953,7 +7267,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           else if (id === "debugStatus") uiState.debug.status = String(event.value || "");
           else if (id === "commandPageSize") { uiState.commands.pageSize = Number(event.value) || 5; uiState.commands.page = 1; }
           else if (id === "commandFilter") { uiState.commands.filter = String(event.value || ""); uiState.commands.page = 1; }
-          else if (["rpath", "cpath"].includes(id)) return;
+          else if (id === "promptPageSize") { uiState.prompts.pageSize = Number(event.value) || 5; uiState.prompts.page = 1; }
+          else if (["rpath", "cpath", "parguments"].includes(id)) return;
           queueUiRender(`change:${id}`);
           return;
         }
@@ -6963,6 +7278,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
             if (uiLogFilterTimer) clearTimeout(uiLogFilterTimer);
             uiLogFilterTimer = null;
           } else if (event.id === "commandQuery") uiState.commands.page = 1;
+          else if (event.id === "promptQuery") uiState.prompts.page = 1;
           queueUiRender(`enter:${event.id}`);
           return;
         case "submit": {
@@ -7014,6 +7330,32 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
             } catch (error) {
               d.form_warning = String(error?.message || error);
               queueUiRender("submit:commandForm-warning", 0);
+              return;
+            }
+          } else if (event.formId === "promptForm") {
+            const d = uiState.dialog?.kind === "prompt" ? uiState.dialog.data : null;
+            if (!d) return;
+            d.name_warning = await guidedPromptNameWarning(values.pname, values.poldName);
+            d.template_warning = String(values.ptemplate || "").trim() ? "" : "Template is required.";
+            let args = [];
+            try { args = parseGuidedPromptArguments(values.parguments, values.pname || "prompt"); d.args_warning = ""; }
+            catch (error) { d.args_warning = String(error?.message || error); }
+            d.form_warning = "";
+            if (d.name_warning || d.args_warning || d.template_warning) {
+              queueUiRender("submit:promptForm-invalid", 0);
+              return;
+            }
+            try {
+              await uiInternalApi("/api/prompts/save", { method: "POST", body: {
+                old_name: values.poldName, name: values.pname, title: values.ptitle,
+                description: values.pdescription, arguments: args, template: values.ptemplate,
+              } });
+              uiState.dialog = null;
+              uiState.prompts.page = 1;
+              uiNotice(`Guided prompt ${String(values.pname || "").trim()} saved.`, "ok");
+            } catch (error) {
+              d.form_warning = String(error?.message || error);
+              queueUiRender("submit:promptForm-warning", 0);
               return;
             }
           }
@@ -7223,6 +7565,32 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       const x = await bodyJson(req), key = String(x.name || "").toLowerCase();
       await writeCommandConfig((await readCommandConfig()).filter(row => row.name.toLowerCase() !== key));
       emitUiChange(["commands", "dashboard", "endpoints"], "commands");
+      return json({ ok: true });
+    }
+    if (u.pathname === "/api/prompts" && req.method === "GET") return json(await guidedPromptCatalog({
+      query: u.searchParams.get("q") || "",
+      page: u.searchParams.get("page") || 1,
+      page_size: u.searchParams.get("page_size") || 5,
+    }));
+    if (u.pathname === "/api/prompts/save" && req.method === "POST") {
+      const x = await bodyJson(req), name = String(x.name || "").trim(), old = String(x.old_name || "").trim();
+      const nameWarning = await guidedPromptNameWarning(name, old);
+      if (nameWarning) return json({ error: nameWarning, field: "name" }, 400);
+      let row;
+      try { row = normalizeGuidedPromptEntry({ name, title: x.title, description: x.description, arguments: x.arguments, template: x.template }); }
+      catch (error) { return json({ error: String(error?.message || error) }, 400); }
+      const rows = await readGuidedPromptConfig(), oldKey = old.toLowerCase(), key = name.toLowerCase();
+      if (rows.some(existing => existing.name.toLowerCase() === key && existing.name.toLowerCase() !== oldKey)) return json({ error: "Prompt name already exists" }, 409);
+      const index = rows.findIndex(existing => existing.name.toLowerCase() === oldKey || (!old && existing.name.toLowerCase() === key));
+      if (index >= 0) rows[index] = row; else rows.push(row);
+      await writeGuidedPromptConfig(rows);
+      emitUiChange(["prompts"], "prompts");
+      return json({ ok: true, config_file: GUIDED_PROMPTS_PATH });
+    }
+    if (u.pathname === "/api/prompts/delete" && req.method === "POST") {
+      const x = await bodyJson(req), key = String(x.name || "").toLowerCase();
+      await writeGuidedPromptConfig((await readGuidedPromptConfig()).filter(row => row.name.toLowerCase() !== key));
+      emitUiChange(["prompts"], "prompts");
       return json({ ok: true });
     }
     if (u.pathname === "/api/commands/download" && req.method === "POST") {
@@ -7665,7 +8033,7 @@ document.addEventListener("keydown", event => {
     send({ type: "action", action: "close-dialog", dataset: {}, values: {} });
     return;
   }
-  if (event.key !== "Enter" || !["logTool", "logQuery", "debugQuery", "commandQuery"].includes(event.target.id)) return;
+  if (event.key !== "Enter" || !["logTool", "logQuery", "debugQuery", "commandQuery", "promptQuery"].includes(event.target.id)) return;
   event.preventDefault();
   send({ type: "enter", id: event.target.id, value: event.target.value, focus: focusState(event.target) });
 });

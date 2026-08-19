@@ -8,12 +8,14 @@ on:
     paths:
       - "mrmcp.js"
       - "commands.yaml"
+      - "guided_prompts.yaml"
       - "assets/**"
       - ".github/workflows/test-macos.yml"
   pull_request:
     paths:
       - "mrmcp.js"
       - "commands.yaml"
+      - "guided_prompts.yaml"
       - "assets/**"
       - ".github/workflows/test-macos.yml"
 
@@ -61,7 +63,7 @@ jobs:
         run: >-
           deno compile --minimum-dependency-age=0 -A --unstable-ffi
           --target ${{ matrix.target }}
-          --include assets --include commands.yaml
+          --include assets --include commands.yaml --include guided_prompts.yaml
           --output mrmcp-test
           mrmcp.js
 
