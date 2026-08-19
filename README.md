@@ -70,13 +70,14 @@ Session and Workspace:
 
 - `list_workspaces`, `create_workspace`, `open_workspace`, `query_tool_calls`
 
-Files and text:
+Filesystem:
 
-- `read_file`, `read_files`, `write_file`, `write_files`
-- `glob`, `grep`, `edit`, `replace`
-- `file_info`, `create_directory`, `copy_path`
-- `trash_paths`, `untrash_action`
+- `fs_glob`, `fs_grep`, `fs_read`, `fs_navigate`, `fs_stat`
+- `fs_write`, `fs_edit`
+- `fs_mkdir`, `fs_copy`, `fs_move`, `fs_trash`, `fs_restore`
 - `publish_file`, `publish_html`
+
+The `fs_*` surface is multi-file where appropriate, stateless for navigation/pagination, uses opaque file fingerprints for optimistic concurrency, and reports independent per-entry outcomes instead of cross-entry rollback. See `TOOLS.md` for the complete tool contracts and rationale.
 
 Commands and execution:
 
@@ -84,7 +85,7 @@ Commands and execution:
 - `exec`, `exec_start`, `exec_attach`, `exec_write`, `exec_kill`, `exec_list`, `exec_status`
 - `js`, `js_add_node_module_dir`, `js_reset`
 
-Filesystem removal is reversible: MrMCP exposes trash/restore tools instead of a permanent delete tool. All Workspaces share the single MrMCP-managed `APP_DIR/.mrmcp/trash/` store; MrMCP never creates `.mrmcp` metadata directories inside named Workspaces.
+Filesystem removal is reversible: `fs_trash`/`fs_restore` use explicit `trash_id` transactions instead of a permanent delete tool. All Workspaces share the single MrMCP-managed `APP_DIR/.mrmcp/trash/` store; MrMCP never creates `.mrmcp` metadata directories inside named Workspaces.
 
 Persistent processes use the integer `exec_id` returned by `exec_start`; follow-up process tools require the same Session `context_handle`.
 

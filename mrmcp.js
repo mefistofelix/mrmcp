@@ -77,15 +77,15 @@ const GUIDED_PROMPTS_PATH = join(APP_DIR, "guided_prompts.yaml");
 const PORT_FALLBACK_STEP = 50;
 const UI_INPUT_EVENT = "tauriless://webview-message", UI_RENDER_EVENT = "mrmcp://ui-render";
 const BASE_TOOLS = [
-  "list_workspaces", "create_workspace", "open_workspace", "read_file", "read_files", "write_file", "write_files",
-  "edit", "replace", "glob", "grep",
-  "file_info", "create_directory", "copy_path", "move_path", "trash_paths", "untrash_action",
+  "list_workspaces", "create_workspace", "open_workspace",
+  "fs_glob", "fs_grep", "fs_read", "fs_navigate", "fs_stat",
+  "fs_write", "fs_edit", "fs_mkdir", "fs_copy", "fs_move", "fs_trash", "fs_restore",
   "publish_file", "publish_html", "discover_commands", "query_tool_calls", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
   "js", "js_add_node_module_dir", "js_reset",
 ];
 const READ_TOOLS = new Set([
-  "list_workspaces", "read_file", "read_files", "glob", "grep",
-  "file_info", "discover_commands", "query_tool_calls", "exec_attach", "exec_list", "exec_status",
+  "list_workspaces", "fs_glob", "fs_grep", "fs_read", "fs_navigate", "fs_stat",
+  "discover_commands", "query_tool_calls", "exec_attach", "exec_list", "exec_status",
 ]);
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
@@ -2399,9 +2399,6 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     }
     return target;
   }
-  async function fileHash(path) {
-    return await sha256(new Uint8Array(await Deno.readFile(path)));
-  }
   const TEXT_ENCODINGS = new Set(["utf-8", "utf-16le", "utf-16be", "windows-1252", "latin1"]);
   const CP1252_SPECIAL = new Map([
     [0x20ac,0x80],[0x201a,0x82],[0x0192,0x83],[0x201e,0x84],[0x2026,0x85],[0x2020,0x86],[0x2021,0x87],
@@ -2515,12 +2512,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     bytes.set(prefix); bytes.set(payload, prefix.length);
     return { bytes, encoding, bom, line_endings: lineEndingKind(text) };
   }
-  function editNeedle(value, document) {
-    const mode = document.line_endings;
-    return ["lf", "crlf", "cr"].includes(mode) ? normalizeLineEndings(value, mode) : String(value);
-  }
   function globRegex(pattern = "**/*") {
-    const source = String(pattern).replaceAll("\\", "/");
+    const source = String(pattern).replaceAll("\\", "/").replace(/^\.\//, "");
     let output = "^";
     for (let index = 0; index < source.length; index++) {
       const character = source[index];
@@ -2538,29 +2531,113 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     }
     return new RegExp(output + "$");
   }
-  async function walk(root, start = ".", options = {}) {
-    const base = await safePath(root, start), rootReal = await Deno.realPath(root);
-    const result = [], limit = Math.min(Number(options.limit || 2000), 10000);
-    const match = globRegex(options.pattern || "**/*");
-    const baseStat = await Deno.stat(base);
-    if (baseStat.isFile) {
-      const rel = relative(rootReal, base).replaceAll("\\", "/");
-      return match.test(rel) ? [rel] : [];
+  const slashPath = value => String(value || "").replaceAll("\\", "/").replace(/^\.\//, "");
+  const compileGlobs = (patterns, fallback = ["**/*"]) =>
+    (Array.isArray(patterns) && patterns.length ? patterns : fallback).map(pattern => globRegex(pattern));
+  const matchesGlobs = (path, globs) => globs.some(regex => regex.test(path));
+  const excludedByGlobs = (path, globs) => matchesGlobs(path, globs) || matchesGlobs(`${path}/x`, globs);
+  const fingerprintBytes = async bytes => `fp_${await sha256(bytes)}`;
+  const fileFingerprint = async path => await fingerprintBytes(await Deno.readFile(path));
+
+  function parseGitignore(source, base = "") {
+    const rules = [];
+    for (let raw of String(source || "").split(/\r?\n/)) {
+      if (!raw || raw.startsWith("#")) continue;
+      if (raw.startsWith("\\#")) raw = raw.slice(1);
+      let negated = false;
+      if (raw.startsWith("!")) { negated = true; raw = raw.slice(1); }
+      else if (raw.startsWith("\\!")) raw = raw.slice(1);
+      raw = raw.replace(/(?<!\\)\s+$/, "").replaceAll("\\ ", " ");
+      if (!raw) continue;
+      const directoryOnly = raw.endsWith("/");
+      if (directoryOnly) raw = raw.slice(0, -1);
+      const anchored = raw.startsWith("/");
+      if (anchored) raw = raw.slice(1);
+      if (!raw) continue;
+      const prefix = base ? `${base}/` : "";
+      const pattern = anchored || raw.includes("/") ? `${prefix}${raw}` : `${prefix}**/${raw}`;
+      rules.push({ negated, directoryOnly, match: globRegex(pattern), descendant: globRegex(`${pattern}/**`) });
     }
-    if (!baseStat.isDirectory) return result;
-    async function visit(dir) {
-      for await (const e of Deno.readDir(dir)) {
-        if (result.length >= limit) return;
-        if (!options.include_hidden && e.name.startsWith(".")) continue;
-        if (!options.include_dependencies && ["node_modules", "vendor", "dist"].includes(e.name)) continue;
-        const absolute = join(dir, e.name);
-        const rel = relative(rootReal, absolute).replaceAll("\\", "/");
-        if (e.isDirectory) await visit(absolute);
-        else if (e.isFile && match.test(rel)) result.push(rel);
+    return rules;
+  }
+  async function gitignoreRules(rootReal, directory, inherited = []) {
+    const base = slashPath(relative(rootReal, directory));
+    try {
+      const source = await Deno.readTextFile(join(directory, ".gitignore"));
+      return [...inherited, ...parseGitignore(source, base === "." ? "" : base)];
+    } catch (error) {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+      return inherited;
+    }
+  }
+  function gitignored(path, isDirectory, rules) {
+    let ignored = false;
+    for (const rule of rules) {
+      const direct = rule.match.test(path) && (!rule.directoryOnly || isDirectory);
+      const descendant = rule.descendant.test(path) || (isDirectory && rule.descendant.test(`${path}/x`));
+      if (direct || descendant) ignored = !rule.negated;
+    }
+    return ignored;
+  }
+  async function inheritedGitignoreRules(rootReal, base) {
+    const rel = slashPath(relative(rootReal, base));
+    const parts = !rel || rel === "." ? [] : rel.split("/");
+    let directory = rootReal, rules = await gitignoreRules(rootReal, rootReal, []);
+    for (const part of parts) {
+      directory = join(directory, part);
+      const stat = await Deno.stat(directory).catch(() => null);
+      if (!stat?.isDirectory) break;
+      rules = await gitignoreRules(rootReal, directory, rules);
+    }
+    return rules;
+  }
+  async function fsWalk(root, start = ".", options = {}) {
+    const rootReal = await Deno.realPath(root), base = await safePath(rootReal, start);
+    const stat = await Deno.lstat(base), include = compileGlobs(options.include), exclude = compileGlobs(options.exclude, []);
+    const hidden = options.hidden === true, useGitignore = options.gitignore !== false;
+    const result = [], hardLimit = Math.min(Math.max(Number(options.hard_limit || 100000), 1), 200000);
+    const afterPath = slashPath(options.after_path || ""), fromPath = slashPath(options.from_path || "");
+    const inPage = path => (!afterPath || path.localeCompare(afterPath) > 0) && (!fromPath || path.localeCompare(fromPath) >= 0);
+    const baseDirectory = stat.isDirectory ? base : dirname(base);
+    const initialRules = useGitignore ? await inheritedGitignoreRules(rootReal, baseDirectory) : [];
+    const localPath = absolute => {
+      if (stat.isFile || stat.isSymlink) return basename(absolute);
+      return slashPath(relative(base, absolute));
+    };
+    const displayPath = absolute => slashPath(relative(rootReal, absolute)) || ".";
+    if (stat.isFile || stat.isSymlink) {
+      const local = basename(base), display = displayPath(base);
+      if (inPage(display) && (!hidden || !basename(base).startsWith(".")) && matchesGlobs(local, include) && !excludedByGlobs(local, exclude)
+        && (!useGitignore || !gitignored(display, false, initialRules)))
+        result.push({ path: display, type: stat.isSymlink ? "symlink" : "file", size: stat.size });
+      return { entries: result, limited: false };
+    }
+    async function visit(directory, inheritedRules, loadRules = true) {
+      if (result.length >= hardLimit) return;
+      const rules = useGitignore && loadRules ? await gitignoreRules(rootReal, directory, inheritedRules) : inheritedRules;
+      const entries = [];
+      for await (const entry of Deno.readDir(directory)) entries.push(entry);
+      entries.sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) {
+        if (result.length >= hardLimit) return;
+        if (!hidden && entry.name.startsWith(".")) continue;
+        const absolute = join(directory, entry.name), display = displayPath(absolute), local = localPath(absolute);
+        const ignored = useGitignore && gitignored(display, entry.isDirectory, rules);
+        const excluded = excludedByGlobs(local, exclude);
+        if (inPage(display) && !ignored && !excluded && matchesGlobs(local, include)) {
+          const entryStat = await Deno.lstat(absolute);
+          result.push({
+            path: display,
+            type: entry.isDirectory ? "directory" : entry.isSymlink ? "symlink" : "file",
+            size: entryStat.size,
+          });
+        }
+        if (entry.isDirectory && !ignored && !excluded) await visit(absolute, rules);
       }
     }
-    await visit(base);
-    return result;
+    await visit(base, initialRules, false);
+    result.sort((a, b) => a.path.localeCompare(b.path) || a.type.localeCompare(b.type));
+    return { entries: result, limited: result.length >= hardLimit };
   }
   async function copyRecursive(from, to) {
     const st = await Deno.stat(from);
@@ -3279,11 +3356,26 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const exactEdit = {
       type: "object", additionalProperties: false,
       properties: {
-        old_text: { type: "string", description: "Exact text to replace in the document state produced by earlier edits." },
-        new_text: { type: "string", description: "Exact replacement text after JSON string decoding. Pass the intended decoded text; the tool performs no additional C/JavaScript-style escape decoding." },
-        expected_occurrences: { type: "integer", minimum: 1, default: 1 },
+        old_text: { type: "string", minLength: 1, description: "Exact text to replace in the evolving document state produced by earlier edits for this same file." },
+        new_text: { type: "string", description: "Exact replacement text after JSON string decoding. The tool performs no second C/JavaScript-style escape decoding." },
+        expected_occurrences: { type: "integer", minimum: 1, default: 1, description: "Exact number of occurrences that must exist at this edit step before replacement." },
       },
       required: ["old_text", "new_text"],
+    };
+    const fingerprintInput = {
+      type: "string", pattern: "^fp_[A-Za-z0-9_-]+$",
+      description: "Opaque whole-file content fingerprint returned by fs_read, fs_grep, fs_navigate, fs_stat or a previous mutation. When supplied, the mutation is applied only if the current bytes still match it.",
+    };
+    const pathSelection = {
+      path: { type: "string", default: ".", description: "Workspace-relative file or directory at which selection starts." },
+      include: { type: "array", minItems: 1, maxItems: 100, items: { type: "string" }, default: ["**/*"], description: "Globstar patterns selecting candidate paths relative to path." },
+      exclude: { type: "array", maxItems: 100, items: { type: "string" }, default: [], description: "Globstar patterns removed from the selected set relative to path." },
+      gitignore: { type: "boolean", default: true, description: "Apply .gitignore files recursively, including nested .gitignore files encountered below path and applicable parent rules." },
+      hidden: { type: "boolean", default: false, description: "Include dot-prefixed files and directories. .gitignore rules are still read when hidden=false." },
+    };
+    const lineContext = {
+      context_lines_before: { type: "integer", minimum: 0, maximum: 100, default: 0, description: "Number of text lines returned before each requested range or match." },
+      context_lines_after: { type: "integer", minimum: 0, maximum: 100, default: 0, description: "Number of text lines returned after each requested range or match." },
     };
     const execIdInput = {
       type: "integer", minimum: 1,
@@ -3332,119 +3424,131 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
           },
         }, required: ["name"] },
       ],
-      read_file: [
-        "Read one text file with encoding detection, line-ending metadata and optional line bounds. Prefer this over exec, js, uv or Python.",
+      fs_glob: [
+        "Discover files, directories and symlinks with globstar include/exclude patterns. This is also the filesystem tree navigator. Results are deterministically ordered and statelessly paginated with after_path. .gitignore handling follows applicable parent rules and nested .gitignore files recursively.",
         { properties: {
-          path: { type: "string" }, encoding: inputEncoding,
-          start_line: { type: "integer", minimum: 1 }, end_line: { type: "integer", minimum: 1 },
+          ...pathSelection,
+          limit: { type: "integer", minimum: 1, maximum: 10000, default: 500 },
+          after_path: { type: "string", description: "Workspace-relative final path returned by the previous page. Only lexically later entries are returned." },
           ...contextInput,
-        }, required: ["path"] },
+        } },
       ],
-      read_files: [
-        "Read several text files with encoding detection. Prefer this over exec, js, uv or Python.",
+      fs_grep: [
+        "Search text across selected files. Returns whole-file fingerprints for matched files so a later fs_edit/fs_write can detect intervening changes. Pagination is explicit and stateless through resume_after.",
         { properties: {
-          paths: { type: "array", minItems: 1, maxItems: 100, items: { type: "string" } },
-          encoding: inputEncoding,
-          max_bytes_per_file: { type: "integer", minimum: 1, maximum: 5242880, default: 1048576 },
+          pattern: { type: "string", minLength: 1 }, ...pathSelection,
+          regex: { type: "boolean", default: false }, case_sensitive: { type: "boolean", default: false },
+          encoding: inputEncoding, ...lineContext,
+          mode: { type: "string", enum: ["matches", "files", "count"], default: "matches" },
+          max_file_bytes: { type: "integer", minimum: 1, maximum: 52428800, default: 5242880 },
+          limit: { type: "integer", minimum: 1, maximum: 2000, default: 300 },
+          resume_after: {
+            type: "object", additionalProperties: false,
+            properties: { path: { type: "string" }, line: { type: "integer", minimum: 1 } }, required: ["path"],
+            description: "Stateless continuation point returned as next_resume_after. path alone means continue after that whole file; path+line means continue after that line within the file.",
+          },
           ...contextInput,
-        }, required: ["paths"] },
+        }, required: ["pattern"] },
       ],
-      write_file: [
-        "Create or overwrite one complete text file while preserving encoding, BOM and line endings by default.",
-        { properties: {
-          path: { type: "string" }, content: { type: "string" },
-          create_parents: { type: "boolean", default: true }, expected_sha256: { type: "string" },
-          ...outputText, ...contextInput,
-        }, required: ["path", "content"] },
-      ],
-      write_files: [
-        "Atomically write several complete text files with duplicate-path validation and rollback.",
+      fs_read: [
+        "Read one or many text files with line ranges and optional context. Every successful file result includes an opaque whole-file fingerprint plus encoding/BOM/line-ending metadata. Output text uses LF line separators; preservation/conversion is handled by mutation tools.",
         { properties: {
           files: { type: "array", minItems: 1, maxItems: 100, items: {
             type: "object", additionalProperties: false,
-            properties: { path: { type: "string" }, content: { type: "string" }, expected_sha256: { type: "string" }, ...outputText },
+            properties: {
+              path: { type: "string" }, start_line: { type: "integer", minimum: 1 }, end_line: { type: "integer", minimum: 1 },
+              ...lineContext, encoding: inputEncoding,
+            }, required: ["path"],
+          } },
+          max_output_bytes_per_file: { type: "integer", minimum: 1, maximum: 5242880, default: 1048576, description: "Target maximum UTF-8 bytes of normalized text returned for each file result. A single complete line may exceed it so line content is never split. This bounds response payload, not source file size." },
+          ...contextInput,
+        }, required: ["files"] },
+      ],
+      fs_navigate: [
+        "Find the next or previous text match relative to explicit positions in one or many known files. Navigation is completely stateless: each file supplies from_line and direction; searching is strict, so forward starts after from_line and backward starts before it. A returned match line can therefore be sent back unchanged as the next from_line to continue.",
+        { properties: {
+          pattern: { type: "string", minLength: 1 },
+          files: { type: "array", minItems: 1, maxItems: 100, items: {
+            type: "object", additionalProperties: false,
+            properties: {
+              path: { type: "string" }, from_line: { type: "integer", minimum: 0, description: "Exclusive reference line. forward starts at from_line+1; backward starts at from_line-1. Use 0 to search forward from the first line." },
+              direction: { type: "string", enum: ["forward", "backward"] },
+              max_matches: { type: "integer", minimum: 1, maximum: 100, default: 1 }, encoding: inputEncoding,
+            }, required: ["path", "from_line", "direction"],
+          } },
+          regex: { type: "boolean", default: false }, case_sensitive: { type: "boolean", default: false }, ...lineContext,
+          ...contextInput,
+        }, required: ["pattern", "files"] },
+      ],
+      fs_stat: [
+        "Read filesystem metadata for one or many paths. Set fingerprint=true to hash regular-file content when a concurrency token is needed without reading text.",
+        { properties: {
+          paths: { type: "array", minItems: 1, maxItems: 200, items: { type: "string" } },
+          fingerprint: { type: "boolean", default: false }, ...contextInput,
+        }, required: ["paths"] },
+      ],
+      fs_write: [
+        "Create or replace complete text files. Per-file expected_fingerprint provides optimistic concurrency. Batch entries are independent: successful files are never rolled back because another file fails, and the structured result reports every outcome.",
+        { properties: {
+          files: { type: "array", minItems: 1, maxItems: 100, items: {
+            type: "object", additionalProperties: false,
+            properties: { path: { type: "string" }, content: { type: "string" }, expected_fingerprint: fingerprintInput, ...outputText },
             required: ["path", "content"],
           } },
           create_parents: { type: "boolean", default: true }, ...contextInput,
         }, required: ["files"] },
       ],
-      edit: [
-        "Preferred tool for source edits. Applies ordered exact edits to each evolving in-memory document, validates occurrence counts, writes each file once and rolls back the whole batch. Do not use exec, js, uv or Python for edits expressible here.",
+      fs_edit: [
+        "Apply multiple ordered exact edits to one or many existing text files. For each file MrMCP reads once, verifies expected_fingerprint against that initial version, applies edits sequentially to the evolving in-memory document, then writes once. Thus edit N sees edits 1..N-1. If validation for any edit in a file fails, that file is not written. Other files in the batch remain independent and are never rolled back.",
         { properties: {
           files: { type: "array", minItems: 1, maxItems: 100, items: {
             type: "object", additionalProperties: false,
             properties: {
-              path: { type: "string" }, expected_sha256: { type: "string" }, input_encoding: inputEncoding,
-              ...outputText,
-              edits: { type: "array", minItems: 1, maxItems: 200, items: exactEdit },
-            },
-            required: ["path", "edits"],
+              path: { type: "string" }, expected_fingerprint: fingerprintInput, input_encoding: inputEncoding,
+              ...outputText, edits: { type: "array", minItems: 1, maxItems: 200, items: exactEdit },
+            }, required: ["path", "edits"],
           } },
           ...contextInput,
         }, required: ["files"] },
       ],
-      replace: [
-        "Preview or atomically apply repeated literal or regular-expression replacements across a file glob. Supports exclusions, hidden/dependency traversal, file-size limits and an exact expected replacement count. Prefer this over exec, js, uv or Python.",
+      fs_mkdir: [
+        "Create one or many directories. parents=true creates missing parents. Batch entries are independent; successful directories remain in place when another entry fails.",
         { properties: {
-          query: { type: "string" }, replacement: {
-            type: "string",
-            description: "Replacement text after JSON string decoding. Pass the intended decoded text, not a pre-escaped source representation: JSON \"\\n\" decodes to a newline, while JSON \"\\\\n\" decodes to literal backslash+n. The tool performs no additional C/JavaScript-style escape decoding. With regex=false the replacement is inserted literally, including $; with regex=true JavaScript replacement tokens such as $1 and $& are supported.",
-          },
-          path: { type: "string", default: "." }, glob: { type: "string", default: "**/*" },
-          exclude: { type: "array", items: { type: "string" }, default: [] },
-          regex: { type: "boolean", default: false }, case_sensitive: { type: "boolean", default: true },
-          include_hidden: { type: "boolean", default: false },
-          include_dependencies: { type: "boolean", default: false },
-          max_file_bytes: { type: "integer", minimum: 1, maximum: 52428800, default: 5242880 },
-          expected_replacements: { type: "integer", minimum: 0 },
-          dry_run: { type: "boolean", default: true },
-          max_files: { type: "integer", minimum: 1, maximum: 1000, default: 200 },
-          input_encoding: inputEncoding, ...outputText, ...contextInput,
-        }, required: ["query", "replacement"] },
-      ],
-      glob: [
-        "List files recursively under the current Workspace using a glob pattern, optional exclusions and explicit hidden/dependency traversal. Prefer this over find, dir, ls, exec, uv or Python.",
-        { properties: {
-          path: { type: "string", default: "." }, pattern: { type: "string", default: "**/*" },
-          exclude: { type: "array", items: { type: "string" }, default: [] },
-          include_hidden: { type: "boolean", default: false },
-          include_dependencies: { type: "boolean", default: false },
-          limit: { type: "integer", minimum: 1, maximum: 10000, default: 2000 },
-          ...contextInput,
-        } },
-      ],
-      grep: [
-        "Search text under the current Workspace without spawning rg, grep, uv or Python. Supports literal/regex matching, globs, exclusions, context lines, hidden/dependency traversal, encoding selection and content/file/count output modes.",
-        { properties: {
-          pattern: { type: "string" }, path: { type: "string", default: "." },
-          glob: { type: "string", default: "**/*" },
-          exclude: { type: "array", items: { type: "string" }, default: [] },
-          regex: { type: "boolean", default: false }, case_sensitive: { type: "boolean", default: false },
-          include_hidden: { type: "boolean", default: false },
-          include_dependencies: { type: "boolean", default: false },
-          max_file_bytes: { type: "integer", minimum: 1, maximum: 52428800, default: 5242880 },
-          encoding: inputEncoding,
-          context_before: { type: "integer", minimum: 0, maximum: 20, default: 0 },
-          context_after: { type: "integer", minimum: 0, maximum: 20, default: 0 },
-          output_mode: { type: "string", enum: ["content", "files_with_matches", "count"], default: "content" },
-          max_results: { type: "integer", minimum: 1, maximum: 2000, default: 300 },
-          ...contextInput,
-        }, required: ["pattern"] },
-      ],
-      file_info: ["Return file or directory metadata.", { properties: { path: { type: "string" }, ...contextInput }, required: ["path"] }],
-      create_directory: ["Create a directory and its parents.", { properties: { path: { type: "string" }, ...contextInput }, required: ["path"] }],
-      copy_path: ["Copy a file or directory recursively.", { properties: { from: { type: "string" }, to: { type: "string" }, ...contextInput }, required: ["from", "to"] }],
-      move_path: ["Move or rename a path.", { properties: { from: { type: "string" }, to: { type: "string" }, ...contextInput }, required: ["from", "to"] }],
-      trash_paths: [
-        "Move files or directories selected by explicit Workspace-relative paths and/or one glob into MrMCP's single reversible .mrmcp/trash store beside the application data. Workspaces never receive their own .mrmcp directory. Each call creates one timestamped action directory plus a sibling JSON manifest; use untrash_action from the originating Workspace with the returned action_id to restore the whole action.",
-        { anyOf: [{ required: ["paths"] }, { required: ["glob"] }], properties: {
           paths: { type: "array", minItems: 1, maxItems: 200, items: { type: "string" } },
-          glob: { type: "string" }, ...contextInput,
+          parents: { type: "boolean", default: true }, ...contextInput,
+        }, required: ["paths"] },
+      ],
+      fs_copy: [
+        "Copy one or many files/directories recursively. Destinations must not already exist. Batch entries are independent; successful copies remain in place when another entry fails.",
+        { properties: {
+          entries: { type: "array", minItems: 1, maxItems: 100, items: {
+            type: "object", additionalProperties: false,
+            properties: { from: { type: "string" }, to: { type: "string" } }, required: ["from", "to"],
+          } },
+          create_parents: { type: "boolean", default: true }, ...contextInput,
+        }, required: ["entries"] },
+      ],
+      fs_move: [
+        "Move or rename one or many files/directories, with cross-filesystem copy/remove fallback. Destinations must not already exist. Batch entries are independent; successful moves are never reversed because another entry fails.",
+        { properties: {
+          entries: { type: "array", minItems: 1, maxItems: 100, items: {
+            type: "object", additionalProperties: false,
+            properties: { from: { type: "string" }, to: { type: "string" } }, required: ["from", "to"],
+          } },
+          create_parents: { type: "boolean", default: true }, ...contextInput,
+        }, required: ["entries"] },
+      ],
+      fs_trash: [
+        "Reversibly move explicit paths and/or a globstar selection into MrMCP's single application trash store. Selection uses the same include/exclude/gitignore/hidden semantics as fs_glob. Entries are independent: successful paths remain in one returned trash_id when another path fails. No cross-entry rollback is attempted.",
+        { anyOf: [{ required: ["paths"] }, { required: ["selection"] }], properties: {
+          paths: { type: "array", minItems: 1, maxItems: 200, items: { type: "string" } },
+          selection: { type: "object", additionalProperties: false, properties: { ...pathSelection } },
+          ...contextInput,
         } },
       ],
-      untrash_action: [
-        "Restore every file and directory from one trash_paths action. Restore is all-or-nothing: if any original target is unavailable, nothing is restored.",
-        { properties: { action_id: { type: "string" }, ...contextInput }, required: ["action_id"] },
+      fs_restore: [
+        "Restore paths still present under one trash_id. Entries are independent: successful restores remain restored, failed entries stay in the trash for inspection or retry, and the trash transaction is removed only when no payload remains.",
+        { properties: { trash_id: { type: "string", description: "Trash transaction identifier returned by fs_trash." }, ...contextInput }, required: ["trash_id"] },
       ],
       publish_file: [
         "Present an existing file to the user through the attached MCP App widget. The server snapshots the file into persistent private publish storage, reusing an existing snapshot when the same fast content fingerprint was already published, and returns an HTTPS URL in structuredContent; publications never expire automatically and survive server restarts as well as later changes, moves or deletion of the Workspace source. The widget renders image/* through an HTML img element or shows an Open File action for other MIME types. Do not read/Base64-encode the file and do not construct alternate preview payloads; simply call publish_file after creating the file.",
@@ -3531,24 +3635,90 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
 
     const nullableString = { anyOf: [{ type: "string" }, { type: "null" }] };
     const objectArray = { type: "array", items: { type: "object", additionalProperties: true } };
-    const editResultArray = {
-      type: "array", items: {
-        type: "object", additionalProperties: false,
-        properties: {
-          path: { type: "string" }, replacements: { type: "integer", minimum: 0 },
-          sha256: { type: "string" }, encoding: { type: "string" }, bom: { type: "boolean" }, line_endings: { type: "string" },
-          edits: { type: "array", items: {
-            type: "object", additionalProperties: false,
-            properties: {
-              index: { type: "integer", minimum: 1 },
-              expected_occurrences: { type: "integer", minimum: 1 },
-              occurrences: { type: "integer", minimum: 0, description: "Occurrences found and replaced in the evolving document state." },
-            },
-            required: ["index", "expected_occurrences", "occurrences"],
-          } },
-        },
-        required: ["path", "replacements", "sha256", "encoding", "bom", "line_endings", "edits"],
-      },
+    const fsLine = {
+      type: "object", additionalProperties: false,
+      properties: { line: { type: "integer", minimum: 1 }, text: { type: "string" } }, required: ["line", "text"],
+    };
+    const fsMatch = {
+      type: "object", additionalProperties: false,
+      properties: {
+        line: { type: "integer", minimum: 1 }, column: { type: "integer", minimum: 1 }, text: { type: "string" },
+        context_before: { type: "array", items: fsLine }, context_after: { type: "array", items: fsLine },
+      }, required: ["line", "column", "text"],
+    };
+    const fsEditResult = {
+      type: "object", additionalProperties: false,
+      properties: {
+        index: { type: "integer", minimum: 1 }, expected_occurrences: { type: "integer", minimum: 1 },
+        occurrences: { type: "integer", minimum: 0, description: "Occurrences found at this step in the evolving in-memory document." },
+      }, required: ["index", "expected_occurrences", "occurrences"],
+    };
+    const fsStatus = values => ({ type: "string", enum: values });
+    const fsEntry = (properties, required = ["path", "status"]) => ({ type: "object", additionalProperties: false, properties, required });
+    const fsArray = items => ({ type: "array", items });
+    const fsErrorProperty = { error: { type: "string" } };
+    const fsTextProperties = { encoding: { type: "string" }, bom: { type: "boolean" }, line_endings: { type: "string" } };
+    const fsFingerprintProperties = {
+      fingerprint: { type: "string" }, expected_fingerprint: { type: "string" },
+      fingerprint_before: { type: "string" }, fingerprint_after: { type: "string" },
+    };
+    const fsGlobEntry = fsEntry({
+      path: { type: "string" }, status: fsStatus(["ok"]), type: fsStatus(["file", "directory", "symlink"]), size: { type: "integer", minimum: 0 },
+    }, ["path", "status", "type", "size"]);
+    const fsGrepEntry = fsEntry({
+      path: { type: "string" }, status: fsStatus(["ok", "not_found", "permission_denied", "failed"]), ...fsErrorProperty,
+      fingerprint: { type: "string" }, size: { type: "integer", minimum: 0 }, ...fsTextProperties,
+      count: { type: "integer", minimum: 0 }, matches: { type: "array", items: fsMatch },
+    });
+    const fsReadEntry = fsEntry({
+      path: { type: "string" }, status: fsStatus(["ok", "not_found", "not_file", "range_out_of_bounds", "permission_denied", "failed"]), ...fsErrorProperty,
+      content: { type: "string" }, size: { type: "integer", minimum: 0 }, fingerprint: { type: "string" }, ...fsTextProperties,
+      start_line: { type: "integer", minimum: 1 }, end_line: { type: "integer", minimum: 0 }, total_lines: { type: "integer", minimum: 0 },
+      truncated: { type: "boolean" }, next_start_line: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] },
+    });
+    const fsNavigateEntry = fsEntry({
+      path: { type: "string" }, status: fsStatus(["ok", "not_found", "permission_denied", "failed"]), ...fsErrorProperty,
+      fingerprint: { type: "string" }, size: { type: "integer", minimum: 0 }, total_lines: { type: "integer", minimum: 0 }, ...fsTextProperties,
+      count: { type: "integer", minimum: 0 }, matches: { type: "array", items: fsMatch },
+    });
+    const fsStatEntry = fsEntry({
+      path: { type: "string" }, status: fsStatus(["ok", "not_found", "permission_denied", "failed"]), ...fsErrorProperty,
+      type: fsStatus(["file", "directory", "symlink", "other"]), size: { type: "integer", minimum: 0 },
+      modified_at: nullableString, created_at: nullableString, fingerprint: { type: "string" },
+    });
+    const fsWriteEntry = fsEntry({
+      path: { type: "string" }, status: fsStatus(["written", "fingerprint_mismatch", "source_changed", "not_found", "permission_denied", "failed"]), ...fsErrorProperty,
+      size: { type: "integer", minimum: 0 }, size_before: { type: "integer", minimum: 0 }, size_after: { type: "integer", minimum: 0 },
+      ...fsFingerprintProperties, ...fsTextProperties,
+    });
+    const fsEditEntry = fsEntry({
+      path: { type: "string" }, status: fsStatus(["edited", "fingerprint_mismatch", "source_changed", "occurrence_mismatch", "mixed_line_endings", "not_found", "permission_denied", "failed"]), ...fsErrorProperty,
+      size: { type: "integer", minimum: 0 }, size_before: { type: "integer", minimum: 0 }, size_after: { type: "integer", minimum: 0 },
+      ...fsFingerprintProperties, ...fsTextProperties, replacements: { type: "integer", minimum: 0 }, edits: { type: "array", items: fsEditResult },
+    });
+    const fsMkdirEntry = fsEntry({
+      path: { type: "string" }, status: fsStatus(["created", "exists", "not_directory", "parent_missing", "permission_denied", "failed"]), ...fsErrorProperty,
+      type: fsStatus(["directory"]), size: { type: "integer", minimum: 0 },
+    });
+    const fsCopyEntry = fsEntry({
+      from: { type: "string" }, to: { type: "string" },
+      status: fsStatus(["copied", "not_found", "destination_exists", "invalid_destination", "parent_missing", "failed_partial", "permission_denied", "failed"]),
+      ...fsErrorProperty,
+    }, ["from", "to", "status"]);
+    const fsMoveEntry = fsEntry({
+      from: { type: "string" }, to: { type: "string" },
+      status: fsStatus(["moved", "not_found", "destination_exists", "invalid_destination", "parent_missing", "failed_partial", "permission_denied", "failed"]),
+      ...fsErrorProperty,
+    }, ["from", "to", "status"]);
+    const fsTrashEntry = fsEntry({
+      path: { type: "string" }, status: fsStatus(["trashed", "not_found", "invalid_target", "failed_partial", "permission_denied", "failed"]), ...fsErrorProperty,
+    });
+    const fsRestoreEntry = fsEntry({
+      path: { type: "string" }, status: fsStatus(["restored", "wrong_workspace", "invalid_payload", "not_in_trash", "destination_exists", "parent_missing", "failed_partial", "permission_denied", "failed"]), ...fsErrorProperty,
+    });
+    const fsResumePoint = {
+      type: "object", additionalProperties: false,
+      properties: { path: { type: "string" }, line: { type: "integer", minimum: 1 } }, required: ["path"],
     };
     const stringArray = { type: "array", items: { type: "string" } };
     const envelopeProperties = {
@@ -3561,14 +3731,12 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       properties: { ...envelopeProperties, ...properties },
       required: ["context_handle"],
     });
+    const strictOutputSchema = properties => ({ ...outputSchema(properties), required: ["context_handle", ...Object.keys(properties)] });
     const sessionlessOutputSchema = (properties = {}) => ({
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       type: "object", additionalProperties: false,
       properties, required: Object.keys(properties),
     });
-    const textMetadata = {
-      encoding: { type: "string" }, bom: { type: "boolean" }, line_endings: { type: "string" },
-    };
     const processProperties = {
       exec_id: { type: "integer", minimum: 1, description: "Present for persistent processes created by exec_start; equals that exec_start Tool Call id." },
       status: { type: "string" },
@@ -3592,20 +3760,18 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
           description: "Absolute Workspace-level AGENTS.md or agents.md path. When non-null, read and follow it before modifying files under this Workspace.",
         },
       }),
-      read_file: outputSchema({ path: { type: "string" }, start_line: { type: "integer" }, end_line: { type: "integer" }, content: { type: "string" }, ...textMetadata }),
-      read_files: outputSchema({ files: objectArray }),
-      write_file: outputSchema({ path: { type: "string" }, bytes: { type: "integer" }, sha256: { type: "string" }, ...textMetadata }),
-      write_files: outputSchema({ files: objectArray }),
-      edit: outputSchema({ files: editResultArray, total_replacements: { type: "integer" } }),
-      replace: outputSchema({ dry_run: { type: "boolean" }, scanned_files: { type: "integer" }, total_replacements: { type: "integer" }, files: objectArray }),
-      glob: outputSchema({ files: stringArray, truncated: { type: "boolean" } }),
-      grep: outputSchema({ output_mode: { type: "string" }, scanned_files: { type: "integer" }, matched_files: { type: "integer" }, results: objectArray, truncated: { type: "boolean" } }),
-      file_info: outputSchema({ path: { type: "string" }, name: { type: "string" }, is_file: { type: "boolean" }, is_directory: { type: "boolean" }, is_symlink: { type: "boolean" }, size: { type: "integer" }, modified_at: nullableString, created_at: nullableString }),
-      create_directory: outputSchema({ path: { type: "string" } }),
-      copy_path: outputSchema({ from: { type: "string" }, to: { type: "string" } }),
-      move_path: outputSchema({ from: { type: "string" }, to: { type: "string" } }),
-      trash_paths: outputSchema({ action_id: { type: "string" }, trash_path: { type: "string" }, manifest_path: { type: "string" }, paths: stringArray }),
-      untrash_action: outputSchema({ action_id: { type: "string" }, paths: stringArray }),
+      fs_glob: strictOutputSchema({ entries: fsArray(fsGlobEntry), next_after_path: nullableString, truncated: { type: "boolean" } }),
+      fs_grep: strictOutputSchema({ mode: { type: "string", enum: ["matches", "files", "count"] }, scanned_files: { type: "integer" }, matched_files: { type: "integer" }, files: fsArray(fsGrepEntry), next_resume_after: { anyOf: [fsResumePoint, { type: "null" }] }, truncated: { type: "boolean" } }),
+      fs_read: strictOutputSchema({ files: fsArray(fsReadEntry) }),
+      fs_navigate: strictOutputSchema({ files: fsArray(fsNavigateEntry) }),
+      fs_stat: strictOutputSchema({ entries: fsArray(fsStatEntry) }),
+      fs_write: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, files: fsArray(fsWriteEntry) }),
+      fs_edit: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, total_replacements: { type: "integer" }, files: fsArray(fsEditEntry) }),
+      fs_mkdir: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsMkdirEntry) }),
+      fs_copy: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsCopyEntry) }),
+      fs_move: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsMoveEntry) }),
+      fs_trash: strictOutputSchema({ trash_id: nullableString, trash_path: nullableString, manifest_path: nullableString, succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsTrashEntry) }),
+      fs_restore: strictOutputSchema({ trash_id: { type: "string" }, succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsRestoreEntry) }),
       publish_file: outputSchema({ id: { type: "string" }, content_id: { type: "string" }, path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" }, size: { type: "integer" }, uri: { type: "string", description: "Persistent HTTPS URL consumed by the attached MCP App widget; publications never expire automatically." } }),
       publish_html: outputSchema({ id: { type: "string" }, content_id: { type: "string" }, title: { type: "string" }, uri: { type: "string", description: "Persistent HTTPS URL loaded by the attached MCP App widget." }, height: { type: "integer" }, created_at: { type: "string" } }),
       discover_commands: outputSchema({ commands: {
@@ -3648,9 +3814,9 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const processOutputSchema = outputSchema(processProperties);
 
     const titles = {
-      list_workspaces: "List Workspaces", create_workspace: "Create Workspace", open_workspace: "Open Workspace", read_file: "Read", read_files: "Read batch",
-      write_file: "Write", write_files: "Write batch", edit: "Edit", replace: "Replace",
-      glob: "Glob", grep: "Grep", trash_paths: "Trash paths", untrash_action: "Restore trash action",
+      list_workspaces: "List Workspaces", create_workspace: "Create Workspace", open_workspace: "Open Workspace",
+      fs_glob: "FS Glob", fs_grep: "FS Grep", fs_read: "FS Read", fs_navigate: "FS Navigate", fs_stat: "FS Stat",
+      fs_write: "FS Write", fs_edit: "FS Edit", fs_mkdir: "FS Mkdir", fs_copy: "FS Copy", fs_move: "FS Move", fs_trash: "FS Trash", fs_restore: "FS Restore",
       publish_file: "Publish File", publish_html: "Publish HTML", discover_commands: "Discover Commands", query_tool_calls: "Query Tool Calls",
       exec: "Run Command", exec_start: "Start Persistent Command", exec_attach: "Attach Process Output", exec_write: "Write Stdin",
       exec_kill: "Terminate Process", exec_list: "List Processes", exec_status: "Process Status", js: "JavaScript Kernel",
@@ -3658,8 +3824,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     };
     const annotations = name => ({
       readOnlyHint: READ_TOOLS.has(name) || name === "publish_file",
-      destructiveHint: ["write_file", "write_files", "edit", "replace", "move_path", "exec", "exec_start", "exec_write", "exec_kill", "js", "js_add_node_module_dir", "js_reset"].includes(name),
-      idempotentHint: (READ_TOOLS.has(name) && name !== "publish_file") || ["write_file", "write_files", "edit", "create_directory", "js_reset"].includes(name),
+      destructiveHint: ["fs_write", "fs_edit", "fs_move", "exec", "exec_start", "exec_write", "exec_kill", "js", "js_add_node_module_dir", "js_reset"].includes(name),
+      idempotentHint: (READ_TOOLS.has(name) && name !== "publish_file") || ["fs_write", "fs_mkdir", "js_reset"].includes(name),
       openWorldHint: name.startsWith("exec") || name === "js" || name === "publish_file" || name === "publish_html",
     });
     const schema = value => ({
@@ -3726,10 +3892,12 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         open_workspace: ["workspace_name", "cwd", "agent_guidance_path"],
         query_tool_calls: ["calls"],
         publish_html: ["id", "title", "uri", "height", "created_at"],
-        glob: ["files", "truncated"],
-        grep: ["scanned_files", "matched_files", "results", "truncated"],
-        replace: ["scanned_files", "total_replacements", "files"],
-        edit: ["total_replacements", "files"],
+        fs_glob: ["entries", "next_after_path", "truncated"],
+        fs_grep: ["scanned_files", "matched_files", "files", "next_resume_after", "truncated"],
+        fs_read: ["files"], fs_navigate: ["files"], fs_stat: ["entries"],
+        fs_write: ["succeeded", "failed", "files"], fs_edit: ["succeeded", "failed", "total_replacements", "files"],
+        fs_mkdir: ["succeeded", "failed", "entries"], fs_copy: ["succeeded", "failed", "entries"], fs_move: ["succeeded", "failed", "entries"],
+        fs_trash: ["trash_id", "succeeded", "failed", "entries"], fs_restore: ["trash_id", "succeeded", "failed", "entries"],
         exec_start: ["exec_id"],
         exec_attach: ["exec_id", "output", "remaining_bytes"],
         exec_status: ["exec_id", "status", "output_mode"],
@@ -3753,9 +3921,11 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const expectedInputs = {
       create_workspace: ["name"],
       open_workspace: ["name", "current_context_handle"],
-      glob: ["exclude", "include_hidden", "include_dependencies", "limit"],
-      grep: ["exclude", "regex", "case_sensitive", "include_hidden", "include_dependencies", "max_file_bytes", "encoding", "context_before", "context_after", "output_mode", "max_results"],
-      replace: ["exclude", "regex", "case_sensitive", "include_hidden", "include_dependencies", "max_file_bytes", "expected_replacements", "dry_run", "max_files"],
+      fs_glob: ["path", "include", "exclude", "gitignore", "hidden", "limit", "after_path"],
+      fs_grep: ["pattern", "path", "include", "exclude", "gitignore", "hidden", "regex", "case_sensitive", "encoding", "context_lines_before", "context_lines_after", "mode", "max_file_bytes", "limit", "resume_after"],
+      fs_read: ["files", "max_output_bytes_per_file"], fs_navigate: ["pattern", "files", "regex", "case_sensitive", "context_lines_before", "context_lines_after"], fs_stat: ["paths", "fingerprint"],
+      fs_write: ["files", "create_parents"], fs_edit: ["files"], fs_mkdir: ["paths", "parents"],
+      fs_copy: ["entries", "create_parents"], fs_move: ["entries", "create_parents"], fs_trash: ["paths", "selection"], fs_restore: ["trash_id"],
       publish_html: ["html", "title", "height"],
       query_tool_calls: ["limit", "tool", "status", "query", "before_id"],
       exec_attach: ["exec_id"], exec_write: ["exec_id"], exec_kill: ["exec_id"], exec_status: ["exec_id", "output", "tail_lines"],
@@ -4549,324 +4719,386 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     if (name === "open_workspace") return await workspaceInfo(selection);
     if (!selection?.context || !selection?.root) throw new Error("Session Workspace selection is missing");
     const resolvePath = path => resolveWorkspacePath(selection, path);
-    const readOne = async pathArg => {
-      const target = await resolvePath(pathArg);
-      const document = await readTextDocument(target.path, args.encoding || "auto");
-      const lines = document.text.split(/\r\n|\r|\n/);
-      const start = Math.max(1, Number(args.start_line || 1));
-      const end = Math.min(lines.length, Number(args.end_line || lines.length));
-      return {
-        path: target.display, start_line: start, end_line: end,
-        encoding: document.encoding, bom: document.bom, line_endings: document.line_endings,
-        content: lines.slice(start - 1, end).join("\n"),
-      };
+    const pathKey = path => Deno.build.os === "windows" ? resolve(path).toLowerCase() : resolve(path);
+    const exists = async path => {
+      try { return await Deno.lstat(path); }
+      catch (error) { if (error instanceof Deno.errors.NotFound) return null; throw error; }
     };
-    if (name === "read_file") return await readOne(args.path);
-    if (name === "read_files") {
-      const max = Math.min(Number(args.max_bytes_per_file || 1048576), 5242880), files = [];
-      for (const item of args.paths || []) {
-        try {
-          const target = await resolvePath(item), stat = await Deno.stat(target.path);
-          if (stat.size > max) files.push({ path: target.display, error: `File exceeds ${max} bytes`, size: stat.size });
-          else {
-            const document = await readTextDocument(target.path, args.encoding || "auto");
-            files.push({ path: target.display, content: document.text, size: stat.size,
-              encoding: document.encoding, bom: document.bom, line_endings: document.line_endings });
-          }
-        } catch (error) { files.push({ path: String(item), error: String(error?.message || error) }); }
-      }
-      return { files };
-    }
-    if (name === "write_file") {
-      const target = await resolvePath(args.path);
-      let source = null;
-      try { source = await readTextDocument(target.path, "auto"); }
-      catch (error) { if (!(error instanceof Deno.errors.NotFound)) throw error; }
-      if (args.expected_sha256) {
-        const current = source ? await sha256(source.bytes) : "";
-        if (current !== args.expected_sha256) throw new Error("File hash changed");
-      }
-      const output = encodeTextDocument(String(args.content), source, args);
-      if (args.create_parents !== false) await Deno.mkdir(dirname(target.path), { recursive: true });
-      await Deno.writeFile(target.path, output.bytes);
-      return { path: target.display, bytes: output.bytes.length, sha256: await fileHash(target.path),
-        encoding: output.encoding, bom: output.bom, line_endings: output.line_endings };
-    }
-    if (name === "write_files") {
-      const changes = [], seen = new Set();
-      for (const file of args.files || []) {
-        const target = await resolvePath(file.path), key = Deno.build.os === "windows" ? target.path.toLowerCase() : target.path;
-        if (seen.has(key)) throw new Error(`Duplicate file path: ${file.path}`);
-        seen.add(key);
-        let before = null, source = null;
-        try { before = await Deno.readFile(target.path); source = decodeTextDocument(before, "auto"); }
-        catch (error) { if (!(error instanceof Deno.errors.NotFound)) throw error; }
-        if (file.expected_sha256) {
-          const current = before ? await sha256(before) : "";
-          if (current !== file.expected_sha256) throw new Error(`${file.path}: file hash changed`);
-        }
-        changes.push({ target, before, output: encodeTextDocument(String(file.content), source, file) });
-      }
-      try {
-        for (const change of changes) {
-          if (args.create_parents !== false) await Deno.mkdir(dirname(change.target.path), { recursive: true });
-          await Deno.writeFile(change.target.path, change.output.bytes);
-        }
-      } catch (error) {
-        for (const change of changes) {
-          try {
-            if (change.before == null) await Deno.remove(change.target.path);
-            else await Deno.writeFile(change.target.path, change.before);
-          } catch {}
-        }
-        throw error;
-      }
-      return { files: await Promise.all(changes.map(async change => ({
-        path: change.target.display, sha256: await fileHash(change.target.path), bytes: change.output.bytes.length,
-        encoding: change.output.encoding, bom: change.output.bom, line_endings: change.output.line_endings,
-      }))) };
-    }
-    if (name === "edit") {
-      const changes = [], seen = new Set();
-      for (const file of args.files || []) {
-        const target = await resolvePath(file.path), key = Deno.build.os === "windows" ? target.path.toLowerCase() : target.path;
-        if (seen.has(key)) throw new Error(`Duplicate file path: ${file.path}; group all ordered edits in one files entry`);
-        seen.add(key);
-        const document = await readTextDocument(target.path, file.input_encoding || "auto");
-        if (file.expected_sha256 && await sha256(document.bytes) !== file.expected_sha256)
-          throw new Error(`${file.path}: file hash changed`);
-        let current = document.text, replacements = 0;
-        const editResults = [];
-        for (let index = 0; index < (file.edits || []).length; index++) {
-          const edit = file.edits[index];
-          const oldText = editNeedle(edit.old_text, document), newText = editNeedle(edit.new_text, document);
-          if (!oldText) throw new Error(`${file.path}: edit ${index + 1} has empty old_text`);
-          const count = current.split(oldText).length - 1;
-          const expected = Number(edit.expected_occurrences ?? 1);
-          if (count !== expected)
-            throw new Error(`${file.path}: edit ${index + 1} expected ${expected} occurrences, found ${count}`);
-          current = current.split(oldText).join(newText);
-          replacements += count;
-          editResults.push({ index: index + 1, expected_occurrences: expected, occurrences: count });
-        }
-        const output = encodeTextDocument(current, document, file);
-        changes.push({ target, before: document.bytes, output, replacements, edits: editResults });
-      }
-      try { for (const change of changes) await Deno.writeFile(change.target.path, change.output.bytes); }
-      catch (error) {
-        for (const change of changes) await Deno.writeFile(change.target.path, change.before).catch(() => {});
-        throw error;
-      }
+    const errorStatus = error => error instanceof Deno.errors.NotFound ? "not_found"
+      : error instanceof Deno.errors.PermissionDenied ? "permission_denied" : "failed";
+    const textLines = document => normalizeLineEndings(document.text, "lf").split("\n");
+    const searchRegex = (pattern, regex, caseSensitive) => new RegExp(
+      regex ? String(pattern) : String(pattern).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
+      caseSensitive ? "" : "i",
+    );
+    const contextMatches = (lines, indexes, before, after, regex) => indexes.map(index => {
+      regex.lastIndex = 0;
+      const match = regex.exec(lines[index]);
       return {
-        total_replacements: changes.reduce((total, change) => total + change.replacements, 0),
-        files: await Promise.all(changes.map(async change => ({
-          path: change.target.display, replacements: change.replacements,
-          sha256: await fileHash(change.target.path), encoding: change.output.encoding,
-          bom: change.output.bom, line_endings: change.output.line_endings, edits: change.edits,
-        }))),
+        line: index + 1, column: (match?.index ?? 0) + 1, text: lines[index],
+        ...(before ? { context_before: lines.slice(Math.max(0, index - before), index).map((text, offset) => ({
+          line: Math.max(0, index - before) + offset + 1, text,
+        })) } : {}),
+        ...(after ? { context_after: lines.slice(index + 1, index + 1 + after).map((text, offset) => ({ line: index + offset + 2, text })) } : {}),
       };
-    }
-    const excludedPath = (path, patterns = []) => patterns.some(pattern => globRegex(pattern).test(path));
-    if (name === "replace") {
-      const dryRun = args.dry_run !== false;
-      const flags = args.case_sensitive === false ? "gim" : "gm";
-      const source = args.regex
-        ? String(args.query)
-        : String(args.query).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      if (!source) throw new Error("query must not be empty");
-      const regex = new RegExp(source, flags), changes = [];
-      const maxFiles = Math.min(Number(args.max_files || 200), 1000);
-      const maxFileBytes = Math.min(Number(args.max_file_bytes || 5 * 1024 * 1024), 50 * 1024 * 1024);
-      let scannedFiles = 0, totalReplacements = 0, limitExceeded = false;
-      const paths = await walk(selection.root.path, args.path || ".", {
-        pattern: args.glob || "**/*", limit: 10000,
-        include_hidden: args.include_hidden === true,
-        include_dependencies: args.include_dependencies === true,
-      });
-      for (const relativePath of paths) {
-        if (excludedPath(relativePath, args.exclude || [])) continue;
-        const path = await safePath(selection.root.path, relativePath);
-        try {
-          const stat = await Deno.stat(path);
-          scannedFiles++;
-          if (!stat.isFile || stat.size > maxFileBytes) continue;
-          const document = await readTextDocument(path, args.input_encoding || "auto");
-          regex.lastIndex = 0;
-          const matches = [...document.text.matchAll(regex)].length;
-          regex.lastIndex = 0;
-          if (!matches) continue;
-          totalReplacements += matches;
-          if (changes.length >= maxFiles) {
-            limitExceeded = true;
-            break;
-          }
-          const replacement = String(args.replacement);
-          const replaced = args.regex
-            ? document.text.replace(regex, replacement)
-            : document.text.replace(regex, () => replacement);
-          changes.push({
-            path, display: relativePath, before: document.bytes, matches,
-            output: encodeTextDocument(replaced, document, args),
-          });
-        } catch {}
-        if (limitExceeded) break;
-      }
-      if (limitExceeded) throw new Error(`replace would change more than max_files (${maxFiles}) files`);
-      if (args.expected_replacements != null && totalReplacements !== Number(args.expected_replacements))
-        throw new Error(`replace expected ${Number(args.expected_replacements)} total replacements, found ${totalReplacements}`);
-      if (!dryRun) {
-        try { for (const change of changes) await Deno.writeFile(change.path, change.output.bytes); }
-        catch (error) {
-          for (const change of changes) await Deno.writeFile(change.path, change.before).catch(() => {});
-          throw error;
-        }
-      }
+    });
+
+    if (name === "fs_glob") {
+      const limit = Math.min(Number(args.limit || 500), 10000);
+      const walked = await fsWalk(selection.root.path, args.path || ".", { ...args, after_path: args.after_path, hard_limit: limit + 1 });
+      const page = walked.entries.slice(0, limit), truncated = walked.entries.length > limit || walked.limited;
       return {
-        dry_run: dryRun,
-        scanned_files: scannedFiles,
-        total_replacements: totalReplacements,
-        files: changes.map(change => ({
-          path: change.display, replacements: change.matches,
-          encoding: change.output.encoding, bom: change.output.bom, line_endings: change.output.line_endings,
-        })),
-      };
-    }
-    if (name === "glob") {
-      const limit = Math.min(Number(args.limit || 2000), 10000);
-      const paths = await walk(selection.root.path, args.path || ".", {
-        pattern: args.pattern || "**/*", limit: 10000,
-        include_hidden: args.include_hidden === true,
-        include_dependencies: args.include_dependencies === true,
-      });
-      const filtered = paths.filter(path => !excludedPath(path, args.exclude || []));
-      return {
-        files: filtered.slice(0, limit),
-        truncated: filtered.length > limit || paths.length >= 10000,
-      };
-    }
-    if (name === "grep") {
-      const flags = args.case_sensitive ? "g" : "gi";
-      const source = args.regex
-        ? String(args.pattern)
-        : String(args.pattern).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      if (!source) throw new Error("pattern must not be empty");
-      const regex = new RegExp(source, flags), max = Math.min(Number(args.max_results || 300), 2000);
-      const maxFileBytes = Math.min(Number(args.max_file_bytes || 5 * 1024 * 1024), 50 * 1024 * 1024);
-      const before = Math.min(Number(args.context_before || 0), 20);
-      const after = Math.min(Number(args.context_after || 0), 20);
-      const mode = String(args.output_mode || "content"), results = [];
-      let scannedFiles = 0, matchedFiles = 0, truncated = false;
-      const paths = await walk(selection.root.path, args.path || ".", {
-        pattern: args.glob || "**/*", limit: 10000,
-        include_hidden: args.include_hidden === true,
-        include_dependencies: args.include_dependencies === true,
-      });
-      for (const relativePath of paths) {
-        if (excludedPath(relativePath, args.exclude || [])) continue;
-        try {
-          const path = await safePath(selection.root.path, relativePath), stat = await Deno.stat(path);
-          scannedFiles++;
-          if (!stat.isFile || stat.size > maxFileBytes) continue;
-          const document = await readTextDocument(path, args.encoding || "auto");
-          const lines = document.text.split(/\r\n|\r|\n/), matches = [];
-          for (let index = 0; index < lines.length; index++) {
-            regex.lastIndex = 0;
-            if (regex.test(lines[index])) matches.push(index);
-          }
-          if (!matches.length) continue;
-          matchedFiles++;
-          if (mode === "files_with_matches") results.push({ path: relativePath });
-          else if (mode === "count") results.push({ path: relativePath, count: matches.length });
-          else for (const index of matches) {
-            results.push({
-              path: relativePath, line: index + 1, text: lines[index],
-              ...(before ? { before: lines.slice(Math.max(0, index - before), index).map((text, offset) => ({
-                line: Math.max(0, index - before) + offset + 1, text,
-              })) } : {}),
-              ...(after ? { after: lines.slice(index + 1, index + 1 + after).map((text, offset) => ({
-                line: index + offset + 2, text,
-              })) } : {}),
-            });
-            if (results.length >= max) { truncated = true; break; }
-          }
-        } catch {}
-        if (results.length >= max) {
-          if (mode !== "content") truncated = true;
-          break;
-        }
-      }
-      return {
-        output_mode: mode,
-        scanned_files: scannedFiles,
-        matched_files: matchedFiles,
-        results: results.slice(0, max),
+        entries: page.map(entry => ({ ...entry, status: "ok" })),
+        next_after_path: truncated && page.length ? page.at(-1).path : null,
         truncated,
       };
     }
-    if (name === "file_info") {
-      const target = await resolvePath(args.path), stat = await Deno.lstat(target.path);
-      return { path: target.display, name: basename(target.path), is_file: stat.isFile,
-        is_directory: stat.isDirectory, is_symlink: stat.isSymlink, size: stat.size,
-        modified_at: stat.mtime?.toISOString() || null, created_at: stat.birthtime?.toISOString() || null };
-    }
-    if (name === "create_directory") {
-      const target = await resolvePath(args.path); await Deno.mkdir(target.path, { recursive: true });
-      return { path: target.display };
-    }
-    if (name === "copy_path" || name === "move_path") {
-      const from = await resolvePath(args.from), to = await resolvePath(args.to);
-      await Deno.mkdir(dirname(to.path), { recursive: true });
-      if (name === "copy_path") await copyRecursive(from.path, to.path);
-      else {
-        try { await Deno.rename(from.path, to.path); }
-        catch (error) {
-          if (!(error instanceof Deno.errors.NotSupported) && error?.code !== "EXDEV") throw error;
-          await copyRecursive(from.path, to.path); await Deno.remove(from.path, { recursive: true });
-        }
-      }
-      return { from: from.display, to: to.display };
-    }
-    if (name === "trash_paths" || name === "untrash_action") {
-      const rootReal = await Deno.realPath(selection.root.path);
-      const metadataRoot = resolve(DATA);
-      const trashRoot = resolve(TRASH_ROOT);
-      const exists = async path => {
-        try { await Deno.lstat(path); return true; }
-        catch (error) { if (error instanceof Deno.errors.NotFound) return false; throw error; }
-      };
-      const slash = path => relative(rootReal, path).replaceAll("\\", "/") || ".";
-      if (name === "trash_paths") {
-        const candidates = [];
-        const addCandidate = async raw => {
-          const target = await resolvePath(raw);
-          if (!await exists(target.path)) throw new Error(`Path not found: ${raw}`);
-          if (resolve(target.path) === resolve(rootReal)) throw new Error("Cannot trash the current Workspace");
-          if (resolve(target.path) === metadataRoot || within(metadataRoot, target.path))
-            throw new Error("Cannot trash MrMCP metadata");
-          candidates.push(target);
-        };
-        for (const raw of args.paths || []) await addCandidate(raw);
-        const pattern = String(args.glob || "").trim();
-        if (pattern) {
-          const match = globRegex(pattern);
-          async function visit(dir) {
-            for await (const entry of Deno.readDir(dir)) {
-              const absolute = join(dir, entry.name), display = slash(absolute);
-              if (resolve(absolute) === metadataRoot || within(metadataRoot, absolute)) continue;
-              const matched = match.test(display);
-              if (matched) await addCandidate(display);
-              if (entry.isDirectory && !matched) await visit(absolute);
-              if (candidates.length > 10000) throw new Error("trash_paths glob matched more than 10000 paths");
+    if (name === "fs_grep") {
+      const pattern = String(args.pattern || "");
+      if (!pattern) throw new Error("pattern must not be empty");
+      const regex = searchRegex(pattern, args.regex === true, args.case_sensitive === true);
+      const before = Math.min(Number(args.context_lines_before || 0), 100), afterContext = Math.min(Number(args.context_lines_after || 0), 100);
+      const mode = String(args.mode || "matches"), limit = Math.min(Number(args.limit || 300), 2000);
+      const maxFileBytes = Math.min(Number(args.max_file_bytes || 5 * 1024 * 1024), 50 * 1024 * 1024);
+      const cursor = args.resume_after || null, walked = await fsWalk(selection.root.path, args.path || ".", { ...args, from_path: cursor?.path });
+      const files = []; let scannedFiles = 0, matchedFiles = 0, returned = 0, truncated = false, nextAfter = null, lastWalkedPath = null;
+      for (let entryIndex = 0; entryIndex < walked.entries.length; entryIndex++) {
+        const entry = walked.entries[entryIndex];
+        lastWalkedPath = entry.path;
+        if (entry.type !== "file") continue;
+        if (cursor && entry.path.localeCompare(String(cursor.path)) < 0) continue;
+        if (cursor && entry.path === cursor.path && cursor.line == null) continue;
+        try {
+          const path = await safePath(selection.root.path, entry.path), stat = await Deno.stat(path);
+          scannedFiles++;
+          if (stat.size > maxFileBytes) continue;
+          const document = await readTextDocument(path, args.encoding || "auto"), lines = textLines(document), indexes = [];
+          for (let index = 0; index < lines.length; index++) {
+            regex.lastIndex = 0;
+            if (regex.test(lines[index])) indexes.push(index);
+          }
+          if (!indexes.length) continue;
+          matchedFiles++;
+          const fingerprint = await fingerprintBytes(document.bytes);
+          const metadata = { size: stat.size, encoding: document.encoding, bom: document.bom, line_endings: document.line_endings };
+          if (mode === "matches") {
+            const eligible = indexes.filter(index => !cursor || entry.path !== cursor.path || index + 1 > Number(cursor.line));
+            if (!eligible.length) continue;
+            const selected = eligible.slice(0, Math.max(0, limit - returned));
+            if (selected.length) {
+              files.push({
+                path: entry.path, status: "ok", fingerprint, ...metadata,
+                matches: contextMatches(lines, selected, before, afterContext, regex), count: eligible.length,
+              });
+              returned += selected.length;
+            }
+            if (returned >= limit) {
+              const moreInFile = selected.length < eligible.length;
+              const morePaths = entryIndex < walked.entries.length - 1 || walked.limited;
+              truncated = moreInFile || morePaths;
+              if (truncated) nextAfter = moreInFile
+                ? { path: entry.path, line: selected.at(-1) + 1 }
+                : { path: entry.path };
+              break;
+            }
+          } else {
+            files.push({ path: entry.path, status: "ok", fingerprint, ...metadata, ...(mode === "count" ? { count: indexes.length } : {}) });
+            returned++;
+            if (returned >= limit) {
+              truncated = entryIndex < walked.entries.length - 1 || walked.limited;
+              if (truncated) nextAfter = { path: entry.path };
+              break;
             }
           }
-          await visit(rootReal);
+        } catch (error) {
+          files.push({ path: entry.path, status: errorStatus(error), error: String(error?.message || error) });
         }
-        if (!candidates.length) throw new Error("trash_paths matched no paths");
+      }
+      if (!truncated && walked.limited && lastWalkedPath) {
+        truncated = true;
+        nextAfter = { path: lastWalkedPath };
+      }
+      return { mode, scanned_files: scannedFiles, matched_files: matchedFiles, files, next_resume_after: nextAfter, truncated };
+    }
+    if (name === "fs_read") {
+      const maxBytes = Math.min(Number(args.max_output_bytes_per_file || 1048576), 5242880), files = [];
+      for (const file of args.files || []) {
+        try {
+          const target = await resolvePath(file.path), stat = await Deno.stat(target.path);
+          if (!stat.isFile) { files.push({ path: target.display, status: "not_file", size: stat.size }); continue; }
+          const document = await readTextDocument(target.path, file.encoding || "auto"), lines = textLines(document), total = lines.length;
+          const requestedStart = Number(file.start_line || 1), requestedEnd = Number(file.end_line || total);
+          if (requestedStart > total || requestedEnd < requestedStart) {
+            files.push({
+              path: target.display, status: "range_out_of_bounds", total_lines: total, size: stat.size,
+              fingerprint: await fingerprintBytes(document.bytes), encoding: document.encoding, bom: document.bom, line_endings: document.line_endings,
+            });
+            continue;
+          }
+          const start = Math.max(1, requestedStart - Number(file.context_lines_before || 0));
+          const end = Math.min(total, requestedEnd + Number(file.context_lines_after || 0));
+          const selected = []; let used = 0, last = start - 1;
+          for (let line = start; line <= end; line++) {
+            const text = lines[line - 1], bytes = enc.encode((selected.length ? "\n" : "") + text).length;
+            if (selected.length && used + bytes > maxBytes) break;
+            selected.push(text); used += bytes; last = line;
+            if (used >= maxBytes) break;
+          }
+          const truncated = last < end;
+          files.push({
+            path: target.display, status: "ok", content: selected.join("\n"), start_line: start, end_line: last, total_lines: total,
+            truncated, next_start_line: truncated ? last + 1 : null, size: stat.size, fingerprint: await fingerprintBytes(document.bytes),
+            encoding: document.encoding, bom: document.bom, line_endings: document.line_endings,
+          });
+        } catch (error) {
+          files.push({ path: String(file.path), status: errorStatus(error), error: String(error?.message || error) });
+        }
+      }
+      return { files };
+    }
+    if (name === "fs_navigate") {
+      const pattern = String(args.pattern || "");
+      if (!pattern) throw new Error("pattern must not be empty");
+      const regex = searchRegex(pattern, args.regex === true, args.case_sensitive === true);
+      const before = Math.min(Number(args.context_lines_before || 0), 100), afterContext = Math.min(Number(args.context_lines_after || 0), 100), files = [];
+      for (const file of args.files || []) {
+        try {
+          const target = await resolvePath(file.path), document = await readTextDocument(target.path, file.encoding || "auto"), lines = textLines(document);
+          const limit = Math.min(Number(file.max_matches || 1), 100), indexes = [], fromLine = Math.max(Number(file.from_line), 0);
+          if (file.direction === "backward") {
+            for (let index = Math.min(fromLine - 2, lines.length - 1); index >= 0 && indexes.length < limit; index--) {
+              regex.lastIndex = 0; if (regex.test(lines[index])) indexes.push(index);
+            }
+          } else {
+            for (let index = Math.min(fromLine, lines.length); index < lines.length && indexes.length < limit; index++) {
+              regex.lastIndex = 0; if (regex.test(lines[index])) indexes.push(index);
+            }
+          }
+          files.push({
+            path: target.display, status: "ok", fingerprint: await fingerprintBytes(document.bytes), count: indexes.length,
+            matches: contextMatches(lines, indexes, before, afterContext, regex), size: document.bytes.length, total_lines: lines.length,
+            encoding: document.encoding, bom: document.bom, line_endings: document.line_endings,
+          });
+        } catch (error) { files.push({ path: String(file.path), status: errorStatus(error), error: String(error?.message || error) }); }
+      }
+      return { files };
+    }
+    if (name === "fs_stat") {
+      const entries = [];
+      for (const raw of args.paths || []) {
+        try {
+          const target = await resolvePath(raw), stat = await Deno.lstat(target.path);
+          entries.push({
+            path: target.display, status: "ok", type: stat.isFile ? "file" : stat.isDirectory ? "directory" : stat.isSymlink ? "symlink" : "other",
+            size: stat.size, modified_at: stat.mtime?.toISOString() || null, created_at: stat.birthtime?.toISOString() || null,
+            ...(args.fingerprint === true && stat.isFile ? { fingerprint: await fileFingerprint(target.path) } : {}),
+          });
+        } catch (error) { entries.push({ path: String(raw), status: errorStatus(error), error: String(error?.message || error) }); }
+      }
+      return { entries };
+    }
+    if (name === "fs_write") {
+      const seen = new Set(), files = [];
+      for (const file of args.files || []) {
+        let target;
+        try {
+          target = await resolvePath(file.path);
+          const key = pathKey(target.path);
+          if (seen.has(key)) throw new Error(`Duplicate file path: ${file.path}`);
+          seen.add(key);
+          const before = await Deno.readFile(target.path).catch(error => {
+            if (error instanceof Deno.errors.NotFound) return null;
+            throw error;
+          });
+          const source = before ? decodeTextDocument(before, "auto") : null;
+          const fingerprintBefore = before ? await fingerprintBytes(before) : "";
+          if (file.expected_fingerprint && file.expected_fingerprint !== fingerprintBefore) {
+            files.push({
+              path: target.display, status: "fingerprint_mismatch", expected_fingerprint: file.expected_fingerprint,
+              ...(fingerprintBefore ? { fingerprint: fingerprintBefore } : {}), size: before?.length || 0,
+            });
+            continue;
+          }
+          const output = encodeTextDocument(String(file.content), source, file);
+          const currentBytes = await Deno.readFile(target.path).catch(error => {
+            if (error instanceof Deno.errors.NotFound) return null;
+            throw error;
+          });
+          const currentFingerprint = currentBytes ? await fingerprintBytes(currentBytes) : "";
+          if (currentFingerprint !== fingerprintBefore) {
+            files.push({
+              path: target.display, status: "source_changed", ...(fingerprintBefore ? { fingerprint_before: fingerprintBefore } : {}),
+              ...(currentFingerprint ? { fingerprint: currentFingerprint } : {}), size: currentBytes?.length || 0,
+            });
+            continue;
+          }
+          if (args.create_parents !== false) await Deno.mkdir(dirname(target.path), { recursive: true });
+          await Deno.writeFile(target.path, output.bytes);
+          files.push({
+            path: target.display, status: "written", size_before: before?.length || 0, size_after: output.bytes.length,
+            ...(fingerprintBefore ? { fingerprint_before: fingerprintBefore } : {}),
+            fingerprint_after: await fingerprintBytes(output.bytes), encoding: output.encoding,
+            bom: output.bom, line_endings: output.line_endings,
+          });
+        } catch (error) {
+          files.push({ path: target?.display || String(file.path), status: errorStatus(error), error: String(error?.message || error) });
+        }
+      }
+      const succeeded = files.filter(file => file.status === "written").length;
+      return { succeeded, failed: files.length - succeeded, files };
+    }
+    if (name === "fs_edit") {
+      const seen = new Set(), files = []; let totalReplacements = 0;
+      for (const file of args.files || []) {
+        let target;
+        try {
+          target = await resolvePath(file.path);
+          const key = pathKey(target.path);
+          if (seen.has(key)) throw new Error(`Duplicate file path: ${file.path}; group all ordered edits for one file in one files entry`);
+          seen.add(key);
+          const document = await readTextDocument(target.path, file.input_encoding || "auto"), fingerprintBefore = await fingerprintBytes(document.bytes);
+          if (file.expected_fingerprint && file.expected_fingerprint !== fingerprintBefore) {
+            files.push({
+              path: target.display, status: "fingerprint_mismatch", expected_fingerprint: file.expected_fingerprint,
+              fingerprint: fingerprintBefore, size: document.bytes.length,
+            });
+            continue;
+          }
+          if (document.line_endings === "mixed" && String(file.line_endings || "preserve").toLowerCase() === "preserve") {
+            files.push({
+              path: target.display, status: "mixed_line_endings", fingerprint: fingerprintBefore, size: document.bytes.length,
+              error: "Mixed source line endings cannot be preserved exactly through normalized text editing; choose lf, crlf, or cr explicitly",
+            });
+            continue;
+          }
+          let current = normalizeLineEndings(document.text, "lf"), replacements = 0, failed = null;
+          const editResults = [];
+          for (let index = 0; index < (file.edits || []).length; index++) {
+            const edit = file.edits[index], oldText = normalizeLineEndings(String(edit.old_text), "lf");
+            const newText = normalizeLineEndings(String(edit.new_text), "lf"), expected = Number(edit.expected_occurrences ?? 1);
+            const occurrences = oldText ? current.split(oldText).length - 1 : 0;
+            editResults.push({ index: index + 1, expected_occurrences: expected, occurrences });
+            if (!oldText || occurrences !== expected) { failed = { index: index + 1, expected, occurrences }; break; }
+            current = current.split(oldText).join(newText);
+            replacements += occurrences;
+          }
+          if (failed) {
+            files.push({
+              path: target.display, status: "occurrence_mismatch", fingerprint: fingerprintBefore, size: document.bytes.length,
+              replacements, edits: editResults,
+              error: `Edit ${failed.index} expected ${failed.expected} occurrences, found ${failed.occurrences}`,
+            });
+            continue;
+          }
+          const output = encodeTextDocument(current, document, file);
+          const currentFingerprint = await fileFingerprint(target.path);
+          if (currentFingerprint !== fingerprintBefore) {
+            files.push({
+              path: target.display, status: "source_changed", fingerprint_before: fingerprintBefore,
+              fingerprint: currentFingerprint, size: (await Deno.stat(target.path)).size, replacements, edits: editResults,
+            });
+            continue;
+          }
+          await Deno.writeFile(target.path, output.bytes);
+          totalReplacements += replacements;
+          files.push({
+            path: target.display, status: "edited", fingerprint_before: fingerprintBefore,
+            fingerprint_after: await fingerprintBytes(output.bytes), size_before: document.bytes.length, size_after: output.bytes.length,
+            replacements, edits: editResults, encoding: output.encoding, bom: output.bom, line_endings: output.line_endings,
+          });
+        } catch (error) {
+          files.push({ path: target?.display || String(file.path), status: errorStatus(error), error: String(error?.message || error) });
+        }
+      }
+      const succeeded = files.filter(file => file.status === "edited").length;
+      return { succeeded, failed: files.length - succeeded, total_replacements: totalReplacements, files };
+    }
+    if (name === "fs_mkdir") {
+      const entries = [], seen = new Set();
+      for (const raw of args.paths || []) {
+        let target;
+        try {
+          target = await resolvePath(raw);
+          const key = pathKey(target.path);
+          if (seen.has(key)) throw new Error(`Duplicate directory path: ${raw}`);
+          seen.add(key);
+          const stat = await exists(target.path);
+          if (stat && !stat.isDirectory) entries.push({ path: target.display, status: "not_directory" });
+          else if (stat) entries.push({ path: target.display, status: "exists", type: "directory", size: stat.size });
+          else if (args.parents === false && !await exists(dirname(target.path))) entries.push({ path: target.display, status: "parent_missing" });
+          else {
+            await Deno.mkdir(target.path, { recursive: args.parents !== false });
+            entries.push({ path: target.display, status: "created", type: "directory" });
+          }
+        } catch (error) {
+          entries.push({ path: target?.display || String(raw), status: errorStatus(error), error: String(error?.message || error) });
+        }
+      }
+      const succeeded = entries.filter(entry => entry.status === "created" || entry.status === "exists").length;
+      return { succeeded, failed: entries.length - succeeded, entries };
+    }
+    if (name === "fs_copy" || name === "fs_move") {
+      const entries = [], destinations = new Set();
+      for (const entry of args.entries || []) {
+        let from, to;
+        try {
+          from = await resolvePath(entry.from); to = await resolvePath(entry.to);
+          const destinationKey = pathKey(to.path);
+          if (destinations.has(destinationKey)) throw new Error(`Duplicate destination path: ${entry.to}`);
+          destinations.add(destinationKey);
+          const sourceStat = await exists(from.path), destinationStat = await exists(to.path);
+          if (!sourceStat) { entries.push({ from: from.display, to: to.display, status: "not_found" }); continue; }
+          if (sourceStat.isDirectory && within(from.path, to.path)) {
+            entries.push({ from: from.display, to: to.display, status: "invalid_destination", error: "Destination cannot be inside the source directory" });
+            continue;
+          }
+          if (destinationStat) { entries.push({ from: from.display, to: to.display, status: "destination_exists" }); continue; }
+          if (args.create_parents === false && !await exists(dirname(to.path))) {
+            entries.push({ from: from.display, to: to.display, status: "parent_missing" }); continue;
+          }
+          if (args.create_parents !== false) await Deno.mkdir(dirname(to.path), { recursive: true });
+          if (name === "fs_copy") await copyRecursive(from.path, to.path);
+          else await moveRecursive(from.path, to.path);
+          entries.push({ from: from.display, to: to.display, status: name === "fs_copy" ? "copied" : "moved" });
+        } catch (error) {
+          const partial = to?.path && !!await exists(to.path).catch(() => false);
+          entries.push({
+            from: from?.display || String(entry.from), to: to?.display || String(entry.to),
+            status: partial ? "failed_partial" : errorStatus(error), error: String(error?.message || error),
+          });
+        }
+      }
+      const wanted = name === "fs_copy" ? "copied" : "moved";
+      const succeeded = entries.filter(entry => entry.status === wanted).length;
+      return { succeeded, failed: entries.length - succeeded, entries };
+    }
+    if (name === "fs_trash" || name === "fs_restore") {
+      const rootReal = await Deno.realPath(selection.root.path), metadataRoot = resolve(DATA), trashRoot = resolve(TRASH_ROOT);
+      const slash = path => slashPath(relative(rootReal, path)) || ".";
+      if (name === "fs_trash") {
+        const candidates = [], entries = [];
+        const addCandidate = async raw => {
+          let target;
+          try {
+            target = await resolvePath(raw);
+            if (!await exists(target.path)) { entries.push({ path: target.display, status: "not_found" }); return; }
+            if (resolve(target.path) === resolve(rootReal)) { entries.push({ path: target.display, status: "invalid_target", error: "Cannot trash the current Workspace" }); return; }
+            if (resolve(target.path) === metadataRoot || within(metadataRoot, target.path)) {
+              entries.push({ path: target.display, status: "invalid_target", error: "Cannot trash MrMCP metadata" }); return;
+            }
+            candidates.push(target);
+          } catch (error) {
+            entries.push({ path: target?.display || String(raw), status: errorStatus(error), error: String(error?.message || error) });
+          }
+        };
+        for (const raw of args.paths || []) await addCandidate(raw);
+        if (args.selection) {
+          const walked = await fsWalk(selection.root.path, args.selection.path || ".", { ...args.selection, hard_limit: 10001 });
+          if (walked.limited || walked.entries.length > 10000) throw new Error("fs_trash selection matched more than 10000 paths");
+          for (const entry of walked.entries) await addCandidate(entry.path);
+        }
         const unique = new Map();
-        for (const target of candidates) {
-          const key = Deno.build.os === "windows" ? resolve(target.path).toLowerCase() : resolve(target.path);
-          if (!unique.has(key)) unique.set(key, target);
-        }
+        for (const target of candidates) if (!unique.has(pathKey(target.path))) unique.set(pathKey(target.path), target);
         const ordered = [...unique.values()].sort((a, b) =>
           a.display.split("/").length - b.display.split("/").length || a.display.localeCompare(b.display));
         const selected = [];
@@ -4874,69 +5106,80 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
           if (selected.some(parent => resolve(parent.path) !== resolve(target.path) && within(parent.path, target.path))) continue;
           selected.push(target);
         }
+        if (!selected.length) return { trash_id: null, trash_path: null, manifest_path: null, succeeded: 0, failed: entries.length, entries };
         const date = new Date(), pad = value => String(value).padStart(2, "0");
         const baseId = `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
-        let actionId = baseId, increment = 1;
+        let trashId = baseId, increment = 1;
         for (;;) {
-          const actionDir = join(trashRoot, actionId), manifestPath = join(trashRoot, `${actionId}.json`);
-          if (!await exists(actionDir) && !await exists(manifestPath)) break;
-          actionId = `${baseId}-${++increment}`;
+          const trashDir = join(trashRoot, trashId), manifestPath = join(trashRoot, `${trashId}.json`);
+          if (!await exists(trashDir) && !await exists(manifestPath)) break;
+          trashId = `${baseId}-${++increment}`;
         }
-        const actionDir = join(trashRoot, actionId), manifestPath = join(trashRoot, `${actionId}.json`);
-        const trashRootExisted = await exists(trashRoot), moved = [];
-        try {
-          await Deno.mkdir(actionDir, { recursive: true });
-          for (const [index, target] of selected.entries()) {
-            const destination = join(actionDir, `${index}-${basename(target.path)}`);
+        const trashDir = join(trashRoot, trashId), manifestPath = join(trashRoot, `${trashId}.json`);
+        const items = selected.map((target, index) => ({
+          original: resolve(target.path), payload: `${index}-${basename(target.path)}`,
+        }));
+        await Deno.mkdir(trashDir, { recursive: true });
+        await Deno.writeTextFile(manifestPath, JSON.stringify({ trash_id: trashId, created_at: new Date().toISOString(), items }, null, 2) + "\n");
+        let succeeded = 0;
+        for (const [index, target] of selected.entries()) {
+          const destination = join(trashDir, items[index].payload);
+          try {
             await moveRecursive(target.path, destination);
-            moved.push({ source: target.path, destination });
+            entries.push({ path: target.display, status: "trashed" });
+            succeeded++;
+          } catch (error) {
+            const partial = !!await exists(destination).catch(() => false);
+            entries.push({ path: target.display, status: partial ? "failed_partial" : errorStatus(error), error: String(error?.message || error) });
           }
-          await Deno.writeTextFile(manifestPath, JSON.stringify({
-            action_id: actionId,
-            created_at: new Date().toISOString(),
-            paths: selected.map(target => resolve(target.path)),
-          }, null, 2) + "\n");
-        } catch (error) {
-          for (const item of moved.reverse()) await moveRecursive(item.destination, item.source).catch(() => {});
-          await Deno.remove(actionDir, { recursive: true }).catch(() => {});
-          if (!trashRootExisted) await Deno.remove(trashRoot).catch(() => {});
-          throw error;
+        }
+        let retainedPayload = false;
+        for (const item of items) {
+          if (await exists(join(trashDir, item.payload))) { retainedPayload = true; break; }
+        }
+        if (!retainedPayload) {
+          await Deno.remove(trashDir, { recursive: true }).catch(() => {});
+          await Deno.remove(manifestPath).catch(() => {});
+          return { trash_id: null, trash_path: null, manifest_path: null, succeeded: 0, failed: entries.length, entries };
         }
         return {
-          action_id: actionId,
-          trash_path: actionDir,
-          manifest_path: manifestPath,
-          paths: selected.map(target => target.display),
+          trash_id: trashId, trash_path: trashDir, manifest_path: manifestPath,
+          succeeded, failed: entries.length - succeeded, entries,
         };
       }
-      const actionId = String(args.action_id || "").trim();
-      if (!/^\d{8}-\d{6}(?:-\d+)?$/.test(actionId)) throw new Error("Invalid trash action_id");
-      const actionDir = join(trashRoot, actionId), manifestPath = join(trashRoot, `${actionId}.json`);
+      const trashId = String(args.trash_id || "").trim();
+      if (!/^\d{8}-\d{6}(?:-\d+)?$/.test(trashId)) throw new Error("Invalid trash_id");
+      const trashDir = join(trashRoot, trashId), manifestPath = join(trashRoot, `${trashId}.json`);
       const manifest = JSON.parse(await Deno.readTextFile(manifestPath));
-      const paths = Array.isArray(manifest.paths) ? manifest.paths.map(path => resolve(String(path))) : [];
-      if (!paths.length) throw new Error("Trash action contains no paths");
-      const items = [];
-      for (const [index, target] of paths.entries()) {
-        if (!within(rootReal, target)) throw new Error("Trash action belongs to another Workspace");
-        const source = join(actionDir, `${index}-${basename(target)}`);
-        if (!within(actionDir, source) || !await exists(source)) throw new Error(`Trashed path is unavailable: ${target}`);
-        if (await exists(target)) throw new Error(`Restore target already exists: ${target}`);
-        if (!await exists(dirname(target))) throw new Error(`Restore parent is unavailable: ${target}`);
-        items.push({ source, target });
-      }
-      const restored = [];
-      try {
-        for (const item of items) {
-          await moveRecursive(item.source, item.target);
-          restored.push(item);
+      const items = Array.isArray(manifest.items) ? manifest.items : [];
+      if (!items.length) throw new Error("Trash transaction contains no items");
+      const entries = []; let succeeded = 0;
+      for (const item of items) {
+        const target = resolve(String(item.original || "")), source = resolve(trashDir, String(item.payload || ""));
+        if (!within(rootReal, target)) { entries.push({ path: slash(target), status: "wrong_workspace" }); continue; }
+        if (!within(trashDir, source)) { entries.push({ path: slash(target), status: "invalid_payload" }); continue; }
+        if (!await exists(source)) { entries.push({ path: slash(target), status: "not_in_trash" }); continue; }
+        if (await exists(target)) { entries.push({ path: slash(target), status: "destination_exists" }); continue; }
+        if (!await exists(dirname(target))) { entries.push({ path: slash(target), status: "parent_missing" }); continue; }
+        try {
+          await moveRecursive(source, target);
+          entries.push({ path: slash(target), status: "restored" });
+          succeeded++;
+        } catch (error) {
+          const partial = !!await exists(target).catch(() => false);
+          entries.push({ path: slash(target), status: partial ? "failed_partial" : errorStatus(error), error: String(error?.message || error) });
         }
-      } catch (error) {
-        for (const item of restored.reverse()) await moveRecursive(item.target, item.source).catch(() => {});
-        throw error;
       }
-      await Deno.remove(actionDir, { recursive: true });
-      await Deno.remove(manifestPath);
-      return { action_id: actionId, paths };
+      let remaining = false;
+      for (const item of items) {
+        const source = resolve(trashDir, String(item.payload || ""));
+        if (within(trashDir, source) && await exists(source)) { remaining = true; break; }
+      }
+      if (!remaining) {
+        await Deno.remove(trashDir, { recursive: true }).catch(() => {});
+        await Deno.remove(manifestPath).catch(() => {});
+      }
+      return { trash_id: trashId, succeeded, failed: entries.length - succeeded, entries };
     }
     if (name === "publish_file") {
       const target = await resolvePath(args.path);
@@ -5827,7 +6070,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const serverInfoMeta = { "io.modelcontextprotocol/serverInfo": mcpServerInfo() };
     const instructions = fullAccess
       ? "Use list_workspaces when you need to discover enabled Workspace names. Use create_workspace with only a name when you need a new empty Workspace; MrMCP creates and registers its Desktop directory internally, then call open_workspace with that same name. If you already have the current Session handle, pass it as current_context_handle to move that same Session to the Workspace; if it is omitted, empty, unknown or expired, open_workspace creates a new Session. The result includes workspace_name, absolute cwd and agent_guidance_path; when that path is non-null, read and follow the referenced AGENTS.md before repository work. Pass the returned context_handle unchanged on every later Session-bound tool call. " +
-        "Use read_file/read_files, glob, grep, edit and replace directly for file inspection, discovery, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. " +
+        "Use fs_glob, fs_grep, fs_read, fs_navigate, fs_stat, fs_write and fs_edit directly for filesystem discovery, inspection, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. " +
         "When work may benefit from command-line capability beyond the structured tools, call discover_commands proactively before inventing workarounds or assuming a utility is unavailable. It returns the complete user-chosen available command catalog in one call; prefer a listed command when it fits, remember the catalog for the Session, and invoke its logical_name directly through exec.program without PATH probes. " +
         "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; cancelling/disconnecting exec terminates its child. For persistent or interactive work, call exec_start; it immediately returns exec_id, which is the stable integer Tool Call id of that start. Pass that exec_id together with the same context_handle to exec_attach, exec_write, exec_kill or exec_status; ids from other Sessions are inaccessible. exec_list shows only currently running persistent executions in this Session. exec_status is the non-consuming way to inspect running or recently completed/killed executions and optionally retrieve all output or a tail. exec_attach with progressToken streams unread backlog plus live output through progress until process exit and then returns that complete unread transcript; without progressToken it long-polls and returns at most 16 KiB of unread output plus remaining_bytes, so call it repeatedly to drain buffered output and call it again with remaining_bytes=0/status=running to wait for future output. Disconnecting exec_attach only detaches and never kills the persistent process. " +
         "Use publish_file to present existing files through its MCP App widget, and publish_html when an interactive self-contained HTML/CSS/JavaScript visualization is more appropriate. " +
@@ -6167,14 +6410,14 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         const trashPath = join(TRASH_ROOT, entry.name);
         let lastAt = 0;
         try { lastAt = Deno.statSync(trashPath).mtime?.getTime() || 0; } catch {}
-        actions.push({ action_id: entry.name, trash_path: trashPath, last_at: lastAt });
+        actions.push({ trash_id: entry.name, trash_path: trashPath, last_at: lastAt });
       }
     } catch {}
-    actions.sort((a, b) => b.last_at - a.last_at || b.action_id.localeCompare(a.action_id));
+    actions.sort((a, b) => b.last_at - a.last_at || b.trash_id.localeCompare(a.trash_id));
     const latest = actions[0];
     return latest
       ? { count: actions.length, ...latest }
-      : { count: 0, last_at: null, action_id: "", trash_path: "" };
+      : { count: 0, last_at: null, trash_id: "", trash_path: "" };
   }
 
   function trashActivityProjection(p, tool) {
@@ -6183,23 +6426,23 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     )?.n || 0);
     const row = one(`SELECT started_at,completed_at,root_path,resolved_json FROM logs
       WHERE server_id=? AND tool=? AND status='completed' ORDER BY id DESC LIMIT 1`, p.id, tool);
-    if (!row) return { count, last_at: null, action_id: "", trash_path: "" };
-    const result = parseJson(row.resolved_json, {}), actionId = String(result?.action_id || "");
+    if (!row) return { count, last_at: null, trash_id: "", trash_path: "" };
+    const result = parseJson(row.resolved_json, {}), trashId = String(result?.trash_id || "");
     let relativeTrashPath = String(result?.trash_path || "");
-    if (!relativeTrashPath && tool === "untrash_action" && actionId) {
+    if (!relativeTrashPath && tool === "fs_restore" && trashId) {
       const original = one(`SELECT resolved_json FROM logs
-        WHERE server_id=? AND tool='trash_paths' AND status='completed' AND instr(resolved_json,?)>0
-        ORDER BY id DESC LIMIT 1`, p.id, `\"action_id\":\"${actionId}\"`);
+        WHERE server_id=? AND tool='fs_trash' AND status='completed' AND instr(resolved_json,?)>0
+        ORDER BY id DESC LIMIT 1`, p.id, `\"trash_id\":\"${trashId}\"`);
       relativeTrashPath = String(parseJson(original?.resolved_json || "", {})?.trash_path || "");
     }
-    if (!relativeTrashPath && actionId) relativeTrashPath = join(TRASH_ROOT, actionId);
+    if (!relativeTrashPath && trashId) relativeTrashPath = join(TRASH_ROOT, trashId);
     const trashPath = isAbsolute(relativeTrashPath) ? relativeTrashPath : row.root_path && relativeTrashPath
       ? join(String(row.root_path), ...relativeTrashPath.replaceAll("\\", "/").split("/"))
       : relativeTrashPath;
     return {
       count,
       last_at: row.completed_at || row.started_at,
-      action_id: actionId,
+      trash_id: trashId,
       trash_path: trashPath,
     };
   }
@@ -6258,7 +6501,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       };
       result.trash_activity = {
         trash: liveTrashProjection(),
-        untrash: trashActivityProjection(p, "untrash_action"),
+        untrash: trashActivityProjection(p, "fs_restore"),
       };
     }
     if (["all", "oauth"].includes(section)) result.oauth_clients = oauthProjection();
@@ -6386,7 +6629,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     status: `<? const d=it.data||{},s=d.settings||{},a=d.activity||{},bad=!!s.mcp_listen_error,warn=!!s.listener_fallback,recent=a.recent_sessions||[],inFlight=a.tool_calls_in_flight||0,errors=a.tool_calls_errors||0,invalid=a.tool_calls_invalid||0; ?><span class="status-group <?= d.live!=="connected"?(d.live==="reconnecting"?"pending":"failed"):(bad?"failed":(warn?"pending":"ok")) ?>"><?= d.live!=="connected"?(d.live==="reconnecting"?"🟡 reconnecting":"🔴 offline"):(bad?"🔴 listener error":(warn?"🟡 fallback":"🟢 live")) ?></span><span class="status-group status-link" data-action=header-settings title="HTTP / HTTPS effective listener ports; GUI uses local Tauriless assets">🔌 <span class=status-ports><?= s.mcp_http_active?s.mcp_http_port:"off" ?>/<?= s.mcp_https_active?s.mcp_https_port:"off" ?></span><? if(warn){ ?> <span class=pending>⚠</span><? } ?></span><span class=status-group title="Sessions with a Tool Call in the last <?= a.active_window_minutes||10 ?> minutes">💬 <span class="status-link <?= a.active_sessions?'ok':'muted' ?>" data-action=header-sessions><?= a.active_sessions||0 ?> active</span><? if(recent.length){ ?> · <span class=status-sessions><? recent.forEach((x,i)=>{ ?><?= i?" ":"" ?><span class=status-link data-action=session-tool-calls data-id="<?= x.id ?>">#<?= x.id ?>(<?= x.tool_calls ?>)</span><? }) ?></span><? } ?></span><span class=status-group title="Tool Calls in flight / total recorded / failed / invalid">🛠️ <span class="status-link <?= inFlight?'pending':'muted' ?>" data-action=header-tool-calls data-status=running><?= inFlight ?> in flight</span> · <span class="status-link status-total" data-action=header-tool-calls data-status=""><?= a.tool_calls_total||0 ?> total</span> · <span class="status-link <?= errors?'failed':'muted' ?>" data-action=header-tool-calls data-status=failed><?= errors ?> errors</span> · <span class="status-link <?= invalid?'invalid':'muted' ?>" data-action=header-tool-calls data-status=invalid><?= invalid ?> invalid</span></span>`,
     cards: `<? const meta={sessions:["💬","Sessions"],roots:["📁","Workspaces"],tool_calls:["🛠️","Tool Calls"],tool_calls_in_flight:["🛠️","Tool Calls In Flight"],failed_calls:["⚠️","Failed Calls"],http_requests:["🌐","HTTP Requests"]}; Object.entries(it.data || {}).forEach(([key,value]) => { const item=meta[key]||["•",key]; ?><div class=card><div class=muted><?= item[0] ?> <?= item[1] ?></div><strong style="font-size:24px"><?= value ?></strong></div><? }) ?>`,
     active_tool_calls: `<? const rows=it.data||[],icons={completed:"✅",failed:"❌",invalid:"◆",killed:"❌",timed_out:"❌",running:"⏳",received:"⏳"}; ?><div class="card dashboard-call-card"><table class=dashboard-call-table><thead><tr><th>State</th><th>Tool Call</th><th>Session</th><th>Time</th></tr></thead><tbody><? if(!rows.length){ ?><tr><td colspan=4 class=muted>No active Tool Calls.</td></tr><? } else { rows.forEach(l=>{ const ms=Number(l.elapsed_ms||0),elapsed=ms<1000?ms+"ms":(ms/1000).toFixed(ms<10000?1:0)+"s"; ?><tr data-action=dashboard-tool-call data-id="<?= l.id ?>" title="Open Tool Call #<?= l.id ?>" class="<?= l.active?'':'dashboard-call-recent' ?>"<? if(!l.active){ ?> style="--dashboard-call-ttl:<?= Math.max(50,Number(l.ttl_ms||0)) ?>ms"<? } ?>><td class="<?= l.active?'pending':l.status ?> nowrap"><?= icons[l.status]||"•" ?> <?= l.active?"running":l.status ?></td><td class=dashboard-call-summary><?= l.call_summary ?><? if(l.progress_requested){ ?> <span class=progress-requested>📡 progress</span><? } ?></td><td class=idcell><?= l.context_id?"#"+l.context_id:"—" ?></td><td class=nowrap><?= elapsed ?><? if(!l.active){ ?> <span class=muted>· done</span><? } ?></td></tr><? }) } ?></tbody></table></div>`,
-    trash_activity: `<? const d=it.data||{},m=d.maintenance||{},items=[["🗑️","Trash",d.trash,false],["↩️","Untrash",d.untrash,true]]; items.forEach(([icon,label,x,historical])=>{ x=x||{}; ?><div class=card><div class=row><div class=grow><div class=muted><?= icon ?> <?= label ?></div><strong style="font-size:24px"><?= x.count||0 ?></strong></div><? if(!historical){ const busy=m.active&&m.action==="trash"; ?><button class="small danger" data-action=empty-trash<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Emptying · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Empty Trash<? } ?></button><? } ?><? if(x.last_at){ ?><div class=muted>Last <?= it.logdt(x.last_at) ?></div><? } ?></div><? if(x.last_at){ ?><div><span class=muted>Action</span> <code><?= x.action_id||"—" ?></code></div><div style="margin-top:5px"><span class=muted><?= historical?"Trash path (historical)":"Trash path" ?></span><br><code class=context-id><?= x.trash_path||"—" ?></code></div><? } else { ?><div class=muted><?= historical ? "No completed untrash actions." : "Trash is empty." ?></div><? } ?></div><? }) ?>`,
+    trash_activity: `<? const d=it.data||{},m=d.maintenance||{},items=[["🗑️","Trash",d.trash,false],["↩️","Untrash",d.untrash,true]]; items.forEach(([icon,label,x,historical])=>{ x=x||{}; ?><div class=card><div class=row><div class=grow><div class=muted><?= icon ?> <?= label ?></div><strong style="font-size:24px"><?= x.count||0 ?></strong></div><? if(!historical){ const busy=m.active&&m.action==="trash"; ?><button class="small danger" data-action=empty-trash<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Emptying · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Empty Trash<? } ?></button><? } ?><? if(x.last_at){ ?><div class=muted>Last <?= it.logdt(x.last_at) ?></div><? } ?></div><? if(x.last_at){ ?><div><span class=muted>Trash ID</span> <code><?= x.trash_id||"—" ?></code></div><div style="margin-top:5px"><span class=muted><?= historical?"Trash path (historical)":"Trash path" ?></span><br><code class=context-id><?= x.trash_path||"—" ?></code></div><? } else { ?><div class=muted><?= historical ? "No completed untrash actions." : "Trash is empty." ?></div><? } ?></div><? }) ?>`,
     tls: `<? const t=it.data||{}, problem=!t.tls_active_trusted||!!t.tls_last_error||!!t.mcp_listen_error; ?><div class="card <?= problem ? "tls-alert" : "tls-good" ?>"><div class=row><h3 class=grow>🔒 TLS / Let's Encrypt</h3><b class="<?= t.tls_active_trusted ? "ok" : "failed" ?>"><?= t.tls_active_trusted ? "trusted" : (t.tls_active ? "fallback active" : "offline") ?></b></div><div class=grid><div><span class=muted>HTTPS Listener</span><br><b><?= t.mcp_https_active ? "0.0.0.0:"+t.mcp_https_port+" active" : "not listening" ?></b></div><div><span class=muted>Active Certificate</span><br><b><?= t.tls_active_kind || "none" ?> · <?= t.tls_active_valid ? "valid" : "invalid" ?></b></div><div><span class=muted>Expires</span><br><b><?= it.dt(t.tls_active_expires) || "unknown" ?></b></div><div><span class=muted>Last ACME Request</span><br><b><?= it.dt(t.tls_last_request_at) || "never recorded" ?></b></div><div><span class=muted>Last ACME Result</span><br><b class="<?= t.tls_last_request_valid ? "ok" : (t.tls_last_request_status === "error" ? "failed" : "pending") ?>"><? if (t.tls_last_request_status) { ?><?= t.tls_last_request_status ?> · certificate <?= t.tls_last_request_valid ? "valid" : "not valid" ?><? } else { ?>not recorded<? } ?></b></div><div><span class=muted>Last Valid Certificate</span><br><b><?= it.dt(t.tls_last_issued_at) || "not recorded" ?></b></div><div><span class=muted>Renewal Due</span><br><b><?= it.dt(t.tls_renewal_due_at) || "as soon as allowed" ?></b></div><div><span class=muted>Rate-Limit Reset</span><br><b><?= it.dt(t.tls_rate_limit_reset_at) || "none" ?></b></div><div><span class=muted>Next ACME Attempt</span><br><b><?= it.dt(t.tls_next_attempt_at) || "not scheduled" ?></b></div></div><? if (t.tls_last_error || t.mcp_listen_error) { ?><pre class=tls-error><?= t.tls_last_error || t.mcp_listen_error ?></pre><? } ?><? if (!t.tls_active_trusted) { ?><p class=failed><b>Public clients such as ChatGPT will reject the self-signed fallback until Let's Encrypt succeeds.</b></p><? } ?></div>`,
     urls: `<? (it.data || []).forEach(x => { if (!x?.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?><? if (x.note) { ?> <span class=muted><?= x.note ?></span><? } ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?>`,
     roots: `<? const d=it.data||{},rows=d.roots||[],defaults=d.default_sessions||[]; ?><div class=roots-layout><div class=roots-named><h3>📁 Workspaces</h3><? if(!rows.length){ ?><div class=card><p class=muted>No Workspaces registered.</p></div><? } ?><? rows.forEach(r => { ?><div class="card root-card<?= r.enabled?'':' root-disabled' ?>"<? if(r.enabled){ ?> data-root-drop="<?= r.id ?>"<? } ?>><div class=root-card-header><div class=grow><h3>📁 <?= r.name ?></h3><code class="<?= r.path_warning?'failed':'' ?>"<? if(r.path_warning){ ?> title="<?= r.path_warning ?>"<? } ?>><?= r.path ?></code></div><div class=command-actions><button class=small data-action=edit-root data-id="<?= r.id ?>">✏️ Edit</button><button class="small danger" data-action=delete-root data-id="<?= r.id ?>">🗑️ Delete</button></div></div><div class="<?= r.enabled?'ok':'muted' ?>"><?= r.enabled ? "enabled" : "disabled" ?></div><div class=root-session-list><? if(!r.enabled){ ?><div class=muted>Enable this Workspace to assign Sessions.</div><? } else if(!(r.sessions||[]).length){ ?><div class=root-drop-empty>Drop a Session here</div><? } ?><? (r.sessions||[]).forEach(v=>{ ?><div class=session-chip draggable=true data-session-drag data-session-id="<?= v.pk ?>" title="Drag Session #<?= v.pk ?>"><div class=session-chip-main><span>💬</span><b>#<?= v.pk ?></b><span class=grow><?= v.client_name ?></span></div><div class=session-chip-meta><span><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></span><span><span class=muted>Last Activity</span> <?= it.logdt(v.last_active_at) ?></span><span><span class=muted>Status</span> <span class="<?= v.expired?'failed':'ok' ?>"><?= v.expired?'expired':'active' ?></span></span><span><span class=muted>Tool Calls:</span> <?= v.tool_calls||0 ?></span></div></div><? }) ?></div></div><? }) ?></div><div class=roots-default><div class=row><h3 class=grow>💬 Sessions</h3><span class=muted>No Workspace assigned</span></div><div class="card default-root-card" data-root-drop="0"><p class=muted>Uses the program folder until assigned to a Workspace.</p><div class=root-session-list><? if(!defaults.length){ ?><div class=root-drop-empty>Drop a Session here to remove its Workspace association.</div><? } ?><? defaults.forEach(v=>{ ?><div class=session-chip draggable=true data-session-drag data-session-id="<?= v.pk ?>" title="Drag Session #<?= v.pk ?>"><div class=session-chip-main><span>💬</span><b>#<?= v.pk ?></b><span class=grow><?= v.client_name ?></span></div><div class=session-chip-meta><span><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></span><span><span class=muted>Last Activity</span> <?= it.logdt(v.last_active_at) ?></span><span><span class=muted>Status</span> <span class="<?= v.expired?'failed':'ok' ?>"><?= v.expired?'expired':'active' ?></span></span><span><span class=muted>Tool Calls:</span> <?= v.tool_calls||0 ?></span></div></div><? }) ?></div></div></div></div>`,
