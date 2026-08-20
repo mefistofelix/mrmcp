@@ -99,7 +99,7 @@ Commands and execution:
 - `exec`, `exec_start`, `exec_attach`, `exec_write`, `exec_kill`, `exec_list`, `exec_status`
 - `js`, `js_add_node_module_dir`, `js_reset`
 - `tools_schema` — inspect canonical live MCP descriptors; `tools_log` — query Tool Calls that reached the current Session.
-- `telegram_req` — make one generic pre-authenticated Telegram Bot API JSON request using the Bot token configured by the user in Settings.
+- `telegram_req` — make one generic pre-authenticated Telegram Bot API JSON request using the Bot token configured by the user on the dedicated **✈️ Telegram** sidebar page.
 
 Filesystem removal is reversible: `fs_trash`/`fs_restore` use explicit `trash_id` transactions instead of a permanent delete tool. All Workspaces share the single MrMCP-managed `APP_DIR/.mrmcp/trash/` store; MrMCP never creates `.mrmcp` metadata directories inside named Workspaces.
 

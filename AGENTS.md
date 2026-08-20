@@ -122,6 +122,7 @@ Keep these sections:
 - Commands;
 - Guided Prompts;
 - HTTP Log;
+- Telegram;
 - Settings;
 - Help.
 
@@ -294,7 +295,7 @@ The public memory surface is exactly `memory_find` and `memory_set`; do not add 
 
 ## Telegram Bot API
 
-`telegram_req` is the only Telegram surface. Keep it as one native-`fetch()` Bot API JSON request tool: the agent supplies `request.method` plus ordinary Bot API JSON fields, while the local Settings page supplies the Bot token. Never expose the token as a tool argument/result and never import TDLib, a Telegram SDK, or anything from `doc/telegram.js`. Normalize safely numeric `chat_id`, remember `migrate_to_chat_id` redirects only at runtime, and retry one migrated request once; chat/channel ids and higher application state belong to the agent/Memory.
+`telegram_req` is the only Telegram surface. Keep it as one native-`fetch()` Bot API JSON request tool: the agent supplies `request.method` plus ordinary Bot API JSON fields, while the dedicated Telegram sidebar page supplies the Bot token. Never expose the token as a tool argument/result and never import TDLib, a Telegram SDK, or anything from `doc/telegram.js`. Normalize safely numeric `chat_id`, remember `migrate_to_chat_id` redirects only at runtime, and retry one migrated request once; chat/channel ids and higher application state belong to the agent/Memory.
 
 ## Published content and MCP App widget
 
