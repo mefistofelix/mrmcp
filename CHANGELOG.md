@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.120
+
+- Refreshed the README Tool Calls screenshot with the current interface while masking sensitive data in the captured log details.
+
 ## 0.10.119
 
 - Decoupled desktop GUI Replay from MCP Tool Calls. Browser CDP replay and Automation AAF replay now read the selected historical input only as a source, then execute directly through the shared low-level CDP/Auto.js engines without `callTool()`/`executeTool()`, Tool Call logging, descriptor snapshots, Tool Call counters/notifications, `tool_call_content`, or any new database persistence. Replay is therefore a local operator action, not a new Tool Call.
