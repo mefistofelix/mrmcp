@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.10.115
+
+- Replaced `publish_file` and `publish_html` with one stateless `publish` tool. Each call supplies exactly one Workspace `path`, direct UTF-8 `text`, or `base64` payload plus a required MIME type; optional filename, title, description, height and `auto|inline|download` presentation metadata drive one smart MCP App without introducing previous-result/image-id state.
+- Unified every publication source into the same persistent `.mrmcp/publish/` file snapshot pipeline. Path sources are copied, direct text/Base64 sources are materialized as bytes, all use a random capability-prefixed sanitized filename and the same fast size/first/last/middle content fingerprint, and `published_uses` retains Session/Workspace plus MIME/presentation metadata while deduplicated payloads survive restart/source deletion until explicit cleanup.
+- Replaced separate download/HTML URLs and widgets with one persistent `/published/<id>/<filename>` content URL plus one versioned MIME-aware View. Browser-displayable MIME types retain the filename while using inline Content-Disposition, opaque/binary MIME types use attachment, and the widget independently interprets the presentation hint to show an image/iframe preview or file action. HTML remains isolated in a nested sandbox without `allow-same-origin`; title and description render above the published element.
+- Simplified the Published administration view around generic content resources: MIME replaces the old file/HTML type distinction, all physical snapshots remain directly visible under `.mrmcp/publish/`, Session and size filtering remain, and the clean current schema no longer depends on the obsolete publication `kind` column/index.
+
 ## 0.10.114
 
 - Added `desktop_auto`, the single AAF desktop-automation MCP tool backed by the unversioned latest static `npm:@mefistofelix/auto.js` import. Its `yaml` field links directly to the public AAF specification. Auto.js `run()` structured output is preserved, including arbitrary mixed final state; zero/one/many retained final-state WebP/PNG images keep their nested state positions with `image_id` replacing binary data, while `images[]` maps ids/paths/absolute rect/scale to distinct MCP `ImageContent` blocks for direct model vision. Transient observation images deliberately bypass Published storage, MCP Apps and resource links. Auto.js `0.1.3` fixes Deno npm libvips resolution and declares Sharp as its package metadata dependency, so compact WebP materialization works from the standalone npm package instead of falling back to raw BGRA8.

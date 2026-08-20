@@ -349,37 +349,33 @@ The returned `results` and `state` preserve Auto.js `run()` semantics. `results`
 
 Retained final-state screenshots remain at the exact nested state locations chosen by the scenario. MrMCP removes only their binary `data`, keeps their AAF metadata (`format`, absolute desktop `rect`, `grayscale`, `scale`), and inserts `image_id`. A top-level `images[]` transport index maps each distinct image id to every referencing `$.state` path and to its MCP `content_index`. The same retained image referenced from several state paths is emitted only once.
 
-The MCP result `content` is multimodal: index `0` is the JSON `TextContent` representation of the structured result, followed by one MCP `ImageContent` block per distinct retained image. Thus no-image scenarios return ordinary structured/text data, while scenarios with several images return all of them in the same tool result. The images are direct model input, not `publish_file`, Published storage, an MCP App or a `resource_link`. MCP encodes `ImageContent.data` as Base64 on the wire; Auto.js WebP plus `scale` is the intended size-control path. `rect` always remains the original absolute screen-space capture rectangle, so coordinates can be mapped back correctly after downscaling.
+The MCP result `content` is multimodal: index `0` is the JSON `TextContent` representation of the structured result, followed by one MCP `ImageContent` block per distinct retained image. Thus no-image scenarios return ordinary structured/text data, while scenarios with several images return all of them in the same tool result. The images are direct model input, not `publish`, Published storage, an MCP App or a `resource_link`. MCP encodes `ImageContent.data` as Base64 on the wire; Auto.js WebP plus `scale` is the intended size-control path. `rect` always remains the original absolute screen-space capture rectangle, so coordinates can be mapped back correctly after downscaling.
 
 ---
 
 ## Publication
 
-### `publish_file`
+### `publish`
 
-Snapshots an existing Workspace file into persistent MrMCP publish storage and presents it through the attached MCP App widget.
-
-Arguments:
-
-- `path` — required.
-- `filename` — optional presented/download filename.
-- `mime_type` — optional MIME override.
-- `context_handle`.
-
-Publications survive source changes/deletion and server restarts until explicitly cleared.
-
-### `publish_html`
-
-Publishes self-contained interactive HTML through the MCP App widget.
+Publishes content to the user through one MIME-aware MCP App and persists an immutable snapshot under `.mrmcp/publish/`.
 
 Arguments:
 
-- `html` — required.
-- `title` — default `Interactive HTML`, maximum 200 characters.
-- `height` — widget height, default 600, range 120–2000.
+- exactly one source:
+  - `path` — existing Workspace file; MrMCP snapshots its bytes.
+  - `text` — string encoded as UTF-8 bytes.
+  - `base64` — Base64-encoded bytes decoded directly into publish storage.
+- `mime_type` — required MIME type for the published bytes. Browser-displayable MIME types are served inline; opaque/binary MIME types are served as attachments.
+- `filename` — optional presented filename. A path defaults to its source basename; direct text/Base64 content gets a MIME-based fallback name when omitted.
+- `presentation` — optional widget hint: `auto` (default), `inline`, or `download`. This affects the first-frame MCP App presentation only and does not override HTTP MIME/Content-Disposition semantics.
+- `title` — optional heading, maximum 200 characters.
+- `description` — optional text below the title, maximum 2000 characters.
+- `height` — preferred iframe-style inline-preview height, default 600, range 120–2000.
 - `context_handle`.
 
-Remote dependencies remain subject to host/browser CSP and CORS. The whole MCP request is bounded by the server request-body limit.
+Every source becomes a normal physical file named with the random publication capability prefix plus a sanitized filename. Content is deduplicated with the same fast size/first/last/middle sampling fingerprint, and a reused resource may retain references from multiple Sessions and Workspaces without copying the payload. Publications survive source changes/deletion and server restarts until explicitly cleared.
+
+The returned `uri` is the persistent HTTPS URL of the published content itself, not the MCP App resource. Displayable resources keep their filename in an inline `Content-Disposition`; executables and other opaque binary MIME types use attachment disposition. The smart widget uses MIME plus `presentation` to choose an image/iframe preview or a file action, always linking back to that content URL. HTML is loaded in a nested sandboxed iframe without `allow-same-origin`; self-contained HTML/CSS/JavaScript is the portable default, while remote dependencies remain subject to host/browser CSP and CORS. The whole MCP request, including `text` or `base64`, is bounded by the server request-body limit.
 
 ---
 

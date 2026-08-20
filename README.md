@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.111
+# MrMCP 0.10.115
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated `/mcp` endpoint, Workspace-scoped Sessions, filesystem and process tools, OAuth/Basic authentication, TLS automation, and a local Tauriless administration UI.
 
@@ -22,7 +22,7 @@ MrMCP is a stateless Model Context Protocol server implemented in Deno. It expos
 - Automatic TLS/certificate handling.
 - Tool Call and optional HTTP diagnostic logs, with confirmed page-level Clear actions for Tool Calls, Sessions, Workspaces, OAuth Clients and HTTP history.
 - Local desktop UI with system tray and native notifications.
-- `publish_file` and `publish_html` MCP App presentation helpers with persistent deduplicated `.mrmcp/publish/` snapshots, serialized publication writes, multi-Workspace publication references and a local Published manager for filtering, native opening and deletion.
+- One MIME-aware `publish` MCP App helper for Workspace paths, direct text and Base64 bytes, with persistent deduplicated `.mrmcp/publish/` files, inline/download presentation hints, multi-Workspace publication references and a local Published manager for filtering, native opening and deletion.
 
 ## Requirements
 
@@ -80,7 +80,7 @@ Filesystem:
 - `fs_glob`, `fs_grep`, `fs_read`, `fs_navigate`, `fs_stat`
 - `fs_write`, `fs_edit`
 - `fs_mkdir`, `fs_copy`, `fs_move`, `fs_trash`, `fs_restore`
-- `publish_file`, `publish_html`
+- `publish` — publish exactly one Workspace path, text string or Base64 payload with a required MIME type, optional filename/title/description and an `auto|inline|download` presentation hint.
 
 The `fs_*` surface is multi-file where appropriate, stateless for navigation/pagination, uses opaque file fingerprints for optimistic concurrency, and reports independent per-entry outcomes instead of cross-entry rollback. See `TOOLS.md` for the complete tool contracts and rationale.
 

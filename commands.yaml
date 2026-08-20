@@ -64,7 +64,7 @@ commands:
       Matplotlib example producing an image:
       {"program":"uv","args":["run","-"],"stdin":"# /// script\n# dependencies = [\"matplotlib\"]\n# ///\n\nimport matplotlib.pyplot as plt\n\nx = [1, 2, 3, 4]\ny = [1, 4, 9, 16]\nplt.plot(x, y, marker=\"o\")\nplt.title(\"Example chart\")\nplt.xlabel(\"x\")\nplt.ylabel(\"y\")\nplt.tight_layout()\nplt.savefig(\"chart.png\", dpi=160, bbox_inches=\"tight\")\n"}
 
-      When Python creates an image, chart, PDF or other user-facing file, let the command write it normally and then call publish_file with that path; do not manually Base64-encode or read binary outputs as text.
+      When Python creates an image, chart, PDF or other user-facing file, let the command write it normally and then call publish with that path and its real mime_type; do not manually Base64-encode or read binary outputs as text.
     download_url: https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip
     documentation_url: https://docs.astral.sh/uv/
   - logical_name: sqlite3
@@ -81,10 +81,10 @@ commands:
     download_url: https://download.sysinternals.com/files/Handle.zip
     documentation_url: https://learn.microsoft.com/en-us/sysinternals/downloads/handle
   - logical_name: d2
-    description: "Modern standalone diagram scripting CLI written in Go. Prefer it for architecture, software, network and system diagrams when D2 syntax is suitable; invoke it directly with exec program d2, for example: d2 diagram.d2 diagram.svg. After rendering, call publish_file on diagram.svg to request the sandboxed MCP App preview. The executable is expected to already exist as .mrmcp/bin/d2 or d2.exe; this catalog entry intentionally has no download URL."
+    description: "Modern standalone diagram scripting CLI written in Go. Prefer it for architecture, software, network and system diagrams when D2 syntax is suitable; invoke it directly with exec program d2, for example: d2 diagram.d2 diagram.svg. After rendering, call publish with path diagram.svg and mime_type image/svg+xml to request the sandboxed MCP App preview. The executable is expected to already exist as .mrmcp/bin/d2 or d2.exe; this catalog entry intentionally has no download URL."
     documentation_url: https://d2lang.com/tour/intro/
   - logical_name: mermaid
     path: arielc
-    description: "Preferred native Mermaid renderer for diagrams and chart-like Mermaid formats. Rust standalone CLI with no Node.js, browser or Puppeteer dependency; render .mmd input to SVG using exec program mermaid, for example: mermaid -i diagram.mmd -o diagram.svg, then call publish_file on diagram.svg to request the sandboxed MCP App preview. Supports Mermaid flowcharts, sequence/class/state/ER/C4 diagrams, mind maps, timelines, Gantt, pie, XY charts, Sankey, radar and other supported Mermaid types."
+    description: "Preferred native Mermaid renderer for diagrams and chart-like Mermaid formats. Rust standalone CLI with no Node.js, browser or Puppeteer dependency; render .mmd input to SVG using exec program mermaid, for example: mermaid -i diagram.mmd -o diagram.svg, then call publish with path diagram.svg and mime_type image/svg+xml to request the sandboxed MCP App preview. Supports Mermaid flowcharts, sequence/class/state/ER/C4 diagrams, mind maps, timelines, Gantt, pie, XY charts, Sankey, radar and other supported Mermaid types."
     download_url: https://github.com/rinfimate/ariel-rs-cli/releases/download/v0.2.0/arielc-windows-x86_64.zip
     documentation_url: https://github.com/rinfimate/ariel-rs-cli

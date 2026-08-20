@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.114 — Harden filesystem tools, text detection, schema diagnostics and maintenance UI.
+MrMCP 0.10.115 — Unify user publication into one MIME-aware publish tool and smart MCP App.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -24,7 +24,7 @@ import { isIP } from "node:net";
 import { userInfo } from "node:os";
 import { Eta } from "jsr:@bgub/eta@4.6.0";
 import { parse as parseYaml, stringify as stringifyYaml } from "jsr:@std/yaml@1.1.2";
-import { contentType as mediaContentType, typeByExtension } from "jsr:@std/media-types@1.1.0";
+import { contentType as mediaContentType } from "jsr:@std/media-types@1.1.0";
 
 const SELF = new URL(import.meta.url);
 const IS_BACKEND_WORKER = globalThis.name === "mrmcp-backend";
@@ -86,7 +86,7 @@ const BASE_TOOLS = [
   "list_workspaces", "create_workspace", "open_workspace",
   "fs_glob", "fs_grep", "fs_read", "fs_navigate", "fs_stat",
   "fs_write", "fs_edit", "fs_mkdir", "fs_copy", "fs_move", "fs_trash", "fs_restore",
-  "desktop_auto", "publish_file", "publish_html", "discover_commands", "inspect_tools", "query_tool_calls", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
+  "desktop_auto", "publish", "discover_commands", "inspect_tools", "query_tool_calls", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
   "js", "js_add_node_module_dir", "js_reset",
 ];
 const READ_TOOLS = new Set([
@@ -96,7 +96,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.114";
+const VERSION = "0.10.115";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;
@@ -105,8 +105,7 @@ const CONTEXT_HANDLE_OUTPUT_DESCRIPTION = "Opaque capability identifying a persi
 const CONTEXT_HANDLE_RULE = "Requires the exact Session context_handle returned by open_workspace.";
 const MCP_UI_EXTENSION = "io.modelcontextprotocol/ui";
 const MCP_UI_MIME_TYPE = "text/html;profile=mcp-app";
-const FILE_PREVIEW_UI_URI = "ui://mrmcp/file-preview-v9.html";
-const HTML_PREVIEW_UI_URI = "ui://mrmcp/html-preview-v6.html";
+const PUBLISH_UI_URI = "ui://mrmcp/publish-v1.html";
 const enc = new TextEncoder(), dec = new TextDecoder();
 const TOOL_RESULT_CONTENT = Symbol("tool-result-content");
 
@@ -473,7 +472,7 @@ async function backend({ addWorkspace = null } = {}) {
     prompts: { page: 1, query: "", pageSize: 5 },
     sessions: { oauthClientId: "" },
     logs: { page: 1, toolQuery: "", query: "", context: "", status: "", pageSize: 25, openRowId: "", selfTest: null },
-    published: { page: 1, kind: "", context: "", size: "" },
+    published: { page: 1, context: "", size: "" },
     debug: { query: "", method: "", status: "", openRowId: "" },
   };
   let uiRenderTimer = null, uiLogFilterTimer = null, uiNoticeTimer = null, uiRenderRunning = false, uiRenderQueued = false;
@@ -780,7 +779,6 @@ async function backend({ addWorkspace = null } = {}) {
       root_id INTEGER NOT NULL DEFAULT 0,
       root_name TEXT NOT NULL DEFAULT '',
       root_path TEXT NOT NULL DEFAULT '',
-      kind TEXT NOT NULL,
       source_path TEXT NOT NULL DEFAULT '',
       source_filename TEXT NOT NULL DEFAULT '',
       published_name TEXT NOT NULL,
@@ -788,6 +786,8 @@ async function backend({ addWorkspace = null } = {}) {
       mime_type TEXT NOT NULL DEFAULT '',
       size INTEGER NOT NULL DEFAULT 0,
       title TEXT NOT NULL DEFAULT '',
+      description TEXT NOT NULL DEFAULT '',
+      presentation TEXT NOT NULL DEFAULT 'auto',
       height INTEGER NOT NULL DEFAULT 600,
       created_at INTEGER NOT NULL,
       request_count INTEGER NOT NULL DEFAULT 0,
@@ -796,7 +796,6 @@ async function backend({ addWorkspace = null } = {}) {
     );
     CREATE INDEX IF NOT EXISTS published_time ON published(created_at DESC);
     CREATE INDEX IF NOT EXISTS published_context ON published(context_id,created_at DESC);
-    CREATE INDEX IF NOT EXISTS published_kind ON published(kind,created_at DESC);
     CREATE TABLE IF NOT EXISTS published_uses(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       published_id TEXT NOT NULL,
@@ -810,6 +809,8 @@ async function backend({ addWorkspace = null } = {}) {
       filename TEXT NOT NULL DEFAULT '',
       mime_type TEXT NOT NULL DEFAULT '',
       title TEXT NOT NULL DEFAULT '',
+      description TEXT NOT NULL DEFAULT '',
+      presentation TEXT NOT NULL DEFAULT 'auto',
       height INTEGER NOT NULL DEFAULT 0,
       published_at INTEGER NOT NULL,
       FOREIGN KEY(published_id) REFERENCES published(id) ON DELETE CASCADE
@@ -832,6 +833,13 @@ async function backend({ addWorkspace = null } = {}) {
   if (!publishedColumns.has("root_id")) db.exec("ALTER TABLE published ADD COLUMN root_id INTEGER NOT NULL DEFAULT 0");
   if (!publishedColumns.has("root_name")) db.exec("ALTER TABLE published ADD COLUMN root_name TEXT NOT NULL DEFAULT ''");
   if (!publishedColumns.has("root_path")) db.exec("ALTER TABLE published ADD COLUMN root_path TEXT NOT NULL DEFAULT ''");
+  if (!publishedColumns.has("description")) db.exec("ALTER TABLE published ADD COLUMN description TEXT NOT NULL DEFAULT ''");
+  if (!publishedColumns.has("presentation")) db.exec("ALTER TABLE published ADD COLUMN presentation TEXT NOT NULL DEFAULT 'auto'");
+  db.exec("DROP INDEX IF EXISTS published_kind");
+  if (publishedColumns.has("kind")) db.exec("ALTER TABLE published DROP COLUMN kind");
+  const publishedUseColumns = new Set(db.prepare("PRAGMA table_info(published_uses)").all().map(column => column.name));
+  if (!publishedUseColumns.has("description")) db.exec("ALTER TABLE published_uses ADD COLUMN description TEXT NOT NULL DEFAULT ''");
+  if (!publishedUseColumns.has("presentation")) db.exec("ALTER TABLE published_uses ADD COLUMN presentation TEXT NOT NULL DEFAULT 'auto'");
   const one = (sql, ...args) => db.prepare(sql).get(...args);
   const all = (sql, ...args) => db.prepare(sql).all(...args);
   const run = (sql, ...args) => {
@@ -959,8 +967,8 @@ async function backend({ addWorkspace = null } = {}) {
     tool_call_transport: ["log_id", "progress_requested"],
     debug_log_workspaces: ["debug_log_id", "context_id", "root_id", "root_name", "root_path"],
     oauth_refresh_tokens: ["token_hash", "client_id", "server_id", "resource", "scope", "last_used_at"],
-    published: ["id", "server_id", "content_key", "context_handle", "context_id", "root_id", "root_name", "root_path", "kind", "source_path", "source_filename", "published_name", "filename", "mime_type", "size", "title", "height", "created_at", "request_count", "last_request_at"],
-    published_uses: ["id", "published_id", "context_handle", "context_id", "root_id", "root_name", "root_path", "source_path", "source_filename", "filename", "mime_type", "title", "height", "published_at"],
+    published: ["id", "server_id", "content_key", "context_handle", "context_id", "root_id", "root_name", "root_path", "source_path", "source_filename", "published_name", "filename", "mime_type", "size", "title", "description", "presentation", "height", "created_at", "request_count", "last_request_at"],
+    published_uses: ["id", "published_id", "context_handle", "context_id", "root_id", "root_name", "root_path", "source_path", "source_filename", "filename", "mime_type", "title", "description", "presentation", "height", "published_at"],
   };
   const schemaErrors = [];
   for (const [table, columns] of Object.entries(requiredSchema)) {
@@ -1317,37 +1325,42 @@ async function backend({ addWorkspace = null } = {}) {
       [MCP_UI_EXTENSION]: { mimeTypes: [MCP_UI_MIME_TYPE] },
     },
   } : {};
-  const filePreviewUiMeta = () => ({
+  const publishUiMeta = () => ({
     ui: {
       prefersBorder: false,
-      csp: { resourceDomains: [publicOrigin()] },
+      csp: { resourceDomains: [publicOrigin()], frameDomains: [publicOrigin()] },
     },
   });
-  const filePreviewResource = (uri = FILE_PREVIEW_UI_URI) => ({
+  const publishResource = (uri = PUBLISH_UI_URI) => ({
     uri,
-    name: "mrmcp_file_preview",
-    title: "MrMCP file preview",
-    description: "Sandboxed MCP App used by publish_file. It reads the published HTTPS URL from structuredContent, renders image files with a normal img element, and offers an Open File action for other MIME types.",
+    name: "mrmcp_publish",
+    title: "MrMCP publish",
+    description: "Smart MCP App used by publish. It reads one persistent HTTPS content URL from structuredContent and chooses an inline preview or file action from MIME type plus the caller's presentation hint.",
     mimeType: MCP_UI_MIME_TYPE,
-    _meta: filePreviewUiMeta(),
+    _meta: publishUiMeta(),
   });
-  function filePreviewAppHtml() {
+  function publishAppHtml() {
     return String.raw`<!doctype html>
 <html lang="en" data-mode="inline">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MrMCP file preview</title>
+<title>MrMCP publish</title>
 <style>
 :root { color-scheme: light dark; }
 * { box-sizing: border-box; }
 html, body, main { margin: 0; width: 100%; min-width: 0; background: transparent; }
+#header { display: none; padding: 8px 4px 10px; font-family: system-ui, sans-serif; }
+#title { font-size: 16px; font-weight: 700; line-height: 1.25; overflow-wrap: anywhere; }
+#description { margin-top: 4px; font-size: 13px; line-height: 1.4; opacity: .72; overflow-wrap: anywhere; white-space: pre-wrap; }
 #imageStage { position: relative; display: none; width: 100%; place-items: center; overflow: hidden; }
 #image { display: block; width: 100%; height: auto; object-fit: contain; }
-#actions { position: absolute; top: 8px; right: 8px; display: flex; gap: 6px; opacity: .25; transition: opacity .15s; }
-#imageStage:hover #actions, #actions:focus-within { opacity: 1; }
-#actions button, #actions a { display: grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 1px solid #ffffff55; border-radius: 8px; color: white; background: #000b; font: 20px/1 system-ui, sans-serif; text-decoration: none; cursor: pointer; }
-#actions [hidden] { display: none; }
+#frameStage { position: relative; display: none; width: 100%; }
+#frame { display: block; width: 100%; min-height: 120px; border: 0; background: transparent; }
+.actions { position: absolute; top: 8px; right: 8px; display: flex; gap: 6px; opacity: .25; transition: opacity .15s; }
+#imageStage:hover .actions, #frameStage:hover .actions, .actions:focus-within { opacity: 1; }
+.actions button, .actions a { display: grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 1px solid #ffffff55; border-radius: 8px; color: white; background: #000b; font: 20px/1 system-ui, sans-serif; text-decoration: none; cursor: pointer; }
+.actions [hidden] { display: none; }
 #fileStage { display: none; align-items: center; gap: 12px; padding: 14px; border: 1px solid #ffffff22; border-radius: 10px; font: 14px/1.35 system-ui, sans-serif; }
 #fileIcon { font-size: 28px; }
 #fileInfo { flex: 1; min-width: 0; }
@@ -1356,18 +1369,30 @@ html, body, main { margin: 0; width: 100%; min-width: 0; background: transparent
 #fileOpen { padding: 7px 10px; border: 1px solid #ffffff33; border-radius: 8px; color: inherit; text-decoration: none; white-space: nowrap; }
 #error { display: none; padding: 10px; color: var(--color-text-danger, #b42318); font: 14px/1.4 system-ui, sans-serif; overflow-wrap: anywhere; }
 html[data-mode="fullscreen"], html[data-mode="fullscreen"] body, html[data-mode="fullscreen"] main { height: 100%; overflow: hidden; }
-html[data-mode="fullscreen"] #imageStage { display: grid; height: 100%; }
+html[data-mode="fullscreen"] main { display: flex; flex-direction: column; }
+html[data-mode="fullscreen"] #header { flex: 0 0 auto; }
+html[data-mode="fullscreen"] #imageStage, html[data-mode="fullscreen"] #frameStage { flex: 1; min-height: 0; }
+html[data-mode="fullscreen"] #imageStage { display: grid; }
 html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
-@media (hover: none) { #actions { opacity: 1; } }
+html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
+@media (hover: none) { .actions { opacity: 1; } }
 </style>
 </head>
 <body>
 <main>
+  <div id="header"><div id="title"></div><div id="description"></div></div>
   <div id="imageStage">
     <img id="image" alt="Published image">
-    <div id="actions">
-      <button id="fullscreen" type="button" title="Fullscreen" aria-label="Fullscreen" hidden>⛶</button>
+    <div class="actions">
+      <button id="imageFullscreen" type="button" title="Fullscreen" aria-label="Fullscreen" hidden>⛶</button>
       <a id="imageOpen" target="_blank" rel="noopener noreferrer" title="Open original" aria-label="Open original">↗</a>
+    </div>
+  </div>
+  <div id="frameStage">
+    <iframe id="frame" title="Published content" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox" allow="fullscreen" referrerpolicy="no-referrer"></iframe>
+    <div class="actions">
+      <button id="frameFullscreen" type="button" title="Fullscreen" aria-label="Fullscreen" hidden>⛶</button>
+      <a id="frameOpen" target="_blank" rel="noopener noreferrer" title="Open original" aria-label="Open original">↗</a>
     </div>
   </div>
   <div id="fileStage">
@@ -1381,20 +1406,27 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
 (function () {
   'use strict';
   var root = document.documentElement;
+  var header = document.getElementById('header');
+  var title = document.getElementById('title');
+  var description = document.getElementById('description');
   var imageStage = document.getElementById('imageStage');
+  var frameStage = document.getElementById('frameStage');
   var fileStage = document.getElementById('fileStage');
   var image = document.getElementById('image');
+  var frame = document.getElementById('frame');
   var imageOpen = document.getElementById('imageOpen');
+  var frameOpen = document.getElementById('frameOpen');
   var fileName = document.getElementById('fileName');
   var fileMeta = document.getElementById('fileMeta');
   var fileOpen = document.getElementById('fileOpen');
-  var fullscreen = document.getElementById('fullscreen');
+  var imageFullscreen = document.getElementById('imageFullscreen');
+  var frameFullscreen = document.getElementById('frameFullscreen');
   var error = document.getElementById('error');
   var pending = new Map();
   var nextId = Math.floor(Math.random() * 1073741823) + 1;
   var currentMode = 'inline';
   var fullscreenAvailable = false;
-  var currentIsImage = false;
+  var currentPreview = '';
   var publicationId = '';
 
   function post(message) { window.parent.postMessage(message, '*'); }
@@ -1421,15 +1453,19 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
   function setMode(mode) {
     currentMode = mode === 'fullscreen' ? 'fullscreen' : 'inline';
     root.dataset.mode = currentMode;
-    fullscreen.title = currentMode === 'fullscreen' ? 'Exit fullscreen' : 'Fullscreen';
-    fullscreen.setAttribute('aria-label', fullscreen.title);
+    var label = currentMode === 'fullscreen' ? 'Exit fullscreen' : 'Fullscreen';
+    imageFullscreen.title = label;
+    imageFullscreen.setAttribute('aria-label', label);
+    frameFullscreen.title = label;
+    frameFullscreen.setAttribute('aria-label', label);
   }
   function applyHostContext(context) {
     context = context || {};
     if (context.theme) root.style.colorScheme = context.theme;
     if (context.displayMode) setMode(context.displayMode);
     fullscreenAvailable = array(context.availableDisplayModes).indexOf('fullscreen') >= 0;
-    fullscreen.hidden = !fullscreenAvailable || !currentIsImage;
+    imageFullscreen.hidden = !fullscreenAvailable || currentPreview !== 'image';
+    frameFullscreen.hidden = !fullscreenAvailable || currentPreview !== 'frame';
   }
   function formatSize(value) {
     var size = Number(value || 0);
@@ -1437,6 +1473,14 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     if (size < 1024) return size + ' B';
     if (size < 1048576) return (size / 1024).toFixed(1) + ' KB';
     return (size / 1048576).toFixed(1) + ' MB';
+  }
+  function previewKind(mime) {
+    var essence = String(mime || '').split(';', 1)[0].trim().toLowerCase();
+    if (essence.indexOf('image/') === 0 && essence !== 'image/svg+xml') return 'image';
+    if (essence.indexOf('text/') === 0 || essence.indexOf('audio/') === 0 || essence.indexOf('video/') === 0 ||
+        essence === 'application/pdf' || essence === 'application/json' || /\+json$/.test(essence) ||
+        essence === 'application/xml' || /\+xml$/.test(essence) || essence === 'image/svg+xml') return 'frame';
+    return '';
   }
   function render(result) {
     result = result || {};
@@ -1447,208 +1491,73 @@ html[data-mode="fullscreen"] #image { width: 100%; height: 100%; }
     if (publicationId && id && id !== publicationId) return;
     if (uri && id) publicationId = id;
     var mime = String(structured.mime_type || '').toLowerCase();
-    var filename = String(structured.filename || 'Published file');
-    currentIsImage = mime.indexOf('image/') === 0;
+    var filename = String(structured.filename || 'Published content');
+    var presentation = String(structured.presentation || 'auto').toLowerCase();
+    var label = String(structured.title || '');
+    var detail = String(structured.description || '');
+    var height = Math.max(120, Math.min(Number(structured.height || 600), 2000));
+    var kind = presentation === 'download' ? '' : previewKind(mime);
+    currentPreview = kind;
     imageStage.style.display = 'none';
+    frameStage.style.display = 'none';
     fileStage.style.display = 'none';
     image.removeAttribute('src');
+    frame.removeAttribute('src');
     showError('');
+    title.textContent = label;
+    description.textContent = detail;
+    header.style.display = label || detail ? 'block' : 'none';
     if (!uri) return;
-    if (currentIsImage) {
-      image.alt = filename;
+    if (kind === 'image') {
+      image.alt = label || filename;
       imageOpen.href = uri;
       image.src = uri;
       imageStage.style.display = 'grid';
-      fullscreen.hidden = !fullscreenAvailable;
+      imageFullscreen.hidden = !fullscreenAvailable;
+      frameFullscreen.hidden = true;
+      return;
+    }
+    if (kind === 'frame') {
+      frame.title = label || filename;
+      frame.style.height = height + 'px';
+      frameOpen.href = uri;
+      frame.src = uri;
+      frameStage.style.display = 'block';
+      frameFullscreen.hidden = !fullscreenAvailable;
+      imageFullscreen.hidden = true;
       return;
     }
     if (currentMode === 'fullscreen') setMode('inline');
-    fullscreen.hidden = true;
+    imageFullscreen.hidden = true;
+    frameFullscreen.hidden = true;
     fileName.textContent = filename;
     fileMeta.textContent = [mime || 'file', formatSize(structured.size)].filter(Boolean).join(' · ');
     fileOpen.href = uri;
     fileStage.style.display = 'flex';
   }
   function toggleFullscreen() {
-    if (!fullscreenAvailable || !currentIsImage) return;
+    if (!fullscreenAvailable || !currentPreview) return;
     var requested = currentMode === 'fullscreen' ? 'inline' : 'fullscreen';
-    fullscreen.disabled = true;
+    imageFullscreen.disabled = true;
+    frameFullscreen.disabled = true;
     request('ui/request-display-mode', { mode: requested }, 3000).then(function (result) {
       setMode(result && result.mode ? result.mode : requested);
-    }).catch(function () {}).finally(function () { fullscreen.disabled = false; });
+    }).catch(function () {}).finally(function () {
+      imageFullscreen.disabled = false;
+      frameFullscreen.disabled = false;
+    });
   }
 
-  fullscreen.addEventListener('click', toggleFullscreen);
+  imageFullscreen.addEventListener('click', toggleFullscreen);
+  frameFullscreen.addEventListener('click', toggleFullscreen);
   image.addEventListener('dblclick', toggleFullscreen);
   image.addEventListener('load', function () { showError(''); });
   image.addEventListener('error', function () {
     imageStage.style.display = 'none';
-    showError('Unable to load the published image. The publication may have been cleared or the URL could not be loaded; call publish_file again.');
+    showError('Unable to load the published image. The publication may have been cleared or the URL could not be loaded; call publish again.');
   });
-
-  window.addEventListener('message', function (event) {
-    if (event.source !== window.parent) return;
-    var message = event.data;
-    if (!message || message.jsonrpc !== '2.0') return;
-    if (message.id !== undefined && pending.has(message.id)) {
-      var item = pending.get(message.id);
-      pending.delete(message.id);
-      if (message.error) item.reject(message.error); else item.resolve(message.result);
-      return;
-    }
-    if (message.method === 'ui/notifications/tool-result') render(message.params);
-    if (message.method === 'ui/notifications/host-context-changed') applyHostContext(message.params);
-  }, { passive: true });
-
-  request('ui/initialize', {
-    protocolVersion: '2026-01-26',
-    appInfo: { name: 'mrmcp-file-preview', version: '1.6.0' },
-    appCapabilities: { availableDisplayModes: ['inline', 'fullscreen'] }
-  }, 3000).then(function (result) {
-    applyHostContext(result && result.hostContext);
-    notify('ui/notifications/initialized', {});
-  }).catch(function () {
-    notify('ui/notifications/initialized', {});
-  });
-
-  if (typeof ResizeObserver === 'function') {
-    var lastWidth = 0, lastHeight = 0;
-    new ResizeObserver(function () {
-      var width = Math.ceil(document.documentElement.scrollWidth);
-      var height = Math.ceil(document.documentElement.scrollHeight);
-      if (width === lastWidth && height === lastHeight) return;
-      lastWidth = width; lastHeight = height;
-      notify('ui/notifications/size-changed', { width: width, height: height });
-    }).observe(document.documentElement);
-  }
-})();
-</script>
-</body>
-</html>`;
-  }
-  const htmlPreviewUiMeta = () => ({
-    ui: {
-      prefersBorder: false,
-      csp: { frameDomains: [publicOrigin()] },
-    },
-  });
-  const htmlPreviewResource = (uri = HTML_PREVIEW_UI_URI) => ({
-    uri,
-    name: "mrmcp_html_preview",
-    title: "MrMCP HTML preview",
-    description: "Sandboxed MCP App used by publish_html. It loads the persisted HTML URL returned in structuredContent inside a nested sandboxed iframe.",
-    mimeType: MCP_UI_MIME_TYPE,
-    _meta: htmlPreviewUiMeta(),
-  });
-  function htmlPreviewAppHtml() {
-    return String.raw`<!doctype html>
-<html lang="en" data-mode="inline">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MrMCP HTML preview</title>
-<style>
-:root { color-scheme: light dark; }
-* { box-sizing: border-box; }
-html, body, main { margin: 0; width: 100%; min-width: 0; background: transparent; }
-#bar { display: none; align-items: center; gap: 8px; min-height: 34px; padding: 4px 6px; font: 13px/1.2 system-ui, sans-serif; }
-#title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .75; }
-#fullscreen { width: 30px; height: 28px; padding: 0; border: 1px solid #ffffff33; border-radius: 7px; color: inherit; background: transparent; cursor: pointer; }
-#frame { display: none; width: 100%; min-height: 120px; border: 0; background: transparent; }
-#error { display: none; padding: 10px; color: var(--color-text-danger, #b42318); font: 14px/1.4 system-ui, sans-serif; overflow-wrap: anywhere; }
-html[data-mode="fullscreen"], html[data-mode="fullscreen"] body, html[data-mode="fullscreen"] main { height: 100%; overflow: hidden; }
-html[data-mode="fullscreen"] main { display: flex; flex-direction: column; }
-html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-height: 0; }
-</style>
-</head>
-<body>
-<main>
-  <div id="bar"><div id="title"></div><button id="fullscreen" type="button" title="Fullscreen" aria-label="Fullscreen" hidden>⛶</button></div>
-  <iframe id="frame" title="Published HTML" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox" allow="fullscreen" referrerpolicy="no-referrer"></iframe>
-  <div id="error" role="alert"></div>
-</main>
-<script>
-(function () {
-  'use strict';
-  var root = document.documentElement;
-  var bar = document.getElementById('bar');
-  var title = document.getElementById('title');
-  var frame = document.getElementById('frame');
-  var fullscreen = document.getElementById('fullscreen');
-  var error = document.getElementById('error');
-  var pending = new Map();
-  var nextId = Math.floor(Math.random() * 1073741823) + 1;
-  var currentMode = 'inline';
-  var fullscreenAvailable = false;
-  var publicationId = '';
-
-  function post(message) { window.parent.postMessage(message, '*'); }
-  function notify(method, params) { post({ jsonrpc: '2.0', method: method, params: params || {} }); }
-  function request(method, params, timeoutMs) {
-    var id = nextId++;
-    post({ jsonrpc: '2.0', id: id, method: method, params: params || {} });
-    return new Promise(function (resolve, reject) {
-      var timer = timeoutMs ? setTimeout(function () {
-        pending.delete(id);
-        reject(new Error(method + ' timeout'));
-      }, timeoutMs) : 0;
-      pending.set(id, {
-        resolve: function (value) { if (timer) clearTimeout(timer); resolve(value); },
-        reject: function (reason) { if (timer) clearTimeout(timer); reject(reason); }
-      });
-    });
-  }
-  function array(value) { return Array.isArray(value) ? value : []; }
-  function showError(text) {
-    error.textContent = text || '';
-    error.style.display = text ? 'block' : 'none';
-  }
-  function setMode(mode) {
-    currentMode = mode === 'fullscreen' ? 'fullscreen' : 'inline';
-    root.dataset.mode = currentMode;
-    fullscreen.title = currentMode === 'fullscreen' ? 'Exit fullscreen' : 'Fullscreen';
-    fullscreen.setAttribute('aria-label', fullscreen.title);
-  }
-  function applyHostContext(context) {
-    context = context || {};
-    if (context.theme) root.style.colorScheme = context.theme;
-    if (context.displayMode) setMode(context.displayMode);
-    fullscreenAvailable = array(context.availableDisplayModes).indexOf('fullscreen') >= 0;
-    fullscreen.hidden = !fullscreenAvailable;
-  }
-  function render(result) {
-    result = result || {};
-    var structured = result.structuredContent && typeof result.structuredContent === 'object'
-      ? result.structuredContent : result;
-    var uri = typeof structured.uri === 'string' ? structured.uri : '';
-    var id = String(structured.id || '');
-    if (publicationId && id && id !== publicationId) return;
-    if (uri && id) publicationId = id;
-    var label = String(structured.title || 'Interactive HTML');
-    var height = Math.max(120, Math.min(Number(structured.height || 600), 2000));
-    showError('');
-    frame.style.display = 'none';
-    bar.style.display = 'none';
-    frame.removeAttribute('src');
-    if (!uri) return;
-    title.textContent = label;
-    frame.title = label;
-    frame.style.height = height + 'px';
-    frame.src = uri;
-    bar.style.display = 'flex';
-    frame.style.display = 'block';
-  }
-  function toggleFullscreen() {
-    if (!fullscreenAvailable) return;
-    var requested = currentMode === 'fullscreen' ? 'inline' : 'fullscreen';
-    fullscreen.disabled = true;
-    request('ui/request-display-mode', { mode: requested }, 3000).then(function (result) {
-      setMode(result && result.mode ? result.mode : requested);
-    }).catch(function () {}).finally(function () { fullscreen.disabled = false; });
-  }
-
-  fullscreen.addEventListener('click', toggleFullscreen);
   frame.addEventListener('load', function () { showError(''); });
+
   window.addEventListener('message', function (event) {
     if (event.source !== window.parent) return;
     var message = event.data;
@@ -1665,7 +1574,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
 
   request('ui/initialize', {
     protocolVersion: '2026-01-26',
-    appInfo: { name: 'mrmcp-html-preview', version: '1.3.0' },
+    appInfo: { name: 'mrmcp-publish', version: '1.0.0' },
     appCapabilities: { availableDisplayModes: ['inline', 'fullscreen'] }
   }, 3000).then(function (result) {
     applyHostContext(result && result.hostContext);
@@ -1689,15 +1598,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
 </body>
 </html>`;
   }
-  const MIME_OVERRIDES = new Map([
-    [".mmd", "text/plain"], [".d2", "text/plain"],
-    [".sqlite", "application/vnd.sqlite3"], [".db", "application/octet-stream"],
-  ]);
   const mimeEssence = value => String(value || "").split(";", 1)[0].trim().toLowerCase();
-  const inferredMimeType = path => {
-    const extension = extname(String(path)).toLowerCase();
-    return MIME_OVERRIDES.get(extension) || typeByExtension(extension) || "application/octet-stream";
-  };
   const responseContentType = (mimeType, filename) =>
     mediaContentType(String(mimeType || "").trim()) ||
     mediaContentType(extname(String(filename || "")).toLowerCase()) ||
@@ -1708,7 +1609,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       essence.startsWith("audio/") || essence.startsWith("video/") ||
       essence === "application/pdf" || essence === "application/json" || essence.endsWith("+json") ||
       essence === "application/xml" || essence.endsWith("+xml") ||
-      essence === "application/javascript" || essence === "application/wasm";
+      essence === "application/javascript";
   };
   const isActiveDocumentMime = mimeType => {
     const essence = mimeEssence(mimeType);
@@ -1719,15 +1620,51 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const name = basename(String(value || "download")).replace(/[\u0000-\u001f\u007f<>:\"|?*\/\\]/g, "_").trim();
     return name && name !== "." && name !== ".." ? name.slice(0, 240) : "download";
   };
-  const downloadUrl = (token, filename) => `${publicBase()}/download/${token}/${encodeURIComponent(filename)}`;
-  const publishedHtmlUrl = id => `${publicBase()}/published-html/${encodeURIComponent(id)}`;
+  const publishedUrl = (token, filename) => `${publicBase()}/published/${token}/${encodeURIComponent(filename)}`;
   const publishedPath = name => join(PUBLISH_DIR, name);
-  const publishedFileName = (id, sourceFilename) => {
-    const rawExtension = extname(sourceFilename), rawStem = basename(sourceFilename, rawExtension);
+  const publishedFileName = (id, filename) => {
+    const rawExtension = extname(filename), rawStem = basename(filename, rawExtension);
     const extension = rawExtension.replace(/[\u0000-\u001f\u007f<>:\"|?*\/\\]/g, "_");
-    const stem = rawStem.replace(/[\u0000-\u001f\u007f<>:\"|?*\/\\]/g, "_").trim() || "file";
+    const stem = rawStem.replace(/[\u0000-\u001f\u007f<>:\"|?*\/\\]/g, "_").trim() || "content";
     const maxStem = Math.max(1, 240 - id.length - 1 - extension.length);
     return `${id}-${stem.slice(0, maxStem)}${extension}`;
+  };
+  const defaultPublishedFilename = mimeType => {
+    const essence = mimeEssence(mimeType);
+    const extension = essence === "text/html" || essence === "application/xhtml+xml" ? ".html"
+      : essence === "text/plain" ? ".txt"
+      : essence === "application/json" || essence.endsWith("+json") ? ".json"
+      : essence === "application/pdf" ? ".pdf"
+      : essence === "application/xml" || essence === "text/xml" || essence.endsWith("+xml") ? ".xml"
+      : essence === "image/png" ? ".png"
+      : essence === "image/jpeg" ? ".jpg"
+      : essence === "image/webp" ? ".webp"
+      : essence === "image/gif" ? ".gif"
+      : essence === "image/svg+xml" ? ".svg"
+      : essence === "audio/mpeg" ? ".mp3"
+      : essence === "video/mp4" ? ".mp4"
+      : essence === "application/zip" ? ".zip"
+      : essence === "application/wasm" ? ".wasm" : ".bin";
+    return `content${extension}`;
+  };
+  const normalizePublishMime = value => {
+    const mimeType = String(value || "").trim(), essence = mimeEssence(value);
+    if (!mimeType || /[^\x20-\x7e]/.test(mimeType) || !/^[^\s\/;]+\/[^\s;]+$/.test(essence))
+      throw new Error("mime_type must be a valid MIME type");
+    return mimeType;
+  };
+  const normalizePresentation = value => {
+    const presentation = String(value || "auto").trim().toLowerCase() || "auto";
+    if (!["auto", "inline", "download"].includes(presentation)) throw new Error("Invalid presentation");
+    return presentation;
+  };
+  const decodePublishBase64 = value => {
+    const input = String(value ?? "").replace(/\s+/g, "");
+    if (input && (input.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(input))) throw new Error("Invalid base64 content");
+    const bytes = new Uint8Array(Buffer.from(input, "base64"));
+    const canonical = Buffer.from(bytes).toString("base64").replace(/=+$/, "");
+    if (canonical !== input.replace(/=+$/, "")) throw new Error("Invalid base64 content");
+    return bytes;
   };
   let publishSerial = Promise.resolve();
   const serializePublish = work => {
@@ -1762,24 +1699,31 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       const first = await fileSlice(file, 0, length);
       const last = await fileSlice(file, Math.max(0, size - length), length);
       const middle = await fileSlice(file, Math.max(0, Math.floor((size - length) / 2)), length);
-      return hashContent("file", [String(size), first, last, middle]);
+      return hashContent("content", [String(size), first, last, middle]);
     } finally { file.close(); }
   }
-  const htmlContentKey = html => hashContent("html", [enc.encode(html)]);
+  const bytesContentKey = bytes => {
+    const size = bytes.byteLength, length = Math.min(10, size);
+    const first = bytes.subarray(0, length);
+    const last = bytes.subarray(Math.max(0, size - length), size);
+    const middleStart = Math.max(0, Math.floor((size - length) / 2));
+    return hashContent("content", [String(size), first, last, bytes.subarray(middleStart, middleStart + length)]);
+  };
   const addPublishedUse = (publishedId, metadata) => {
     const contextHandle = String(metadata.context_handle || ""), contextId = Number(metadata.context_id || 0), rootId = Number(metadata.root_id || 0);
     const values = [
       contextHandle, String(metadata.root_name || ""), String(metadata.root_path || ""), String(metadata.source_path || ""), String(metadata.source_filename || ""),
-      String(metadata.filename || ""), String(metadata.mime_type || ""), String(metadata.title || ""), Number(metadata.height || 0), Number(metadata.published_at || Date.now()),
+      String(metadata.filename || ""), String(metadata.mime_type || ""), String(metadata.title || ""), String(metadata.description || ""),
+      normalizePresentation(metadata.presentation), Number(metadata.height || 0), Number(metadata.published_at || Date.now()),
     ];
     const existing = one(`SELECT id FROM published_uses
       WHERE published_id=? AND context_id=? AND root_id=? ORDER BY id DESC LIMIT 1`, publishedId, contextId, rootId);
     if (existing) return run(`UPDATE published_uses SET
-      context_handle=?,root_name=?,root_path=?,source_path=?,source_filename=?,filename=?,mime_type=?,title=?,height=?,published_at=?
+      context_handle=?,root_name=?,root_path=?,source_path=?,source_filename=?,filename=?,mime_type=?,title=?,description=?,presentation=?,height=?,published_at=?
       WHERE id=?`, ...values, existing.id);
     return run(`INSERT INTO published_uses(
-      published_id,context_handle,context_id,root_id,root_name,root_path,source_path,source_filename,filename,mime_type,title,height,published_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`, publishedId, contextHandle, contextId, rootId, ...values.slice(1));
+      published_id,context_handle,context_id,root_id,root_name,root_path,source_path,source_filename,filename,mime_type,title,description,presentation,height,published_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, publishedId, contextHandle, contextId, rootId, ...values.slice(1));
   };
   async function cleanupPublished(id, strict = false) {
     const record = one("SELECT published_name FROM published WHERE id=?", id);
@@ -1797,48 +1741,56 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     return true;
   }
   async function openPublished(id) {
-    const record = one("SELECT id,kind,filename FROM published WHERE id=?", id);
+    const record = one("SELECT id,filename FROM published WHERE id=?", id);
     if (!record) throw new Error("Published item not found");
     const latest = one("SELECT filename FROM published_uses WHERE published_id=? ORDER BY published_at DESC,id DESC LIMIT 1", id);
     const filename = latest?.filename || record.filename;
-    const url = record.kind === "html" ? publishedHtmlUrl(record.id)
-      : record.kind === "file" ? downloadUrl(record.id, filename) : "";
-    if (!url) throw new Error("Unsupported published item type");
     if (!IS_BACKEND_WORKER) throw new Error("URL opening is available only in the desktop UI");
-    self.postMessage({ type: "os-open-url", url });
+    self.postMessage({ type: "os-open-url", url: publishedUrl(record.id, filename) });
   }
   async function cleanupPublishedOrphans() {
     const live = new Set(all("SELECT published_name FROM published").map(record => String(record.published_name)));
     for await (const entry of Deno.readDir(PUBLISH_DIR))
       if (entry.isFile && !live.has(entry.name)) await Deno.remove(join(PUBLISH_DIR, entry.name)).catch(() => {});
   }
-  async function publishPath(path, options = {}) {
+  async function publishContent(source, options = {}) {
     return await serializePublish(async () => {
-      const allowedRoot = await Deno.realPath(options.allowed_root || dirname(path));
-      const realPath = await Deno.realPath(path);
-      if (!within(allowedRoot, realPath)) throw new Error("Published file resolves outside its allowed root");
-      const stat = await Deno.stat(realPath);
-      if (!stat.isFile) throw new Error("Only regular files can be published");
-      const sourceFilename = basename(realPath);
-      const filename = safeDownloadName(options.filename || sourceFilename);
-      const mimeType = String(options.mime_type || inferredMimeType(sourceFilename)).trim() || "application/octet-stream";
-      if (/[^\x20-\x7e]/.test(mimeType) || !/^[^\s\/]+\/[^\s]+$/.test(mimeType))
-        throw new Error("Invalid MIME type");
-      const contentKey = await fileContentKey(realPath, stat.size);
-      let record = one("SELECT * FROM published WHERE server_id=? AND content_key=? AND kind='file'", options.server_id, contentKey), created = false;
+      const mimeType = normalizePublishMime(options.mime_type);
+      const presentation = normalizePresentation(options.presentation);
+      const title = String(options.title || "").trim().slice(0, 200);
+      const description = String(options.description || "").trim().slice(0, 2000);
+      const height = Math.max(120, Math.min(Number(options.height || 600), 2000));
+      let realPath = "", sourceFilename = "", bytes = null, size = 0, contentKey = "";
+      if (source.path) {
+        const allowedRoot = await Deno.realPath(options.allowed_root || dirname(source.path));
+        realPath = await Deno.realPath(source.path);
+        if (!within(allowedRoot, realPath)) throw new Error("Published file resolves outside its allowed root");
+        const stat = await Deno.stat(realPath);
+        if (!stat.isFile) throw new Error("Only regular files can be published");
+        sourceFilename = basename(realPath);
+        size = stat.size;
+        contentKey = await fileContentKey(realPath, size);
+      } else {
+        bytes = source.bytes instanceof Uint8Array ? source.bytes : new Uint8Array(source.bytes || []);
+        size = bytes.byteLength;
+        contentKey = bytesContentKey(bytes);
+      }
+      const filename = safeDownloadName(options.filename || sourceFilename || defaultPublishedFilename(mimeType));
+      let record = one("SELECT * FROM published WHERE server_id=? AND content_key=?", options.server_id, contentKey), created = false;
       if (!record) {
-        const id = randomToken(32), publishedName = publishedFileName(id, sourceFilename), snapshotPath = publishedPath(publishedName), createdAt = Date.now();
-        await Deno.copyFile(realPath, snapshotPath);
+        const id = randomToken(32), publishedName = publishedFileName(id, filename), snapshotPath = publishedPath(publishedName), createdAt = Date.now();
+        if (realPath) await Deno.copyFile(realPath, snapshotPath);
+        else await Deno.writeFile(snapshotPath, bytes, { createNew: true });
         const snapshotStat = await Deno.stat(snapshotPath);
-        if (snapshotStat.size !== stat.size || await fileContentKey(snapshotPath, snapshotStat.size) !== contentKey) {
+        if (snapshotStat.size !== size || await fileContentKey(snapshotPath, snapshotStat.size) !== contentKey) {
           await Deno.remove(snapshotPath).catch(() => {});
-          throw new Error("File changed while it was being published; retry the publication.");
+          throw new Error(realPath ? "File changed while it was being published; retry the publication." : "Published content verification failed");
         }
         try {
-          run(`INSERT INTO published(id,server_id,content_key,context_handle,context_id,root_id,root_name,root_path,kind,source_path,source_filename,published_name,filename,mime_type,size,title,height,created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+          run(`INSERT INTO published(id,server_id,content_key,context_handle,context_id,root_id,root_name,root_path,source_path,source_filename,published_name,filename,mime_type,size,title,description,presentation,height,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
             id, options.server_id, contentKey, options.context_handle || "", Number(options.context_id || 0), Number(options.root_id || 0), String(options.root_name || ""), String(options.root_path || ""),
-            "file", realPath, sourceFilename, publishedName, filename, mimeType, snapshotStat.size, "", 0, createdAt,
+            realPath, sourceFilename, publishedName, filename, mimeType, snapshotStat.size, title, description, presentation, height, createdAt,
           );
         } catch (error) {
           await Deno.remove(snapshotPath).catch(() => {});
@@ -1849,64 +1801,28 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       } else {
         const snapshotPath = publishedPath(record.published_name);
         const snapshotStat = await Deno.stat(snapshotPath).catch(() => null);
-        if (!snapshotStat?.isFile || snapshotStat.size !== stat.size || await fileContentKey(snapshotPath, snapshotStat.size) !== contentKey) {
-          await Deno.copyFile(realPath, snapshotPath);
+        if (!snapshotStat?.isFile || snapshotStat.size !== size || await fileContentKey(snapshotPath, snapshotStat.size) !== contentKey) {
+          if (realPath) await Deno.copyFile(realPath, snapshotPath);
+          else await Deno.writeFile(snapshotPath, bytes);
           const repaired = await Deno.stat(snapshotPath);
-          if (repaired.size !== stat.size || await fileContentKey(snapshotPath, repaired.size) !== contentKey)
-            throw new Error("File changed while it was being published; retry the publication.");
+          if (repaired.size !== size || await fileContentKey(snapshotPath, repaired.size) !== contentKey)
+            throw new Error(realPath ? "File changed while it was being published; retry the publication." : "Published content verification failed");
         }
       }
       const publishedAt = Date.now();
       try {
         addPublishedUse(record.id, {
-          ...options, source_path: realPath, source_filename: sourceFilename, filename, mime_type: mimeType, published_at: publishedAt,
+          ...options, source_path: realPath, source_filename: sourceFilename, filename, mime_type: mimeType,
+          title, description, presentation, height, published_at: publishedAt,
         });
       } catch (error) {
         if (created) await cleanupPublished(record.id).catch(() => {});
         throw error;
       }
       return {
-        id: record.id, content_id: contentKey, filename, mime_type: mimeType, size: Number(record.size || stat.size),
-        uri: downloadUrl(record.id, filename),
-      };
-    });
-  }
-  async function publishHtml(html, options = {}) {
-    return await serializePublish(async () => {
-      const contentKey = htmlContentKey(html);
-      let record = one("SELECT * FROM published WHERE server_id=? AND content_key=? AND kind='html'", options.server_id, contentKey), created = false;
-      if (!record) {
-        const id = `html_${randomToken(24)}`, publishedName = `${id}.html`, createdAt = Date.now(), snapshotPath = publishedPath(publishedName);
-        await Deno.writeTextFile(snapshotPath, html, { createNew: true });
-        const size = (await Deno.stat(snapshotPath)).size;
-        try {
-          run(`INSERT INTO published(id,server_id,content_key,context_handle,context_id,root_id,root_name,root_path,kind,source_path,source_filename,published_name,filename,mime_type,size,title,height,created_at)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-            id, options.server_id, contentKey, options.context_handle || "", Number(options.context_id || 0), Number(options.root_id || 0), String(options.root_name || ""), String(options.root_path || ""),
-            "html", "", "", publishedName, publishedName, "text/html; charset=utf-8", size, String(options.title || ""), Number(options.height || 600), createdAt,
-          );
-        } catch (error) {
-          await Deno.remove(snapshotPath).catch(() => {});
-          throw error;
-        }
-        record = one("SELECT * FROM published WHERE id=?", id);
-        created = true;
-      } else {
-        const snapshotPath = publishedPath(record.published_name);
-        if (!(await Deno.stat(snapshotPath).catch(() => null))?.isFile) await Deno.writeTextFile(snapshotPath, html);
-      }
-      const publishedAt = Date.now();
-      try {
-        addPublishedUse(record.id, {
-          ...options, filename: record.filename, mime_type: "text/html; charset=utf-8", published_at: publishedAt,
-        });
-      } catch (error) {
-        if (created) await cleanupPublished(record.id).catch(() => {});
-        throw error;
-      }
-      return {
-        id: record.id, content_id: contentKey, title: String(options.title || "Interactive HTML"), uri: publishedHtmlUrl(record.id),
-        height: Number(options.height || 600), created_at: new Date(record.created_at).toISOString(),
+        id: record.id, content_id: contentKey, filename, mime_type: mimeType, size: Number(record.size || size),
+        uri: publishedUrl(record.id, filename), presentation, title, description, height,
+        created_at: new Date(record.created_at).toISOString(),
       };
     });
   }
@@ -1916,63 +1832,41 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const disposition = mode === "inline" ? "inline" : "attachment";
     return `${disposition}; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
   };
-  async function publishedHtmlResponse(req, u) {
-    const match = u.pathname.match(/^\/published-html\/(html_[A-Za-z0-9_-]{24,})$/);
+  async function publishedContentResponse(req, u) {
+    const match = u.pathname.match(/^\/published\/([A-Za-z0-9_-]{24,})\/([^/]+)$/);
     if (!match || !["GET", "HEAD"].includes(req.method))
       return text("Not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
-    const record = one("SELECT * FROM published WHERE id=? AND kind='html'", match[1]);
-    if (!record) return text("Not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
-    const data = await Deno.readFile(publishedPath(record.published_name)).catch(() => null);
-    if (!data) {
-      await cleanupPublished(record.id);
-      return text("Not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
-    }
-    run("UPDATE published SET request_count=request_count+1,last_request_at=? WHERE id=?", Date.now(), record.id);
-    const headers = {
-      "content-type": "text/html; charset=utf-8",
-      "content-length": String(data.byteLength),
-      "cache-control": "no-store, max-age=0",
-      "x-content-type-options": "nosniff",
-      "cross-origin-resource-policy": "cross-origin",
-      "referrer-policy": "no-referrer",
-    };
-    return req.method === "HEAD"
-      ? new Response(null, { status: 200, headers })
-      : new Response(data, { status: 200, headers });
-  }
-  async function downloadResponse(req, u) {
-    const match = u.pathname.match(/^\/download\/([A-Za-z0-9_-]{40,})\/([^/]+)$/);
-    if (!match || !["GET", "HEAD"].includes(req.method))
-      return text("Not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
-    const token = match[1], record = one("SELECT * FROM published WHERE id=? AND kind='file'", token);
-    if (!record)
-      return text("Download not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
+    const token = match[1], record = one("SELECT * FROM published WHERE id=?", token);
+    if (!record) return text("Published content not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
     let requestedName;
     try { requestedName = decodeURIComponent(match[2]); } catch { requestedName = ""; }
     const use = requestedName ? one(`SELECT filename,mime_type FROM published_uses
       WHERE published_id=? AND filename=? ORDER BY published_at DESC,id DESC LIMIT 1`, token, requestedName) : null;
     const effectiveMime = use?.mime_type || record.mime_type;
+    const effectiveName = safeDownloadName(requestedName || record.filename);
     const allowedRoot = await Deno.realPath(PUBLISH_DIR).catch(() => null);
     const realPath = await Deno.realPath(publishedPath(record.published_name)).catch(() => null);
     const stat = realPath && allowedRoot && within(allowedRoot, realPath)
       ? await Deno.stat(realPath).catch(() => null) : null;
     if (!stat?.isFile) {
       await cleanupPublished(token);
-      return text("File not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
+      return text("Published content not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
     }
     run("UPDATE published SET request_count=request_count+1,last_request_at=? WHERE id=?", Date.now(), token);
     const inlinePreview = isInlinePreviewMime(effectiveMime);
+    const essence = mimeEssence(effectiveMime);
     const activeDocument = isActiveDocumentMime(effectiveMime);
+    const htmlDocument = essence === "text/html" || essence === "application/xhtml+xml";
     const headers = {
-      "content-type": responseContentType(effectiveMime, requestedName || record.filename),
+      "content-type": responseContentType(effectiveMime, effectiveName),
       "content-length": String(stat.size),
-      "content-disposition": contentDisposition(requestedName || record.filename, inlinePreview ? "inline" : "attachment"),
-      "cache-control": "no-store, max-age=0", "x-content-type-options": "nosniff",
+      "content-disposition": contentDisposition(effectiveName, inlinePreview ? "inline" : "attachment"),
+      "cache-control": "no-store, max-age=0", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer",
       ...(inlinePreview ? {
         "access-control-allow-origin": "*",
         "cross-origin-resource-policy": "cross-origin",
       } : {}),
-      ...(activeDocument ? {
+      ...(!htmlDocument && activeDocument ? {
         "content-security-policy": "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data: blob:; font-src data:",
       } : !inlinePreview ? { "content-security-policy": "default-src 'none'; sandbox" } : {}),
     };
@@ -3416,8 +3310,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
   function serverTools(p, fullAccess = true, freshUiResources = false) {
     if (!fullAccess) return [];
     const available = new Set(BASE_TOOLS);
-    const fileUiResourceUri = freshUiResources ? freshUiResourceUri(FILE_PREVIEW_UI_URI) : FILE_PREVIEW_UI_URI;
-    const htmlUiResourceUri = freshUiResources ? freshUiResourceUri(HTML_PREVIEW_UI_URI) : HTML_PREVIEW_UI_URI;
+    const publishUiResourceUri = freshUiResources ? freshUiResourceUri(PUBLISH_UI_URI) : PUBLISH_UI_URI;
     const workspaceNameInput = {
       type: "string", minLength: 1, maxLength: 128,
       description: "Name of the enabled Workspace to open. Any enabled Workspace name may be supplied; the value is validated when the tool runs. The selected Session is attached to this Workspace immediately.",
@@ -3655,21 +3548,20 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
           ...contextInput,
         }, required: ["yaml"] },
       ],
-      publish_file: [
-        "Present an existing file to the user through the attached MCP App widget. The server snapshots the file into persistent private publish storage, reusing an existing snapshot when the same fast content fingerprint was already published, and returns an HTTPS URL in structuredContent; publications never expire automatically and survive server restarts as well as later changes, moves or deletion of the Workspace source. The widget renders image/* through an HTML img element or shows an Open File action for other MIME types. Do not read/Base64-encode the file and do not construct alternate preview payloads; simply call publish_file after creating the file.",
-        { properties: {
-          path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" },
+      publish: [
+        "Publish content to the user through one MIME-aware MCP App. Provide exactly one source: path snapshots an existing Workspace file, text stores the UTF-8 bytes of the supplied string, and base64 decodes supplied bytes directly without requiring an intermediate file. Every source is persisted as a normal file under .mrmcp/publish using a random capability prefix plus a sanitized filename, deduplicated by the same fast content fingerprint, and remains available across server restarts until explicitly cleared. mime_type is required and controls the actual HTTPS resource response: browser-displayable MIME types are served inline with the filename retained in Content-Disposition, while opaque/binary types are served as attachments. presentation is only a UI hint: auto chooses a sensible preview from MIME type, inline asks for preview when supported, and download asks the widget to present the resource as a file action. The widget always links to the persistent content URL itself, not to the widget resource. title and description render above the published element; height controls iframe-style inline previews. Self-contained HTML is portable; remote HTML dependencies remain subject to host/browser CSP and CORS. The whole MCP request, including text/base64, is limited by the server request-body limit.",
+        { oneOf: [{ required: ["path"] }, { required: ["text"] }, { required: ["base64"] }], properties: {
+          path: { type: "string", description: "Existing Workspace file to snapshot into publish storage." },
+          text: { type: "string", description: "String content encoded as UTF-8 bytes before publication." },
+          base64: { type: "string", description: "Base64-encoded bytes decoded directly into publish storage." },
+          mime_type: { type: "string", minLength: 3, maxLength: 200, description: "Required MIME type describing the published bytes and controlling browser inline-vs-attachment delivery." },
+          filename: { type: "string", maxLength: 240, description: "Optional user-facing filename. For path it defaults to the source basename; for text/base64 a MIME-based content name is generated when omitted." },
+          presentation: { type: "string", enum: ["auto", "inline", "download"], default: "auto", description: "Presentation hint for the smart widget. It never changes the bytes or MIME response semantics; unsupported inline previews fall back to a file action." },
+          title: { type: "string", maxLength: 200, description: "Optional heading rendered above the published element." },
+          description: { type: "string", maxLength: 2000, description: "Optional descriptive text rendered below the title and above the published element." },
+          height: { type: "integer", minimum: 120, maximum: 2000, default: 600, description: "Preferred height for iframe-style inline previews." },
           ...contextInput,
-        }, required: ["path"] },
-      ],
-      publish_html: [
-        "Render arbitrary interactive HTML through the attached MCP App widget. The HTML is content-hashed and snapshotted into the same persistent .mrmcp/publish storage used by publish_file; identical HTML reuses the existing snapshot while each publication retains its own Session/Workspace reference, so it remains available after server restarts. The widget loads its persistent HTTPS URL inside a nested sandboxed iframe that allows scripts, forms, modals and popup links but deliberately omits allow-same-origin, so the document cannot access the MCP App or host DOM and origin-dependent storage/cookie APIs may be unavailable. Prefer self-contained HTML/CSS/JavaScript for portable results. Remote images, fonts, scripts, modules, fetch/WebSocket calls and other network dependencies may work when the current host/browser permits them, but are host/CSP dependent and normal browser CORS still applies, so do not assume they are portable. The whole MCP request, including HTML and JSON, is limited by the server's 2 MiB request-body limit.",
-        { properties: {
-          html: { type: "string", minLength: 1 },
-          title: { type: "string", default: "Interactive HTML", maxLength: 200 },
-          height: { type: "integer", minimum: 120, maximum: 2000, default: 600 },
-          ...contextInput,
-        }, required: ["html"] },
+        }, required: ["mime_type"] },
       ],
       discover_commands: [
         "Read the complete catalog of extra executable commands intentionally made available to the agent. Call this proactively whenever a task might benefit from capabilities beyond MrMCP's built-in tools, before inventing a workaround, assuming a utility is unavailable, or choosing a generic alternative. When a listed command fits the task, prefer it: its presence reflects an explicit user choice. The whole available catalog is returned in one call with descriptions and documentation links, so normally call it once per Session and reuse what you learned; there is no search or pagination, which also avoids failures from guessed or misspelled command names. If the operator globally disables command discovery, this tool returns an empty commands array. Every returned logical_name is directly callable as exec.program. MrMCP resolves catalog logical names before normal platform PATH lookup; do not probe PATH or search the filesystem first.",
@@ -3910,8 +3802,12 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
           required: ["id", "state_paths", "format", "mime_type", "bytes", "rect", "grayscale", "scale", "content_index"],
         } },
       }),
-      publish_file: outputSchema({ id: { type: "string" }, content_id: { type: "string" }, path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" }, size: { type: "integer" }, uri: { type: "string", description: "Persistent HTTPS URL consumed by the attached MCP App widget; publications never expire automatically." } }),
-      publish_html: outputSchema({ id: { type: "string" }, content_id: { type: "string" }, title: { type: "string" }, uri: { type: "string", description: "Persistent HTTPS URL loaded by the attached MCP App widget." }, height: { type: "integer" }, created_at: { type: "string" } }),
+      publish: outputSchema({
+        id: { type: "string" }, content_id: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" }, size: { type: "integer" },
+        uri: { type: "string", description: "Persistent HTTPS URL of the published content itself. Browser-displayable MIME types open inline; opaque/binary MIME types are attachments." },
+        presentation: { type: "string", enum: ["auto", "inline", "download"] }, title: { type: "string" }, description: { type: "string" },
+        height: { type: "integer" }, created_at: { type: "string" },
+      }),
       discover_commands: outputSchema({ commands: {
         type: "array", items: {
           type: "object", additionalProperties: false,
@@ -3956,16 +3852,16 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       list_workspaces: "List Workspaces", create_workspace: "Create Workspace", open_workspace: "Open Workspace",
       fs_glob: "FS Glob", fs_grep: "FS Grep", fs_read: "FS Read", fs_navigate: "FS Navigate", fs_stat: "FS Stat",
       fs_write: "FS Write", fs_edit: "FS Edit", fs_mkdir: "FS Mkdir", fs_copy: "FS Copy", fs_move: "FS Move", fs_trash: "FS Trash", fs_restore: "FS Restore",
-      desktop_auto: "Desktop Auto", publish_file: "Publish File", publish_html: "Publish HTML", discover_commands: "Discover Commands", inspect_tools: "Query Tool Schema", query_tool_calls: "Query Tool Calls",
+      desktop_auto: "Desktop Auto", publish: "Publish to User", discover_commands: "Discover Commands", inspect_tools: "Query Tool Schema", query_tool_calls: "Query Tool Calls",
       exec: "Run Command", exec_start: "Start Persistent Command", exec_attach: "Attach Process Output", exec_write: "Write Stdin",
       exec_kill: "Terminate Process", exec_list: "List Processes", exec_status: "Process Status", js: "JavaScript Kernel",
       js_add_node_module_dir: "Add Module Directory", js_reset: "Reset JavaScript Kernel",
     };
     const annotations = name => ({
-      readOnlyHint: READ_TOOLS.has(name) || name === "publish_file",
+      readOnlyHint: READ_TOOLS.has(name) || name === "publish",
       destructiveHint: ["desktop_auto", "fs_write", "fs_edit", "fs_move", "exec", "exec_start", "exec_write", "exec_kill", "js", "js_add_node_module_dir", "js_reset"].includes(name),
-      idempotentHint: (READ_TOOLS.has(name) && name !== "publish_file") || ["fs_write", "fs_mkdir", "js_reset"].includes(name),
-      openWorldHint: name === "desktop_auto" || name.startsWith("exec") || name === "js" || name === "publish_file" || name === "publish_html",
+      idempotentHint: (READ_TOOLS.has(name) && name !== "publish") || ["fs_write", "fs_mkdir", "js_reset"].includes(name),
+      openWorldHint: name === "desktop_auto" || name.startsWith("exec") || name === "js" || name === "publish",
     });
     const schema = value => ({
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3984,11 +3880,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         inputSchema: schema(requiresContext ? withRequiredContext(defs[name][1]) : defs[name][1]),
         outputSchema: outputSchemas[name] || genericOutputSchema,
         annotations: annotations(name),
-        ...(name === "publish_file" ? { _meta: {
-          ui: { resourceUri: fileUiResourceUri },
-        } } : name === "publish_html" ? { _meta: {
-          ui: { resourceUri: htmlUiResourceUri },
-        } } : {}),
+        ...(name === "publish" ? { _meta: { ui: { resourceUri: publishUiResourceUri } } } : {}),
       };
     });
     for (const custom of all("SELECT * FROM custom_tools WHERE server_id=? ORDER BY name", p.id)) tools.push({
@@ -4031,7 +3923,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         open_workspace: ["workspace_name", "cwd", "agent_guidance_path"],
         inspect_tools: ["tools", "missing"],
         query_tool_calls: ["calls"],
-        publish_html: ["id", "title", "uri", "height", "created_at"],
+        publish: ["id", "filename", "mime_type", "uri", "presentation", "title", "description", "height", "created_at"],
         fs_glob: ["entries", "next_after_path", "truncated"],
         fs_grep: ["scanned_files", "matched_files", "files", "next_resume_after", "truncated"],
         fs_read: ["files"], fs_navigate: ["files"], fs_stat: ["entries"],
@@ -4067,7 +3959,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       fs_read: ["files", "max_output_bytes_per_file"], fs_navigate: ["pattern", "files", "regex", "case_sensitive", "context_lines_before", "context_lines_after"], fs_stat: ["paths", "fingerprint"],
       fs_write: ["files", "create_parents"], fs_edit: ["files"], fs_mkdir: ["paths", "parents"],
       fs_copy: ["entries", "create_parents"], fs_move: ["entries", "create_parents"], fs_trash: ["paths", "selection"], fs_restore: ["trash_id"],
-      desktop_auto: ["yaml"], publish_html: ["html", "title", "height"],
+      desktop_auto: ["yaml"], publish: ["path", "text", "base64", "mime_type", "filename", "presentation", "title", "description", "height"],
       inspect_tools: ["names"],
       query_tool_calls: ["limit", "tool", "status", "query", "before_id"],
       exec_attach: ["exec_id"], exec_write: ["exec_id"], exec_kill: ["exec_id"], exec_status: ["exec_id", "output", "tail_lines"],
@@ -4092,47 +3984,40 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       name: tool.name,
       errors: validateToolDescriptor(tool),
     })).filter(x => x.errors.length);
-    const fileResource = filePreviewResource(), htmlResource = htmlPreviewResource();
-    const publishTool = tools.find(tool => tool.name === "publish_file");
-    const publishHtmlTool = tools.find(tool => tool.name === "publish_html");
+    const publishView = publishResource();
+    const publishTool = tools.find(tool => tool.name === "publish");
     const freshToolsA = serverTools(p, true, true), freshToolsB = serverTools(p, true, true);
-    const freshFileA = freshToolsA.find(tool => tool.name === "publish_file")?._meta?.ui?.resourceUri || "";
-    const freshFileB = freshToolsB.find(tool => tool.name === "publish_file")?._meta?.ui?.resourceUri || "";
-    const freshHtmlA = freshToolsA.find(tool => tool.name === "publish_html")?._meta?.ui?.resourceUri || "";
-    const freshHtmlB = freshToolsB.find(tool => tool.name === "publish_html")?._meta?.ui?.resourceUri || "";
+    const freshPublishA = freshToolsA.find(tool => tool.name === "publish")?._meta?.ui?.resourceUri || "";
+    const freshPublishB = freshToolsB.find(tool => tool.name === "publish")?._meta?.ui?.resourceUri || "";
     const uiErrors = [];
-    if (!matchesUiResourceUri(freshFileA, FILE_PREVIEW_UI_URI) || freshFileA === FILE_PREVIEW_UI_URI || freshFileA === freshFileB ||
-        !matchesUiResourceUri(freshHtmlA, HTML_PREVIEW_UI_URI) || freshHtmlA === HTML_PREVIEW_UI_URI || freshHtmlA === freshHtmlB)
+    const publishSchema = publishTool?.inputSchema;
+    if (!publishTool || tools.some(tool => ["publish_file", "publish_html"].includes(tool.name)))
+      uiErrors.push("unified publish tool surface is invalid");
+    if (!publishSchema?.required?.includes("mime_type") || !publishSchema?.required?.includes("context_handle") || publishSchema?.oneOf?.length !== 3 ||
+        !["path", "text", "base64"].every(name => publishSchema.oneOf.some(branch => branch.required?.length === 1 && branch.required[0] === name)))
+      uiErrors.push("publish source/MIME schema is invalid");
+    if (!matchesUiResourceUri(freshPublishA, PUBLISH_UI_URI) || freshPublishA === PUBLISH_UI_URI || freshPublishA === freshPublishB)
       uiErrors.push("fresh UI resource URI generation failed");
-    if (fileResource.uri !== FILE_PREVIEW_UI_URI || htmlResource.uri !== HTML_PREVIEW_UI_URI)
-      uiErrors.push("unexpected UI resource URI");
-    if (fileResource.mimeType !== MCP_UI_MIME_TYPE || htmlResource.mimeType !== MCP_UI_MIME_TYPE)
-      uiErrors.push("unexpected UI resource MIME type");
-    if (!filePreviewAppHtml().includes("ui/notifications/tool-result") || !htmlPreviewAppHtml().includes("ui/notifications/tool-result"))
-      uiErrors.push("UI bridge listener missing");
-    if (filePreviewAppHtml().includes("base64") || filePreviewAppHtml().includes("data:"))
-      uiErrors.push("file UI must not embed Base64/data URLs");
-    if (!filePreviewAppHtml().includes("structured.uri") || !htmlPreviewAppHtml().includes("structured.uri"))
-      uiErrors.push("UI structuredContent URL handling missing");
-    if (!filePreviewAppHtml().includes("publicationId") || !htmlPreviewAppHtml().includes("publicationId"))
-      uiErrors.push("UI publication identity pinning missing");
-    if (filePreviewAppHtml().includes("openai:set_globals") || htmlPreviewAppHtml().includes("openai:set_globals") ||
-        filePreviewAppHtml().includes("openai.toolOutput") || htmlPreviewAppHtml().includes("openai.toolOutput"))
+    if (publishView.uri !== PUBLISH_UI_URI) uiErrors.push("unexpected UI resource URI");
+    if (publishView.mimeType !== MCP_UI_MIME_TYPE) uiErrors.push("unexpected UI resource MIME type");
+    if (!publishAppHtml().includes("ui/notifications/tool-result")) uiErrors.push("UI bridge listener missing");
+    if (publishAppHtml().includes("data:")) uiErrors.push("publish UI must not embed data URLs");
+    if (!publishAppHtml().includes("structured.uri") || !publishAppHtml().includes("structured.presentation") ||
+        !publishAppHtml().includes("structured.title") || !publishAppHtml().includes("structured.description"))
+      uiErrors.push("UI structuredContent presentation handling missing");
+    if (!publishAppHtml().includes("publicationId")) uiErrors.push("UI publication identity pinning missing");
+    if (publishAppHtml().includes("openai:set_globals") || publishAppHtml().includes("openai.toolOutput"))
       uiErrors.push("UI must not consume ChatGPT-global tool output");
-    if (filePreviewAppHtml().includes("var nextId = 1;") || htmlPreviewAppHtml().includes("var nextId = 1;"))
-      uiErrors.push("UI bridge request ids must not share a fixed initial value");
-    if ((filePreviewAppHtml().match(/ui\/notifications\/initialized/g) || []).length < 2 ||
-        (htmlPreviewAppHtml().match(/ui\/notifications\/initialized/g) || []).length < 2)
+    if (publishAppHtml().includes("var nextId = 1;")) uiErrors.push("UI bridge request ids must not share a fixed initial value");
+    if ((publishAppHtml().match(/ui\/notifications\/initialized/g) || []).length < 2)
       uiErrors.push("UI initialize-timeout recovery missing");
-    if (!htmlPreviewAppHtml().includes("sandbox=\"allow-scripts") || htmlPreviewAppHtml().includes("allow-same-origin"))
-      uiErrors.push("publish_html nested iframe sandbox is invalid");
-    if (!htmlPreviewUiMeta().ui?.csp?.frameDomains?.includes(publicOrigin()))
-      uiErrors.push("publish_html frameDomains metadata missing public origin");
-    if (publishTool?._meta?.ui?.resourceUri !== FILE_PREVIEW_UI_URI) uiErrors.push("publish_file UI metadata missing");
-    if (publishHtmlTool?._meta?.ui?.resourceUri !== HTML_PREVIEW_UI_URI) uiErrors.push("publish_html UI metadata missing");
-    if (Object.keys(publishTool?._meta || {}).some(key => key.startsWith("openai/")) ||
-        Object.keys(publishHtmlTool?._meta || {}).some(key => key.startsWith("openai/")))
-      uiErrors.push("publish widgets must use only MCP Apps UI metadata");
+    if (!publishAppHtml().includes("sandbox=\"allow-scripts") || publishAppHtml().includes("allow-same-origin"))
+      uiErrors.push("publish nested iframe sandbox is invalid");
+    if (!publishUiMeta().ui?.csp?.frameDomains?.includes(publicOrigin()) || !publishUiMeta().ui?.csp?.resourceDomains?.includes(publicOrigin()))
+      uiErrors.push("publish UI CSP metadata missing public origin");
+    if (publishTool?._meta?.ui?.resourceUri !== PUBLISH_UI_URI) uiErrors.push("publish UI metadata missing");
+    if (Object.keys(publishTool?._meta || {}).some(key => key.startsWith("openai/")))
+      uiErrors.push("publish widget must use only MCP Apps UI metadata");
     const serverInfo = mcpServerInfo();
     if (serverInfo.icons?.[0]?.src !== `${publicBase()}/mrmcp-icon.png` || serverInfo.icons?.[0]?.mimeType !== "image/png")
       uiErrors.push("serverInfo public icon metadata missing");
@@ -4158,12 +4043,11 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         ttlMs: 0,
         cacheScope: "private",
       },
-      resources_list_result: { resources: [fileResource, htmlResource] },
+      resources_list_result: { resources: [publishView] },
       resources_read_result: {
         resultType: "complete",
         contents: [
-          { uri: FILE_PREVIEW_UI_URI, mimeType: MCP_UI_MIME_TYPE, text: filePreviewAppHtml(), _meta: filePreviewUiMeta() },
-          { uri: HTML_PREVIEW_UI_URI, mimeType: MCP_UI_MIME_TYPE, text: htmlPreviewAppHtml(), _meta: htmlPreviewUiMeta() },
+          { uri: PUBLISH_UI_URI, mimeType: MCP_UI_MIME_TYPE, text: publishAppHtml(), _meta: publishUiMeta() },
         ],
         ttlMs: 0,
         cacheScope: "private",
@@ -5451,24 +5335,23 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       }
       return { trash_id: trashId, succeeded, failed: entries.length - succeeded, entries };
     }
-    if (name === "publish_file") {
-      const target = await resolvePath(args.path);
-      const result = await publishPath(target.path, {
-        filename: args.filename || basename(target.path), mime_type: args.mime_type,
-        allowed_root: target.root.path, server_id: p.id, context_handle: args.context_handle,
+    if (name === "publish") {
+      const sourceCount = [args.path !== undefined, args.text !== undefined, args.base64 !== undefined].filter(Boolean).length;
+      if (sourceCount !== 1) throw new Error("Provide exactly one of path, text or base64");
+      const options = {
+        filename: args.filename, mime_type: args.mime_type, presentation: args.presentation,
+        title: args.title, description: args.description, height: args.height,
+        server_id: p.id, context_handle: args.context_handle,
         context_id: selection.context.id, root_id: selection.root.id, root_name: selection.root.name, root_path: selection.root.path,
-      });
-      return { path: target.display, ...result };
-    }
-    if (name === "publish_html") {
-      const html = String(args.html ?? "");
-      if (!html.trim()) throw new Error("html must not be empty");
-      const title = String(args.title || "Interactive HTML").trim().slice(0, 200) || "Interactive HTML";
-      const height = Math.max(120, Math.min(Number(args.height || 600), 2000));
-      return await publishHtml(html, {
-        title, height, server_id: p.id, context_handle: args.context_handle,
-        context_id: selection.context.id, root_id: selection.root.id, root_name: selection.root.name, root_path: selection.root.path,
-      });
+      };
+      if (args.path !== undefined) {
+        const target = await resolvePath(args.path);
+        return await publishContent({ path: target.path }, {
+          ...options, filename: args.filename || basename(target.path), allowed_root: target.root.path,
+        });
+      }
+      const bytes = args.text !== undefined ? enc.encode(String(args.text)) : decodePublishBase64(args.base64);
+      return await publishContent({ bytes }, options);
     }
     if (name === "discover_commands") return await discoverCommands();
     if (name === "query_tool_calls") {
@@ -5581,9 +5464,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
 
   function redactPublishedCapabilityUrls(value) {
     if (typeof value === "string")
-      return value
-        .replace(/\/download\/[A-Za-z0-9_-]{40,}\//g, "/download/[REDACTED]/")
-        .replace(/\/published-html\/html_[A-Za-z0-9_-]{24,}/g, "/published-html/[REDACTED]");
+      return value.replace(/\/published\/[A-Za-z0-9_-]{24,}\//g, "/published/[REDACTED]/");
     if (Array.isArray(value)) return value.map(redactPublishedCapabilityUrls);
     if (value && typeof value === "object") return Object.fromEntries(
       Object.entries(value).map(([key, item]) => [key, redactPublishedCapabilityUrls(item)]),
@@ -5669,8 +5550,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         : JSON.stringify(structuredContent, null, 2);
       const max = 1024 * 1024, rendered = full.length > max
         ? full.slice(0, max) + `\n\n[truncated; full output in log ${id}]` : full;
-      const resultUiResourceUri = name === "publish_file" ? freshUiResourceUri(FILE_PREVIEW_UI_URI)
-        : name === "publish_html" ? freshUiResourceUri(HTML_PREVIEW_UI_URI) : "";
+      const resultUiResourceUri = name === "publish" ? freshUiResourceUri(PUBLISH_UI_URI) : "";
       const toolResult = {
         content: [{ type: "text", text: rendered }, ...extraContent], structuredContent, isError: status !== "completed",
         ...(resultUiResourceUri ? { _meta: { ui: { resourceUri: resultUiResourceUri } } } : {}),
@@ -5800,11 +5680,9 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
   }
   function debugUrl(raw) {
     const u = new URL(raw);
-    if (u.pathname.startsWith("/download/")) {
+    if (u.pathname.startsWith("/published/")) {
       const parts = u.pathname.split("/");
-      u.pathname = `/download/[REDACTED]/${parts.at(-1) || "file"}`;
-    } else if (u.pathname.startsWith("/published-html/")) {
-      u.pathname = "/published-html/[REDACTED]";
+      u.pathname = `/published/[REDACTED]/${parts.at(-1) || "content"}`;
     }
     for (const key of [...u.searchParams.keys()]) if (sensitiveKey(key)) u.searchParams.set(key, "[REDACTED]");
     return u.pathname + u.search;
@@ -5866,8 +5744,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const remoteHost = info?.remoteAddr?.hostname || "", started = Date.now();
     const debugEnabled = getCfg("debug_http_log", "0") === "1";
     const requestPath = new URL(req.url).pathname;
-    const downloadRequest = requestPath.startsWith("/download/");
-    const publishedHtmlRequest = requestPath.startsWith("/published-html/");
+    const publishedRequest = requestPath.startsWith("/published/");
     let debugId = 0, debugError = "";
     const requestBodyPromise = debugEnabled
       ? debugBody(req.clone()).catch(error => {
@@ -5901,10 +5778,9 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     headers.set("permissions-policy", "camera=(), microphone=(), geolocation=()");
     if (!headers.has("cache-control")) headers.set("cache-control", "no-store");
     const responseType = String(headers.get("content-type") || "").toLowerCase();
-    let responseCapture = null, responseBody = downloadRequest ? "[binary download body omitted]"
-      : publishedHtmlRequest ? "[published HTML body omitted]" : "";
+    let responseCapture = null, responseBody = publishedRequest ? "[published content body omitted]" : "";
     let body = response.body;
-    if (debugEnabled && body && !downloadRequest && !publishedHtmlRequest) {
+    if (debugEnabled && body && !publishedRequest) {
       responseCapture = debugCaptureBody(body);
       body = responseCapture.stream;
     }
@@ -6087,8 +5963,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   // OAuth discovery/authorization and MCP 2026-07-28 routing.
   async function mcpHandler(req, info, transport = "http") {
     const u = new URL(req.url);
-    if (u.pathname.startsWith("/download/")) return await downloadResponse(req, u);
-    if (u.pathname.startsWith("/published-html/")) return await publishedHtmlResponse(req, u);
+    if (u.pathname.startsWith("/published/")) return await publishedContentResponse(req, u);
     if (transport === "https" && req.method === "GET" && u.pathname === "/mrmcp-icon.png")
       return await staticAssetResponse("/assets/mrmcp-logo.png");
     if (u.pathname === "/.well-known/oauth-authorization-server" ||
@@ -6345,7 +6220,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         "Use fs_glob, fs_grep, fs_read, fs_navigate, fs_stat, fs_write and fs_edit directly for filesystem discovery, inspection, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. Use desktop_auto for desktop observation and interaction through AAF YAML; when the model needs to see a screenshot, retain its image handle anywhere in the scenario's final state so the tool returns that image directly as MCP image content. Multiple retained screenshots and ordinary OCR/text/geometry/state values may coexist in one result. " +
         "When work may benefit from command-line capability beyond the structured tools, call discover_commands proactively before inventing workarounds or assuming a utility is unavailable. It returns the complete user-chosen available command catalog in one call; prefer a listed command when it fits, remember the catalog for the Session, and invoke its logical_name directly through exec.program without PATH probes. Use inspect_tools when exact live tool descriptor data is needed instead of relying on a connector-synthesized schema view. " +
         "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; cancelling/disconnecting exec terminates its child. For persistent or interactive work, call exec_start; it immediately returns exec_id, which is the stable integer Tool Call id of that start. Pass that exec_id together with the same context_handle to exec_attach, exec_write, exec_kill or exec_status; ids from other Sessions are inaccessible. exec_list shows only currently running persistent executions in this Session. exec_status is the non-consuming way to inspect running or recently completed/killed executions and optionally retrieve all output or a tail. exec_attach with progressToken streams unread backlog plus live output through progress until process exit and then returns that complete unread transcript; without progressToken it long-polls and returns at most 16 KiB of unread output plus remaining_bytes, so call it repeatedly to drain buffered output and call it again with remaining_bytes=0/status=running to wait for future output. Disconnecting exec_attach only detaches and never kills the persistent process. " +
-        "Use publish_file to present existing files through its MCP App widget, and publish_html when an interactive self-contained HTML/CSS/JavaScript visualization is more appropriate. " +
+        "Use publish to present content to the user from exactly one of path, text or base64. Supply the real MIME type and optional filename; presentation=auto lets the smart MCP App choose an inline preview or file action, while inline/download are presentation hints. title and description appear above the published element. " +
         "Every authenticated client can invoke every published tool; context_handle is the bearer capability selecting the persistent Session and its current Workspace."
       : "The endpoint is reachable, but anonymous access exposes no tools. Authenticate with OAuth or Basic authentication.";
 
@@ -6403,10 +6278,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           }
         }
       } else if (x.method === "resources/list") {
-        const resources = fullAccess ? [
-          filePreviewResource(freshUiResourceUri(FILE_PREVIEW_UI_URI)),
-          htmlPreviewResource(freshUiResourceUri(HTML_PREVIEW_UI_URI)),
-        ] : [];
+        const resources = fullAccess ? [publishResource(freshUiResourceUri(PUBLISH_UI_URI))] : [];
         r.result = {
           resultType: "complete", resources, ttlMs: 0,
           cacheScope: "private", _meta: serverInfoMeta,
@@ -6417,11 +6289,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           responseStatus = 403;
         } else {
           const resourceUri = String(x.params?.uri || "");
-          const resource = matchesUiResourceUri(resourceUri, FILE_PREVIEW_UI_URI)
-            ? { uri: resourceUri, text: filePreviewAppHtml(), _meta: filePreviewUiMeta() }
-            : matchesUiResourceUri(resourceUri, HTML_PREVIEW_UI_URI)
-            ? { uri: resourceUri, text: htmlPreviewAppHtml(), _meta: htmlPreviewUiMeta() }
-            : null;
+          const resource = matchesUiResourceUri(resourceUri, PUBLISH_UI_URI)
+            ? { uri: resourceUri, text: publishAppHtml(), _meta: publishUiMeta() } : null;
           if (!resource) {
             r.error = { code: -32002, message: `Resource not found: ${resourceUri}` };
             responseStatus = 200;
@@ -6781,10 +6650,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   };
   const publishedAdminFilter = (serverId, current = {}) => {
     const conditions = ["p.server_id=?"], values = [serverId];
-    const kind = ["file", "html"].includes(String(current.kind || "")) ? String(current.kind) : "";
     const contextId = Math.max(0, Number(current.context) || 0);
     const size = ["small", "medium", "large", "huge"].includes(String(current.size || "")) ? String(current.size) : "";
-    if (kind) { conditions.push("p.kind=?"); values.push(kind); }
     if (contextId) {
       conditions.push("(p.context_id=? OR EXISTS(SELECT 1 FROM published_uses u WHERE u.published_id=p.id AND u.context_id=?))");
       values.push(contextId, contextId);
@@ -6793,17 +6660,17 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     else if (size === "medium") conditions.push("p.size>=1048576 AND p.size<10485760");
     else if (size === "large") conditions.push("p.size>=10485760 AND p.size<104857600");
     else if (size === "huge") conditions.push("p.size>=104857600");
-    return { where: conditions.join(" AND "), values, kind, context: contextId || "", size };
+    return { where: conditions.join(" AND "), values, context: contextId || "", size };
   };
   const publishedAdminProjection = (serverId, current = {}) => {
-    const { where, values, kind, context, size } = publishedAdminFilter(serverId, current), pageSize = 25;
+    const { where, values, context, size } = publishedAdminFilter(serverId, current), pageSize = 25;
     const total = Number(one(`SELECT COUNT(*) n FROM published p WHERE ${where}`, ...values)?.n || 0);
     const pages = Math.max(1, Math.ceil(total / pageSize));
     const page = Math.min(pages, Math.max(1, Number(current.page) || 1)), offset = (page - 1) * pageSize;
-    const rows = all(`SELECT p.id,p.content_key,p.context_id,p.root_id,p.root_name,p.root_path,p.kind,p.source_path,p.source_filename,p.published_name,p.filename,p.mime_type,p.size,p.title,p.height,p.created_at,p.request_count,p.last_request_at
+    const rows = all(`SELECT p.id,p.content_key,p.context_id,p.root_id,p.root_name,p.root_path,p.source_path,p.source_filename,p.published_name,p.filename,p.mime_type,p.size,p.title,p.description,p.presentation,p.height,p.created_at,p.request_count,p.last_request_at
       FROM published p WHERE ${where} ORDER BY p.created_at DESC,p.id DESC LIMIT ? OFFSET ?`, ...values, pageSize, offset);
     for (const row of rows) {
-      row.references = all(`SELECT u.context_id,u.root_id,u.root_name,u.root_path,u.source_path,u.source_filename,u.filename,u.mime_type,u.title,u.height,u.published_at
+      row.references = all(`SELECT u.context_id,u.root_id,u.root_name,u.root_path,u.source_path,u.source_filename,u.filename,u.mime_type,u.title,u.description,u.presentation,u.height,u.published_at
         FROM published_uses u
         WHERE u.published_id=? AND u.id=(SELECT MAX(u2.id) FROM published_uses u2
           WHERE u2.published_id=u.published_id AND u2.context_id=u.context_id AND u2.root_id=u.root_id)
@@ -6811,14 +6678,14 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       if (!row.references.length && row.context_id) row.references = [{
         context_id: row.context_id, root_id: row.root_id, root_name: row.root_name, root_path: row.root_path,
         source_path: row.source_path, source_filename: row.source_filename, filename: row.filename, mime_type: row.mime_type,
-        title: row.title, height: row.height, published_at: row.created_at,
+        title: row.title, description: row.description, presentation: row.presentation, height: row.height, published_at: row.created_at,
       }];
       row.reference_count = row.references.length;
     }
     const sessions = all(`SELECT context_id FROM published WHERE server_id=? AND context_id>0
       UNION SELECT u.context_id FROM published_uses u JOIN published p ON p.id=u.published_id WHERE p.server_id=? AND u.context_id>0
       ORDER BY context_id DESC`, serverId, serverId).map(row => Number(row.context_id));
-    return { rows, total, page, pages, page_size: pageSize, sessions, kind, context, size };
+    return { rows, total, page, pages, page_size: pageSize, sessions, context, size };
   };
 
   async function restartMcp() {
@@ -6892,7 +6759,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 <? } else if(section==="prompts"){ const p=s.prompts||{}; ?><section id=prompts class=page><div class=row><h2 class=grow>🧭 Guided Prompts</h2><button data-action=prompt-help>❓ Template Help</button><button class=primary data-action=new-prompt>➕ Add Prompt</button></div><p class=muted><code>guided_prompts.yaml</code> is authoritative. Entries are exposed through MCP <code>prompts/list</code> and rendered on demand through <code>prompts/get</code>.</p><div class=row><input id=promptQuery class=grow placeholder="Search name, title, description or arguments…" value="<?= p.query||'' ?>"><select id=promptPageSize><? [5,10,25,50].forEach(n=>{ ?><option<?= Number(p.pageSize||5)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-prompts>🔎 Search</button></div><div id=promptList></div></section>
 <? } else if(section==="prompt_help"){ const h=s.promptHelp||{}; ?><section id=prompt_help class=page><div class=row><h2 class=grow>🧭 Guided Prompt Templates</h2><button data-action=prompts-back>← Guided Prompts</button></div><div class=card><h3>YAML shape</h3><p><code>guided_prompts.yaml</code> contains a top-level <code>prompts</code> array. Prompt arguments are MCP string arguments with <code>name</code> plus optional <code>title</code>, <code>description</code> and <code>required</code>; <code>required</code> controls whether the client must supply them.</p><pre><?= h.yaml||'' ?></pre></div><div class=card><h3>Eta</h3><p>The <code>template</code> is rendered with Eta using standard tags and no HTML escaping. Read values with <code>&lt;%= it.args.focus %&gt;</code>, use normal JavaScript in <code>&lt;% ... %&gt;</code>, and branch on any model field. Templates are trusted local configuration and are not sandboxed.</p><pre><?= h.model||'' ?></pre></div><div class=card><h3>Session / Workspace context</h3><p><code>it.session</code> and <code>it.workspace</code> are populated only when the prompt declares a <code>context_handle</code> argument and the client supplies a valid active MrMCP Session handle. <code>it.workspaces</code> is always available and includes the fallback Workspace plus enabled named Workspaces.</p></div></section>
 <? } else if(section==="logs"){ const l=s.logs||{}; ?><section id=logs class=page><div class=row><h2 class=grow>🛠️ Tool Calls</h2><button class=danger data-action=clear-tool-calls<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Click a row for details. Terminate active work from Actions.</p><div class=row><input id=logTool placeholder="Tool / command…" value="<?= l.toolQuery||'' ?>"><input id=logQuery class=grow placeholder="Search input, output, errors…" value="<?= l.query||'' ?>"><select id=logContext><option value="">All sessions</option><? (s.contextValues||[]).forEach(v=>{ ?><option value="<?= v.pk ?>"<?= String(l.context||"")===String(v.pk)?" selected":"" ?>>#<?= v.pk ?></option><? }) ?></select><select id=logStatus class="<?= l.status||'' ?>"><option value="">All states</option><? ['completed','failed','invalid','running'].forEach(v=>{ ?><option class="<?= v ?>" value="<?= v ?>"<?= l.status===v?' selected':'' ?>><?= v ?></option><? }) ?></select><select id=logPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(l.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=clear-log-filters>🧹 Clear Filters</button></div><? if(l.selfTest){ ?><div id=logSelfTest class=card><div class=row><h3 class=grow>🧪 MCP Self-Test</h3><button class=small data-action=copy-detail data-target=logDetail>📋 Copy JSON</button><button class=small data-action=close-self-test>✕ Close</button></div><pre id=logDetail><?= it.pretty(l.selfTest) ?></pre></div><? } ?><div id=logList></div></section>
-<? } else if(section==="published"){ ?><section id=published class=page><div class=row><h2 class=grow>📦 Published</h2><button class=danger data-action=clear-published<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear Matching</button></div><p class=muted>Deduplicated persistent snapshots created by <code>publish_file</code> and <code>publish_html</code>. One resource may have references from multiple Sessions and Workspaces.</p><div id=publishedList></div></section>
+<? } else if(section==="published"){ ?><section id=published class=page><div class=row><h2 class=grow>📦 Published</h2><button class=danger data-action=clear-published<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear Matching</button></div><p class=muted>Deduplicated persistent content snapshots created by <code>publish</code>. Path, text and Base64 sources all become ordinary files under <code>.mrmcp/publish</code>; one resource may have references from multiple Sessions and Workspaces.</p><div id=publishedList></div></section>
 <? } else if(section==="debug"){ const d=s.debug||{},enabled=!!s.debug?.enabled; ?><section id=debug class=page><div class=row><h2 class=grow>🐞 HTTP Debug Log</h2><button class="debug-toggle <?= enabled?'enabled':'disabled' ?>" data-action=toggle-debug-settings aria-pressed="<?= enabled?'true':'false' ?>"><?= enabled?"🟢 Logging ON · Disable":"🔴 Logging OFF · Enable" ?></button><button class=danger data-action=clear-debug>🗑️ Clear</button></div><p class=muted>Off by default. Secrets are redacted. Disabling stops new records but keeps stored data visible. Click a row for request JSON.</p><div class=row><input id=debugQuery class=grow placeholder="Search URL, headers, body or errors…" value="<?= d.query||'' ?>"><select id=debugMethod><option value="">All methods</option><? ['GET','POST','OPTIONS'].forEach(v=>{ ?><option<?= d.method===v?' selected':'' ?>><?= v ?></option><? }) ?></select><input id=debugStatus type=number placeholder="Status" value="<?= d.status||'' ?>"><button data-action=load-debug>🔎 Search</button></div><div id=debugList></div></section>
 <? } else if(section==="oauth"){ ?><section id=oauth class=page><div class=row><h2 class=grow>🔐 OAuth Clients</h2><button class=danger data-action=clear-clients<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><div id=oauthList></div></section>
 <? } else if(section==="settings"){ ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><div class=settings-layout><div class=settings-main><div class=card><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><p class=muted>Off: child <code>PATH</code> contains only <code>.mrmcp/bin</code>. Other environment variables are unchanged.</p></div><div class=card><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
@@ -6911,7 +6778,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     oauth: `<table class=oauth-table><tr><th>Client</th><th>Sessions</th><th>Tokens</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td class=oauth-client><b><?= c.name ?></b><div class=oauth-client-id title="<?= c.client_id ?>"><code><?= c.client_id ?></code></div><div class=oauth-meta><span class=muted>Created</span> <?= it.logdt(c.created_at) ?></div></td><td class=oauth-meta><div class=oauth-count><b><?= c.session_count||0 ?></b> total</div><div><span class=muted>First</span> <?= c.first_session_at ? it.logdt(c.first_session_at) : "—" ?></div><div><span class=muted>Last</span> <?= c.last_session_at ? it.logdt(c.last_session_at) : "—" ?></div></td><td><div class=oauth-tokens><div class=oauth-token><b><?= c.token_count||0 ?></b> <span>Access</span><div class=oauth-meta><span class=muted>Issued</span> <?= c.last_token_at ? it.logdt(c.last_token_at) : "—" ?></div></div><div class=oauth-token><b><?= c.refresh_token_count||0 ?></b> <span>Refresh</span><div class=oauth-meta><span class=muted>Used</span> <?= c.last_refresh_at ? it.logdt(c.last_refresh_at) : "—" ?></div></div></div></td><td class=oauth-actions><button class=small data-action=oauth-sessions data-id="<?= c.client_id ?>">💬 View Sessions</button><button class="small danger" data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> Available Tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,
     logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=http-session><? if(l.context_id){ ?><div class=idcell>#<?= l.context_id ?></div><? if(l.root_id&&l.root_name){ ?><div class=workspace-label>📁 <?= l.root_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><code><?= l.tool ?></code><? if(l.call_preview){ ?><div class=tool-command-preview>↳ <?= l.call_preview ?></div><? } ?><? if(l.progress_requested){ ?><div class=progress-requested>📡 Progress requested</div><? } ?></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Kill</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><? if(x.progress_requested){ ?><span class=progress-requested>📡 Progress requested</span><? } ?><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><div class=tool-detail-grid><div class=tool-detail-main><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><? if(x.resolved_json){ ?><section class=json-detail><div class=row><b class=grow>Tool Return Value JSON</b><button class=small data-action=copy-detail data-target="tool-return-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-return-<?= l.id ?>"><?= it.prettyParsed(x.resolved_json) ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>MCP Result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div><aside class=tool-descriptor><div class=row><b class=grow>Agent Tool Definition</b><? if(x.tool_descriptor){ ?><span class="descriptor-status <?= x.tool_descriptor_matches_current?'current':'outdated' ?>"><?= x.tool_descriptor_matches_current?'CURRENT':'OUTDATED' ?></span><button class=small data-action=copy-detail data-target="tool-descriptor-<?= l.id ?>">📋 Copy JSON</button><? } ?></div><? if(x.tool_descriptor){ ?><pre id="tool-descriptor-<?= l.id ?>" hidden><?= it.pretty(x.tool_descriptor) ?></pre><? if(x.tool_descriptor.title){ ?><div class=muted>Title</div><div><?= x.tool_descriptor.title ?></div><? } ?><div class=muted>Description</div><p><?= x.tool_descriptor.description||"—" ?></p><div class=muted>Input Schema</div><pre><?= it.pretty(x.tool_descriptor.inputSchema||{}) ?></pre><div class=muted>Output Schema</div><pre><?= it.pretty(x.tool_descriptor.outputSchema||{}) ?></pre><? } else { ?><p class=muted>No descriptor snapshot was recorded for this call.</p><? } ?></aside></div></div></td></tr><? } }) ?></tbody></table>`,
-    published: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class=row><select id=publishedKind><option value="">All types</option><option value=file<?= d.kind==='file'?' selected':'' ?>>File</option><option value=html<?= d.kind==='html'?' selected':'' ?>>HTML</option></select><select id=publishedContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=publishedSize><option value="">All sizes</option><option value=small<?= d.size==='small'?' selected':'' ?>>&lt; 1 MB</option><option value=medium<?= d.size==='medium'?' selected':'' ?>>1–10 MB</option><option value=large<?= d.size==='large'?' selected':'' ?>>10–100 MB</option><option value=huge<?= d.size==='huge'?' selected':'' ?>>≥ 100 MB</option></select><button data-action=clear-published-filters>🧹 Clear Filters</button></div><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> publication<?= d.total===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Published Pages"><button class=page-button data-action=published-page data-published-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=published-page data-published-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=published-page data-published-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No published items match the current filters.</p></div><? } else { ?><table class=published-table><thead><tr><th>Created</th><th>Resource</th><th>Published By</th><th>Published File</th><th>Activity</th><th>Source</th><th></th></tr></thead><tbody><? rows.forEach(r=>{ ?><tr><td class=nowrap><?= it.logdt(r.created_at) ?></td><td class=published-id><div class=nowrap><?= r.kind==='html'?'🌐 HTML':'📄 File' ?></div><code title="<?= r.id ?>"><?= r.id ?></code><? if(r.content_key){ ?><div class=published-file-meta title="<?= r.content_key ?>">key <?= r.content_key ?></div><? } ?></td><td class=http-session><? const refs=r.references||[]; if(refs.length){ refs.forEach(u=>{ ?><div class=published-reference><span class=idcell>#<?= u.context_id ?></span><? if(u.root_name){ ?> <span class=workspace-label title="<?= u.root_name ?>">📁 <?= u.root_name ?></span><? } ?></div><? }); } else { ?>—<? } ?></td><td><button class=published-open data-action=open-published data-id="<?= r.id ?>" title="<?= r.published_name ?> · Open public URL in browser"><code><?= r.published_name ?></code></button><? if(r.kind==='html'&&r.title){ ?><div class=published-file-meta><?= r.title ?></div><? } else if(r.filename&&r.filename!==r.source_filename){ ?><div class=published-file-meta>Download name: <?= r.filename ?></div><? } ?></td><td class=published-activity><b><?= r.request_count||0 ?> req</b><div class=published-file-meta><?= it.bytes(r.size) ?></div><? if(r.last_request_at){ ?><div class=published-file-meta>last <?= it.logdt(r.last_request_at) ?></div><? } ?></td><td class=published-source><? const latest=(r.references||[])[0]; if(latest?.source_path){ ?><code title="<?= latest.source_path ?>"><?= latest.source_path ?></code><? } else if(r.source_path){ ?><code title="<?= r.source_path ?>"><?= r.source_path ?></code><? } else { ?><span class=muted>Generated HTML</span><? } ?><? if((r.reference_count||0)>1){ ?><div class=published-file-meta><?= r.reference_count ?> references</div><? } ?></td><td class=nowrap><button class="small danger" data-action=delete-published data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></tbody></table><? } ?>`,
+    published: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class=row><select id=publishedContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=publishedSize><option value="">All sizes</option><option value=small<?= d.size==='small'?' selected':'' ?>>&lt; 1 MB</option><option value=medium<?= d.size==='medium'?' selected':'' ?>>1–10 MB</option><option value=large<?= d.size==='large'?' selected':'' ?>>10–100 MB</option><option value=huge<?= d.size==='huge'?' selected':'' ?>>≥ 100 MB</option></select><button data-action=clear-published-filters>🧹 Clear Filters</button></div><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> publication<?= d.total===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Published Pages"><button class=page-button data-action=published-page data-published-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=published-page data-published-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=published-page data-published-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No published items match the current filters.</p></div><? } else { ?><table class=published-table><thead><tr><th>Created</th><th>Resource</th><th>Published By</th><th>Published File</th><th>Activity</th><th>Source</th><th></th></tr></thead><tbody><? rows.forEach(r=>{ ?><tr><td class=nowrap><?= it.logdt(r.created_at) ?></td><td class=published-id><div class=nowrap>📦 <?= r.mime_type||'content' ?></div><code title="<?= r.id ?>"><?= r.id ?></code><? if(r.content_key){ ?><div class=published-file-meta title="<?= r.content_key ?>">key <?= r.content_key ?></div><? } ?></td><td class=http-session><? const refs=r.references||[]; if(refs.length){ refs.forEach(u=>{ ?><div class=published-reference><span class=idcell>#<?= u.context_id ?></span><? if(u.root_name){ ?> <span class=workspace-label title="<?= u.root_name ?>">📁 <?= u.root_name ?></span><? } ?></div><? }); } else { ?>—<? } ?></td><td><button class=published-open data-action=open-published data-id="<?= r.id ?>" title="<?= r.published_name ?> · Open public URL in browser"><code><?= r.published_name ?></code></button><? if(r.title){ ?><div class=published-file-meta><?= r.title ?></div><? } ?><? if(r.filename&&r.filename!==r.source_filename){ ?><div class=published-file-meta>Presented as: <?= r.filename ?></div><? } ?><? if(r.presentation&&r.presentation!=='auto'){ ?><div class=published-file-meta><?= r.presentation ?></div><? } ?></td><td class=published-activity><b><?= r.request_count||0 ?> req</b><div class=published-file-meta><?= it.bytes(r.size) ?></div><? if(r.last_request_at){ ?><div class=published-file-meta>last <?= it.logdt(r.last_request_at) ?></div><? } ?></td><td class=published-source><? const latest=(r.references||[])[0]; if(latest?.source_path){ ?><code title="<?= latest.source_path ?>"><?= latest.source_path ?></code><? } else if(r.source_path){ ?><code title="<?= r.source_path ?>"><?= r.source_path ?></code><? } else { ?><span class=muted>Direct content</span><? } ?><? if((r.reference_count||0)>1){ ?><div class=published-file-meta><?= r.reference_count ?> references</div><? } ?></td><td class=nowrap><button class="small danger" data-action=delete-published data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></tbody></table><? } ?>`,
     debug: `<? const d=it.data||{},rows=d.rows||[]; ?><p class="<?= d.enabled?'ok':'failed' ?>"><b><?= d.enabled?'● Recording enabled':'● Recording disabled' ?></b><? if(!d.enabled){ ?> · showing stored requests<? } ?></p><? if(!rows.length){ ?><p class=muted>No stored HTTP debug requests match the current filters.</p><? } else { ?><table><tr><th>ID</th><th>Time</th><th>Session</th><th>Client</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>IP</th><th>Error</th></tr><? rows.forEach(r => { ?><tr data-action=select-debug data-id="<?= r.id ?>" title="Click to expand"><td class=idcell>#<?= r.id ?></td><td class=nowrap><?= it.logdt(r.ts) ?></td><td class=http-session><? if(r.context_id){ ?><div class=idcell>#<?= r.context_id ?></div><? if(r.workspace_name){ ?><div class=workspace-label>📁 <?= r.workspace_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><? if(r.client_id){ ?><code><?= r.client_id ?></code><? } else { ?>—<? } ?></td><td><b><?= r.method ?></b></td><td><code><?= r.path ?></code></td><td class="<?= !r.status?'pending':(r.status>=400?'failed':'ok') ?>"><?= r.status||"…" ?></td><td><?= r.status ? r.duration_ms+"ms" : "in flight" ?></td><td class=nowrap><?= r.remote_addr||"—" ?><? if(r.remote_addr){ ?> (<?= r.remote_count||1 ?>)<? } ?></td><td><?= r.error_preview ?></td></tr><? if(String(d.openRowId||"")===String(r.id)&&d.openDetail){ const x=d.openDetail; ?><tr class=detail-row data-detail-kind=http data-detail-id="<?= r.id ?>"><td colspan=10><div class="detail-panel http-detail-panel"><div class="row http-detail-head"><div class=grow><b>HTTP Request #<?= r.id ?></b><div class=http-detail-meta><span><?= it.logdt(x.ts) ?></span><span><? if(x.context_id){ ?>Session #<?= x.context_id ?><? } else { ?>No Session<? } ?></span><? if(x.workspace_name){ ?><span>📁 <?= x.workspace_name ?></span><? } ?><span><? if(x.client_id){ ?>Client <code><?= x.client_id ?></code><? } else { ?>No client id<? } ?></span><span><?= x.remote_addr||"unknown IP" ?><? if(x.remote_addr){ ?> · <?= x.remote_count||1 ?> total request<?= Number(x.remote_count||1)===1?'':'s' ?><? } ?></span><span><?= x.status ? x.duration_ms+"ms" : "in flight" ?></span></div></div><button class=small data-action=copy-detail data-target="http-json-<?= r.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=http>✕ Close</button></div><div class=http-detail-grid><section class=http-detail-block><div class=row><h4 class=grow>→ Request</h4><b><?= x.method ?></b> <code><?= x.path ?></code></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.request_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.request_body||{}) ?></pre></section><section class=http-detail-block><div class=row><h4 class=grow>← Response</h4><b class="<?= !x.status?'pending':(x.status>=400?'failed':'ok') ?>"><?= x.status||"in flight" ?></b></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.response_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.response_body||{}) ?></pre></section></div><? if(x.error){ ?><section class="http-detail-block http-detail-error"><h4 class=failed>Error</h4><pre><?= x.error ?></pre></section><? } ?><details class=http-detail-raw><summary>Raw record</summary><pre id="http-json-<?= r.id ?>"><?= it.pretty(x) ?></pre></details></div></td></tr><? } }) ?></table><? } ?>`,
   } : {};
   const fragmentBytes = value => {
@@ -7234,7 +7101,6 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const text = value == null ? "" : String(value);
     if (id === "logTool") uiState.logs.toolQuery = text;
     else if (id === "logQuery") uiState.logs.query = text;
-    else if (id === "publishedKind") uiState.published.kind = text;
     else if (id === "publishedContext") uiState.published.context = text;
     else if (id === "publishedSize") uiState.published.size = text;
     else if (id === "debugQuery") uiState.debug.query = text;
@@ -7529,9 +7395,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         return;
       case "clear-published": {
         const filters = {
-          kind: uiState.published.kind, context: uiState.published.context, size: uiState.published.size,
+          context: uiState.published.context, size: uiState.published.size,
         };
-        const filtered = !!(filters.kind || filters.context || filters.size);
+        const filtered = !!(filters.context || filters.size);
         uiConfirm("Clear Published", filtered
           ? "Delete every published item matching the current filters across all pages? This cannot be undone."
           : "Delete every published item across all pages? This cannot be undone.",
@@ -7539,7 +7405,6 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         return;
       }
       case "clear-published-filters":
-        uiState.published.kind = "";
         uiState.published.context = "";
         uiState.published.size = "";
         uiState.published.page = 1;
@@ -7775,7 +7640,6 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           if (id === "logContext") { uiState.logs.context = String(event.value || ""); uiState.logs.page = 1; }
           else if (id === "logStatus") { uiState.logs.status = String(event.value || ""); uiState.logs.page = 1; }
           else if (id === "logPageSize") { uiState.logs.pageSize = Number(event.value) || 25; uiState.logs.page = 1; }
-          else if (id === "publishedKind") { uiState.published.kind = String(event.value || ""); uiState.published.page = 1; }
           else if (id === "publishedContext") { uiState.published.context = String(event.value || ""); uiState.published.page = 1; }
           else if (id === "publishedSize") { uiState.published.size = String(event.value || ""); uiState.published.page = 1; }
           else if (id === "debugMethod") uiState.debug.method = String(event.value || "");
