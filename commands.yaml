@@ -8,7 +8,8 @@ commands:
     download_url: https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip
     documentation_url: https://docs.deno.com/runtime/
   - logical_name: cymbal
-    description: "Language-agnostic code navigation CLI backed by tree-sitter and a local SQLite index for symbols, references, impact analysis and agent-oriented repository exploration."
+    description: |-
+      Preferred source-exploration and code-navigation CLI for unfamiliar repositories, backed by tree-sitter and a local incrementally refreshed SQLite index. Start with `cymbal investigate <symbol>` for an adaptive source/callers/impact view. Prefer `cymbal search` before raw grep, and `cymbal outline` / `cymbal show` before broad file reads. Use `cymbal trace` for downward dependencies, `cymbal impact` for upstream blast radius, and `cymbal changed` to understand the impact of the current Git diff. Add `--graph` when topology matters and `--json` when machine-structured output is preferable.
     download_url: https://github.com/1broseidon/cymbal/releases/download/v0.14.0/cymbal_v0.14.0_windows_x86_64.zip
     documentation_url: https://github.com/1broseidon/cymbal
   - logical_name: gh
