@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.115
+# MrMCP 0.10.117
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated `/mcp` endpoint, Workspace-scoped Sessions, filesystem and process tools, OAuth/Basic authentication, TLS automation, and a local Tauriless administration UI.
 
@@ -13,6 +13,8 @@ MrMCP is a stateless Model Context Protocol server implemented in Deno. It expos
 - MCP `2026-07-28` with explicit `context_handle` Session capabilities.
 - Named Workspaces with drag-and-drop Session assignment.
 - AAF desktop automation through `desktop_auto`, including zero/one/many model-visible WebP/PNG screenshots mixed with structured OCR, geometry and state output.
+- Low-level dependency-free Chrome DevTools Protocol control through always-batched `cdp_call`, with persistent browser/profile and logical page labels plus subscription/poll access to CDP notifications.
+- Explicit persistent Session/Workspace key-value memory through `memory_find` and `memory_set`, with explicitly typed JSON/text values, TTL and a local Memory manager.
 - Filesystem, text search/editing, reversible trash and generated-file publishing.
 - Foreground and persistent processes with progress streaming when requested.
 - Persistent JavaScript kernels scoped to Session + Workspace.
@@ -56,12 +58,12 @@ The desktop UI is local-only and opens no GUI TCP listener. Public MCP/OAuth tra
 
 MrMCP keeps transport state stateless. Persistent application state is selected explicitly with a `context_handle`.
 
-1. Call `list_workspaces` to discover enabled Workspace names; when a new empty Workspace is needed, `create_workspace(name)` creates and registers it on the user's Desktop without exposing or accepting its path.
-2. Call `open_workspace(name)` to create a Session in that Workspace.
+1. Call `list_workspaces` to discover enabled Workspace names.
+2. Call `open_workspace(name)` to create a Session in an existing Workspace. When you explicitly want a missing Workspace created as a new empty Desktop folder, call `open_workspace(name, create=true)` instead; missing names are never created implicitly.
 3. Reuse the returned `context_handle` on later Session-bound tools.
 4. To move the same Session, call `open_workspace(name, current_context_handle)`.
 
-`open_workspace` also returns the Workspace name, absolute working directory and optional `agent_guidance_path`. Guidance resolution prefers Workspace-root `AGENTS.md` / `agents.md` and falls back to `CLAUDE.md` / `Claude.md` / `claude.md`; when the returned path is present, read and follow it before repository work.
+`open_workspace` also returns the Workspace name, absolute working directory, optional `agent_guidance_path`, whether this call created the Workspace, and a compact Memory summary containing live counts plus up to five latest keys for Workspace and Session scope. Guidance resolution prefers Workspace-root `AGENTS.md` / `agents.md` and falls back to `CLAUDE.md` / `Claude.md` / `claude.md`; when the returned path is present, read and follow it before repository work.
 
 The administration UI displays Sessions with short numeric ids. The opaque `ctx_...` value remains the MCP bearer capability. A Session may move between Workspaces, while historical Tool Calls retain the Workspace snapshot captured when each call started.
 
@@ -69,11 +71,20 @@ The administration UI displays Sessions with short numeric ids. The opaque `ctx_
 
 Session and Workspace:
 
-- `list_workspaces`, `create_workspace`, `open_workspace`, `query_tool_calls`
+- `list_workspaces`, `open_workspace`, `tools_log`
 
-Desktop automation:
+Desktop and browser automation:
 
 - `desktop_auto` — execute one AAF YAML scenario through Auto.js; arbitrary final state is preserved and retained screenshots are returned directly as MCP image content for model vision.
+- `cdp_call` — send an always-present `calls[]` batch spanning browsers/targets. Entries may be untouched standard CDP `{method,params}` or namespaced `_mrmcp` XPath `click`/`find` operations; standard `Page.captureScreenshot` may optionally return a Base64 screenshot post-processed through the public Auto.js `auto.vips` API to scaled WebP (current encoder Q=80) while preserving all normal CDP screenshot params.
+- `cdp_subs`, `cdp_poll` — add/remove runtime subscriptions (including `*`, target/method-prefix and full-message regex filters) and read bounded CDP traffic through ascending cursors or ad-hoc polling.
+
+Memory:
+
+- `memory_find` — search the explicitly selected current-Session or named-Workspace memory by exact/prefix key, text, set date and stable pagination.
+- `memory_set` — set/replace/delete text values with explicit `json=true|false`; JSON text is validated before storage, with optional TTL in the selected Session or Workspace scope.
+
+The desktop **Memory** page filters stored values by Session, Workspace, scope, set date and text, labels JSON vs TEXT, and allows full value/type/TTL inspection, editing and deletion. JSON values use an editable JSON tree with node-level operations; text values use the plain text editor. Expired TTL rows are removed automatically; Clear Operational Data preserves Memory.
 
 Filesystem:
 
@@ -89,6 +100,8 @@ Commands and execution:
 - `discover_commands` returns the complete available extra-command catalog in YAML order, with descriptions and documentation links. Agent discovery can be globally enabled/disabled from the Commands page without changing the catalog or executables.
 - `exec`, `exec_start`, `exec_attach`, `exec_write`, `exec_kill`, `exec_list`, `exec_status`
 - `js`, `js_add_node_module_dir`, `js_reset`
+- `tools_schema` — inspect canonical live MCP descriptors; `tools_log` — query Tool Calls that reached the current Session.
+- `telegram_req` — make one generic pre-authenticated Telegram Bot API JSON request using the Bot token configured by the user in Settings.
 
 Filesystem removal is reversible: `fs_trash`/`fs_restore` use explicit `trash_id` transactions instead of a permanent delete tool. All Workspaces share the single MrMCP-managed `APP_DIR/.mrmcp/trash/` store; MrMCP never creates `.mrmcp` metadata directories inside named Workspaces.
 

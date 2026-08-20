@@ -6,7 +6,7 @@ This file documents the current built-in MCP tool surface, its arguments, semant
 
 ### Session capability
 
-Most tools require `context_handle`, the opaque `ctx_...` capability returned by `open_workspace`. Pass it unchanged. `list_workspaces`, `create_workspace` and the read-only diagnostic `inspect_tools` are sessionless; `open_workspace` creates or reuses a Session and returns the handle used afterward.
+Most tools require `context_handle`, the opaque `ctx_...` capability returned by `open_workspace`. Pass it unchanged. `list_workspaces` and the read-only diagnostic `tools_schema` are sessionless; `open_workspace` itself needs no pre-existing Session, can explicitly create a missing Workspace with `create=true`, then creates/reuses a Session and returns the handle used afterward.
 
 ### Filesystem paths
 
@@ -87,26 +87,19 @@ Arguments: none.
 
 Rationale: discovery is sessionless so a client can choose a Workspace before it has a Session capability.
 
-### `create_workspace`
-
-Creates a new empty directory on the current user's Desktop and registers it as an enabled Workspace.
-
-Arguments:
-
-- `name` — new globally unique Workspace name.
-
-The path is intentionally not supplied by the agent; MrMCP resolves the Desktop and final directory internally.
-
 ### `open_workspace`
 
-Opens an enabled Workspace and returns the Session capability used by later tools.
+Opens an enabled Workspace and returns the Session capability used by later tools. Workspace creation is deliberately folded into this tool rather than exposed as a second public creation tool.
 
 Arguments:
 
 - `name` — Workspace name.
+- `create` — default `false`. Set `true` only when you explicitly want a missing Workspace created as a new empty directory on the current user's Desktop and registered under exactly this name. With `false`, a missing or disabled Workspace is an error. If the Workspace already exists, `create=true` simply opens it and does not replace it.
 - `current_context_handle` — optional existing active Session capability. When valid, the same Session is moved to the selected Workspace. Otherwise a new Session is created.
 
-Returns `workspace_name`, absolute `cwd`, `agent_guidance_path` and `context_handle`. Guidance resolution checks only the Workspace root, preferring `AGENTS.md` / `agents.md` and then falling back to `CLAUDE.md` / `Claude.md` / `claude.md`.
+The creation path remains name-only: the agent does not supply the filesystem path; MrMCP resolves the Desktop and final directory internally and performs the same name/path/existing-target collision checks used by the GUI workflow.
+
+Returns `workspace_name`, absolute `cwd`, `agent_guidance_path`, `workspace_created`, `memory_summary` and `context_handle`. `workspace_created` is true only when this exact call created the missing Workspace. `memory_summary.workspace` and `memory_summary.session` each contain the number of live memories plus up to five most recently set keys, giving the agent a small orientation hint without eagerly returning values. Guidance resolution checks only the Workspace root, preferring `AGENTS.md` / `agents.md` and then falling back to `CLAUDE.md` / `Claude.md` / `claude.md`.
 
 ---
 
@@ -353,6 +346,108 @@ The MCP result `content` is multimodal: index `0` is the JSON `TextContent` repr
 
 ---
 
+## Chrome DevTools Protocol
+
+The CDP surface is deliberately small: `cdp_call`, `cdp_subs`, and `cdp_poll`. It has no Puppeteer/Playwright dependency and does not import `doc/CDP.js`; that file remains low-level behavioral know-how. Standard CDP commands stay standard, while two deliberately namespaced `_mrmcp` operations capture the useful XPath behavior from the reference without adding separate MCP tools. The authoritative protocol reference is `https://chromedevtools.github.io/devtools-protocol/`.
+
+### `cdp_call`
+
+Sends one or more CDP operations. The input is **always** a `calls[]` array, including the one-call case. Each entry independently selects a persistent global browser/profile label, an optional logical page target and one operation, so one Tool Call may span several targets and browsers. MrMCP stores each browser profile under `.mrmcp/cdp/<browser>/`, assigns a stable unique loopback debugging port, reconnects to a still-running browser when possible, and otherwise launches a compatible Chromium browser automatically. Browser state is global, not Session-owned, and a launched browser may outlive MrMCP.
+
+Arguments:
+
+- `calls[]` — required, 1–100 entries, returned in the same order.
+  - `browser` — required persistent browser/profile label for this entry.
+  - `target` — optional persistent logical page label. If its saved page still exists, MrMCP resolves a current flattened `sessionId`; if it disappeared, MrMCP creates a new paused `about:blank` page, initializes/resumes it and replaces the persisted `targetId`. `_mrmcp` operations require a target; standard browser-level CDP methods may omit it.
+  - `call` — exactly one of:
+    - `method` — exact standard CDP method such as `Page.navigate`, `Runtime.evaluate`, `Network.getResponseBody` or `Page.captureScreenshot`; `params` is passed to CDP unchanged. Never supply transport `id` or `sessionId`.
+    - `_mrmcp` — private MrMCP operation, never sent as a CDP method. `_mrmcp:"click"` accepts `params.xpath` plus optional `attempts` (default 5, max 20) and `interval_ms` (default 300); it performs the reference `Runtime.evaluate` retry/click flow with `awaitPromise`, `returnByValue`, `silent` and `userGesture`. `_mrmcp:"find"` accepts `params.xpath` plus optional `limit` (default 20, max 100) and returns compact matching node/element metadata including text and client rects. Both operations preprocess augmented XPath: `ends-with(a,b)` becomes the XPath-1.0 `substring(...) = b` equivalent and `icontains(a,b)` becomes a case-insensitive `contains(translate(...),b)` expression.
+  - `_image` — optional MrMCP response post-processing **only** for a standard `Page.captureScreenshot` call and only with `wait=true`. The standard screenshot request remains untouched, so every normal CDP screenshot parameter remains available. `return` is currently `base64`; `format:"original"` keeps the browser-returned encoding without loading an image codec, while `format:"webp"` lazily uses the public Auto.js `auto.vips.decodeImage` / `auto.vips.encodeImage` API. Its current WebP encoder is fixed at `quality:80`; `scale` multiplies dimensions before encoding. PNG/WebP browser screenshots can enter this post-processing path. The resulting Base64 stays in `cdp.result.data`; an `image` metadata object reports encoding, resulting format/MIME, byte size, scale and quality. MrMCP never imports Sharp directly and does not save CDP screenshots to disk unless a later explicit tool does so.
+- `wait` — one batch-wide flag, default `true`. `true` dispatches every entry and waits independently for every response; one failed entry does not abort siblings. `false` dispatches all possible entries and returns assigned request ids immediately; retrieve eventual responses with `cdp_poll`. `_image` is intentionally unavailable with `wait=false` because post-processing happens on the waited response.
+- `context_handle`.
+
+The result is `{wait, results[]}` in input order. Each row reports browser/target/session diagnostics, assigned request `id`, `queued`, `cdp`, nullable `image`, setup errors, `success` and a compact row error. For private `_mrmcp` operations, the ring/response envelope remembers logical method names such as `_mrmcp.click` even though the wire command is `Runtime.evaluate`.
+
+The persistent database stores browser-to-port and `(browser,target)`-to-CDP-`targetId`; `sessionId` remains runtime-only. Reconnecting to a still-running browser reconstructs sessions through CDP. A missing page/browser incarnation is repaired lazily the next time its logical target is used.
+
+New page sessions use flattened auto-attach with `waitForDebuggerOnStart:true`. While paused, MrMCP enables `Runtime`, `Page`, `Network`, best-effort `ServiceWorker`, focus emulation, `_send_to_cdp` via `Runtime.addBinding`, and best-effort push-messaging `BackgroundService` observation. It sends `Runtime.disable` before `Runtime.runIfWaitingForDebugger`; this disables execution-context reporting but does not remove the binding or prevent later `Runtime.evaluate`. JavaScript may call `_send_to_cdp("...")`, producing the standard `Runtime.bindingCalled` event. Optional setup failures are exposed in `setup_errors`.
+
+### `cdp_subs`
+
+Adds and/or removes global runtime subscriptions for one browser in a single call. Removals are applied before additions. Subscriptions are not Session-owned and are intentionally not persisted across MrMCP restarts.
+
+Arguments:
+
+- `browser` — required browser label.
+- `add` — either `"*"` for one catch-all subscription or an array of subscription specs. A spec may contain:
+  - `targets[]` — logical target labels; `"*"` matches every target. Omit for all target-associated messages.
+  - `methods[]` — exact methods; `"*"` matches all methods.
+  - `method_prefixes[]` — prefixes such as `Network.`, `Page.` or `Runtime.`; `"*"` matches all methods. Exact and prefix filters are OR alternatives.
+  - `include_browser` — include traffic with no target association. When omitted it defaults true only if no target list is supplied.
+  - `regex` — optional JavaScript regex source tested against `JSON.stringify` of the **complete raw inbound CDP message**, so diagnostic subscriptions can match arbitrary payload text such as `pippo`, URLs, ids or nested values without knowing the method in advance.
+  - `regex_flags` — optional `i`, `m`, `s`, `u` flags, each at most once.
+- `remove` — either `"*"` to remove every live subscription for that browser or an array of opaque `cdpsub_...` ids.
+- `context_handle`.
+
+Target, method/prefix and regex dimensions combine with AND; alternatives within exact/prefix methods combine with OR. Internal `Target.*` state handling always runs regardless of public subscriptions. Notifications are put in the public ring only when some live subscription matches; responses are retained independently so `wait=false` remains recoverable.
+
+### `cdp_poll`
+
+Reads retained CDP traffic. With `subscription`, polling proceeds forward from that subscription's ascending cursor and `advance:true` (default) advances only that cursor. Without a subscription, `browser` is required and polling returns the latest matching retained messages from the tail in chronological order without consuming them.
+
+Optional ad-hoc filters are `target`, `type=all|notification|response`, response `id`, exact `methods[]`, `method_prefixes[]`, and `limit` (1–200, default 50). Response envelopes remember the original/logical request method, so method/prefix filtering also works for standard and `_mrmcp` responses.
+
+Each browser has one shared ring rather than one copy per subscription. It is capped at 10,000 messages and 32 MiB serialized size; oversized or oldest entries are dropped as necessary. `dropped`, `oldest_seq`, `newest_seq`, and `stream_resets` make loss and reconnection explicit. A subscription itself stores only its filters and cursor.
+
+---
+
+## Memory
+
+MrMCP exposes one small explicit persistent key-value memory surface: `memory_find` and `memory_set`. There is deliberately no separate `memory_get`; exact lookup is `memory_find` with `key`. Values are explicitly either validated JSON text or ordinary text and are stored in SQLite, not in hidden model state.
+
+Every call explicitly chooses one scope:
+
+- `scope="session"` — memory belongs only to the current `context_handle`'s Session. `workspace` must be omitted.
+- `scope="workspace"` — `workspace` is required and names the Workspace whose shared memory is addressed. It does not depend on which Workspace the current Session happens to be using.
+
+### `memory_find`
+
+Finds live memories only in the selected scope. Expired TTL rows are removed before the query.
+
+Arguments:
+
+- `scope` — required `session|workspace`.
+- `workspace` — required only for Workspace scope.
+- `key` — optional exact key.
+- `key_prefix` — optional key prefix.
+- `query` — optional case-insensitive literal search across key plus stored JSON/text value.
+- `set_after`, `set_before` — optional ISO date/time bounds on `set_at`.
+- `limit` — 1–100, default 20.
+- `before_id` — stable backward-pagination cursor; `next_before_id` is returned when another page exists.
+- `context_handle`.
+
+Each result contains stable row `id`, scope, Session id or Workspace label, key, explicit `json` boolean, `value` (parsed JSON when true, ordinary string when false), `ttl_seconds`, ISO `set_at`, and nullable ISO `expires_at`.
+
+### `memory_set`
+
+Sets or replaces one key, or deletes it. `key` is 1–512 characters. Stored value text is limited to 1 MiB.
+
+Arguments:
+
+- `scope` and optional/required `workspace` as above.
+- `key` — required.
+- `value` — exact string value; required unless deleting.
+- `json` — required when setting: `true` validates `value` with `JSON.parse`; `false` stores it unchanged.
+- `ttl_seconds` — `0` means permanent; a positive value expires that many seconds after this set operation.
+- `delete=true` — removes the key; omit both `value` and `json`.
+- `context_handle`.
+
+Replacing a key creates a fresh row identity and `set_at`; TTL is therefore restarted from the replacement time. Deleting a Session or Workspace also removes memories owned by it. **Clear Operational Data intentionally preserves Memory**, just as it preserves Sessions, Workspaces and CDP browser/profile state.
+
+The desktop **Memory** page is a lazy administrative view over the same table. It filters by scope, Session, Workspace, set-date range and text, paginates results, labels JSON/TEXT, displays TTL/expiry, and allows the complete value, type, key and TTL to be inspected/edited or the entry to be deleted. JSON memories use the same vendored JSONEditor tree as Tool Call JSON and support node-level editing; text memories use a plain textarea. JSONEditor writes back through the normal managed form field and Deno submit path, while backend JSON validation remains authoritative.
+
+---
+
 ## Publication
 
 ### `publish`
@@ -379,6 +474,12 @@ The returned `uri` is the persistent HTTPS URL of the published content itself, 
 
 ---
 
+## Tool-call inspection
+
+The desktop **Tool Calls** detail preserves the ordinary structured logs and separately retains detectable binary content from tool inputs and outputs, including MCP image/resource blobs and Base64 image payloads with recognizable MIME/magic. Expanded rows show compact MIME/size/JSON-path cards and inline image thumbnails that enlarge on hover; non-image binary stays metadata-only. Input JSON, raw tool return, final MCP Result and descriptor schemas render through a native collapsible syntax-highlighted tree while their raw JSON remains available to Copy actions. No third-party JSON viewer is loaded.
+
+---
+
 ## Command discovery and diagnostics
 
 ### `discover_commands`
@@ -393,7 +494,7 @@ Results contain `logical_name`, description and optional documentation URL. A re
 
 Rationale: user-provided command capability remains extensible without growing the built-in MCP surface.
 
-### `inspect_tools`
+### `tools_schema`
 
 Returns the canonical complete descriptor for one or more exact currently published tool names, directly from the same `serverTools()` source used by MCP `tools/list`.
 
@@ -407,7 +508,7 @@ Publication-widget resource URIs are returned in canonical form. Normal `tools/l
 
 Rationale: connector/tool wrappers may present a synthesized or abbreviated schema view. This diagnostic path lets an agent inspect the authoritative server descriptor itself when exact schema, descriptions, output statuses, annotations or metadata matter, without duplicating descriptor definitions in a second implementation.
 
-### `query_tool_calls`
+### `tools_log`
 
 Queries Tool Calls that actually reached MrMCP for the current Session.
 
@@ -421,6 +522,21 @@ Arguments:
 - `context_handle`.
 
 The call excludes its own current log row. Requests blocked before reaching MrMCP cannot appear here.
+
+---
+
+## Telegram Bot API
+
+### `telegram_req`
+
+Sends one generic Telegram Bot API JSON request. The local user configures only the Bot token in **Settings → Telegram Bot**; the token is injected by MrMCP and is never an agent argument or returned value. The agent owns chat/channel ids and other application state, which can be kept in Memory when useful.
+
+Arguments:
+
+- `request` — one object containing required Bot API `method` plus that method's normal JSON parameters.
+- `context_handle`.
+
+MrMCP uses native `fetch()` only: no TDLib and no Telegram client library. Numeric-string `chat_id` is normalized to a number when safely representable. If Telegram returns `parameters.migrate_to_chat_id`, MrMCP remembers that redirect for the running process, rewrites the request and retries once. The result contains the method, Telegram's JSON response body, and nullable migration metadata. Telegram method semantics remain the Bot API's own contract.
 
 ---
 

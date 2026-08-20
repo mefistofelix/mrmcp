@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.115 — Unify user publication into one MIME-aware publish tool and smart MCP App.
+MrMCP 0.10.117 — Add richer Tool Call inspection, Telegram Bot requests, and typed scoped memory.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -13,8 +13,7 @@ import { Buffer } from "node:buffer";
 import chardet from "npm:chardet@2.1.1";
 import iconv from "npm:iconv-lite@0.7.0";
 import * as auto from "npm:@mefistofelix/auto.js";
-let sharpModulePromise;
-const loadSharp = () => sharpModulePromise ??= import("npm:sharp");
+const loadAutoVips = async () => auto.vips;
 import { inflateRawSync, inflateSync } from "node:zlib";
 import { Readable, Writable } from "node:stream";
 import { spawn as nodeSpawn } from "node:child_process";
@@ -83,20 +82,20 @@ const GUIDED_PROMPTS_PATH = join(APP_DIR, "guided_prompts.yaml");
 const PORT_FALLBACK_STEP = 50;
 const UI_INPUT_EVENT = "tauriless://webview-message", UI_RENDER_EVENT = "mrmcp://ui-render";
 const BASE_TOOLS = [
-  "list_workspaces", "create_workspace", "open_workspace",
+  "list_workspaces", "open_workspace",
   "fs_glob", "fs_grep", "fs_read", "fs_navigate", "fs_stat",
   "fs_write", "fs_edit", "fs_mkdir", "fs_copy", "fs_move", "fs_trash", "fs_restore",
-  "desktop_auto", "publish", "discover_commands", "inspect_tools", "query_tool_calls", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
+  "desktop_auto", "publish", "cdp_call", "cdp_subs", "cdp_poll", "memory_find", "memory_set", "telegram_req", "discover_commands", "tools_schema", "tools_log", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
   "js", "js_add_node_module_dir", "js_reset",
 ];
 const READ_TOOLS = new Set([
   "list_workspaces", "fs_glob", "fs_grep", "fs_read", "fs_navigate", "fs_stat",
-  "discover_commands", "inspect_tools", "query_tool_calls", "exec_attach", "exec_list", "exec_status",
+  "discover_commands", "tools_schema", "tools_log", "exec_attach", "exec_list", "exec_status",
 ]);
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.115";
+const VERSION = "0.10.117";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;
@@ -445,6 +444,7 @@ async function backend({ addWorkspace = null } = {}) {
   const BIN_DIR = join(DATA, "bin");
   const TEMP_DIR = join(DATA, "tmp");
   const PUBLISH_DIR = join(DATA, "publish");
+  const CDP_DIR = join(DATA, "cdp");
   Deno.mkdirSync(DATA, { recursive: true });
   if (!addWorkspace) {
     Deno.mkdirSync(BIN_DIR, { recursive: true });
@@ -453,13 +453,14 @@ async function backend({ addWorkspace = null } = {}) {
     });
     Deno.mkdirSync(TEMP_DIR, { recursive: true });
     Deno.mkdirSync(PUBLISH_DIR, { recursive: true });
+    Deno.mkdirSync(CDP_DIR, { recursive: true });
   }
   const db = new DatabaseSync(DB_PATH);
   let uiRevision = 0, uiRenderConnected = false, uiRenderVisible = false, uiRenderVisibilityEpoch = 0;
   const deliverUiRender = payload => {
     if (IS_BACKEND_WORKER) self.postMessage({ type: "ui-render", payload });
   };
-  const UI_SECTIONS = new Set(["dashboard", "sessions", "logs", "published", "roots", "commands", "prompts", "prompt_help", "debug", "oauth", "settings", "help"]);
+  const UI_SECTIONS = new Set(["dashboard", "sessions", "logs", "published", "memory", "roots", "commands", "prompts", "prompt_help", "debug", "oauth", "settings", "help"]);
   const uiState = {
     currentSection: "dashboard",
     scrollBySection: { dashboard: [0, 0] },
@@ -473,6 +474,7 @@ async function backend({ addWorkspace = null } = {}) {
     sessions: { oauthClientId: "" },
     logs: { page: 1, toolQuery: "", query: "", context: "", status: "", pageSize: 25, openRowId: "", selfTest: null },
     published: { page: 1, context: "", size: "" },
+    memory: { page: 1, query: "", scope: "", context: "", workspace: "", from: "", to: "" },
     debug: { query: "", method: "", status: "", openRowId: "" },
   };
   let uiRenderTimer = null, uiLogFilterTimer = null, uiNoticeTimer = null, uiRenderRunning = false, uiRenderQueued = false;
@@ -584,11 +586,12 @@ async function backend({ addWorkspace = null } = {}) {
     const scopes = new Set();
     if (/\blogs\b/.test(statement)) ["logs", "sessions", "dashboard"].forEach(scope => scopes.add(scope));
     if (/\btool_call_transport\b/.test(statement)) ["logs", "dashboard"].forEach(scope => scopes.add(scope));
-    if (/\bcontexts\b/.test(statement)) ["sessions", "roots", "logs", "dashboard"].forEach(scope => scopes.add(scope));
-    if (/\broots\b/.test(statement)) ["roots", "sessions", "dashboard"].forEach(scope => scopes.add(scope));
+    if (/\bcontexts\b/.test(statement)) ["sessions", "roots", "logs", "memory", "dashboard"].forEach(scope => scopes.add(scope));
+    if (/\broots\b/.test(statement)) ["roots", "sessions", "memory", "dashboard"].forEach(scope => scopes.add(scope));
     if (/\bdebug_logs\b/.test(statement)) scopes.add("debug");
     if (/\bprocess_runs\b/.test(statement)) ["logs", "dashboard"].forEach(scope => scopes.add(scope));
     if (/\bpublished(?:_uses)?\b/.test(statement)) scopes.add("published");
+    if (/\bmemories\b/.test(statement)) scopes.add("memory");
     if (/\bcustom_tools\b/.test(statement)) ["commands", "dashboard", "endpoints"].forEach(scope => scopes.add(scope));
     if (/\boauth_(?:clients|tokens|refresh_tokens|codes)\b/.test(statement)) ["oauth", "dashboard"].forEach(scope => scopes.add(scope));
     if (/\bserver_config\b/.test(statement)) ["dashboard", "endpoints", "settings", "oauth"].forEach(scope => scopes.add(scope));
@@ -770,6 +773,58 @@ async function backend({ addWorkspace = null } = {}) {
       error TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS process_runs_time ON process_runs(started_at DESC);
+    CREATE TABLE IF NOT EXISTS cdp_browsers(
+      browser TEXT PRIMARY KEY,
+      port INTEGER NOT NULL UNIQUE,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS cdp_targets(
+      browser TEXT NOT NULL,
+      target TEXT NOT NULL,
+      target_id TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL,
+      PRIMARY KEY(browser,target),
+      FOREIGN KEY(browser) REFERENCES cdp_browsers(browser) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS cdp_targets_id ON cdp_targets(browser,target_id);
+    CREATE TABLE IF NOT EXISTS memories(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      scope TEXT NOT NULL CHECK(scope IN ('session','workspace')),
+      owner_id INTEGER NOT NULL,
+      owner_name TEXT NOT NULL DEFAULT '',
+      key TEXT NOT NULL,
+      value_json TEXT NOT NULL,
+      is_json INTEGER NOT NULL DEFAULT 1,
+      ttl_seconds INTEGER NOT NULL DEFAULT 0,
+      set_at INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(scope,owner_id,key)
+    );
+    CREATE INDEX IF NOT EXISTS memories_owner_time ON memories(scope,owner_id,set_at DESC,id DESC);
+    CREATE INDEX IF NOT EXISTS memories_expiry ON memories(expires_at) WHERE expires_at>0;
+    CREATE TABLE IF NOT EXISTS tool_call_content(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      log_id INTEGER NOT NULL,
+      direction TEXT NOT NULL CHECK(direction IN ('input','output')),
+      json_path TEXT NOT NULL DEFAULT '',
+      content_type TEXT NOT NULL DEFAULT 'binary',
+      mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
+      bytes INTEGER NOT NULL DEFAULT 0,
+      data BLOB NOT NULL,
+      FOREIGN KEY(log_id) REFERENCES logs(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS tool_call_content_log ON tool_call_content(log_id,direction,id);
+    CREATE TRIGGER IF NOT EXISTS memories_context_delete AFTER DELETE ON contexts BEGIN
+      DELETE FROM memories WHERE scope='session' AND owner_id=OLD.id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS memories_root_delete AFTER DELETE ON roots BEGIN
+      DELETE FROM memories WHERE scope='workspace' AND owner_id=OLD.id;
+    END;
+    CREATE TRIGGER IF NOT EXISTS memories_root_rename AFTER UPDATE OF name ON roots BEGIN
+      UPDATE memories SET owner_name=NEW.name WHERE scope='workspace' AND owner_id=NEW.id;
+    END;
     CREATE TABLE IF NOT EXISTS published(
       id TEXT PRIMARY KEY,
       server_id INTEGER NOT NULL,
@@ -822,6 +877,8 @@ async function backend({ addWorkspace = null } = {}) {
       value INTEGER NOT NULL DEFAULT 0
     );
   `);
+  const memoryColumns = new Set(db.prepare("PRAGMA table_info(memories)").all().map(column => column.name));
+  if (!memoryColumns.has("is_json")) db.exec("ALTER TABLE memories ADD COLUMN is_json INTEGER NOT NULL DEFAULT 1");
   const processRunColumns = new Set(db.prepare("PRAGMA table_info(process_runs)").all().map(column => column.name));
   if (!processRunColumns.has("log_id")) db.exec("ALTER TABLE process_runs ADD COLUMN log_id INTEGER NOT NULL DEFAULT 0");
   db.exec("CREATE INDEX IF NOT EXISTS process_runs_log ON process_runs(log_id)");
@@ -962,6 +1019,10 @@ async function backend({ addWorkspace = null } = {}) {
     roots: ["server_id", "name", "path", "enabled"],
     contexts: ["id", "handle", "server_id", "root_id", "created_at", "updated_at", "last_active_at", "protocol_version", "auth_kind", "oauth_client_id", "client_name", "user_agent"],
     process_runs: ["log_id", "context_id", "context_handle", "root_id", "root_name", "root_path", "stdout_tail", "stderr_tail"],
+    cdp_browsers: ["browser", "port", "created_at", "updated_at"],
+    cdp_targets: ["browser", "target", "target_id", "created_at", "updated_at"],
+    memories: ["id", "scope", "owner_id", "owner_name", "key", "value_json", "is_json", "ttl_seconds", "set_at", "expires_at"],
+    tool_call_content: ["id", "log_id", "direction", "json_path", "content_type", "mime_type", "bytes", "data"],
     logs: ["id", "server_name", "tool", "status", "input_json", "context_id", "context_handle", "root_id", "root_name", "root_path"],
     tool_call_descriptors: ["log_id", "descriptor_json"],
     tool_call_transport: ["log_id", "progress_requested"],
@@ -1019,7 +1080,7 @@ async function backend({ addWorkspace = null } = {}) {
     ["tls_last_request_at", "0"], ["tls_last_request_status", ""], ["tls_last_request_valid", "0"],
     ["tls_next_attempt_at", "0"], ["tls_rate_limit_reset_at", "0"], ["tls_renewal_due_at", "0"],
     ["tls_self_signed_created_at", "0"], ["debug_http_log", "0"],
-    ["inherit_system_path", "1"], ["command_discovery_enabled", "1"],
+    ["inherit_system_path", "1"], ["command_discovery_enabled", "1"], ["telegram_bot_token", ""],
   ]) if (!one("SELECT 1 FROM config WHERE key=?", k)) setCfg(k, v);
   setCfg("tls_cert_path", CERT_PATH);
   setCfg("tls_key_path", KEY_PATH);
@@ -1031,7 +1092,787 @@ async function backend({ addWorkspace = null } = {}) {
     "MrMCP", 1, Date.now(),
   );
   const processes = new Map(), jsKernels = new Map(), activeCallControls = new Map(),
+    cdpBrowsers = new Map(), cdpConnectPromises = new Map(), cdpSubscriptions = new Map(), cdpBrowserSequences = new Map(),
     oauthConsents = new Map(), rateBuckets = new Map();
+
+  const CDP_PORT_MIN = 43000, CDP_PORT_MAX = 49999;
+  const CDP_RING_MAX_MESSAGES = 10000, CDP_RING_MAX_BYTES = 32 * 1024 * 1024;
+  const CDP_BINDING_NAME = "_send_to_cdp";
+  const CDP_CALL_DOCS = "https://chromedevtools.github.io/devtools-protocol/";
+  const CDP_LAUNCH_ARGS = [
+    "--enable-automation",
+    "--mute-audio",
+    "--hide-crash-restore-bubble",
+    "--disable-field-trial-config",
+    "--disable-background-networking",
+    "--enable-features=NetworkService,NetworkServiceInProcess",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-back-forward-cache",
+    "--disable-breakpad",
+    "--no-default-browser-check",
+    "--disable-default-apps",
+    "--disable-dev-shm-usage",
+    "--disable-extensions",
+    "--disable-component-extensions-with-background-pages",
+    "--disable-component-update",
+    "--disable-features=InfiniteSessionRestore,LazyFrameLoading,GlobalMediaControls,DestroyProfileOnBrowserClose,MediaRouter,DialMediaRouteProvider,AcceptCHFrame,AutoExpandDetailsElement,AvoidUnnecessaryBeforeUnloadCheckSync,Translate,PaintHolding",
+    "--disable-popup-blocking",
+    "--allow-pre-commit-input",
+    "--disable-hang-monitor",
+    "--disable-prompt-on-repost",
+    "--force-color-profile=srgb",
+    "--metrics-recording-only",
+    "--no-first-run",
+    "--password-store=basic",
+    "--use-mock-keychain",
+    "--no-service-autorun",
+    "--export-tagged-pdf",
+    "--disable-search-engine-choice-screen",
+  ];
+  const cdpBrowserName = value => {
+    const browser = String(value ?? "").trim();
+    if (!browser || browser.length > 64 || /[<>:"/\\|?*\x00-\x1f\x7f]/.test(browser) || /[. ]$/.test(browser) || browser === "." || browser === "..")
+      throw new Error("browser must be a safe 1-64 character directory label");
+    if (/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(browser)) throw new Error("browser uses a reserved filesystem name");
+    return browser;
+  };
+  const cdpTargetName = value => {
+    const target = String(value ?? "").trim();
+    if (!target || target.length > 128 || /[\x00-\x1f\x7f]/.test(target)) throw new Error("target must be a non-empty 1-128 character label without control characters");
+    return target;
+  };
+  const cdpPathKey = value => Deno.build.os === "windows" ? resolve(value).toLowerCase() : resolve(value);
+  const cdpFileExists = async path => {
+    try { return (await Deno.stat(path)).isFile; }
+    catch (error) { if (error instanceof Deno.errors.NotFound) return false; throw error; }
+  };
+  const cdpBrowserCandidates = () => {
+    const override = String(Deno.env.get("MRMCP_CDP_BROWSER") || "").trim();
+    if (override) return [override];
+    const home = nativeHomeDir();
+    if (Deno.build.os === "windows") {
+      const programFiles = String(Deno.env.get("ProgramFiles") || "C:\\Program Files");
+      const programFilesX86 = String(Deno.env.get("ProgramFiles(x86)") || "C:\\Program Files (x86)");
+      const local = String(Deno.env.get("LOCALAPPDATA") || join(home, "AppData", "Local"));
+      return [
+        join(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
+        join(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
+        join(local, "Google", "Chrome", "Application", "chrome.exe"),
+        join(programFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
+        join(programFilesX86, "Microsoft", "Edge", "Application", "msedge.exe"),
+      ];
+    }
+    if (Deno.build.os === "darwin") return [
+      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+      join(home, "Applications", "Google Chrome.app", "Contents", "MacOS", "Google Chrome"),
+      "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    ];
+    return [
+      "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser",
+      "/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable",
+    ];
+  };
+  async function cdpBrowserExecutable() {
+    for (const candidate of cdpBrowserCandidates()) if (await cdpFileExists(candidate)) return candidate;
+    throw new Error("No CDP-compatible Chromium browser found. Set MRMCP_CDP_BROWSER to an executable path.");
+  }
+  async function cdpCanBind(port) {
+    let listener;
+    try {
+      listener = Deno.listen({ hostname: "127.0.0.1", port });
+      return true;
+    } catch (error) {
+      if (error instanceof Deno.errors.AddrInUse || error instanceof Deno.errors.PermissionDenied) return false;
+      throw error;
+    } finally { try { listener?.close(); } catch {} }
+  }
+  async function cdpPersistentBrowser(browser) {
+    const existing = one("SELECT browser,port FROM cdp_browsers WHERE browser=?", browser);
+    if (existing) return { browser: existing.browser, port: Number(existing.port), user_data_dir: join(CDP_DIR, browser) };
+    const range = CDP_PORT_MAX - CDP_PORT_MIN + 1;
+    const digest = createHash("sha256").update(browser).digest();
+    const seed = digest.readUInt32BE(0) % range;
+    const used = new Set(all("SELECT port FROM cdp_browsers").map(row => Number(row.port)));
+    for (let offset = 0; offset < range; offset++) {
+      const port = CDP_PORT_MIN + ((seed + offset) % range);
+      if (used.has(port) || !await cdpCanBind(port)) continue;
+      const now = Date.now();
+      try {
+        run("INSERT INTO cdp_browsers(browser,port,created_at,updated_at) VALUES(?,?,?,?)", browser, port, now, now);
+      } catch (error) {
+        const raced = one("SELECT browser,port FROM cdp_browsers WHERE browser=?", browser);
+        if (raced) return { browser: raced.browser, port: Number(raced.port), user_data_dir: join(CDP_DIR, browser) };
+        throw error;
+      }
+      return { browser, port, user_data_dir: join(CDP_DIR, browser) };
+    }
+    throw new Error(`No free CDP port in ${CDP_PORT_MIN}-${CDP_PORT_MAX}`);
+  }
+  async function cdpVersion(port, timeoutMs = 800) {
+    const controller = new AbortController(), timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: controller.signal });
+      if (!response.ok) return null;
+      const value = await response.json();
+      return value && typeof value.webSocketDebuggerUrl === "string" ? value : null;
+    } catch { return null; }
+    finally { clearTimeout(timer); }
+  }
+  async function cdpLaunchBrowser(record) {
+    await Deno.mkdir(record.user_data_dir, { recursive: true });
+    const executable = await cdpBrowserExecutable();
+    const args = [
+      ...CDP_LAUNCH_ARGS,
+      `--user-data-dir=${record.user_data_dir}`,
+      `--remote-debugging-port=${record.port}`,
+      "about:blank",
+    ];
+    const child = nodeSpawn(executable, args, { detached: true, stdio: "ignore", windowsHide: true });
+    await new Promise((resolveSpawn, rejectSpawn) => {
+      child.once("spawn", resolveSpawn);
+      child.once("error", rejectSpawn);
+    });
+    child.unref();
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      const version = await cdpVersion(record.port, 500);
+      if (version) return version;
+      if (child.exitCode != null) throw new Error(`Browser exited before CDP became ready (exit ${child.exitCode})`);
+      await sleep(100);
+    }
+    throw new Error(`Browser did not expose CDP on 127.0.0.1:${record.port} within 15 seconds`);
+  }
+  const cdpPublicMessage = message => {
+    const { _bytes, ...publicMessage } = message;
+    return publicMessage;
+  };
+  const cdpMethodMatches = (method, methods, prefixes) => {
+    const exact = Array.isArray(methods) ? methods : [], starts = Array.isArray(prefixes) ? prefixes : [];
+    if (!exact.length && !starts.length || exact.includes("*") || starts.includes("*")) return true;
+    return exact.includes(method) || starts.some(prefix => method.startsWith(prefix));
+  };
+  const cdpSubscriptionMatches = (subscription, message) => {
+    if (!message || subscription.browser !== message.browser) return false;
+    if (!cdpMethodMatches(message.method || "", subscription.methods, subscription.method_prefixes)) return false;
+    if (subscription.regex) {
+      subscription.regex.lastIndex = 0;
+      if (!subscription.regex.test(JSON.stringify(message.cdp ?? null))) return false;
+    }
+    if (!message.target_id) return !!subscription.include_browser;
+    if (!subscription.targets?.length || subscription.targets.includes("*")) return true;
+    return !!message.target && subscription.targets.includes(message.target);
+  };
+  function cdpMarkDropped(record, message) {
+    record.dropped += 1;
+    for (const subscription of cdpSubscriptions.values()) {
+      if (subscription.cursor < message.seq && cdpSubscriptionMatches(subscription, message)) subscription.dropped += 1;
+    }
+  }
+  function cdpRecordMessage(record, message) {
+    const seq = (cdpBrowserSequences.get(record.browser) || 0) + 1;
+    cdpBrowserSequences.set(record.browser, seq);
+    const stored = { seq, ...message };
+    stored._bytes = enc.encode(JSON.stringify(stored)).byteLength;
+    if (stored._bytes > CDP_RING_MAX_BYTES) {
+      cdpMarkDropped(record, stored);
+      return null;
+    }
+    while (record.ring.length && (record.ring.length >= CDP_RING_MAX_MESSAGES || record.ring_bytes + stored._bytes > CDP_RING_MAX_BYTES)) {
+      const removed = record.ring.shift();
+      record.ring_bytes = Math.max(0, record.ring_bytes - Number(removed._bytes || 0));
+      cdpMarkDropped(record, removed);
+    }
+    record.ring.push(stored);
+    record.ring_bytes += stored._bytes;
+    return stored;
+  }
+  const cdpMessageTarget = (record, message) => {
+    let sessionId = typeof message.sessionId === "string" ? message.sessionId : "";
+    let targetId = sessionId ? String(record.session_to_target.get(sessionId) || "") : "";
+    const params = message.params || {};
+    if (!targetId && message.method === "Target.attachedToTarget") {
+      sessionId = String(params.sessionId || sessionId || "");
+      targetId = String(params.targetInfo?.targetId || "");
+    }
+    if (!targetId && ["Target.targetCreated", "Target.targetInfoChanged"].includes(message.method))
+      targetId = String(params.targetInfo?.targetId || "");
+    if (!targetId && ["Target.targetDestroyed", "Target.targetCrashed"].includes(message.method))
+      targetId = String(params.targetId || "");
+    return {
+      session_id: sessionId || null,
+      target_id: targetId || null,
+      target: targetId ? record.target_labels.get(targetId) || null : null,
+    };
+  };
+  function cdpResolveAttachWaiters(record, targetId, sessionId) {
+    const waiters = record.attach_waiters.get(targetId);
+    if (!waiters) return;
+    record.attach_waiters.delete(targetId);
+    for (const resolveWaiter of waiters) resolveWaiter(sessionId);
+  }
+  function cdpWaitForAttach(record, targetId, timeoutMs = 400) {
+    const existing = record.target_to_session.get(targetId);
+    if (existing) return Promise.resolve(existing);
+    return new Promise(resolveWaiter => {
+      const waiters = record.attach_waiters.get(targetId) || [];
+      waiters.push(resolveWaiter);
+      record.attach_waiters.set(targetId, waiters);
+      const timer = setTimeout(() => {
+        const current = record.attach_waiters.get(targetId) || [];
+        const index = current.indexOf(resolveWaiter);
+        if (index >= 0) current.splice(index, 1);
+        if (!current.length) record.attach_waiters.delete(targetId);
+        resolveWaiter(null);
+      }, timeoutMs);
+      const original = resolveWaiter;
+      resolveWaiter = value => { clearTimeout(timer); original(value); };
+      waiters[waiters.length - 1] = resolveWaiter;
+    });
+  }
+  function cdpProtocolError(method, raw) {
+    const message = String(raw?.error?.message || raw?.error || "CDP protocol error");
+    const error = new Error(`${method}: ${message}`);
+    error.cdp = raw;
+    return error;
+  }
+  function cdpRequest(record, method, params = {}, sessionId = "", options = {}) {
+    if (!record.open || record.ws.readyState !== WebSocket.OPEN) throw new Error(`CDP browser ${record.browser} is not connected`);
+    const id = record.next_id++;
+    const request = { id, method, params: params && typeof params === "object" && !Array.isArray(params) ? params : {} };
+    if (sessionId) request.sessionId = sessionId;
+    let resolveResponse, rejectResponse;
+    const promise = options.wait === false ? null : new Promise((resolvePromise, rejectPromise) => {
+      resolveResponse = resolvePromise; rejectResponse = rejectPromise;
+    });
+    record.pending.set(id, {
+      id, method: String(options.logical_method || method), wire_method: method, session_id: sessionId || null,
+      target: options.target || null, target_id: options.target_id || null,
+      expose: !!options.expose, resolve: resolveResponse, reject: rejectResponse,
+      reject_on_error: !!options.reject_on_error,
+    });
+    try { record.ws.send(JSON.stringify(request)); }
+    catch (error) { record.pending.delete(id); rejectResponse?.(error); throw error; }
+    return { id, promise };
+  }
+  async function cdpInternal(record, method, params = {}, sessionId = "") {
+    const { promise } = cdpRequest(record, method, params, sessionId, { wait: true, reject_on_error: true });
+    const raw = await promise;
+    return raw?.result || {};
+  }
+  async function cdpInitializePageSession(record, targetId, sessionId) {
+    if (record.session_init_promises.has(sessionId)) return await record.session_init_promises.get(sessionId);
+    const promise = (async () => {
+      const errors = [];
+      const steps = [
+        ["Runtime.enable", {}],
+        ["Page.enable", {}],
+        ["Network.enable", {}],
+        ["ServiceWorker.enable", {}],
+        ["Emulation.setFocusEmulationEnabled", { enabled: true }],
+        ["Runtime.addBinding", { name: CDP_BINDING_NAME }],
+        ["BackgroundService.clearEvents", { service: "pushMessaging" }],
+        ["BackgroundService.startObserving", { service: "pushMessaging" }],
+        ["BackgroundService.setRecording", { service: "pushMessaging", shouldRecord: true }],
+      ];
+      for (const [method, params] of steps) {
+        try { await cdpInternal(record, method, params, sessionId); }
+        catch (error) { errors.push(`${method}: ${String(error?.message || error)}`); }
+      }
+      try { await cdpInternal(record, "Runtime.disable", {}, sessionId); }
+      catch (error) { errors.push(`Runtime.disable: ${String(error?.message || error)}`); }
+      try { await cdpInternal(record, "Runtime.runIfWaitingForDebugger", {}, sessionId); }
+      catch (error) { errors.push(`Runtime.runIfWaitingForDebugger: ${String(error?.message || error)}`); }
+      record.session_setup_errors.set(sessionId, errors);
+      return errors;
+    })();
+    record.session_init_promises.set(sessionId, promise);
+    try { return await promise; }
+    finally { if (!record.open) record.session_init_promises.delete(sessionId); }
+  }
+  async function cdpResumeNonPageSession(record, sessionId) {
+    try { await cdpInternal(record, "Runtime.runIfWaitingForDebugger", {}, sessionId); }
+    catch {}
+  }
+  function cdpHandleNotificationState(record, message) {
+    const params = message.params || {};
+    if (message.method === "Target.attachedToTarget") {
+      const sessionId = String(params.sessionId || ""), targetId = String(params.targetInfo?.targetId || "");
+      if (sessionId && targetId) {
+        record.target_to_session.set(targetId, sessionId);
+        record.session_to_target.set(sessionId, targetId);
+        if (params.targetInfo) record.live_targets.set(targetId, params.targetInfo);
+        const target = record.target_labels.get(targetId) || one("SELECT target FROM cdp_targets WHERE browser=? AND target_id=?", record.browser, targetId)?.target || "";
+        if (target) { record.target_labels.set(targetId, target); record.label_targets.set(target, targetId); }
+        cdpResolveAttachWaiters(record, targetId, sessionId);
+        if (params.targetInfo?.type === "page") void cdpInitializePageSession(record, targetId, sessionId);
+        else if (params.waitingForDebugger) void cdpResumeNonPageSession(record, sessionId);
+      }
+    } else if (message.method === "Target.detachedFromTarget") {
+      const sessionId = String(params.sessionId || ""), targetId = String(record.session_to_target.get(sessionId) || params.targetId || "");
+      if (sessionId) {
+        record.session_to_target.delete(sessionId);
+        record.session_init_promises.delete(sessionId);
+        record.session_setup_errors.delete(sessionId);
+      }
+      if (targetId && record.target_to_session.get(targetId) === sessionId) record.target_to_session.delete(targetId);
+    } else if (message.method === "Target.targetCreated" || message.method === "Target.targetInfoChanged") {
+      const info = params.targetInfo;
+      if (info?.targetId) record.live_targets.set(String(info.targetId), info);
+    } else if (message.method === "Target.targetDestroyed") {
+      const targetId = String(params.targetId || ""), sessionId = String(record.target_to_session.get(targetId) || "");
+      if (sessionId) {
+        record.target_to_session.delete(targetId); record.session_to_target.delete(sessionId);
+        record.session_init_promises.delete(sessionId); record.session_setup_errors.delete(sessionId);
+      }
+      record.live_targets.delete(targetId);
+      const target = record.target_labels.get(targetId);
+      if (target && record.label_targets.get(target) === targetId) record.label_targets.delete(target);
+      record.target_labels.delete(targetId);
+    } else if (message.method === "Target.targetCrashed") {
+      const targetId = String(params.targetId || "");
+      if (targetId) record.live_targets.delete(targetId);
+    }
+  }
+  function cdpHandleMessage(record, data) {
+    let message;
+    try {
+      const text = typeof data === "string" ? data : data instanceof ArrayBuffer ? dec.decode(new Uint8Array(data)) : String(data);
+      message = JSON.parse(text);
+    } catch { return; }
+    if (message && Number.isInteger(message.id)) {
+      const pending = record.pending.get(message.id);
+      if (pending) record.pending.delete(message.id);
+      if (pending?.expose) cdpRecordMessage(record, {
+        browser: record.browser, type: "response", id: Number(message.id), method: pending.method,
+        target: pending.target || null, target_id: pending.target_id || null, session_id: pending.session_id || null,
+        cdp: message,
+      });
+      if (pending?.resolve) {
+        if (message.error && pending.reject_on_error) pending.reject?.(cdpProtocolError(pending.wire_method || pending.method, message));
+        else pending.resolve(message);
+      }
+      return;
+    }
+    if (!message || typeof message.method !== "string") return;
+    cdpHandleNotificationState(record, message);
+    const targetMeta = cdpMessageTarget(record, message);
+    const envelope = {
+      browser: record.browser, type: "notification", id: null, method: message.method,
+      ...targetMeta, cdp: message,
+    };
+    if ([...cdpSubscriptions.values()].some(subscription => cdpSubscriptionMatches(subscription, envelope))) cdpRecordMessage(record, envelope);
+  }
+  function cdpDisconnect(record, reason = "CDP connection closed") {
+    if (!record.open) return;
+    record.open = false;
+    if (cdpBrowsers.get(record.browser) === record) cdpBrowsers.delete(record.browser);
+    const error = new Error(reason);
+    for (const pending of record.pending.values()) pending.reject?.(error);
+    record.pending.clear();
+    for (const waiters of record.attach_waiters.values()) for (const resolveWaiter of waiters) resolveWaiter(null);
+    record.attach_waiters.clear();
+    record.target_to_session.clear(); record.session_to_target.clear();
+  }
+  async function cdpOpenConnection(browserRecord, version) {
+    const startSeq = cdpBrowserSequences.get(browserRecord.browser) || 0;
+    const ws = new WebSocket(version.webSocketDebuggerUrl);
+    const record = {
+      browser: browserRecord.browser, port: browserRecord.port, user_data_dir: browserRecord.user_data_dir,
+      ws, open: true, connection_id: randomToken(8), start_seq: startSeq,
+      next_id: Math.floor(Math.random() * 0x3fffffff) + 1, pending: new Map(),
+      target_to_session: new Map(), session_to_target: new Map(), target_labels: new Map(), label_targets: new Map(), live_targets: new Map(),
+      attach_waiters: new Map(), session_init_promises: new Map(), session_setup_errors: new Map(), target_promises: new Map(),
+      ring: [], ring_bytes: 0, dropped: 0, message_chain: Promise.resolve(),
+    };
+    for (const row of all("SELECT target,target_id FROM cdp_targets WHERE browser=?", browserRecord.browser)) {
+      record.target_labels.set(String(row.target_id), String(row.target));
+      record.label_targets.set(String(row.target), String(row.target_id));
+    }
+    await new Promise((resolveOpen, rejectOpen) => {
+      const onOpen = () => { cleanup(); resolveOpen(); };
+      const onError = () => { cleanup(); rejectOpen(new Error(`Unable to open CDP WebSocket for ${browserRecord.browser}`)); };
+      const cleanup = () => { ws.removeEventListener("open", onOpen); ws.removeEventListener("error", onError); };
+      ws.addEventListener("open", onOpen); ws.addEventListener("error", onError);
+    });
+    ws.addEventListener("message", event => {
+      record.message_chain = record.message_chain.then(async () => {
+        let data = event.data;
+        if (data instanceof Blob) data = await data.text();
+        cdpHandleMessage(record, data);
+      }).catch(() => {});
+    });
+    ws.addEventListener("close", () => cdpDisconnect(record));
+    ws.addEventListener("error", () => { if (ws.readyState === WebSocket.CLOSED) cdpDisconnect(record, "CDP WebSocket failed"); });
+    try {
+      await cdpInternal(record, "Target.setAutoAttach", { autoAttach: true, flatten: true, waitForDebuggerOnStart: true });
+      await cdpInternal(record, "Target.setDiscoverTargets", { discover: true });
+      const targets = await cdpInternal(record, "Target.getTargets", {});
+      for (const info of targets.targetInfos || []) if (info?.targetId) record.live_targets.set(String(info.targetId), info);
+      try {
+        const commandLine = await cdpInternal(record, "Browser.getBrowserCommandLine", {});
+        const prefix = "--user-data-dir=";
+        const actual = (commandLine.arguments || []).find(argument => String(argument).startsWith(prefix));
+        if (actual && cdpPathKey(String(actual).slice(prefix.length)) !== cdpPathKey(browserRecord.user_data_dir))
+          throw new Error(`CDP port ${browserRecord.port} belongs to a browser using a different user-data-dir`);
+      } catch (error) {
+        if (String(error?.message || error).includes("different user-data-dir")) throw error;
+      }
+      run("UPDATE cdp_browsers SET updated_at=? WHERE browser=?", Date.now(), browserRecord.browser);
+      return record;
+    } catch (error) {
+      try { ws.close(1000, "CDP setup failed"); } catch {}
+      cdpDisconnect(record, `CDP setup failed: ${String(error?.message || error)}`);
+      throw error;
+    }
+  }
+  async function ensureCdpBrowser(rawBrowser) {
+    const browser = cdpBrowserName(rawBrowser);
+    const live = cdpBrowsers.get(browser);
+    if (live?.open && live.ws.readyState === WebSocket.OPEN) return live;
+    const connecting = cdpConnectPromises.get(browser);
+    if (connecting) return await connecting;
+    const promise = (async () => {
+      const persistent = await cdpPersistentBrowser(browser);
+      await Deno.mkdir(persistent.user_data_dir, { recursive: true });
+      let version = await cdpVersion(persistent.port);
+      if (!version) version = await cdpLaunchBrowser(persistent);
+      const record = await cdpOpenConnection(persistent, version);
+      cdpBrowsers.set(browser, record);
+      return record;
+    })();
+    cdpConnectPromises.set(browser, promise);
+    try { return await promise; }
+    finally { cdpConnectPromises.delete(browser); }
+  }
+  async function cdpEnsureSession(record, targetId, preferAutoAttach = false) {
+    let sessionId = record.target_to_session.get(targetId);
+    if (!sessionId && preferAutoAttach) sessionId = await cdpWaitForAttach(record, targetId);
+    if (!sessionId) {
+      const attached = await cdpInternal(record, "Target.attachToTarget", { targetId, flatten: true });
+      sessionId = String(attached.sessionId || "");
+      if (!sessionId) throw new Error(`CDP did not return a sessionId for target ${targetId}`);
+      record.target_to_session.set(targetId, sessionId); record.session_to_target.set(sessionId, targetId);
+    }
+    const info = record.live_targets.get(targetId);
+    if (info?.type === "page" || !info) await cdpInitializePageSession(record, targetId, sessionId);
+    return sessionId;
+  }
+  async function cdpEnsureTarget(record, rawTarget) {
+    const target = cdpTargetName(rawTarget);
+    const existingPromise = record.target_promises.get(target);
+    if (existingPromise) return await existingPromise;
+    const promise = (async () => {
+      let row = one("SELECT target_id FROM cdp_targets WHERE browser=? AND target=?", record.browser, target);
+      let targetId = String(row?.target_id || ""), created = false;
+      const info = targetId ? record.live_targets.get(targetId) : null;
+      if (!targetId || !info || info.type !== "page") {
+        const result = await cdpInternal(record, "Target.createTarget", { url: "about:blank", background: true });
+        targetId = String(result.targetId || "");
+        if (!targetId) throw new Error("Target.createTarget returned no targetId");
+        created = true;
+        const now = Date.now();
+        run(`INSERT INTO cdp_targets(browser,target,target_id,created_at,updated_at) VALUES(?,?,?,?,?)
+          ON CONFLICT(browser,target) DO UPDATE SET target_id=excluded.target_id,updated_at=excluded.updated_at`,
+          record.browser, target, targetId, now, now);
+        record.target_labels.set(targetId, target); record.label_targets.set(target, targetId);
+      } else {
+        record.target_labels.set(targetId, target); record.label_targets.set(target, targetId);
+        run("UPDATE cdp_targets SET updated_at=? WHERE browser=? AND target=?", Date.now(), record.browser, target);
+      }
+      const sessionId = await cdpEnsureSession(record, targetId, created);
+      return { target, target_id: targetId, session_id: sessionId };
+    })();
+    record.target_promises.set(target, promise);
+    try { return await promise; }
+    finally { record.target_promises.delete(target); }
+  }
+  const cdpAugmentedXPath = value => String(value || "")
+    .replace(/ends-with\(([^,]+),([^\)]+)\)/gm, "(substring($1, string-length($1)- string-length($2) + 1) = $2)")
+    .replace(/icontains\(([^,]+),([^\)]+)\)/gm, "contains(translate($1,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),$2)");
+  function cdpSpecialRequest(name, params = {}) {
+    const special = String(name || "").trim();
+    const xpath = cdpAugmentedXPath(params.xpath);
+    if (!xpath) throw new Error(`_${"mrmcp"}.${special || "special"} requires params.xpath`);
+    const quotedXpath = JSON.stringify(xpath);
+    if (special === "click") {
+      const attempts = Math.max(1, Math.min(Number(params.attempts || 5), 20));
+      const intervalMs = Math.max(0, Math.min(Number(params.interval_ms ?? 300), 5000));
+      if (!Number.isInteger(attempts) || !Number.isInteger(intervalMs)) throw new Error("_mrmcp click attempts/interval_ms must be integers");
+      return {
+        wire_method: "Runtime.evaluate", logical_method: "_mrmcp.click", special,
+        params: {
+          returnByValue: true, awaitPromise: true, silent: true, userGesture: true,
+          expression: `new Promise(resolve=>{let n=0;const run=()=>{const el=document.evaluate(${quotedXpath},document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null).singleNodeValue;if(el){el.click?.();resolve(true);return;}n+=1;if(n>=${attempts}){resolve(false);return;}setTimeout(run,${intervalMs});};run();})`,
+        },
+      };
+    }
+    if (special === "find") {
+      const limit = Math.max(1, Math.min(Number(params.limit || 20), 100));
+      if (!Number.isInteger(limit)) throw new Error("_mrmcp find limit must be an integer");
+      return {
+        wire_method: "Runtime.evaluate", logical_method: "_mrmcp.find", special,
+        params: {
+          returnByValue: true, awaitPromise: false, silent: true,
+          expression: `(()=>{const x=document.evaluate(${quotedXpath},document,null,XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,null),items=[];for(let i=0;i<Math.min(x.snapshotLength,${limit});i++){const n=x.snapshotItem(i);if(n&&n.nodeType===1){const r=n.getBoundingClientRect();items.push({tag:String(n.tagName||'').toLowerCase(),text:String(n.innerText??n.textContent??'').trim().slice(0,2000),id:String(n.id||''),class:String(n.className||''),href:String(n.href||''),value:n.value==null?null:String(n.value),rect:{x:r.x,y:r.y,width:r.width,height:r.height}});}else items.push({node_type:n?.nodeType??null,node_name:String(n?.nodeName||''),text:String(n?.textContent||'').trim().slice(0,2000)});}return {count:x.snapshotLength,items};})()`,
+        },
+      };
+    }
+    throw new Error(`Unknown _mrmcp CDP operation: ${special}`);
+  }
+  const cdpPollMatches = (message, filters) => {
+    if (filters.type && filters.type !== "all" && message.type !== filters.type) return false;
+    if (filters.id != null && Number(message.id) !== Number(filters.id)) return false;
+    if (filters.target && message.target !== filters.target) return false;
+    return cdpMethodMatches(String(message.method || ""), filters.methods, filters.method_prefixes);
+  };
+  function cdpSubscriptionOutput(subscription) {
+    return {
+      subscription: subscription.id, browser: subscription.browser, targets: [...subscription.targets],
+      methods: [...subscription.methods], method_prefixes: [...subscription.method_prefixes], include_browser: subscription.include_browser,
+      regex: subscription.regex_source || "", regex_flags: subscription.regex_flags || "",
+      cursor: subscription.cursor, dropped: subscription.dropped, stream_resets: subscription.stream_resets,
+    };
+  }
+  function cdpSubscriptionRegex(source, flags = "") {
+    source = String(source || ""); flags = String(flags || "");
+    if (!source) return null;
+    if (!/^[imsu]*$/.test(flags) || new Set(flags).size !== flags.length) throw new Error("CDP subscription regex_flags may contain each of i,m,s,u at most once");
+    try { return new RegExp(source, flags); }
+    catch (error) { throw new Error(`Invalid CDP subscription regex: ${String(error?.message || error)}`); }
+  }
+  function cdpCreateSubscription(record, args) {
+    const id = `cdpsub_${randomToken(18)}`;
+    const targets = [...new Set((args.targets || []).map(value => String(value) === "*" ? "*" : cdpTargetName(value)))];
+    const methods = [...new Set((args.methods || []).map(value => String(value).trim()).filter(Boolean))];
+    const methodPrefixes = [...new Set((args.method_prefixes || []).map(value => String(value).trim()).filter(Boolean))];
+    const regexSource = String(args.regex || ""), regexFlags = String(args.regex_flags || ""), regex = cdpSubscriptionRegex(regexSource, regexFlags);
+    const subscription = {
+      id, browser: record.browser, targets, methods, method_prefixes: methodPrefixes, regex_source: regexSource, regex_flags: regexFlags, regex,
+      include_browser: args.include_browser == null ? !targets.length : !!args.include_browser,
+      cursor: cdpBrowserSequences.get(record.browser) || 0,
+      dropped: 0, stream_resets: 0, connection_id: record.connection_id,
+    };
+    cdpSubscriptions.set(id, subscription);
+    return subscription;
+  }
+  async function cdpProcessScreenshot(raw, options, requestParams = {}) {
+    if (!raw?.result?.data || raw?.error) return { cdp: raw, image: null };
+    const requestedFormat = String(options?.format || "original"), scale = Number(options?.scale ?? 1), quality = Number(options?.quality ?? 80);
+    const originalFormat = String(requestParams?.format || "png").toLowerCase() === "jpeg" ? "jpeg"
+      : String(requestParams?.format || "png").toLowerCase() === "webp" ? "webp" : "png";
+    let bytes = Buffer.from(String(raw.result.data), "base64"), format = originalFormat;
+    if (requestedFormat === "webp") {
+      if (!Number.isFinite(scale) || scale <= 0 || scale > 4) throw new Error("_image.scale must be >0 and <=4");
+      if (!Number.isInteger(quality) || quality < 1 || quality > 100) throw new Error("_image.quality must be an integer from 1 to 100");
+      if (quality !== 80) throw new Error("_image.quality currently must be 80: the public Auto.js auto.vips encoder uses WebP Q=80");
+      if (!['png', 'webp'].includes(originalFormat)) throw new Error("The public Auto.js auto.vips API can post-process PNG/WebP screenshots; request Page.captureScreenshot format=png or webp before _image.format=webp");
+      const { decodeImage, encodeImage } = await loadAutoVips();
+      const decoded = await decodeImage(bytes, {}, false, originalFormat);
+      bytes = Buffer.from(encodeImage(decoded, "webp", scale));
+      format = "webp";
+    } else if (requestedFormat !== "original") throw new Error("_image.format must be original or webp");
+    const mime = format === "jpeg" ? "image/jpeg" : `image/${format}`;
+    return {
+      cdp: { ...raw, result: { ...raw.result, data: bytes.toString("base64") } },
+      image: { encoding: "base64", format, mime_type: mime, bytes: bytes.length, scale: requestedFormat === "webp" ? scale : 1, quality: requestedFormat === "webp" ? quality : null },
+    };
+  }
+  async function cdpSubs(args) {
+    const browser = cdpBrowserName(args.browser);
+    if (args.add === undefined && args.remove === undefined) throw new Error("cdp_subs requires add and/or remove");
+    if (typeof args.add === "string" && args.add !== "*") throw new Error("cdp_subs add string must be '*'");
+    if (typeof args.remove === "string" && args.remove !== "*") throw new Error("cdp_subs remove string must be '*'");
+    const removed = [], missing = [];
+    if (args.remove === "*") {
+      for (const [id, subscription] of [...cdpSubscriptions]) if (subscription.browser === browser) {
+        cdpSubscriptions.delete(id); removed.push(id);
+      }
+    } else for (const raw of Array.isArray(args.remove) ? args.remove : []) {
+      const id = String(raw || ""), subscription = cdpSubscriptions.get(id);
+      if (subscription?.browser === browser) { cdpSubscriptions.delete(id); removed.push(id); }
+      else missing.push(id);
+    }
+    const additions = args.add === "*"
+      ? [{ targets: ["*"], methods: ["*"], include_browser: true }]
+      : Array.isArray(args.add) ? args.add : [];
+    const added = [];
+    if (additions.length) {
+      const record = await ensureCdpBrowser(browser);
+      for (const spec of additions) added.push(cdpSubscriptionOutput(cdpCreateSubscription(record, spec || {})));
+    }
+    const subscriptions = [...cdpSubscriptions.values()].filter(subscription => subscription.browser === browser).map(cdpSubscriptionOutput);
+    return { browser, added, removed, missing, subscriptions };
+  }
+  async function cdpPoll(args) {
+    const limit = Math.max(1, Math.min(Number(args.limit || 50), 200));
+    let subscription = null, record;
+    if (args.subscription) {
+      subscription = cdpSubscriptions.get(String(args.subscription));
+      if (!subscription) throw new Error("Unknown or expired CDP subscription");
+      record = await ensureCdpBrowser(subscription.browser);
+      if (subscription.connection_id !== record.connection_id) {
+        subscription.connection_id = record.connection_id;
+        subscription.cursor = record.start_seq;
+        subscription.stream_resets += 1;
+      }
+    } else {
+      record = await ensureCdpBrowser(args.browser);
+    }
+    const filters = {
+      type: String(args.type || "all"), id: args.id == null ? null : Number(args.id),
+      target: args.target ? cdpTargetName(args.target) : "",
+      methods: (args.methods || []).map(value => String(value).trim()).filter(Boolean),
+      method_prefixes: (args.method_prefixes || []).map(value => String(value).trim()).filter(Boolean),
+    };
+    let messages = [];
+    if (subscription) {
+      let scannedTo = subscription.cursor;
+      for (const message of record.ring) {
+        if (message.seq <= subscription.cursor) continue;
+        scannedTo = message.seq;
+        if (!cdpSubscriptionMatches(subscription, message) || !cdpPollMatches(message, filters)) continue;
+        messages.push(cdpPublicMessage(message));
+        if (messages.length >= limit) break;
+      }
+      if (args.advance !== false) subscription.cursor = scannedTo || (cdpBrowserSequences.get(record.browser) || subscription.cursor);
+    } else {
+      const matched = record.ring.filter(message => cdpPollMatches(message, filters));
+      messages = matched.slice(Math.max(0, matched.length - limit)).map(cdpPublicMessage);
+    }
+    return {
+      browser: record.browser, subscription: subscription?.id || null, messages,
+      cursor: subscription?.cursor ?? null, dropped: subscription?.dropped ?? record.dropped,
+      stream_resets: subscription?.stream_resets ?? 0,
+      oldest_seq: record.ring.length ? record.ring[0].seq : null,
+      newest_seq: record.ring.length ? record.ring[record.ring.length - 1].seq : null,
+    };
+  }
+
+  const MEMORY_VALUE_MAX_BYTES = 1024 * 1024;
+  function memoryOwnerSummary(scope, ownerId) {
+    const count = Number(one("SELECT COUNT(*) n FROM memories WHERE scope=? AND owner_id=?", scope, Number(ownerId))?.n || 0);
+    const latestKeys = all("SELECT key FROM memories WHERE scope=? AND owner_id=? ORDER BY set_at DESC,id DESC LIMIT 5", scope, Number(ownerId))
+      .map(row => String(row.key));
+    return { count, latest_keys: latestKeys };
+  }
+  const memoryPurgeExpired = (now = Date.now()) => {
+    const result = db.prepare("DELETE FROM memories WHERE expires_at>0 AND expires_at<=?").run(now);
+    if (Number(result.changes || 0)) emitUiChange(["memory"], "memory-expired");
+    return Number(result.changes || 0);
+  };
+  const memoryScopeOwner = (p, selection, rawScope, rawWorkspace = "") => {
+    const scope = String(rawScope || "").trim();
+    if (!['session', 'workspace'].includes(scope)) throw new Error("memory scope must be session or workspace");
+    const workspace = String(rawWorkspace || "").trim();
+    if (scope === "session") {
+      if (workspace) throw new Error("workspace must be omitted for session memory");
+      return { scope, owner_id: Number(selection.context.id), owner_name: `Session #${selection.context.id}`, workspace: null, session_id: Number(selection.context.id) };
+    }
+    if (!workspace) throw new Error("workspace is required for workspace memory");
+    const root = one("SELECT id,name FROM roots WHERE server_id=? AND name=?", p.id, workspace);
+    if (!root) throw new Error(`Workspace not found: ${workspace}`);
+    return { scope, owner_id: Number(root.id), owner_name: String(root.name), workspace: String(root.name), session_id: null };
+  };
+  const memoryPublicRow = row => {
+    const isJson = Number(row.is_json ?? 1) === 1, raw = String(row.value_json ?? "");
+    return {
+      id: Number(row.id), scope: String(row.scope),
+      session_id: row.scope === "session" ? Number(row.owner_id) : null,
+      workspace: row.scope === "workspace" ? String(row.owner_name || "") : null,
+      key: String(row.key), json: isJson, value: isJson ? parseJson(raw, null) : raw, ttl_seconds: Number(row.ttl_seconds || 0),
+      set_at: new Date(Number(row.set_at)).toISOString(),
+      expires_at: Number(row.expires_at || 0) ? new Date(Number(row.expires_at)).toISOString() : null,
+    };
+  };
+  function memorySetValue(p, selection, args, options = {}) {
+    memoryPurgeExpired();
+    const owner = options.owner || memoryScopeOwner(p, selection, args.scope, args.workspace);
+    const key = String(args.key ?? "").trim();
+    if (!key || key.length > 512 || /[\x00-\x1f\x7f]/.test(key)) throw new Error("memory key must be 1-512 characters without control characters");
+    const ttlSeconds = Math.max(0, Number(args.ttl_seconds || 0));
+    if (!Number.isSafeInteger(ttlSeconds) || ttlSeconds > 315360000) throw new Error("ttl_seconds must be an integer from 0 to 315360000");
+    if (args.delete === true) {
+      const result = run("DELETE FROM memories WHERE scope=? AND owner_id=? AND key=?", owner.scope, owner.owner_id, key);
+      return { memory: null, deleted: Number(result.changes || 0) > 0 };
+    }
+    if (!Object.prototype.hasOwnProperty.call(args, "value")) throw new Error("memory_set requires value unless delete=true");
+    if (args.json !== true && args.json !== false) throw new Error("memory_set requires explicit json=true or json=false when setting a value");
+    const valueJson = String(args.value);
+    if (args.json) {
+      try { JSON.parse(valueJson); }
+      catch (error) { throw new Error(`memory_set json=true requires valid JSON text: ${String(error?.message || error)}`); }
+    }
+    if (enc.encode(valueJson).byteLength > MEMORY_VALUE_MAX_BYTES) throw new Error("memory value exceeds the 1 MiB limit");
+    const setAt = Date.now(), expiresAt = ttlSeconds ? setAt + ttlSeconds * 1000 : 0;
+    if (options.replace_id) run("DELETE FROM memories WHERE id=?", Number(options.replace_id));
+    run("DELETE FROM memories WHERE scope=? AND owner_id=? AND key=?", owner.scope, owner.owner_id, key);
+    const inserted = run("INSERT INTO memories(scope,owner_id,owner_name,key,value_json,is_json,ttl_seconds,set_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)",
+      owner.scope, owner.owner_id, owner.owner_name, key, valueJson, args.json ? 1 : 0, ttlSeconds, setAt, expiresAt);
+    const row = one("SELECT * FROM memories WHERE id=?", Number(inserted.lastInsertRowid));
+    return { memory: memoryPublicRow(row), deleted: false };
+  }
+  const telegramChatMigrations = new Map();
+  async function telegramRequest(args) {
+    const token = String(getCfg("telegram_bot_token", "") || "").trim();
+    if (!token) throw new Error("Telegram Bot token is not configured in Settings");
+    const request = structuredClone(args.request || {}), method = String(request.method || "").trim();
+    if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(method)) throw new Error("telegram_req request.method is required and must be a Bot API method name");
+    delete request.method;
+    const migrationKey = value => `${token.slice(0, 8)}:${String(value)}`;
+    if (typeof request.chat_id === "string" && /^-?\d+$/.test(request.chat_id)) {
+      const numeric = Number(request.chat_id);
+      if (Number.isSafeInteger(numeric)) request.chat_id = numeric;
+    }
+    if (request.chat_id != null && telegramChatMigrations.has(migrationKey(request.chat_id)))
+      request.chat_id = telegramChatMigrations.get(migrationKey(request.chat_id));
+    const send = async () => {
+      const response = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
+        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(request),
+      });
+      let body;
+      try { body = await response.json(); }
+      catch { throw new Error(`Telegram Bot API returned non-JSON HTTP ${response.status}`); }
+      return body;
+    };
+    let response = await send(), migrated = null;
+    const migrateTo = response?.ok === false ? response?.parameters?.migrate_to_chat_id : null;
+    if (migrateTo != null && request.chat_id != null) {
+      const old = request.chat_id;
+      telegramChatMigrations.set(migrationKey(old), migrateTo);
+      request.chat_id = migrateTo;
+      migrated = { from: old, to: migrateTo };
+      response = await send();
+    }
+    return { method, response, migrated_chat_id: migrated };
+  }
+
+  function memoryFindRows(p, selection, args) {
+    memoryPurgeExpired();
+    const owner = memoryScopeOwner(p, selection, args.scope, args.workspace);
+    const limit = Math.max(1, Math.min(Number(args.limit || 20), 100));
+    const conditions = ["scope=?", "owner_id=?"], values = [owner.scope, owner.owner_id];
+    const key = String(args.key || ""), keyPrefix = String(args.key_prefix || ""), query = String(args.query || "").trim();
+    if (key) { conditions.push("key=?"); values.push(key); }
+    if (keyPrefix) { conditions.push("substr(key,1,length(?))=?"); values.push(keyPrefix, keyPrefix); }
+    if (query) { conditions.push("instr(lower(key||char(10)||value_json),lower(?))>0"); values.push(query); }
+    if (args.set_after) {
+      const value = Date.parse(String(args.set_after));
+      if (!Number.isFinite(value)) throw new Error("set_after must be an ISO date/time");
+      conditions.push("set_at>=?"); values.push(value);
+    }
+    if (args.set_before) {
+      const value = Date.parse(String(args.set_before));
+      if (!Number.isFinite(value)) throw new Error("set_before must be an ISO date/time");
+      conditions.push("set_at<=?"); values.push(value);
+    }
+    if (args.before_id != null) { conditions.push("id<?"); values.push(Math.max(1, Number(args.before_id))); }
+    const rows = all(`SELECT * FROM memories WHERE ${conditions.join(" AND ")} ORDER BY id DESC LIMIT ?`, ...values, limit + 1);
+    const page = rows.slice(0, limit), hasMore = rows.length > limit;
+    return { memories: page.map(memoryPublicRow), next_before_id: hasMore && page.length ? Number(page.at(-1).id) : null };
+  }
+
   let toolCallGate = null, toolCallsIdle = Promise.resolve(), resolveToolCallsIdle = null,
     maintenanceAction = "", maintenancePhase = "", waitingToolCalls = 0,
     headerActivityTimer = null, dashboardToolCallTimer = null;
@@ -2874,7 +3715,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       display: relative(selection.root.path, absolute).replaceAll("\\", "/") || ".",
     };
   }
-  async function workspaceInfo(selection) {
+  async function workspaceInfo(selection, options = {}) {
     let agentGuidancePath = null;
     for (const name of ["AGENTS.md", "agents.md", "CLAUDE.md", "Claude.md", "claude.md"]) {
       const candidate = await resolveWorkspacePath(selection, name).catch(() => null);
@@ -2884,10 +3725,16 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         break;
       }
     }
+    memoryPurgeExpired();
     return {
       workspace_name: selection.root.name,
       cwd: selection.root.path,
       agent_guidance_path: agentGuidancePath,
+      workspace_created: !!options.created,
+      memory_summary: {
+        workspace: memoryOwnerSummary("workspace", selection.root.id),
+        session: memoryOwnerSummary("session", selection.context.id),
+      },
     };
   }
   const WINDOWS_EXECUTABLE_SUFFIXES = [".exe", ".com", ".cmd", ".bat"];
@@ -3324,10 +4171,6 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       type: "string", minLength: 1, maxLength: 128,
       description: "Name of the enabled Workspace to open. Any enabled Workspace name may be supplied; the value is validated when the tool runs. The selected Session is attached to this Workspace immediately.",
     };
-    const createdWorkspaceNameInput = {
-      type: "string", minLength: 1, maxLength: 128,
-      description: "Name of the new Workspace. MrMCP derives and manages its Desktop directory internally; no path is accepted or returned by create_workspace.",
-    };
     const contextInput = {
       context_handle: {
         type: "string", minLength: 12, maxLength: 256,
@@ -3407,14 +4250,11 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         "List the names of all enabled Workspaces that may be passed to open_workspace. This tool does not require a Session.",
         { properties: {} },
       ],
-      create_workspace: [
-        "Create a new empty Workspace directory on the current user's Desktop and register it as an enabled Workspace. Pass only the Workspace name; MrMCP resolves the Desktop and final path internally. The operation fails before creation if the Workspace name or final path is already registered, and fails if the target directory already exists. This tool does not require a Session.",
-        { properties: { name: createdWorkspaceNameInput }, required: ["name"] },
-      ],
       open_workspace: [
-        "Open the named Workspace and return the Session context_handle to use afterward. Pass current_context_handle to move an existing active Session to that Workspace without changing its handle. If current_context_handle is omitted, empty, unknown or expired, a new Session is created instead. The result includes workspace_name, cwd and agent_guidance_path. Read agent_guidance_path when non-null, then pass the returned context_handle unchanged to every later tool.",
+        "Open the named Workspace and return the Session context_handle to use afterward. Pass create=true only when you explicitly want a missing Workspace created as a new empty Desktop folder; otherwise a missing/disabled name is an error. Pass current_context_handle to move an existing active Session without changing its handle; omitted/empty/unknown/expired creates a new Session. The result includes workspace identity/guidance plus a compact Memory summary (counts and up to five latest keys for Workspace and Session scope). Read agent_guidance_path when non-null before repository work.",
         { properties: {
           name: workspaceNameInput,
+          create: { type: "boolean", default: false, description: "Explicitly create the named Workspace on the Desktop only when it does not already exist. false never creates implicitly." },
           current_context_handle: {
             type: "string",
             description: "Optional current Session capability. An active handle is reused and switched to the named Workspace; an omitted, empty, unknown or expired handle causes a new Session to be created.",
@@ -3572,17 +4412,113 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           ...contextInput,
         }, required: ["mime_type"] },
       ],
+      cdp_call: [
+        `Send one or more CDP operations in one batch. Each entry selects browser/profile, optional logical page target, and call. A call is either an untouched standard CDP {method,params} or one MrMCP extension {_mrmcp,params}; _mrmcp currently supports click and find with augmented XPath ends-with()/icontains() rewrites. Different browsers/targets may be mixed. MrMCP owns JSON-RPC ids/session routing and preserves result order. wait=true waits for every response independently; wait=false returns assigned ids for later cdp_poll. Page.captureScreenshot natively returns Base64 in the CDP response and is never implicitly saved to disk. Optional outer _image requests response post-processing without changing CDP screenshot params: original preserves the CDP bytes; webp uses public Auto.js auto.vips to decode/scale/re-encode at its current fixed WebP Q=80. Official protocol documentation: ${CDP_CALL_DOCS}`,
+        { properties: {
+          wait: { type: "boolean", default: true, description: "Apply to the whole batch. true waits for every dispatched response; false returns after all dispatch attempts and leaves responses for cdp_poll. _image requires wait=true." },
+          calls: { type: "array", minItems: 1, maxItems: 100, items: {
+            type: "object", additionalProperties: false, properties: {
+              browser: { type: "string", minLength: 1, maxLength: 64, description: "Persistent browser/profile label under .mrmcp/cdp with one persisted debugging port." },
+              target: { type: "string", minLength: 1, maxLength: 128, description: "Optional persistent logical page label. Required by _mrmcp click/find; omit for browser-level standard CDP methods." },
+              call: { type: "object", additionalProperties: false, oneOf: [{ required: ["method"], not: { required: ["_mrmcp"] } }, { required: ["_mrmcp"], not: { required: ["method"] } }], properties: {
+                method: { type: "string", minLength: 3, maxLength: 200, description: "Exact standard CDP method, for example Page.navigate, Runtime.evaluate or Page.captureScreenshot." },
+                _mrmcp: { type: "string", enum: ["click", "find"], description: "MrMCP-local CDP extension, never sent as a protocol method. click retries an augmented XPath and invokes element.click(); find returns compact element/text/rect metadata for augmented XPath matches." },
+                params: { type: "object", additionalProperties: true, default: {}, description: "For standard method: raw CDP params unchanged. For _mrmcp click: xpath plus optional attempts (1-20) and interval_ms (0-5000). For _mrmcp find: xpath plus optional limit (1-100)." },
+              } },
+              _image: { type: "object", additionalProperties: false, properties: {
+                return: { type: "string", enum: ["base64"], description: "Explicitly keep the screenshot payload as Base64 in cdp.result.data after optional post-processing." },
+                format: { type: "string", enum: ["original", "webp"], default: "original", description: "original leaves CDP image encoding unchanged; webp decodes the returned screenshot and re-encodes WebP through the public Auto.js vips helpers." },
+                quality: { type: "integer", const: 80, default: 80, description: "WebP quality. The current public Auto.js auto.vips encoder uses fixed Q=80, so 80 is the only accepted value." },
+                scale: { type: "number", exclusiveMinimum: 0, maximum: 4, default: 1, description: "Multiply decoded screenshot dimensions before WebP encoding; 1 preserves dimensions." },
+              }, required: ["return"], description: "MrMCP response post-processing for standard Page.captureScreenshot only. It never modifies the raw CDP request params." },
+            }, required: ["browser", "call"],
+          } },
+          ...contextInput,
+        }, required: ["calls"] },
+      ],
+      cdp_subs: [
+        "Add and/or remove global runtime CDP subscriptions for one browser in one call; removals are applied before additions. add accepts subscription specs or '*' for one catch-all subscription; remove accepts opaque subscription ids or '*' to remove every subscription for that browser. Each spec can filter logical targets (including '*'), exact methods/prefixes (including '*'), browser-level traffic, and an optional JavaScript-compatible regex tested against JSON.stringify of the complete raw inbound CDP message. Filters are AND across target/method/regex dimensions and OR within exact+prefix methods. Subscriptions are runtime-global, not Session-owned, and disappear on restart.",
+        { properties: {
+          browser: { type: "string", minLength: 1, maxLength: 64 },
+          add: { anyOf: [
+            { type: "string", const: "*" },
+            { type: "array", maxItems: 100, items: { type: "object", additionalProperties: false, properties: {
+              targets: { type: "array", maxItems: 100, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 128 }, description: "Logical target labels; '*' matches every target. Omit for every target-associated message." },
+              methods: { type: "array", maxItems: 100, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 200 }, default: [], description: "Exact methods; '*' matches every method." },
+              method_prefixes: { type: "array", maxItems: 100, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 200 }, default: [], description: "Method prefixes such as Network.; '*' matches every method." },
+              include_browser: { type: "boolean", description: "Include messages with no target association. Defaults true only when no targets are supplied." },
+              regex: { type: "string", maxLength: 4000, description: "Optional regex source matched against the serialized complete raw CDP message, useful for diagnostics/content matching." },
+              regex_flags: { type: "string", pattern: "^[imsu]*$", maxLength: 4, default: "", description: "Optional regex flags: i, m, s, u; no duplicates." },
+            } } },
+          ], description: "Subscriptions to add, or '*' for one all-target/all-method/browser-level catch-all subscription." },
+          remove: { anyOf: [
+            { type: "string", const: "*" },
+            { type: "array", maxItems: 100, uniqueItems: true, items: { type: "string", pattern: "^cdpsub_[A-Za-z0-9_-]+$" } },
+          ], description: "Subscription ids to remove, or '*' to remove all live subscriptions for this browser." },
+          ...contextInput,
+        }, required: ["browser"] },
+      ],
+      cdp_poll: [
+        "Read retained CDP traffic. With subscription, read matching traffic forward from that subscription's cursor; advance defaults true and moves only that cursor. Subscription target/method/wildcard/full-message-regex filters are applied first. Without subscription, browser is required and the tool returns the latest matching retained messages from the tail without consuming them. wait=false responses are retained independently of notification subscriptions and may be selected by id. type, target, methods and method_prefixes are additional ad-hoc filters; method filters use the remembered standard or logical _mrmcp request name for responses. The per-browser ring is bounded by count and bytes; dropped and stream_resets make loss/reconnection explicit.",
+        { anyOf: [{ required: ["subscription"] }, { required: ["browser"] }], properties: {
+          subscription: { type: "string", pattern: "^cdpsub_[A-Za-z0-9_-]+$" },
+          browser: { type: "string", minLength: 1, maxLength: 64, description: "Required for ad-hoc polling when subscription is omitted." },
+          target: { type: "string", minLength: 1, maxLength: 128, description: "Optional additional logical target filter." },
+          type: { type: "string", enum: ["all", "notification", "response"], default: "all" },
+          id: { type: "integer", minimum: 1, description: "Optional JSON-RPC response id, especially for a previous cdp_call(wait=false)." },
+          methods: { type: "array", maxItems: 100, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 200 }, default: [], description: "Exact method filter; '*' matches every method. For responses this is the remembered standard method or logical _mrmcp operation name." },
+          method_prefixes: { type: "array", maxItems: 100, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 200 }, default: [], description: "Method prefixes such as Network. or _mrmcp.; '*' matches every method. For responses this filters the remembered standard/logical request method." },
+          limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
+          advance: { type: "boolean", default: true, description: "With subscription, advance its cursor through the scanned retained stream. Ignored for ad-hoc browser polling." },
+          ...contextInput,
+        } },
+      ],
+      memory_find: [
+        "Find persistent key-value memories in exactly one explicitly selected scope. session scope searches only the current context_handle's Session; workspace scope requires a Workspace name and searches that shared Workspace memory. Each result explicitly reports json=true for validated JSON text or json=false for ordinary text. Expired TTL entries are removed before searching. key is exact, key_prefix matches the start of keys, query is a case-insensitive literal search across key plus stored value text, set_after/set_before filter the set timestamp, and before_id provides stable backward pagination. Exact-key lookup through this tool replaces a separate memory_get surface.",
+        { properties: {
+          scope: { type: "string", enum: ["session", "workspace"], description: "Required explicit memory scope." },
+          workspace: { type: "string", minLength: 1, maxLength: 128, description: "Workspace label required only when scope=workspace; omit for session scope." },
+          key: { type: "string", maxLength: 512, description: "Optional exact key filter." },
+          key_prefix: { type: "string", maxLength: 512, description: "Optional key-prefix filter." },
+          query: { type: "string", maxLength: 2000, description: "Case-insensitive literal search across key and stored JSON/text value." },
+          set_after: { type: "string", description: "Optional ISO date/time lower bound for when the memory was last set." },
+          set_before: { type: "string", description: "Optional ISO date/time upper bound for when the memory was last set." },
+          limit: { type: "integer", minimum: 1, maximum: 100, default: 20 },
+          before_id: { type: "integer", minimum: 1, description: "Return only entries with a lower stable memory id." },
+          ...contextInput,
+        }, required: ["scope"] },
+      ],
+      memory_set: [
+        "Set, replace, or delete one persistent key-value memory in an explicitly selected scope. session scope belongs to the current context_handle's Session. workspace scope requires a Workspace label and is shared by every Session using that Workspace. When setting, value is text and json must explicitly say how to interpret it: json=true validates the text with JSON.parse and rejects invalid JSON; json=false stores ordinary text unchanged. ttl_seconds=0 means no expiry; positive TTL is measured from this set operation. Every replacement gets a new set timestamp/id. Use delete=true without value/json to remove the key.",
+        { properties: {
+          scope: { type: "string", enum: ["session", "workspace"], description: "Required explicit memory scope." },
+          workspace: { type: "string", minLength: 1, maxLength: 128, description: "Workspace label required only when scope=workspace; omit for session scope." },
+          key: { type: "string", minLength: 1, maxLength: 512 },
+          value: { type: "string", maxLength: 1048576, description: "Exact value text. Required unless delete=true. With json=true it must be valid JSON text; with json=false it is stored unchanged." },
+          json: { type: "boolean", description: "Required when setting value. true validates/parses JSON; false stores ordinary text. Omit only when delete=true." },
+          delete: { type: "boolean", default: false, description: "Delete this key instead of setting it. value and json must be omitted when true." },
+          ttl_seconds: { type: "integer", minimum: 0, maximum: 315360000, default: 0, description: "0 keeps the memory indefinitely; positive values expire it this many seconds after set_at." },
+          ...contextInput,
+        }, required: ["scope", "key"] },
+      ],
+      telegram_req: [
+        "Send one authenticated Telegram Bot API JSON request using the Bot token configured by the local user in Settings. Pass one request object containing method plus that Bot API method's ordinary JSON fields; MrMCP removes method, POSTs the remaining object to Telegram, normalizes numeric-string chat_id values, remembers migrate_to_chat_id redirects for the running process and retries once when Telegram requests a chat migration. The token is never an agent argument or returned value. No TDLib or Telegram client library is used; the returned response is Telegram's JSON body for the agent to interpret.",
+        { properties: {
+          request: { type: "object", additionalProperties: true, properties: { method: { type: "string", minLength: 1, maxLength: 64, description: "Telegram Bot API method name, for example getUpdates, sendMessage or editMessageText." } }, required: ["method"], description: "Telegram Bot API request. Put method beside the normal JSON parameters for that method. Authentication is injected by MrMCP." },
+          ...contextInput,
+        }, required: ["request"] },
+      ],
       discover_commands: [
         "Read the complete catalog of extra executable commands intentionally made available to the agent. Call this proactively whenever a task might benefit from capabilities beyond MrMCP's built-in tools, before inventing a workaround, assuming a utility is unavailable, or choosing a generic alternative. When a listed command fits the task, prefer it: its presence reflects an explicit user choice. The whole available catalog is returned in one call with descriptions and documentation links, so normally call it once per Session and reuse what you learned; there is no search or pagination, which also avoids failures from guessed or misspelled command names. If the operator globally disables command discovery, this tool returns an empty commands array. Every returned logical_name is directly callable as exec.program. MrMCP resolves catalog logical names before normal platform PATH lookup; do not probe PATH or search the filesystem first.",
         { properties: { ...contextInput } },
       ],
-      inspect_tools: [
+      tools_schema: [
         "Return the canonical complete MCP tool descriptors generated by the same serverTools source used by tools/list for exact published tool names. This exposes name, title, full description, inputSchema, outputSchema, annotations and _meta without connector summarization. Publication View resource URIs are canonical here; tools/list may add a fresh ?instance suffix solely for cache busting. This authenticated diagnostic tool does not require a Session.",
         { properties: {
           names: { type: "array", minItems: 1, maxItems: 50, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 128 }, description: "Exact published tool names to inspect, returned in this order when present. Duplicate names are rejected at execution time." },
         }, required: ["names"] },
       ],
-      query_tool_calls: [
+      tools_log: [
         "Query tool-call history that actually reached the server for this exact context_handle. Filters may be combined. query is a case-insensitive literal substring search across the complete stored log record; tool and status are exact filters; before_id pages backward by stable log id. Use this to diagnose tool behavior or distinguish server-side failures from requests blocked before MCP dispatch; an upstream-blocked request cannot appear here.",
         { properties: {
           limit: { type: "integer", minimum: 1, maximum: 50, default: 10 },
@@ -3761,6 +4697,47 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       },
       required: ["name", "descriptor_json"],
     };
+    const cdpImageOutput = {
+      type: "object", additionalProperties: false,
+      properties: {
+        encoding: { type: "string", const: "base64" }, format: { type: "string", enum: ["png", "jpeg", "webp"] }, mime_type: { type: "string" },
+        bytes: { type: "integer", minimum: 0 }, scale: { type: "number", exclusiveMinimum: 0, maximum: 4 }, quality: { anyOf: [{ type: "integer", minimum: 1, maximum: 100 }, { type: "null" }] },
+      },
+      required: ["encoding", "format", "mime_type", "bytes", "scale", "quality"],
+    };
+    const cdpCallResultOutput = {
+      type: "object", additionalProperties: false,
+      properties: {
+        browser: { type: "string" }, port: { anyOf: [{ type: "integer" }, { type: "null" }] }, user_data_dir: nullableString,
+        target: nullableString, target_id: nullableString, session_id: nullableString,
+        id: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] }, queued: { type: "boolean" },
+        cdp: { anyOf: [{ type: "object", additionalProperties: true }, { type: "null" }] }, image: { anyOf: [cdpImageOutput, { type: "null" }] }, setup_errors: stringArray,
+        success: { type: "boolean" }, error: nullableString,
+      },
+      required: ["browser", "port", "user_data_dir", "target", "target_id", "session_id", "id", "queued", "cdp", "image", "setup_errors", "success", "error"],
+    };
+    const cdpSubscriptionOutputSchema = {
+      type: "object", additionalProperties: false,
+      properties: {
+        subscription: { type: "string" }, browser: { type: "string" }, targets: stringArray, methods: stringArray, method_prefixes: stringArray,
+        include_browser: { type: "boolean" }, regex: { type: "string" }, regex_flags: { type: "string" }, cursor: { type: "integer", minimum: 0 },
+        dropped: { type: "integer", minimum: 0 }, stream_resets: { type: "integer", minimum: 0 },
+      },
+      required: ["subscription", "browser", "targets", "methods", "method_prefixes", "include_browser", "regex", "regex_flags", "cursor", "dropped", "stream_resets"],
+    };
+    const memorySummaryOutput = {
+      type: "object", additionalProperties: false,
+      properties: { count: { type: "integer", minimum: 0 }, latest_keys: stringArray }, required: ["count", "latest_keys"],
+    };
+    const memoryOutput = {
+      type: "object", additionalProperties: false,
+      properties: {
+        id: { type: "integer", minimum: 1 }, scope: { type: "string", enum: ["session", "workspace"] },
+        session_id: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] }, workspace: nullableString,
+        key: { type: "string" }, json: { type: "boolean" }, value: {}, ttl_seconds: { type: "integer", minimum: 0 }, set_at: { type: "string" }, expires_at: nullableString,
+      },
+      required: ["id", "scope", "session_id", "workspace", "key", "json", "value", "ttl_seconds", "set_at", "expires_at"],
+    };
     const processProperties = {
       exec_id: { type: "integer", minimum: 1, description: "Present for persistent processes created by exec_start; equals that exec_start Tool Call id." },
       status: { type: "string" },
@@ -3775,7 +4752,6 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     };
     const outputSchemas = {
       list_workspaces: sessionlessOutputSchema({ workspaces: stringArray }),
-      create_workspace: sessionlessOutputSchema({ created: { type: "boolean" } }),
       open_workspace: outputSchema({
         workspace_name: { type: "string", description: "Unique Workspace name selected for the returned Session." },
         cwd: { type: "string", description: "Absolute path of the selected Workspace." },
@@ -3783,6 +4759,8 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           ...nullableString,
           description: "Absolute Workspace-level guidance path. Resolution prefers AGENTS.md/agents.md, then falls back to CLAUDE.md/Claude.md/claude.md. When non-null, read and follow it before modifying files under this Workspace.",
         },
+        workspace_created: { type: "boolean", description: "True only when this open_workspace call explicitly used create=true and created the missing Workspace." },
+        memory_summary: { type: "object", additionalProperties: false, properties: { workspace: memorySummaryOutput, session: memorySummaryOutput }, required: ["workspace", "session"] },
       }),
       fs_glob: strictOutputSchema({ entries: fsArray(fsGlobEntry), next_after_path: nullableString, truncated: { type: "boolean" } }),
       fs_grep: strictOutputSchema({ mode: { type: "string", enum: ["matches", "files", "count"] }, scanned_files: { type: "integer" }, matched_files: { type: "integer" }, files: fsArray(fsGrepEntry), next_resume_after: { anyOf: [fsResumePoint, { type: "null" }] }, truncated: { type: "boolean" } }),
@@ -3818,6 +4796,24 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         presentation: { type: "string", enum: ["auto", "inline", "download"] }, title: { type: "string" }, description: { type: "string" },
         height: { type: "integer" }, created_at: { type: "string" },
       }),
+      cdp_call: outputSchema({ wait: { type: "boolean" }, results: { type: "array", items: cdpCallResultOutput } }),
+      cdp_subs: outputSchema({
+        browser: { type: "string" }, added: { type: "array", items: cdpSubscriptionOutputSchema }, removed: stringArray, missing: stringArray,
+        subscriptions: { type: "array", items: cdpSubscriptionOutputSchema },
+      }),
+      cdp_poll: outputSchema({
+        browser: { type: "string" }, subscription: nullableString, messages: objectArray, cursor: { anyOf: [{ type: "integer", minimum: 0 }, { type: "null" }] },
+        dropped: { type: "integer", minimum: 0 }, stream_resets: { type: "integer", minimum: 0 }, oldest_seq: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] }, newest_seq: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] },
+      }),
+      memory_find: outputSchema({ memories: { type: "array", items: memoryOutput }, next_before_id: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] } }),
+      memory_set: outputSchema({ memory: { anyOf: [memoryOutput, { type: "null" }] }, deleted: { type: "boolean" } }),
+      telegram_req: outputSchema({
+        method: { type: "string" }, response: { type: "object", additionalProperties: true },
+        migrated_chat_id: { anyOf: [
+          { type: "object", additionalProperties: false, properties: { from: {}, to: {} }, required: ["from", "to"] },
+          { type: "null" },
+        ] },
+      }),
       discover_commands: outputSchema({ commands: {
         type: "array", items: {
           type: "object", additionalProperties: false,
@@ -3829,8 +4825,8 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           required: ["logical_name", "description"],
         },
       } }),
-      inspect_tools: sessionlessOutputSchema({ tools: { type: "array", items: inspectedToolOutput }, missing: stringArray }),
-      query_tool_calls: outputSchema({ calls: objectArray }),
+      tools_schema: sessionlessOutputSchema({ tools: { type: "array", items: inspectedToolOutput }, missing: stringArray }),
+      tools_log: outputSchema({ calls: objectArray }),
       exec: outputSchema(processProperties),
       exec_start: outputSchema({
         exec_id: { type: "integer", minimum: 1 }, status: { type: "string" }, command: {},
@@ -3859,19 +4855,19 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const processOutputSchema = outputSchema(processProperties);
 
     const titles = {
-      list_workspaces: "List Workspaces", create_workspace: "Create Workspace", open_workspace: "Open Workspace",
+      list_workspaces: "List Workspaces", open_workspace: "Open Workspace",
       fs_glob: "FS Glob", fs_grep: "FS Grep", fs_read: "FS Read", fs_navigate: "FS Navigate", fs_stat: "FS Stat",
       fs_write: "FS Write", fs_edit: "FS Edit", fs_mkdir: "FS Mkdir", fs_copy: "FS Copy", fs_move: "FS Move", fs_trash: "FS Trash", fs_restore: "FS Restore",
-      desktop_auto: "Desktop Auto", publish: "Publish to User", discover_commands: "Discover Commands", inspect_tools: "Query Tool Schema", query_tool_calls: "Query Tool Calls",
+      desktop_auto: "Desktop Auto", publish: "Publish to User", cdp_call: "CDP Call", cdp_subs: "CDP Subscriptions", cdp_poll: "CDP Poll", memory_find: "Memory Find", memory_set: "Memory Set", telegram_req: "Telegram Request", discover_commands: "Discover Commands", tools_schema: "Tools Schema", tools_log: "Tools Log",
       exec: "Run Command", exec_start: "Start Persistent Command", exec_attach: "Attach Process Output", exec_write: "Write Stdin",
       exec_kill: "Terminate Process", exec_list: "List Processes", exec_status: "Process Status", js: "JavaScript Kernel",
       js_add_node_module_dir: "Add Module Directory", js_reset: "Reset JavaScript Kernel",
     };
     const annotations = name => ({
-      readOnlyHint: READ_TOOLS.has(name) || name === "publish",
-      destructiveHint: ["desktop_auto", "fs_write", "fs_edit", "fs_move", "exec", "exec_start", "exec_write", "exec_kill", "js", "js_add_node_module_dir", "js_reset"].includes(name),
+      readOnlyHint: READ_TOOLS.has(name) || name === "publish" || name === "cdp_poll" || name === "memory_find",
+      destructiveHint: ["desktop_auto", "cdp_call", "memory_set", "telegram_req", "fs_write", "fs_edit", "fs_move", "exec", "exec_start", "exec_write", "exec_kill", "js", "js_add_node_module_dir", "js_reset"].includes(name),
       idempotentHint: (READ_TOOLS.has(name) && name !== "publish") || ["fs_write", "fs_mkdir", "js_reset"].includes(name),
-      openWorldHint: name === "desktop_auto" || name.startsWith("exec") || name === "js" || name === "publish",
+      openWorldHint: name === "desktop_auto" || name.startsWith("cdp_") || name.startsWith("exec") || name === "js" || name === "publish" || name === "telegram_req",
     });
     const schema = value => ({
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3882,7 +4878,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       required: [...new Set([...(value.required || []), "context_handle"])],
     });
     const tools = [...available].filter(name => defs[name]).map(name => {
-      const requiresContext = !["list_workspaces", "create_workspace", "open_workspace", "inspect_tools"].includes(name);
+      const requiresContext = !["list_workspaces", "open_workspace", "tools_schema"].includes(name);
       return {
         name,
         title: titles[name] || name.replaceAll("_", " ").replace(/\b\w/g, value => value.toUpperCase()),
@@ -3923,17 +4919,20 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     else {
       if (tool.outputSchema.type !== "object") errors.push("outputSchema.type must be object");
       if (tool.outputSchema.additionalProperties !== false) errors.push("outputSchema.additionalProperties must be false");
-      if (!["list_workspaces", "create_workspace", "inspect_tools"].includes(tool.name) && !tool.outputSchema.required?.includes("context_handle"))
+      if (!["list_workspaces", "tools_schema"].includes(tool.name) && !tool.outputSchema.required?.includes("context_handle"))
         errors.push("outputSchema missing required context_handle");
-      if (["list_workspaces", "create_workspace", "inspect_tools"].includes(tool.name) && tool.outputSchema.properties?.context_handle)
+      if (["list_workspaces", "tools_schema"].includes(tool.name) && tool.outputSchema.properties?.context_handle)
         errors.push(`${tool.name} output must not expose context_handle`);
       const expectedOutputs = {
         list_workspaces: ["workspaces"],
-        create_workspace: ["created"],
-        open_workspace: ["workspace_name", "cwd", "agent_guidance_path"],
-        inspect_tools: ["tools", "missing"],
-        query_tool_calls: ["calls"],
+        open_workspace: ["workspace_name", "cwd", "agent_guidance_path", "workspace_created", "memory_summary"],
+        tools_schema: ["tools", "missing"],
+        tools_log: ["calls"],
         publish: ["id", "filename", "mime_type", "source", "uri", "presentation", "title", "description", "height", "created_at"],
+        cdp_call: ["wait", "results"],
+        cdp_subs: ["browser", "added", "removed", "missing", "subscriptions"],
+        cdp_poll: ["browser", "subscription", "messages", "cursor", "dropped", "stream_resets", "oldest_seq", "newest_seq"],
+        memory_find: ["memories", "next_before_id"], memory_set: ["memory", "deleted"], telegram_req: ["method", "response", "migrated_chat_id"],
         fs_glob: ["entries", "next_after_path", "truncated"],
         fs_grep: ["scanned_files", "matched_files", "files", "next_resume_after", "truncated"],
         fs_read: ["files"], fs_navigate: ["files"], fs_stat: ["entries"],
@@ -3953,25 +4952,32 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       if (workspaceName?.type !== "string") errors.push("open_workspace name must be a string");
       if (workspaceName?.enum) errors.push("open_workspace name must not enumerate configured Workspace names");
       if (tool.inputSchema?.properties?.context_handle) errors.push("open_workspace must not accept context_handle");
+      if (!tool.inputSchema?.properties?.create || tool.inputSchema.properties.create.type !== "boolean") errors.push("open_workspace missing optional boolean create");
+      if (tool.inputSchema?.required?.includes("create")) errors.push("open_workspace create must be optional");
       if (!tool.inputSchema?.properties?.current_context_handle) errors.push("open_workspace missing optional current_context_handle");
       if (tool.inputSchema?.required?.includes("current_context_handle")) errors.push("open_workspace current_context_handle must be optional");
-    } else if (["list_workspaces", "create_workspace", "inspect_tools"].includes(tool.name)) {
+    } else if (["list_workspaces", "tools_schema"].includes(tool.name)) {
       if (tool.inputSchema?.properties?.context_handle) errors.push(`${tool.name} must not accept context_handle`);
     } else {
       if (!tool.inputSchema?.properties?.context_handle) errors.push("inputSchema missing context_handle");
       if (!tool.inputSchema?.required?.includes("context_handle")) errors.push("inputSchema context_handle must be required");
     }
     const expectedInputs = {
-      create_workspace: ["name"],
-      open_workspace: ["name", "current_context_handle"],
+      open_workspace: ["name", "create", "current_context_handle"],
       fs_glob: ["path", "include", "exclude", "gitignore", "hidden", "limit", "after_path"],
       fs_grep: ["pattern", "path", "include", "exclude", "gitignore", "hidden", "regex", "case_sensitive", "encoding", "context_lines_before", "context_lines_after", "mode", "max_file_bytes", "limit", "resume_after"],
       fs_read: ["files", "max_output_bytes_per_file"], fs_navigate: ["pattern", "files", "regex", "case_sensitive", "context_lines_before", "context_lines_after"], fs_stat: ["paths", "fingerprint"],
       fs_write: ["files", "create_parents"], fs_edit: ["files"], fs_mkdir: ["paths", "parents"],
       fs_copy: ["entries", "create_parents"], fs_move: ["entries", "create_parents"], fs_trash: ["paths", "selection"], fs_restore: ["trash_id"],
       desktop_auto: ["yaml"], publish: ["path", "text", "base64", "mime_type", "filename", "presentation", "title", "description", "height"],
-      inspect_tools: ["names"],
-      query_tool_calls: ["limit", "tool", "status", "query", "before_id"],
+      cdp_call: ["wait", "calls"],
+      cdp_subs: ["browser", "add", "remove"],
+      cdp_poll: ["subscription", "browser", "target", "type", "id", "methods", "method_prefixes", "limit", "advance"],
+      memory_find: ["scope", "workspace", "key", "key_prefix", "query", "set_after", "set_before", "limit", "before_id"],
+      memory_set: ["scope", "workspace", "key", "value", "json", "delete", "ttl_seconds"],
+      telegram_req: ["request"],
+      tools_schema: ["names"],
+      tools_log: ["limit", "tool", "status", "query", "before_id"],
       exec_attach: ["exec_id"], exec_write: ["exec_id"], exec_kill: ["exec_id"], exec_status: ["exec_id", "output", "tail_lines"],
     };
     for (const key of expectedInputs[tool.name] || [])
@@ -4001,11 +5007,39 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const freshPublishB = freshToolsB.find(tool => tool.name === "publish")?._meta?.ui?.resourceUri || "";
     const uiErrors = [];
     const publishSchema = publishTool?.inputSchema;
+    const openWorkspaceTool = tools.find(tool => tool.name === "open_workspace");
+    const cdpCallTool = tools.find(tool => tool.name === "cdp_call");
+    const cdpSubsTool = tools.find(tool => tool.name === "cdp_subs");
+    const cdpPollTool = tools.find(tool => tool.name === "cdp_poll");
+    const memoryFindTool = tools.find(tool => tool.name === "memory_find");
+    const memorySetTool = tools.find(tool => tool.name === "memory_set");
     if (!publishTool || tools.some(tool => ["publish_file", "publish_html"].includes(tool.name)))
       uiErrors.push("unified publish tool surface is invalid");
+    if (!openWorkspaceTool || tools.some(tool => tool.name === "create_workspace") ||
+        !openWorkspaceTool.inputSchema?.properties?.create || openWorkspaceTool.inputSchema?.properties?.context_handle ||
+        !openWorkspaceTool.outputSchema?.properties?.memory_summary || !openWorkspaceTool.outputSchema?.properties?.workspace_created)
+      uiErrors.push("Workspace open/create surface is invalid");
     if (!publishSchema?.required?.includes("mime_type") || !publishSchema?.required?.includes("context_handle") || publishSchema?.oneOf?.length !== 3 ||
         !["path", "text", "base64"].every(name => publishSchema.oneOf.some(branch => branch.required?.length === 1 && branch.required[0] === name)))
       uiErrors.push("publish source/MIME schema is invalid");
+    if (!cdpCallTool || !cdpSubsTool || !cdpPollTool || tools.some(tool => ["cdp_launch", "cdp_subscribe", "cdp_unsubscribe"].includes(tool.name)))
+      uiErrors.push("CDP tool surface is invalid");
+    const cdpCallSchema = cdpCallTool?.inputSchema;
+    const cdpCallItem = cdpCallSchema?.properties?.calls?.items;
+    if (!cdpCallSchema?.required?.includes("calls") || !cdpCallSchema?.required?.includes("context_handle") ||
+        cdpCallSchema?.properties?.browser || cdpCallSchema?.properties?.call || cdpCallSchema?.properties?.target ||
+        cdpCallSchema?.properties?.calls?.minItems !== 1 || !cdpCallItem?.required?.includes("browser") || !cdpCallItem?.required?.includes("call") ||
+        !cdpCallItem?.properties?._image || !cdpCallItem?.properties?.call?.properties?._mrmcp ||
+        cdpCallItem?.properties?.call?.properties?.id || cdpCallItem?.properties?.call?.properties?.sessionId)
+      uiErrors.push("CDP call schema must be always-batched with standard/private operations, optional image post-processing, and server-owned transport routing");
+    if (!cdpSubsTool?.inputSchema?.properties?.add || !cdpSubsTool?.inputSchema?.properties?.remove ||
+        !JSON.stringify(cdpSubsTool.inputSchema).includes("regex_flags") || !JSON.stringify(cdpSubsTool.inputSchema).includes('"const":"*"') ||
+        !cdpPollTool?.inputSchema?.properties?.subscription || !cdpPollTool?.inputSchema?.properties?.id || !cdpPollTool?.inputSchema?.properties?.advance)
+      uiErrors.push("CDP subscription/poll schema is incomplete");
+    if (!memoryFindTool || !memorySetTool || tools.some(tool => tool.name === "memory_get") ||
+        !memoryFindTool?.inputSchema?.required?.includes("scope") || !memorySetTool?.inputSchema?.required?.includes("scope") ||
+        !memorySetTool?.inputSchema?.required?.includes("key") || !memorySetTool?.inputSchema?.properties?.ttl_seconds)
+      uiErrors.push("memory tool surface/schema is invalid");
     if (!matchesUiResourceUri(freshPublishA, PUBLISH_UI_URI) || freshPublishA === PUBLISH_UI_URI || freshPublishA === freshPublishB)
       uiErrors.push("fresh UI resource URI generation failed");
     if (publishView.uri !== PUBLISH_UI_URI) uiErrors.push("unexpected UI resource URI");
@@ -4069,6 +5103,66 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     };
   }
 
+  const sniffLogBinaryMime = bytes => {
+    if (bytes.length >= 8 && bytes[0] === 0x89 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
+    if (bytes.length >= 12 && bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46 && bytes[8] === 0x57 && bytes[9] === 0x45 && bytes[10] === 0x42 && bytes[11] === 0x50) return "image/webp";
+    if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
+    if (bytes.length >= 6 && String.fromCharCode(...bytes.subarray(0, 6)).startsWith("GIF8")) return "image/gif";
+    if (bytes.length >= 5 && String.fromCharCode(...bytes.subarray(0, 5)) === "%PDF-") return "application/pdf";
+    return "";
+  };
+  const decodeLogBase64 = value => {
+    const text = String(value || "").replace(/\s+/g, "");
+    if (text.length < 16 || text.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(text)) return null;
+    try { return Buffer.from(text, "base64"); } catch { return null; }
+  };
+  function recordToolCallContent(logId, direction, value) {
+    const seen = new WeakSet(), saved = new Set();
+    const save = (path, contentType, mimeType, base64) => {
+      const bytes = decodeLogBase64(base64);
+      if (!bytes?.length) return;
+      const mime = String(mimeType || sniffLogBinaryMime(bytes) || "application/octet-stream").split(";")[0].trim().toLowerCase();
+      const key = `${direction}\n${path}\n${mime}\n${bytes.length}`;
+      if (saved.has(key)) return;
+      saved.add(key);
+      db.prepare("INSERT INTO tool_call_content(log_id,direction,json_path,content_type,mime_type,bytes,data) VALUES(?,?,?,?,?,?,?)")
+        .run(Number(logId), direction, path, contentType, mime, bytes.length, bytes);
+    };
+    const visit = (item, path = "$") => {
+      if (typeof item === "string") {
+        const dataUrl = item.match(/^data:([^;,\s]+)(?:;[^,]*)?;base64,([A-Za-z0-9+/=\s]+)$/i);
+        if (dataUrl) save(path, "data_url", dataUrl[1], dataUrl[2]);
+        else {
+          const bytes = decodeLogBase64(item), mime = bytes && sniffLogBinaryMime(bytes);
+          if (mime) save(path, "base64", mime, item);
+        }
+        return;
+      }
+      if (!item || typeof item !== "object") return;
+      if (seen.has(item)) return;
+      seen.add(item);
+      if (item.type === "image" && typeof item.data === "string") {
+        save(`${path}.data`, "mcp_image", item.mimeType || item.mime_type || "image/png", item.data);
+        return;
+      }
+      if (item.type === "audio" && typeof item.data === "string") {
+        save(`${path}.data`, "mcp_audio", item.mimeType || item.mime_type || "audio/mpeg", item.data);
+        return;
+      }
+      if (item.type === "resource" && item.resource && typeof item.resource.blob === "string") {
+        save(`${path}.resource.blob`, "mcp_resource", item.resource.mimeType || item.resource.mime_type || "application/octet-stream", item.resource.blob);
+        return;
+      }
+      if (typeof item.base64 === "string" && (item.mime_type || item.mimeType || item.mime))
+        save(`${path}.base64`, "base64", item.mime_type || item.mimeType || item.mime, item.base64);
+      for (const [key, child] of Object.entries(item)) {
+        if (key === "base64" && typeof item.base64 === "string" && (item.mime_type || item.mimeType || item.mime)) continue;
+        visit(child, `${path}.${key}`);
+      }
+    };
+    visit(value);
+  }
+
   function beginLog(p, tool, args, contextHandle = "", root = null, descriptor = null, notifyStart = true, progressRequested = false) {
     const context = contextByHandle(p, contextHandle), contextId = Number(context?.id || 0), now = Date.now();
     const previous = contextId ? one(
@@ -4083,6 +5177,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const id = Number(inserted.lastInsertRowid), sessionLabel = context
       ? sessionNotificationLabel(p, context, previousCalls + 1, now, root?.name || "")
       : "";
+    recordToolCallContent(id, "input", args);
     if (descriptor) run(
       "INSERT INTO tool_call_descriptors(log_id,descriptor_json) VALUES(?,?)",
       id, JSON.stringify(descriptor),
@@ -4763,9 +5858,8 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     if (name === "list_workspaces") return {
       workspaces: all("SELECT name FROM roots WHERE server_id=? AND enabled=1 ORDER BY name", p.id).map(row => row.name),
     };
-    if (name === "create_workspace") return await createDesktopWorkspace(p, args.name);
-    if (name === "open_workspace") return await workspaceInfo(selection);
-    if (name === "inspect_tools") {
+    if (name === "open_workspace") return await workspaceInfo(selection, { created: !!execution.workspaceCreated });
+    if (name === "tools_schema") {
       const published = new Map(serverTools(p, true).map(tool => [tool.name, tool]));
       const names = (args.names || []).map(name => String(name));
       if (new Set(names).size !== names.length) throw new Error("names must contain unique tool names");
@@ -5367,8 +6461,65 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       const bytes = args.text !== undefined ? enc.encode(String(args.text)) : decodePublishBase64(args.base64);
       return await publishContent({ bytes }, { ...options, source: args.text !== undefined ? "text" : "base64" });
     }
+    if (name === "cdp_call") {
+      const wait = args.wait !== false, calls = Array.isArray(args.calls) ? args.calls : [];
+      if (!calls.length || calls.length > 100) throw new Error("cdp_call calls must contain 1-100 entries");
+      const results = await Promise.all(calls.map(async spec => {
+        const browserInput = String(spec?.browser || "").trim(), targetInput = spec?.target == null ? null : String(spec.target).trim();
+        let base = {
+          browser: browserInput, port: null, user_data_dir: null, target: targetInput, target_id: null, session_id: null,
+          id: null, queued: false, cdp: null, image: null, setup_errors: [], success: false, error: null,
+        };
+        try {
+          const rawMethod = String(spec?.call?.method || "").trim(), special = String(spec?.call?._mrmcp || "").trim();
+          if (!!rawMethod === !!special) throw new Error("call requires exactly one of method or _mrmcp");
+          const rawParams = spec?.call?.params == null ? {} : spec.call.params;
+          if (!rawParams || typeof rawParams !== "object" || Array.isArray(rawParams)) throw new Error("call.params must be an object");
+          if (special && spec.target === undefined) throw new Error(`_mrmcp.${special} requires target`);
+          if (spec._image && (!rawMethod || rawMethod !== "Page.captureScreenshot")) throw new Error("_image is supported only with standard Page.captureScreenshot");
+          if (spec._image && !wait) throw new Error("_image requires cdp_call wait=true");
+          if (spec._image && spec._image.return !== "base64") throw new Error("_image.return must be base64");
+          const operation = special ? cdpSpecialRequest(special, rawParams) : { wire_method: rawMethod, logical_method: rawMethod, params: rawParams, special: null };
+          const record = await ensureCdpBrowser(browserInput);
+          let target = null, targetId = null, sessionId = null;
+          if (spec.target !== undefined) {
+            const resolvedTarget = await cdpEnsureTarget(record, spec.target);
+            target = resolvedTarget.target; targetId = resolvedTarget.target_id; sessionId = resolvedTarget.session_id;
+          }
+          base = {
+            browser: record.browser, port: record.port, user_data_dir: record.user_data_dir,
+            target, target_id: targetId, session_id: sessionId, id: null, queued: false, cdp: null, image: null,
+            setup_errors: sessionId ? [...(record.session_setup_errors.get(sessionId) || [])] : [], success: false, error: null,
+          };
+          const request = cdpRequest(record, operation.wire_method, operation.params, sessionId || "", {
+            wait, expose: !spec._image, target, target_id: targetId, logical_method: operation.logical_method,
+          });
+          base.id = request.id;
+          if (!wait) return { ...base, queued: true, success: true };
+          const raw = await request.promise;
+          const processed = spec._image && !raw?.error ? await cdpProcessScreenshot(raw, spec._image, rawParams) : { cdp: raw, image: null };
+          if (spec._image) cdpRecordMessage(record, {
+            browser: record.browser, type: "response", id: request.id, method: operation.logical_method,
+            target, target_id: targetId, session_id: sessionId || null, cdp: processed.cdp,
+          });
+          return { ...base, ...processed, success: !processed.cdp?.error, error: processed.cdp?.error ? String(processed.cdp.error.message || processed.cdp.error) : null };
+        } catch (error) {
+          return { ...base, success: false, error: String(error?.message || error) };
+        }
+      }));
+      return { wait, results };
+    }
+    if (name === "cdp_subs") return await cdpSubs(args);
+    if (name === "cdp_poll") return await cdpPoll(args);
+    if (name === "memory_find") return memoryFindRows(p, selection, args);
+    if (name === "memory_set") {
+      if (args.delete === true && (Object.prototype.hasOwnProperty.call(args, "value") || Object.prototype.hasOwnProperty.call(args, "json")))
+        throw new Error("memory_set value and json must be omitted when delete=true");
+      return memorySetValue(p, selection, args);
+    }
+    if (name === "telegram_req") return await telegramRequest(args);
     if (name === "discover_commands") return await discoverCommands();
-    if (name === "query_tool_calls") {
+    if (name === "tools_log") {
       const limit = Math.max(1, Math.min(Number(args.limit || 10), 50));
       const conditions = ["context_handle=?", "id<>?"];
       const values = [args.context_handle, Number(execution.logId || 0)];
@@ -5556,7 +6707,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         : JSON.stringify(publicLogResult, null, 2);
       const stderr = typeof publicLogResult.stderr === "string" ? publicLogResult.stderr : "";
       const status = structuredResult.success === false ? "failed" : "completed";
-      const includeContext = !["list_workspaces", "create_workspace", "inspect_tools"].includes(name);
+      const includeContext = !["list_workspaces", "tools_schema"].includes(name);
       const envelope = includeContext ? contextEnvelope(callInfo.contextHandle) : {};
       const structuredContent = { ...structuredResult, ...envelope };
       const full = typeof structuredResult.content === "string"
@@ -5569,6 +6720,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         content: [{ type: "text", text: rendered }, ...extraContent], structuredContent, isError: status !== "completed",
         ...(resultUiResourceUri ? { _meta: { ui: { resourceUri: resultUiResourceUri } } } : {}),
       };
+      recordToolCallContent(id, "output", toolResult);
       updateLog(id, {
         completed_at: Date.now(), duration_ms: Date.now() - started, status,
         resolved_json: JSON.stringify(publicLogResult), stdout, stderr,
@@ -5584,7 +6736,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       return toolResult;
     } catch (error) {
       const message = String(error?.stack || error);
-      const includeContext = !["list_workspaces", "create_workspace", "inspect_tools"].includes(name);
+      const includeContext = !["list_workspaces", "tools_schema"].includes(name);
       const envelope = includeContext ? contextEnvelope(callInfo.contextHandle) : {};
       const structuredContent = { error: String(error?.message || error), ...envelope };
       const text = includeContext
@@ -6230,9 +7382,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 
     const serverInfoMeta = { "io.modelcontextprotocol/serverInfo": mcpServerInfo() };
     const instructions = fullAccess
-      ? "Use list_workspaces when you need to discover enabled Workspace names. Use create_workspace with only a name when you need a new empty Workspace; MrMCP creates and registers its Desktop directory internally, then call open_workspace with that same name. If you already have the current Session handle, pass it as current_context_handle to move that same Session to the Workspace; if it is omitted, empty, unknown or expired, open_workspace creates a new Session. The result includes workspace_name, absolute cwd and agent_guidance_path; when that path is non-null, read and follow that Workspace guidance file before repository work. MrMCP prefers AGENTS.md/agents.md and falls back to CLAUDE.md/Claude.md/claude.md. Pass the returned context_handle unchanged on every later Session-bound tool call. " +
+      ? "Use list_workspaces when you need to discover enabled Workspace names. Use open_workspace(name) to open one; only pass create=true when you explicitly want a missing Workspace created as a new empty Desktop folder. If you already have the current Session handle, pass it as current_context_handle to move that same Session; omitted, empty, unknown or expired creates a new Session. The result includes workspace_name, absolute cwd, agent_guidance_path, whether this call created the Workspace, and a compact count/latest-key Memory summary for Workspace and Session scopes. When guidance is non-null, read and follow it before repository work. Pass the returned context_handle unchanged on every later Session-bound tool call. " +
         "Use fs_glob, fs_grep, fs_read, fs_navigate, fs_stat, fs_write and fs_edit directly for filesystem discovery, inspection, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. Use desktop_auto for desktop observation and interaction through AAF YAML; when the model needs to see a screenshot, retain its image handle anywhere in the scenario's final state so the tool returns that image directly as MCP image content. Multiple retained screenshots and ordinary OCR/text/geometry/state values may coexist in one result. " +
-        "When work may benefit from command-line capability beyond the structured tools, call discover_commands proactively before inventing workarounds or assuming a utility is unavailable. It returns the complete user-chosen available command catalog in one call; prefer a listed command when it fits, remember the catalog for the Session, and invoke its logical_name directly through exec.program without PATH probes. Use inspect_tools when exact live tool descriptor data is needed instead of relying on a connector-synthesized schema view. " +
+        "When work may benefit from command-line capability beyond the structured tools, call discover_commands proactively before inventing workarounds or assuming a utility is unavailable. It returns the complete user-chosen available command catalog in one call; prefer a listed command when it fits, remember the catalog for the Session, and invoke its logical_name directly through exec.program without PATH probes. Use tools_schema when exact live tool descriptor data is needed instead of relying on a connector-synthesized schema view. " +
         "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; cancelling/disconnecting exec terminates its child. For persistent or interactive work, call exec_start; it immediately returns exec_id, which is the stable integer Tool Call id of that start. Pass that exec_id together with the same context_handle to exec_attach, exec_write, exec_kill or exec_status; ids from other Sessions are inaccessible. exec_list shows only currently running persistent executions in this Session. exec_status is the non-consuming way to inspect running or recently completed/killed executions and optionally retrieve all output or a tail. exec_attach with progressToken streams unread backlog plus live output through progress until process exit and then returns that complete unread transcript; without progressToken it long-polls and returns at most 16 KiB of unread output plus remaining_bytes, so call it repeatedly to drain buffered output and call it again with remaining_bytes=0/status=running to wait for future output. Disconnecting exec_attach only detaches and never kills the persistent process. " +
         "Use publish to present content to the user from exactly one of path, text or base64. Supply the real MIME type and optional filename; presentation=auto lets the smart MCP App choose an inline preview or file action, while inline/download are presentation hints. title and description appear above the published element. " +
         "Every authenticated client can invoke every published tool; context_handle is the bearer capability selecting the persistent Session and its current Workspace."
@@ -6350,14 +7502,19 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
             const toolArgs = { ...rawToolArgs };
             const invokeTool = async requestStream => {
               let toolResult;
-              if (["list_workspaces", "create_workspace", "inspect_tools"].includes(x.params.name)) {
+              if (["list_workspaces", "tools_schema"].includes(x.params.name)) {
                 toolResult = await callTool(
                   p, x.params.name, toolArgs,
                   { authKind: auth.kind, contextHandle: "", selection: null, descriptor, requestStream, progressRequested },
                 );
               } else if (x.params.name === "open_workspace") {
                 delete toolArgs.context_handle;
-                const workspace = workspaceByName(p, toolArgs.name);
+                let workspace = workspaceByName(p, toolArgs.name), workspaceCreated = false;
+                if (!workspace && toolArgs.create === true) {
+                  await createDesktopWorkspace(p, toolArgs.name);
+                  workspace = workspaceByName(p, toolArgs.name);
+                  workspaceCreated = true;
+                }
                 if (!workspace) {
                   const current = resolveContext(p, toolArgs.current_context_handle, observedProtocol);
                   const handle = current.kind === "active" ? current.record.handle : "";
@@ -6383,7 +7540,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
                   const selection = { context: record, root: runtimeWorkspaceRoot(workspace) };
                   toolResult = await callTool(
                     p, x.params.name, toolArgs,
-                    { authKind: auth.kind, contextHandle: record.handle, selection, descriptor, requestStream, progressRequested },
+                    { authKind: auth.kind, contextHandle: record.handle, selection, descriptor, requestStream, progressRequested, workspaceCreated },
                   );
                 }
               } else {
@@ -6457,6 +7614,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       desktop_notifications_workspace: desktopNotificationEnabled("workspace"),
       desktop_notifications_tool_call: desktopNotificationEnabled("tool_call"),
       inherit_system_path: getCfg("inherit_system_path", "1") === "1",
+      telegram_bot_token: getCfg("telegram_bot_token", ""),
       external_url: getCfg("external_url", ""), gui_transport: "Tauriless local asset protocol",
       listener_fallback: listenerFallbacks().length > 0, listener_fallbacks: listenerFallbacks(),
       public_ip: currentIp, public_ip_checked_at: Number(getCfg("public_ip_checked_at", "0")),
@@ -6627,7 +7785,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   // The UI asks for only the active section. Database projections are evaluated lazily so
   // inactive pages do not query their tables during Eta -> Morphlex rerenders.
   const state = (section = "all") => {
-    const valid = new Set(["all", "dashboard", "sessions", "logs", "published", "roots", "commands", "prompts", "prompt_help", "debug", "oauth", "settings", "help"]);
+    const valid = new Set(["all", "dashboard", "sessions", "logs", "published", "memory", "roots", "commands", "prompts", "prompt_help", "debug", "oauth", "settings", "help"]);
     section = valid.has(section) ? section : "dashboard";
     const p = serverConfig();
     if (!p) throw new Error("MrMCP server configuration is missing");
@@ -6701,6 +7859,32 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       ORDER BY context_id DESC`, serverId, serverId).map(row => Number(row.context_id));
     return { rows, total, page, pages, page_size: pageSize, sessions, context, size };
   };
+  const memoryAdminProjection = (current = {}) => {
+    memoryPurgeExpired();
+    const conditions = ["1=1"], values = [], scope = ["session", "workspace"].includes(String(current.scope || "")) ? String(current.scope) : "";
+    const context = Math.max(0, Number(current.context) || 0), workspace = String(current.workspace || "").trim(), query = String(current.query || "").trim();
+    if (scope) { conditions.push("scope=?"); values.push(scope); }
+    if (context) { conditions.push("scope='session' AND owner_id=?"); values.push(context); }
+    if (workspace) { conditions.push("scope='workspace' AND owner_name=?"); values.push(workspace); }
+    if (query) { conditions.push("instr(lower(key||char(10)||value_json),lower(?))>0"); values.push(query); }
+    const from = String(current.from || "").trim(), to = String(current.to || "").trim();
+    if (from) {
+      const value = Date.parse(from.length === 10 ? `${from}T00:00:00` : from);
+      if (Number.isFinite(value)) { conditions.push("set_at>=?"); values.push(value); }
+    }
+    if (to) {
+      const value = Date.parse(to.length === 10 ? `${to}T23:59:59.999` : to);
+      if (Number.isFinite(value)) { conditions.push("set_at<=?"); values.push(value); }
+    }
+    const pageSize = 25, where = conditions.join(" AND ");
+    const total = Number(one(`SELECT COUNT(*) n FROM memories WHERE ${where}`, ...values)?.n || 0), pages = Math.max(1, Math.ceil(total / pageSize));
+    const page = Math.min(pages, Math.max(1, Number(current.page) || 1)), offset = (page - 1) * pageSize;
+    const rows = all(`SELECT id,scope,owner_id,owner_name,key,value_json,is_json,ttl_seconds,set_at,expires_at FROM memories WHERE ${where} ORDER BY id DESC LIMIT ? OFFSET ?`, ...values, pageSize, offset)
+      .map(row => ({ ...row, value_preview: String(row.value_json || "").slice(0, 320) }));
+    const sessions = all("SELECT DISTINCT owner_id id FROM memories WHERE scope='session' ORDER BY owner_id DESC").map(row => Number(row.id));
+    const workspaces = all("SELECT DISTINCT owner_name name FROM memories WHERE scope='workspace' ORDER BY owner_name COLLATE NOCASE").map(row => String(row.name));
+    return { rows, total, page, pages, page_size: pageSize, sessions, workspaces, scope, context: context || "", workspace, query, from, to };
+  };
 
   async function restartMcp() {
     await Promise.allSettled([mcpHttpServer?.shutdown(), mcpHttpsServer?.shutdown()]);
@@ -6764,7 +7948,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   }
 
   const fragmentTemplates = GUI_RUNTIME ? {
-    sidebar: `<? const current=it.data?.state?.currentSection||"dashboard",items=[["dashboard","🏠","Dashboard"],["oauth","🔐","Clients"],["sessions","💬","Sessions"],["roots","📁","Workspaces"],["logs","🛠️","Tool Calls"],["published","📦","Published"],["commands","🧰","Commands"],["prompts","🧭","Guided Prompts"],["debug","🐞","HTTP Log"],["settings","⚙️","Settings"],["help","❓","Help"]]; items.forEach(([id,icon,label])=>{ ?><button data-page="<?= id ?>" class="<?= current===id?'nav-active':'' ?>"<?= current===id?' aria-current=page':'' ?>><span class=menu-icon><?= icon ?></span><?= label ?></button><? }) ?>`,
+    sidebar: `<? const current=it.data?.state?.currentSection||"dashboard",items=[["dashboard","🏠","Dashboard"],["oauth","🔐","Clients"],["sessions","💬","Sessions"],["roots","📁","Workspaces"],["logs","🛠️","Tool Calls"],["published","📦","Published"],["memory","🧠","Memory"],["commands","🧰","Commands"],["prompts","🧭","Guided Prompts"],["debug","🐞","HTTP Log"],["settings","⚙️","Settings"],["help","❓","Help"]]; items.forEach(([id,icon,label])=>{ ?><button data-page="<?= id ?>" class="<?= current===id?'nav-active':'' ?>"<?= current===id?' aria-current=page':'' ?>><span class=menu-icon><?= icon ?></span><?= label ?></button><? }) ?>`,
     view: `<? const s=it.data?.state||{},section=s.currentSection||"dashboard",settings=s.settings||{}; ?>
 <? if(section==="dashboard"){ ?><section id=dashboard class=page><div class=row><h2 class=grow>🏠 Dashboard</h2><span class=muted>Runtime · activity · endpoints</span></div><div id=cards class=grid></div><div class=row><h3 class=grow>🛠️ Active Tool Calls</h3><span class=muted>Live · finished calls remain for 5s</span></div><div id=activeToolCalls></div><div id=trashActivity class=grid></div><div class=dashboard-grid><div><h3>🌐 Server</h3><div id=endpoints></div></div><div><h3>🔒 TLS and Connectivity</h3><div id=tlsStatus></div></div></div></section>
 <? } else if(section==="sessions"){ ?><section id=sessions class=page><div class=row><h2 class=grow>💬 Sessions</h2><span class=muted>Live updates</span><button class=danger data-action=clear-sessions<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Persistent MCP Sessions. Each Session is attached to a <b>📁 Workspace</b>.</p><? if(s.sessions?.oauthClientId){ ?><div class=row><span class=muted>OAuth filter</span><code><?= s.sessions.oauthClientId ?></code><button class=small data-action=clear-session-oauth>✕ Clear</button></div><? } ?><div class=card><b>Client Continuity</b><p class=muted>ChatGPT may create a new Session after model or thinking changes. Client/auth/User-Agent metadata is best effort.</p></div><div id=contextList></div></section>
@@ -6774,11 +7958,12 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 <? } else if(section==="prompt_help"){ const h=s.promptHelp||{}; ?><section id=prompt_help class=page><div class=row><h2 class=grow>🧭 Guided Prompt Templates</h2><button data-action=prompts-back>← Guided Prompts</button></div><div class=card><h3>YAML shape</h3><p><code>guided_prompts.yaml</code> contains a top-level <code>prompts</code> array. Prompt arguments are MCP string arguments with <code>name</code> plus optional <code>title</code>, <code>description</code> and <code>required</code>; <code>required</code> controls whether the client must supply them.</p><pre><?= h.yaml||'' ?></pre></div><div class=card><h3>Eta</h3><p>The <code>template</code> is rendered with Eta using standard tags and no HTML escaping. Read values with <code>&lt;%= it.args.focus %&gt;</code>, use normal JavaScript in <code>&lt;% ... %&gt;</code>, and branch on any model field. Templates are trusted local configuration and are not sandboxed.</p><pre><?= h.model||'' ?></pre></div><div class=card><h3>Session / Workspace context</h3><p><code>it.session</code> and <code>it.workspace</code> are populated only when the prompt declares a <code>context_handle</code> argument and the client supplies a valid active MrMCP Session handle. <code>it.workspaces</code> is always available and includes the fallback Workspace plus enabled named Workspaces.</p></div></section>
 <? } else if(section==="logs"){ const l=s.logs||{}; ?><section id=logs class=page><div class=row><h2 class=grow>🛠️ Tool Calls</h2><button class=danger data-action=clear-tool-calls<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Click a row for details. Terminate active work from Actions.</p><div class=row><input id=logTool placeholder="Tool / command…" value="<?= l.toolQuery||'' ?>"><input id=logQuery class=grow placeholder="Search input, output, errors…" value="<?= l.query||'' ?>"><select id=logContext><option value="">All sessions</option><? (s.contextValues||[]).forEach(v=>{ ?><option value="<?= v.pk ?>"<?= String(l.context||"")===String(v.pk)?" selected":"" ?>>#<?= v.pk ?></option><? }) ?></select><select id=logStatus class="<?= l.status||'' ?>"><option value="">All states</option><? ['completed','failed','invalid','running'].forEach(v=>{ ?><option class="<?= v ?>" value="<?= v ?>"<?= l.status===v?' selected':'' ?>><?= v ?></option><? }) ?></select><select id=logPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(l.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=clear-log-filters>🧹 Clear Filters</button></div><? if(l.selfTest){ ?><div id=logSelfTest class=card><div class=row><h3 class=grow>🧪 MCP Self-Test</h3><button class=small data-action=copy-detail data-target=logDetail>📋 Copy JSON</button><button class=small data-action=close-self-test>✕ Close</button></div><pre id=logDetail><?= it.pretty(l.selfTest) ?></pre></div><? } ?><div id=logList></div></section>
 <? } else if(section==="published"){ ?><section id=published class=page><div class=row><h2 class=grow>📦 Published</h2><button class=danger data-action=clear-published<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear Matching</button></div><p class=muted>Deduplicated persistent content snapshots created by <code>publish</code>. Path, text and Base64 sources all become ordinary files under <code>.mrmcp/publish</code>; one resource may have references from multiple Sessions and Workspaces.</p><div id=publishedList></div></section>
+<? } else if(section==="memory"){ const m=s.memory||{}; ?><section id=memory class=page><div class=row><h2 class=grow>🧠 Memory</h2></div><p class=muted>Persistent explicit key-value memory created by <code>memory_set</code>. Each value is explicitly JSON or plain text; Session memory belongs to one Session and Workspace memory is shared by Workspace label. Expired TTL entries are removed automatically.</p><div class=row><input id=memoryQuery class=grow placeholder="Search keys or values…" value="<?= m.query||'' ?>"><select id=memoryScope><option value=""<?= !m.scope?' selected':'' ?>>All scopes</option><option value=session<?= m.scope==='session'?' selected':'' ?>>Session</option><option value=workspace<?= m.scope==='workspace'?' selected':'' ?>>Workspace</option></select><select id=memoryContext><option value="">All sessions</option><? (m.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(m.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=memoryWorkspace><option value="">All workspaces</option><? (m.workspaces||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= String(m.workspace||'')===String(name)?' selected':'' ?>><?= name ?></option><? }) ?></select><input id=memoryFrom type=date title="Set on or after" value="<?= m.from||'' ?>"><input id=memoryTo type=date title="Set on or before" value="<?= m.to||'' ?>"><button data-action=load-memory>🔎 Search</button><button data-action=clear-memory-filters>🧹 Clear Filters</button></div><div id=memoryList></div></section>
 <? } else if(section==="debug"){ const d=s.debug||{},enabled=!!s.debug?.enabled; ?><section id=debug class=page><div class=row><h2 class=grow>🐞 HTTP Debug Log</h2><button class="debug-toggle <?= enabled?'enabled':'disabled' ?>" data-action=toggle-debug-settings aria-pressed="<?= enabled?'true':'false' ?>"><?= enabled?"🟢 Logging ON · Disable":"🔴 Logging OFF · Enable" ?></button><button class=danger data-action=clear-debug>🗑️ Clear</button></div><p class=muted>Off by default. Secrets are redacted. Disabling stops new records but keeps stored data visible. Click a row for request JSON.</p><div class=row><input id=debugQuery class=grow placeholder="Search URL, headers, body or errors…" value="<?= d.query||'' ?>"><select id=debugMethod><option value="">All methods</option><? ['GET','POST','OPTIONS'].forEach(v=>{ ?><option<?= d.method===v?' selected':'' ?>><?= v ?></option><? }) ?></select><input id=debugStatus type=number placeholder="Status" value="<?= d.status||'' ?>"><button data-action=load-debug>🔎 Search</button></div><div id=debugList></div></section>
 <? } else if(section==="oauth"){ ?><section id=oauth class=page><div class=row><h2 class=grow>🔐 OAuth Clients</h2><button class=danger data-action=clear-clients<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><div id=oauthList></div></section>
-<? } else if(section==="settings"){ ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><div class=settings-layout><div class=settings-main><div class=card><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><p class=muted>Off: child <code>PATH</code> contains only <code>.mrmcp/bin</code>. Other environment variables are unchanged.</p></div><div class=card><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
+<? } else if(section==="settings"){ ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><div class=settings-layout><div class=settings-main><div class=card><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card><h3>🤖 Telegram Bot</h3><div class=row><label class=grow>Bot token</label><? if(settings.field_warnings?.telegram_bot_token){ ?><span class=field-warning>⚠ <?= settings.field_warnings.telegram_bot_token ?></span><? } ?></div><input id=telegramBotToken type=password autocomplete=off value="<?= settings.telegram_bot_token||'' ?>" placeholder="123456789:AA…"><p class=muted>Used only by <code>telegram_req</code> to authenticate Bot API requests. Chat IDs, channels and application state are intentionally left to the agent/Memory.</p></div><div class=card><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><p class=muted>Off: child <code>PATH</code> contains only <code>.mrmcp/bin</code>. Other environment variables are unchanged.</p></div><div class=card><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, Memory, CDP browser state, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
 <? } else if(section==="help"){ ?><section id=help class=page><h2>❓ Help</h2><div class=card><h3>Connect ChatGPT Web</h3><ol><li>Make sure the Dashboard shows a trusted HTTPS certificate. ChatGPT needs a remote HTTPS MCP endpoint; use <code><?= settings.external_base_url ? settings.external_base_url + "/mcp" : "https://your-host/mcp" ?></code>.</li><li>In ChatGPT Web, enable Developer mode. In managed workspaces the current path is <b>Workspace settings → Permissions &amp; Roles → Connected Data Developer mode / Create custom MCP connectors</b>. Authorized users may also find the toggle under <b>Settings → Apps → Advanced Settings</b>.</li><li>Create a custom app from <b>Workspace settings → Apps → Create</b> or <b>Settings → Apps → Create</b>, enter the MrMCP endpoint, choose the offered authentication method, then select <b>Scan Tools</b>.</li><li>If OAuth is enabled in MrMCP, complete the authorization prompt. After the tool scan completes, create the app and select it from a new ChatGPT conversation.</li></ol></div><div class=card><h3>Authentication</h3><p>For ChatGPT, OAuth is the preferred MrMCP setup because ChatGPT can discover the authorization metadata, complete consent, and keep refresh-token connectivity. MrMCP also supports Basic authentication for MCP clients that offer it. Authentication grants access to the server; the <code>context_handle</code> selects persistent context state after authentication.</p></div><div class=card><h3>Write Access</h3><p>MrMCP does not maintain a separate read/write allowlist: every authenticated client receives every published tool. ChatGPT controls whether write/modify actions are usable through the app's permissions and action controls. As of this build, OpenAI documents full MCP write/modify support for Business, Enterprise and Edu; Pro custom MCP access is limited to read/fetch, and availability may change. Test write tools in Developer mode first. Where available, use <b>Workspace settings → Apps → Configure Actions / Action control</b> to enable the required actions. ChatGPT may still ask for confirmation before a write.</p></div><div class=card><h3>Using MrMCP in a Chat</h3><ol><li>Start a new chat and select the MrMCP app from the tools/apps menu.</li><li>If needed, call <code>list_workspaces</code> to discover the enabled Workspace names, then call <code>open_workspace</code> with the desired <code>name</code>. When continuing an existing Session, also pass its handle as <code>current_context_handle</code>; MrMCP moves that same Session to the Workspace. If the handle is omitted, empty, unknown or expired, a new Session is created.</li><li>The result already includes <code>workspace_name</code>, absolute <code>cwd</code> and <code>agent_guidance_path</code>. Read that file when non-null, then reuse the returned <code>context_handle</code> on later Session-bound calls. The Workspaces page can also move Sessions manually.</li><li>If you change ChatGPT model or thinking level, the MCP context may be recreated even inside the same conversation. Check the Sessions page if continuity matters.</li></ol><p class=muted>ChatGPT UI labels and plan availability can change. Current OpenAI references: <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt" target=_blank rel=noopener>Developer mode and MCP apps in ChatGPT</a> · <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt" target=_blank rel=noopener>Apps in ChatGPT</a>.</p></div></section><? } ?>`,
-    dialogs: `<? const dialog=it.data?.state?.dialog; ?><? if(dialog){ ?><div id=dialogOverlay class=dialog-overlay><? if(dialog.kind==="root"){ const r=dialog.data||{}; ?><dialog id=rootDialog open data-managed-dialog=root><form id=rootForm><input id=rid type=hidden value="<?= r.id||'' ?>"><h2>📁 Workspace</h2><div class=row><label class=grow>Workspace name</label><? if(r.name_warning){ ?><span class=field-warning>⚠ <?= r.name_warning ?></span><? } ?></div><input id=rname value="<?= r.name||'' ?>"><div class=row><label class=grow>Directory path</label><? if(r.path_warning){ ?><span class=field-warning>⚠ <?= r.path_warning ?></span><? } else if(!r.path_checked){ ?><span class=muted>Leave the field to validate the directory.</span><? } ?></div><input id=rpath placeholder="C:\\projects\\my-workspace, /srv/my-workspace or ./project" value="<?= r.path||'' ?>"><div class=muted>Relative to the program folder.</div><label><input id=renabled type=checkbox<?= r.enabled!==false?' checked':'' ?>> Enabled</label><? if(r.form_warning){ ?><div class=field-warning>⚠ <?= r.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (r.name_warning||r.path_warning||!r.path_checked||r.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="command"){ const c=dialog.data||{}; ?><dialog id=commandDialog open data-managed-dialog=command><form id=commandForm><input id=coldName type=hidden value="<?= c.registered?c.name:'' ?>"><h2>🧰 Command Catalog Entry</h2><div class=row><label class=grow>Logical name</label><? if(c.name_warning){ ?><span class=field-warning>⚠ <?= c.name_warning ?></span><? } ?></div><input id=cname value="<?= c.name||'' ?>"><div class=row><label class=grow>Path below .mrmcp/bin</label><? if(c.path_warning){ ?><span class="<?= c.path_error?'field-warning':'muted' ?>"><?= c.path_error?'⚠ ':'' ?><?= c.path_warning ?></span><? } else if(!c.path_checked){ ?><span class=muted>Leave the field to validate the path.</span><? } ?></div><input id=cpath placeholder="Optional; defaults to logical name; Windows suffix optional" value="<?= c.path||'' ?>"><label>Description for the agent</label><textarea id=cdescription placeholder="Optional: what it does and when the agent should use it."><?= c.description||'' ?></textarea><div class=row><label class=grow>Download URL</label><? if(c.download_warning){ ?><span class=field-warning>⚠ <?= c.download_warning ?></span><? } ?></div><input id=cdownloadUrl placeholder="https://example.com/tool" value="<?= c.download_url||'' ?>"><div class=row><label class=grow>Documentation URL</label><? if(c.documentation_warning){ ?><span class=field-warning>⚠ <?= c.documentation_warning ?></span><? } ?></div><input id=cdocumentationUrl placeholder="https://example.com/docs" value="<?= c.documentation_url||'' ?>"><? if(c.form_warning){ ?><div class=field-warning>⚠ <?= c.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (c.name_warning||c.path_error||!c.path_checked||c.download_warning||c.documentation_warning||c.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="prompt"){ const p=dialog.data||{}; ?><dialog id=promptDialog open data-managed-dialog=prompt><form id=promptForm><input id=poldName type=hidden value="<?= p.old_name||'' ?>"><h2>🧭 Guided Prompt</h2><div class=row><label class=grow>Name</label><? if(p.name_warning){ ?><span class=field-warning>⚠ <?= p.name_warning ?></span><? } ?></div><input id=pname value="<?= p.name||'' ?>"><label>Title</label><input id=ptitle value="<?= p.title||'' ?>" placeholder="Human-readable title shown by MCP clients"><label>Description</label><textarea id=pdescription placeholder="What this guided prompt does."><?= p.description||'' ?></textarea><div class=row><label class=grow>Arguments · YAML list</label><? if(p.args_warning){ ?><span class=field-warning>⚠ <?= p.args_warning ?></span><? } ?></div><textarea id=parguments rows=8 placeholder="- name: focus&#10;  description: Area to focus on.&#10;  required: false"><?= p.arguments_text||'' ?></textarea><div class=row><label class=grow>Eta template</label><? if(p.template_warning){ ?><span class=field-warning>⚠ <?= p.template_warning ?></span><? } ?></div><textarea id=ptemplate rows=14 placeholder="Review the project. &lt;%= it.args.focus %&gt;"><?= p.template||'' ?></textarea><div class=muted>Standard Eta tags. Model documentation is available from Guided Prompts → Template Help.</div><? if(p.form_warning){ ?><div class=field-warning>⚠ <?= p.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (p.name_warning||p.args_warning||p.template_warning||p.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="confirm"){ ?><dialog id=confirmDialog open data-managed-dialog=confirm><h2>⚠️ <?= dialog.title||"Confirm Action" ?></h2><p><?= dialog.message||"Continue?" ?></p><p class=row><button class="primary danger" data-action=confirm-dialog>✓ Confirm</button><button data-action=close-dialog>✕ Cancel</button></p></dialog><? } ?></div><? } ?>`,
+    dialogs: `<? const dialog=it.data?.state?.dialog; ?><? if(dialog){ ?><div id=dialogOverlay class=dialog-overlay><? if(dialog.kind==="root"){ const r=dialog.data||{}; ?><dialog id=rootDialog open data-managed-dialog=root><form id=rootForm><input id=rid type=hidden value="<?= r.id||'' ?>"><h2>📁 Workspace</h2><div class=row><label class=grow>Workspace name</label><? if(r.name_warning){ ?><span class=field-warning>⚠ <?= r.name_warning ?></span><? } ?></div><input id=rname value="<?= r.name||'' ?>"><div class=row><label class=grow>Directory path</label><? if(r.path_warning){ ?><span class=field-warning>⚠ <?= r.path_warning ?></span><? } else if(!r.path_checked){ ?><span class=muted>Leave the field to validate the directory.</span><? } ?></div><input id=rpath placeholder="C:\\projects\\my-workspace, /srv/my-workspace or ./project" value="<?= r.path||'' ?>"><div class=muted>Relative to the program folder.</div><label><input id=renabled type=checkbox<?= r.enabled!==false?' checked':'' ?>> Enabled</label><? if(r.form_warning){ ?><div class=field-warning>⚠ <?= r.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (r.name_warning||r.path_warning||!r.path_checked||r.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="command"){ const c=dialog.data||{}; ?><dialog id=commandDialog open data-managed-dialog=command><form id=commandForm><input id=coldName type=hidden value="<?= c.registered?c.name:'' ?>"><h2>🧰 Command Catalog Entry</h2><div class=row><label class=grow>Logical name</label><? if(c.name_warning){ ?><span class=field-warning>⚠ <?= c.name_warning ?></span><? } ?></div><input id=cname value="<?= c.name||'' ?>"><div class=row><label class=grow>Path below .mrmcp/bin</label><? if(c.path_warning){ ?><span class="<?= c.path_error?'field-warning':'muted' ?>"><?= c.path_error?'⚠ ':'' ?><?= c.path_warning ?></span><? } else if(!c.path_checked){ ?><span class=muted>Leave the field to validate the path.</span><? } ?></div><input id=cpath placeholder="Optional; defaults to logical name; Windows suffix optional" value="<?= c.path||'' ?>"><label>Description for the agent</label><textarea id=cdescription placeholder="Optional: what it does and when the agent should use it."><?= c.description||'' ?></textarea><div class=row><label class=grow>Download URL</label><? if(c.download_warning){ ?><span class=field-warning>⚠ <?= c.download_warning ?></span><? } ?></div><input id=cdownloadUrl placeholder="https://example.com/tool" value="<?= c.download_url||'' ?>"><div class=row><label class=grow>Documentation URL</label><? if(c.documentation_warning){ ?><span class=field-warning>⚠ <?= c.documentation_warning ?></span><? } ?></div><input id=cdocumentationUrl placeholder="https://example.com/docs" value="<?= c.documentation_url||'' ?>"><? if(c.form_warning){ ?><div class=field-warning>⚠ <?= c.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (c.name_warning||c.path_error||!c.path_checked||c.download_warning||c.documentation_warning||c.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="prompt"){ const p=dialog.data||{}; ?><dialog id=promptDialog open data-managed-dialog=prompt><form id=promptForm><input id=poldName type=hidden value="<?= p.old_name||'' ?>"><h2>🧭 Guided Prompt</h2><div class=row><label class=grow>Name</label><? if(p.name_warning){ ?><span class=field-warning>⚠ <?= p.name_warning ?></span><? } ?></div><input id=pname value="<?= p.name||'' ?>"><label>Title</label><input id=ptitle value="<?= p.title||'' ?>" placeholder="Human-readable title shown by MCP clients"><label>Description</label><textarea id=pdescription placeholder="What this guided prompt does."><?= p.description||'' ?></textarea><div class=row><label class=grow>Arguments · YAML list</label><? if(p.args_warning){ ?><span class=field-warning>⚠ <?= p.args_warning ?></span><? } ?></div><textarea id=parguments rows=8 placeholder="- name: focus&#10;  description: Area to focus on.&#10;  required: false"><?= p.arguments_text||'' ?></textarea><div class=row><label class=grow>Eta template</label><? if(p.template_warning){ ?><span class=field-warning>⚠ <?= p.template_warning ?></span><? } ?></div><textarea id=ptemplate rows=14 placeholder="Review the project. &lt;%= it.args.focus %&gt;"><?= p.template||'' ?></textarea><div class=muted>Standard Eta tags. Model documentation is available from Guided Prompts → Template Help.</div><? if(p.form_warning){ ?><div class=field-warning>⚠ <?= p.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (p.name_warning||p.args_warning||p.template_warning||p.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="memory"){ const m=dialog.data||{}; ?><dialog id=memoryDialog open data-managed-dialog=memory><form id=memoryForm><input id=mid type=hidden value="<?= m.id||'' ?>"><h2>🧠 Memory</h2><div class=muted><?= m.scope==='workspace'?'Workspace':'Session' ?> · <?= m.owner_name||'' ?></div><label>Key</label><input id=mkey value="<?= m.key||'' ?>"><label>Value</label><? if(m.json){ ?><textarea id=mvalue rows=14 hidden><?= m.value_text||'' ?></textarea><div id=memoryJsonEditor class="json-editor-host memory" data-json-source=mvalue data-json-edit=memory data-json-error=memoryJsonError></div><div id=memoryJsonError class=field-warning hidden></div><? } else { ?><textarea id=mvalue rows=14><?= m.value_text||'' ?></textarea><? } ?><label><input id=mjson type=checkbox<?= m.json?' checked':'' ?>> Value is JSON · validate before saving</label><label>TTL seconds · 0 = permanent</label><input id=mttl type=number min=0 max=315360000 value="<?= m.ttl_seconds||0 ?>"><? if(m.form_warning){ ?><div class=field-warning>⚠ <?= m.form_warning ?></div><? } ?><p class=row><button class=primary type=submit>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="confirm"){ ?><dialog id=confirmDialog open data-managed-dialog=confirm><h2>⚠️ <?= dialog.title||"Confirm Action" ?></h2><p><?= dialog.message||"Continue?" ?></p><p class=row><button class="primary danger" data-action=confirm-dialog>✓ Confirm</button><button data-action=close-dialog>✕ Cancel</button></p></dialog><? } ?></div><? } ?>`,
     status: `<? const d=it.data||{},s=d.settings||{},a=d.activity||{},bad=!!s.mcp_listen_error,warn=!!s.listener_fallback,recent=a.recent_sessions||[],inFlight=a.tool_calls_in_flight||0,errors=a.tool_calls_errors||0,invalid=a.tool_calls_invalid||0; ?><span class="status-group <?= d.live!=="connected"?(d.live==="reconnecting"?"pending":"failed"):(bad?"failed":(warn?"pending":"ok")) ?>"><?= d.live!=="connected"?(d.live==="reconnecting"?"🟡 reconnecting":"🔴 offline"):(bad?"🔴 listener error":(warn?"🟡 fallback":"🟢 live")) ?></span><span class="status-group status-link" data-action=header-settings title="HTTP / HTTPS effective listener ports; GUI uses local Tauriless assets">🔌 <span class=status-ports><?= s.mcp_http_active?s.mcp_http_port:"off" ?>/<?= s.mcp_https_active?s.mcp_https_port:"off" ?></span><? if(warn){ ?> <span class=pending>⚠</span><? } ?></span><span class=status-group title="Sessions with a Tool Call in the last <?= a.active_window_minutes||10 ?> minutes">💬 <span class="status-link <?= a.active_sessions?'ok':'muted' ?>" data-action=header-sessions><?= a.active_sessions||0 ?> active</span><? if(recent.length){ ?> · <span class=status-sessions><? recent.forEach((x,i)=>{ ?><?= i?" ":"" ?><span class=status-link data-action=session-tool-calls data-id="<?= x.id ?>">#<?= x.id ?>(<?= x.tool_calls ?>)</span><? }) ?></span><? } ?></span><span class=status-group title="Tool Calls in flight / total recorded / failed / invalid">🛠️ <span class="status-link <?= inFlight?'pending':'muted' ?>" data-action=header-tool-calls data-status=running><?= inFlight ?> in flight</span> · <span class="status-link status-total" data-action=header-tool-calls data-status=""><?= a.tool_calls_total||0 ?> total</span> · <span class="status-link <?= errors?'failed':'muted' ?>" data-action=header-tool-calls data-status=failed><?= errors ?> errors</span> · <span class="status-link <?= invalid?'invalid':'muted' ?>" data-action=header-tool-calls data-status=invalid><?= invalid ?> invalid</span></span>`,
     cards: `<? const meta={sessions:["💬","Sessions"],roots:["📁","Workspaces"],tool_calls:["🛠️","Tool Calls"],tool_calls_in_flight:["🛠️","Tool Calls In Flight"],failed_calls:["⚠️","Failed Calls"],http_requests:["🌐","HTTP Requests"]}; Object.entries(it.data || {}).forEach(([key,value]) => { const item=meta[key]||["•",key]; ?><div class=card><div class=muted><?= item[0] ?> <?= item[1] ?></div><strong style="font-size:24px"><?= value ?></strong></div><? }) ?>`,
     active_tool_calls: `<? const rows=it.data||[],icons={completed:"✅",failed:"❌",invalid:"◆",killed:"❌",timed_out:"❌",running:"⏳",received:"⏳"}; ?><div class="card dashboard-call-card"><table class=dashboard-call-table><thead><tr><th>State</th><th>Tool Call</th><th>Session</th><th>Time</th></tr></thead><tbody><? if(!rows.length){ ?><tr><td colspan=4 class=muted>No active Tool Calls.</td></tr><? } else { rows.forEach(l=>{ const ms=Number(l.elapsed_ms||0),elapsed=ms<1000?ms+"ms":(ms/1000).toFixed(ms<10000?1:0)+"s"; ?><tr data-action=dashboard-tool-call data-id="<?= l.id ?>" title="Open Tool Call #<?= l.id ?>" class="<?= l.active?'':'dashboard-call-recent' ?>"<? if(!l.active){ ?> style="--dashboard-call-ttl:<?= Math.max(50,Number(l.ttl_ms||0)) ?>ms"<? } ?>><td class="<?= l.active?'pending':l.status ?> nowrap"><?= icons[l.status]||"•" ?> <?= l.active?"running":l.status ?></td><td class=dashboard-call-summary><?= l.call_summary ?><? if(l.progress_requested){ ?> <span class=progress-requested>📡 progress</span><? } ?></td><td class=idcell><?= l.context_id?"#"+l.context_id:"—" ?></td><td class=nowrap><?= elapsed ?><? if(!l.active){ ?> <span class=muted>· done</span><? } ?></td></tr><? }) } ?></tbody></table></div>`,
@@ -6791,8 +7976,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     prompts: `<? const d=it.data||{},rows=d.prompts||[]; ?><div class=muted><?= d.total||0 ?> prompt<?= d.total===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?> · config <code><?= d.config_file||'' ?></code></div><? if(!rows.length){ ?><div class=card><p class=muted>No guided prompts match the current search.</p></div><? } else { ?><table class=commands-table><tr><th>Name</th><th>Title</th><th class=command-description>Description</th><th>Arguments</th><th class=command-action-cell></th></tr><? rows.forEach(p=>{ ?><tr><td><code><?= p.name ?></code></td><td><?= p.title||'—' ?></td><td class=command-description><?= p.description||'—' ?></td><td><? if(p.arguments?.length){ p.arguments.forEach(a=>{ ?><div><code><?= a.name ?></code><? if(a.required){ ?> <b>required</b><? } ?></div><? }) } else { ?>—<? } ?></td><td class=command-action-cell><div class=command-actions><button data-action=edit-prompt data-name="<?= p.name ?>">✏️ Edit</button><button class=danger data-action=delete-prompt data-name="<?= p.name ?>">🗑️ Delete</button></div></td></tr><? }) ?></table><? } ?><div class=row><button data-action=prompts-prev<?= d.page<=1?' disabled':'' ?>>Previous</button><button data-action=prompts-next<?= d.has_more?'':' disabled' ?>>Next</button></div>`,
     oauth: `<table class=oauth-table><tr><th>Client</th><th>Sessions</th><th>Tokens</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td class=oauth-client><b><?= c.name ?></b><div class=oauth-client-id title="<?= c.client_id ?>"><code><?= c.client_id ?></code></div><div class=oauth-meta><span class=muted>Created</span> <?= it.logdt(c.created_at) ?></div></td><td class=oauth-meta><div class=oauth-count><b><?= c.session_count||0 ?></b> total</div><div><span class=muted>First</span> <?= c.first_session_at ? it.logdt(c.first_session_at) : "—" ?></div><div><span class=muted>Last</span> <?= c.last_session_at ? it.logdt(c.last_session_at) : "—" ?></div></td><td><div class=oauth-tokens><div class=oauth-token><b><?= c.token_count||0 ?></b> <span>Access</span><div class=oauth-meta><span class=muted>Issued</span> <?= c.last_token_at ? it.logdt(c.last_token_at) : "—" ?></div></div><div class=oauth-token><b><?= c.refresh_token_count||0 ?></b> <span>Refresh</span><div class=oauth-meta><span class=muted>Used</span> <?= c.last_refresh_at ? it.logdt(c.last_refresh_at) : "—" ?></div></div></div></td><td class=oauth-actions><button class=small data-action=oauth-sessions data-id="<?= c.client_id ?>">💬 View Sessions</button><button class="small danger" data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> Available Tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,
-    logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=http-session><? if(l.context_id){ ?><div class=idcell>#<?= l.context_id ?></div><? if(l.root_id&&l.root_name){ ?><div class=workspace-label>📁 <?= l.root_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><code><?= l.tool ?></code><? if(l.call_preview){ ?><div class=tool-command-preview>↳ <?= l.call_preview ?></div><? } ?><? if(l.progress_requested){ ?><div class=progress-requested>📡 Progress requested</div><? } ?></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Kill</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><? if(x.progress_requested){ ?><span class=progress-requested>📡 Progress requested</span><? } ?><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><div class=tool-detail-grid><div class=tool-detail-main><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><? if(x.resolved_json){ ?><section class=json-detail><div class=row><b class=grow>Tool Return Value JSON</b><button class=small data-action=copy-detail data-target="tool-return-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-return-<?= l.id ?>"><?= it.prettyParsed(x.resolved_json) ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>MCP Result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div><aside class=tool-descriptor><div class=row><b class=grow>Agent Tool Definition</b><? if(x.tool_descriptor){ ?><span class="descriptor-status <?= x.tool_descriptor_matches_current?'current':'outdated' ?>"><?= x.tool_descriptor_matches_current?'CURRENT':'OUTDATED' ?></span><button class=small data-action=copy-detail data-target="tool-descriptor-<?= l.id ?>">📋 Copy JSON</button><? } ?></div><? if(x.tool_descriptor){ ?><pre id="tool-descriptor-<?= l.id ?>" hidden><?= it.pretty(x.tool_descriptor) ?></pre><? if(x.tool_descriptor.title){ ?><div class=muted>Title</div><div><?= x.tool_descriptor.title ?></div><? } ?><div class=muted>Description</div><p><?= x.tool_descriptor.description||"—" ?></p><div class=muted>Input Schema</div><pre><?= it.pretty(x.tool_descriptor.inputSchema||{}) ?></pre><div class=muted>Output Schema</div><pre><?= it.pretty(x.tool_descriptor.outputSchema||{}) ?></pre><? } else { ?><p class=muted>No descriptor snapshot was recorded for this call.</p><? } ?></aside></div></div></td></tr><? } }) ?></tbody></table>`,
+    logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=http-session><? if(l.context_id){ ?><div class=idcell>#<?= l.context_id ?></div><? if(l.root_id&&l.root_name){ ?><div class=workspace-label>📁 <?= l.root_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><code><?= l.tool ?></code><? if(l.call_preview){ ?><div class=tool-command-preview>↳ <?= l.call_preview ?></div><? } ?><? if(l.progress_requested){ ?><div class=progress-requested>📡 Progress requested</div><? } ?></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Kill</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><? if(x.progress_requested){ ?><span class=progress-requested>📡 Progress requested</span><? } ?><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><div class=tool-detail-grid><div class=tool-detail-main><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><? if((x.contents||[]).length){ ?><section class=tool-content-detail><div class=row><b class=grow>🖼️ Binary / MCP Content</b><span class=muted><?= x.contents.length ?> retained item<?= x.contents.length===1?'':'s' ?></span></div><div class=tool-content-grid><? x.contents.forEach(c=>{ ?><article class=tool-content-card><div class=row><b class=grow><?= c.direction==='input'?'→ Input':'← Output' ?></b><span class=muted><?= it.bytes(c.bytes) ?></span></div><div><code><?= c.mime_type ?></code></div><div class=tool-content-path><?= c.content_type ?> · <?= c.json_path ?></div><? if(c.data_url){ ?><img class=tool-content-preview src="<?= c.data_url ?>" alt="<?= c.direction ?> <?= c.mime_type ?> preview"><? } else { ?><div class=tool-content-placeholder>Binary resource retained · no inline preview for this MIME type</div><? } ?></article><? }) ?></div></section><? } ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>" class=json-editor-source hidden><?= it.prettyParsed(x.input_json) ?></pre><div class=json-editor-host data-json-source="tool-input-<?= l.id ?>"></div></section><? if(x.resolved_json){ ?><section class=json-detail><div class=row><b class=grow>Tool Return Value JSON</b><button class=small data-action=copy-detail data-target="tool-return-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-return-<?= l.id ?>" class=json-editor-source hidden><?= it.prettyParsed(x.resolved_json) ?></pre><div class=json-editor-host data-json-source="tool-return-<?= l.id ?>"></div></section><? } ?><section class=json-detail><div class=row><b class=grow>MCP Result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>" class=json-editor-source hidden><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre><div class=json-editor-host data-json-source="tool-output-<?= l.id ?>"></div></section><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div><aside class=tool-descriptor><div class=row><b class=grow>Agent Tool Definition</b><? if(x.tool_descriptor){ ?><span class="descriptor-status <?= x.tool_descriptor_matches_current?'current':'outdated' ?>"><?= x.tool_descriptor_matches_current?'CURRENT':'OUTDATED' ?></span><button class=small data-action=copy-detail data-target="tool-descriptor-<?= l.id ?>">📋 Copy JSON</button><? } ?></div><? if(x.tool_descriptor){ ?><pre id="tool-descriptor-<?= l.id ?>" hidden><?= it.pretty(x.tool_descriptor) ?></pre><? if(x.tool_descriptor.title){ ?><div class=muted>Title</div><div><?= x.tool_descriptor.title ?></div><? } ?><div class=muted>Description</div><p><?= x.tool_descriptor.description||"—" ?></p><div class=muted>Input Schema</div><pre id="tool-descriptor-input-<?= l.id ?>" class=json-editor-source hidden><?= it.pretty(x.tool_descriptor.inputSchema||{}) ?></pre><div class="json-editor-host compact" data-json-source="tool-descriptor-input-<?= l.id ?>"></div><div class=muted>Output Schema</div><pre id="tool-descriptor-output-<?= l.id ?>" class=json-editor-source hidden><?= it.pretty(x.tool_descriptor.outputSchema||{}) ?></pre><div class="json-editor-host compact" data-json-source="tool-descriptor-output-<?= l.id ?>"></div><? } else { ?><p class=muted>No descriptor snapshot was recorded for this call.</p><? } ?></aside></div></div></td></tr><? } }) ?></tbody></table>`,
     published: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class=row><select id=publishedContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=publishedSize><option value="">All sizes</option><option value=small<?= d.size==='small'?' selected':'' ?>>&lt; 1 MB</option><option value=medium<?= d.size==='medium'?' selected':'' ?>>1–10 MB</option><option value=large<?= d.size==='large'?' selected':'' ?>>10–100 MB</option><option value=huge<?= d.size==='huge'?' selected':'' ?>>≥ 100 MB</option></select><button data-action=clear-published-filters>🧹 Clear Filters</button></div><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> publication<?= d.total===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Published Pages"><button class=page-button data-action=published-page data-published-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=published-page data-published-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=published-page data-published-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No published items match the current filters.</p></div><? } else { ?><table class=published-table><thead><tr><th>Created</th><th>Resource</th><th>Published By</th><th>Published File</th><th>Activity</th><th>Source</th><th></th></tr></thead><tbody><? rows.forEach(r=>{ ?><tr><td class=nowrap><?= it.logdt(r.created_at) ?></td><td class=published-id><div class=nowrap>📦 <?= r.mime_type||'content' ?></div><code title="<?= r.id ?>"><?= r.id ?></code><? if(r.content_key){ ?><div class=published-file-meta title="<?= r.content_key ?>">key <?= r.content_key ?></div><? } ?></td><td class=http-session><? const refs=r.references||[]; if(refs.length){ refs.forEach(u=>{ ?><div class=published-reference><span class=idcell>#<?= u.context_id ?></span><? if(u.root_name){ ?> <span class=workspace-label title="<?= u.root_name ?>">📁 <?= u.root_name ?></span><? } ?></div><? }); } else { ?>—<? } ?></td><td><button class=published-open data-action=open-published data-id="<?= r.id ?>" title="<?= r.published_name ?> · Open public URL in browser"><code><?= r.published_name ?></code></button><? if(r.title){ ?><div class=published-file-meta><?= r.title ?></div><? } ?><? if(r.filename&&r.filename!==r.source_filename){ ?><div class=published-file-meta>Presented as: <?= r.filename ?></div><? } ?><? if(r.presentation&&r.presentation!=='auto'){ ?><div class=published-file-meta><?= r.presentation ?></div><? } ?></td><td class=published-activity><b><?= r.request_count||0 ?> req</b><div class=published-file-meta><?= it.bytes(r.size) ?></div><? if(r.last_request_at){ ?><div class=published-file-meta>last <?= it.logdt(r.last_request_at) ?></div><? } ?></td><td class=published-source><? const latest=(r.references||[])[0]; if(latest?.source_path){ ?><code title="<?= latest.source_path ?>"><?= latest.source_path ?></code><? } else if(r.source_path){ ?><code title="<?= r.source_path ?>"><?= r.source_path ?></code><? } else { ?><span class=muted>Direct content</span><? } ?><? if((r.reference_count||0)>1){ ?><div class=published-file-meta><?= r.reference_count ?> references</div><? } ?></td><td class=nowrap><button class="small danger" data-action=delete-published data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></tbody></table><? } ?>`,
+    memory: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> memor<?= d.total===1?'y':'ies' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Memory Pages"><button class=page-button data-action=memory-page data-memory-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=memory-page data-memory-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=memory-page data-memory-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No memories match the current filters.</p></div><? } else { ?><table><thead><tr><th>Set</th><th>Scope</th><th>Key</th><th>Value</th><th>TTL</th><th></th></tr></thead><tbody><? rows.forEach(r=>{ ?><tr><td class=nowrap><?= it.logdt(r.set_at) ?></td><td><? if(r.scope==='session'){ ?><span class=idcell>💬 #<?= r.owner_id ?></span><? } else { ?><span class=workspace-label>📁 <?= r.owner_name ?></span><? } ?></td><td><code><?= r.key ?></code></td><td><span class="descriptor-status <?= Number(r.is_json)?'current':'outdated' ?>"><?= Number(r.is_json)?'JSON':'TEXT' ?></span> <code title="Open View / Edit to inspect the complete value"><?= r.value_preview ?><?= String(r.value_json||'').length>320?'…':'' ?></code></td><td class=nowrap><? if(r.expires_at){ ?><?= r.ttl_seconds ?>s<div class=muted>until <?= it.logdt(r.expires_at) ?></div><? } else { ?><span class=muted>permanent</span><? } ?></td><td class=nowrap><button class=small data-action=edit-memory data-id="<?= r.id ?>">✏️ View / Edit</button> <button class="small danger" data-action=delete-memory data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></tbody></table><? } ?>`,
     debug: `<? const d=it.data||{},rows=d.rows||[]; ?><p class="<?= d.enabled?'ok':'failed' ?>"><b><?= d.enabled?'● Recording enabled':'● Recording disabled' ?></b><? if(!d.enabled){ ?> · showing stored requests<? } ?></p><? if(!rows.length){ ?><p class=muted>No stored HTTP debug requests match the current filters.</p><? } else { ?><table><tr><th>ID</th><th>Time</th><th>Session</th><th>Client</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>IP</th><th>Error</th></tr><? rows.forEach(r => { ?><tr data-action=select-debug data-id="<?= r.id ?>" title="Click to expand"><td class=idcell>#<?= r.id ?></td><td class=nowrap><?= it.logdt(r.ts) ?></td><td class=http-session><? if(r.context_id){ ?><div class=idcell>#<?= r.context_id ?></div><? if(r.workspace_name){ ?><div class=workspace-label>📁 <?= r.workspace_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><? if(r.client_id){ ?><code><?= r.client_id ?></code><? } else { ?>—<? } ?></td><td><b><?= r.method ?></b></td><td><code><?= r.path ?></code></td><td class="<?= !r.status?'pending':(r.status>=400?'failed':'ok') ?>"><?= r.status||"…" ?></td><td><?= r.status ? r.duration_ms+"ms" : "in flight" ?></td><td class=nowrap><?= r.remote_addr||"—" ?><? if(r.remote_addr){ ?> (<?= r.remote_count||1 ?>)<? } ?></td><td><?= r.error_preview ?></td></tr><? if(String(d.openRowId||"")===String(r.id)&&d.openDetail){ const x=d.openDetail; ?><tr class=detail-row data-detail-kind=http data-detail-id="<?= r.id ?>"><td colspan=10><div class="detail-panel http-detail-panel"><div class="row http-detail-head"><div class=grow><b>HTTP Request #<?= r.id ?></b><div class=http-detail-meta><span><?= it.logdt(x.ts) ?></span><span><? if(x.context_id){ ?>Session #<?= x.context_id ?><? } else { ?>No Session<? } ?></span><? if(x.workspace_name){ ?><span>📁 <?= x.workspace_name ?></span><? } ?><span><? if(x.client_id){ ?>Client <code><?= x.client_id ?></code><? } else { ?>No client id<? } ?></span><span><?= x.remote_addr||"unknown IP" ?><? if(x.remote_addr){ ?> · <?= x.remote_count||1 ?> total request<?= Number(x.remote_count||1)===1?'':'s' ?><? } ?></span><span><?= x.status ? x.duration_ms+"ms" : "in flight" ?></span></div></div><button class=small data-action=copy-detail data-target="http-json-<?= r.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=http>✕ Close</button></div><div class=http-detail-grid><section class=http-detail-block><div class=row><h4 class=grow>→ Request</h4><b><?= x.method ?></b> <code><?= x.path ?></code></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.request_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.request_body||{}) ?></pre></section><section class=http-detail-block><div class=row><h4 class=grow>← Response</h4><b class="<?= !x.status?'pending':(x.status>=400?'failed':'ok') ?>"><?= x.status||"in flight" ?></b></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.response_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.response_body||{}) ?></pre></section></div><? if(x.error){ ?><section class="http-detail-block http-detail-error"><h4 class=failed>Error</h4><pre><?= x.error ?></pre></section><? } ?><details class=http-detail-raw><summary>Raw record</summary><pre id="http-json-<?= r.id ?>"><?= it.pretty(x) ?></pre></details></div></td></tr><? } }) ?></table><? } ?>`,
   } : {};
   const fragmentBytes = value => {
@@ -6946,6 +8132,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     catch { warnings.acme_directory_url = "ACME directory must be a valid HTTPS URL."; }
     const email = String(settings.tls_email || "").trim();
     if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) warnings.tls_email = "Let's Encrypt email is not valid.";
+    const telegramToken = String(settings.telegram_bot_token || "").trim();
+    if (telegramToken && (telegramToken.length > 512 || /\s/.test(telegramToken))) warnings.telegram_bot_token = "Telegram Bot token must not contain whitespace and must be at most 512 characters.";
     return warnings;
   }
   function uiSettingsProjection(settings) {
@@ -6966,7 +8154,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     viewState.maintenance = projection.maintenance;
     viewState.contextValues = projection.context_values || [];
     viewState.debug.enabled = !!projection.settings.debug_http_log;
-    const model = { section, projection, viewState, commandData: null, promptData: null, logData: null, publishedData: null, debugData: null };
+    const model = { section, projection, viewState, commandData: null, promptData: null, logData: null, publishedData: null, memoryData: null, debugData: null };
     if (section === "prompt_help") viewState.promptHelp = { yaml: GUIDED_PROMPTS_HELP_YAML, model: GUIDED_PROMPTS_HELP_MODEL };
     if (section === "roots") {
       const rows = projection.root_assignments?.roots || [];
@@ -7017,6 +8205,11 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       model.publishedData = publishedAdminProjection(serverConfig().id, current);
       current.page = model.publishedData.page;
       viewState.published.page = current.page;
+    } else if (section === "memory") {
+      const current = uiState.memory;
+      model.memoryData = memoryAdminProjection(current);
+      current.page = model.memoryData.page;
+      viewState.memory = { ...current, sessions: model.memoryData.sessions, workspaces: model.memoryData.workspaces };
     } else if (section === "debug") {
       const current = uiState.debug;
       const query = new URLSearchParams({ q: current.query, method: current.method, status: current.status });
@@ -7068,6 +8261,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       view = fillUiMount(view, "logList", await renderEtaFragment("logs", model.logData || {}, generation));
     } else if (section === "published") {
       view = fillUiMount(view, "publishedList", await renderEtaFragment("published", model.publishedData || {}, generation));
+    } else if (section === "memory") {
+      view = fillUiMount(view, "memoryList", await renderEtaFragment("memory", model.memoryData || {}, generation));
     } else if (section === "debug") {
       view = fillUiMount(view, "debugList", await renderEtaFragment("debug", model.debugData || {}, generation));
     } else if (section === "oauth") {
@@ -7117,6 +8312,12 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     else if (id === "logQuery") uiState.logs.query = text;
     else if (id === "publishedContext") uiState.published.context = text;
     else if (id === "publishedSize") uiState.published.size = text;
+    else if (id === "memoryQuery") uiState.memory.query = text;
+    else if (id === "memoryScope") uiState.memory.scope = text;
+    else if (id === "memoryContext") uiState.memory.context = text;
+    else if (id === "memoryWorkspace") uiState.memory.workspace = text;
+    else if (id === "memoryFrom") uiState.memory.from = text;
+    else if (id === "memoryTo") uiState.memory.to = text;
     else if (id === "debugQuery") uiState.debug.query = text;
     else if (id === "commandQuery") uiState.commands.query = text;
     else if (id === "promptQuery") uiState.prompts.query = text;
@@ -7135,10 +8336,14 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         parguments: "arguments_text", ptemplate: "template",
       };
       if (map[id]) uiState.dialog.data[map[id]] = text;
+    } else if (uiState.dialog?.kind === "memory") {
+      const map = { mid: "id", mkey: "key", mvalue: "value_text", mttl: "ttl_seconds" };
+      if (map[id]) uiState.dialog.data[map[id]] = text;
+      if (id === "mjson") uiState.dialog.data.json = !!checked;
     }
     const settingsMap = {
       externalUrl: "external_url", tlsEmail: "tls_email", publicIpUrls: "public_ip_urls",
-      sslipSuffix: "sslip_suffix", acmeDirectoryUrl: "acme_directory_url",
+      sslipSuffix: "sslip_suffix", acmeDirectoryUrl: "acme_directory_url", telegramBotToken: "telegram_bot_token",
       notifySession: "desktop_notifications_session", notifyWorkspace: "desktop_notifications_workspace",
       notifyToolCall: "desktop_notifications_tool_call", inheritSystemPath: "inherit_system_path",
     };
@@ -7193,6 +8398,12 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         if (!await cleanupPublished(String(data.id || ""), true)) throw new Error("Published item not found");
         uiNotice("Published item deleted.", "ok");
         break;
+      case "delete-memory": {
+        const result = run("DELETE FROM memories WHERE id=?", Number(data.id));
+        if (!Number(result.changes || 0)) throw new Error("Memory not found");
+        uiNotice("Memory deleted.", "ok");
+        break;
+      }
       case "clear-published":
         uiStartMaintenance(clearPublished(data.filters || {}), "Clear Published");
         break;
@@ -7426,6 +8637,28 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       case "published-page":
         uiState.published.page = Math.max(1, Number(data.publishedPage) || 1);
         break;
+      case "edit-memory": {
+        memoryPurgeExpired();
+        const row = one("SELECT * FROM memories WHERE id=?", Number(data.id));
+        if (!row) throw new Error("Memory not found");
+        uiState.dialog = { kind: "memory", data: {
+          ...row, json: Number(row.is_json ?? 1) === 1,
+          value_text: Number(row.is_json ?? 1) === 1 ? JSON.stringify(parseJson(row.value_json, null), null, 2) : String(row.value_json || ""), form_warning: "",
+        } };
+        break;
+      }
+      case "delete-memory":
+        uiConfirm("Delete Memory", "Delete this persistent memory entry?", "delete-memory", { id: data.id });
+        return;
+      case "load-memory":
+        uiState.memory.page = 1;
+        break;
+      case "clear-memory-filters":
+        Object.assign(uiState.memory, { page: 1, query: "", scope: "", context: "", workspace: "", from: "", to: "" });
+        break;
+      case "memory-page":
+        uiState.memory.page = Math.max(1, Number(data.memoryPage) || 1);
+        break;
       case "self-test":
         uiState.currentSection = "logs";
         uiState.logs.selfTest = await uiInternalApi("/api/mcp/self-test");
@@ -7511,6 +8744,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           desktop_notifications_workspace: !!values.notifyWorkspace,
           desktop_notifications_tool_call: !!values.notifyToolCall,
           inherit_system_path: !!values.inheritSystemPath,
+          telegram_bot_token: String(values.telegramBotToken || "").trim(),
         };
         const warnings = settingsFieldWarnings(body);
         if (Object.values(warnings).some(Boolean)) {
@@ -7656,6 +8890,15 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           else if (id === "logPageSize") { uiState.logs.pageSize = Number(event.value) || 25; uiState.logs.page = 1; }
           else if (id === "publishedContext") { uiState.published.context = String(event.value || ""); uiState.published.page = 1; }
           else if (id === "publishedSize") { uiState.published.size = String(event.value || ""); uiState.published.page = 1; }
+          else if (id === "memoryScope") {
+            uiState.memory.scope = String(event.value || ""); uiState.memory.page = 1;
+            if (uiState.memory.scope === "session") uiState.memory.workspace = "";
+            else if (uiState.memory.scope === "workspace") uiState.memory.context = "";
+          }
+          else if (id === "memoryContext") { uiState.memory.context = String(event.value || ""); uiState.memory.workspace = ""; uiState.memory.scope = uiState.memory.context ? "session" : uiState.memory.scope; uiState.memory.page = 1; }
+          else if (id === "memoryWorkspace") { uiState.memory.workspace = String(event.value || ""); uiState.memory.context = ""; uiState.memory.scope = uiState.memory.workspace ? "workspace" : uiState.memory.scope; uiState.memory.page = 1; }
+          else if (id === "memoryFrom") { uiState.memory.from = String(event.value || ""); uiState.memory.page = 1; }
+          else if (id === "memoryTo") { uiState.memory.to = String(event.value || ""); uiState.memory.page = 1; }
           else if (id === "debugMethod") uiState.debug.method = String(event.value || "");
           else if (id === "debugStatus") uiState.debug.status = String(event.value || "");
           else if (id === "commandPageSize") { uiState.commands.pageSize = Number(event.value) || 5; uiState.commands.page = 1; }
@@ -7672,6 +8915,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
             uiLogFilterTimer = null;
           } else if (event.id === "commandQuery") uiState.commands.page = 1;
           else if (event.id === "promptQuery") uiState.prompts.page = 1;
+          else if (event.id === "memoryQuery") uiState.memory.page = 1;
           queueUiRender(`enter:${event.id}`);
           return;
         case "submit": {
@@ -7751,6 +8995,32 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
               queueUiRender("submit:promptForm-warning", 0);
               return;
             }
+          } else if (event.formId === "memoryForm") {
+            const d = uiState.dialog?.kind === "memory" ? uiState.dialog.data : null;
+            if (!d) return;
+            d.form_warning = "";
+            try {
+              const row = one("SELECT * FROM memories WHERE id=?", Number(values.mid));
+              if (!row) throw new Error("Memory not found");
+              const key = String(values.mkey || "").trim();
+              const value = String(values.mvalue ?? "");
+              const isJson = !!values.mjson;
+              const ttlSeconds = Number(values.mttl || 0);
+              memorySetValue(serverConfig(), null, {
+                scope: row.scope, key, value, json: isJson, ttl_seconds: ttlSeconds,
+              }, { owner: {
+                scope: String(row.scope), owner_id: Number(row.owner_id), owner_name: String(row.owner_name),
+                workspace: row.scope === "workspace" ? String(row.owner_name) : null,
+                session_id: row.scope === "session" ? Number(row.owner_id) : null,
+              }, replace_id: Number(row.id) });
+              uiState.dialog = null;
+              uiState.memory.page = 1;
+              uiNotice(`Memory ${key} saved.`, "ok");
+            } catch (error) {
+              d.form_warning = String(error?.message || error);
+              queueUiRender("submit:memoryForm-warning", 0);
+              return;
+            }
           }
           queueUiRender(`submit:${event.formId}`);
           return;
@@ -7807,7 +9077,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         if (external.protocol !== "https:" || (external.port && external.port !== "443"))
           return json({ error: "Public base URL must use HTTPS on port 443" }, 400);
       }
-      for (const key of ["external_url", "tls_email", "sslip_suffix", "acme_directory_url"])
+      for (const key of ["external_url", "tls_email", "sslip_suffix", "acme_directory_url", "telegram_bot_token"])
         if (x[key] != null) setCfg(key, x[key]);
       for (const key of ["desktop_notifications_session", "desktop_notifications_workspace", "desktop_notifications_tool_call"])
         if (x[key] != null) setCfg(key, x[key] ? "1" : "0");
@@ -8195,6 +9465,11 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       }
       const transport = one("SELECT progress_requested FROM tool_call_transport WHERE log_id=?", logId);
       detail.progress_requested = !!transport?.progress_requested;
+      detail.contents = all("SELECT id,direction,json_path,content_type,mime_type,bytes,data FROM tool_call_content WHERE log_id=? ORDER BY direction,id", logId).map(row => ({
+        id: Number(row.id), direction: row.direction, json_path: row.json_path, content_type: row.content_type,
+        mime_type: row.mime_type, bytes: Number(row.bytes || 0),
+        data_url: String(row.mime_type || "").startsWith("image/") ? `data:${row.mime_type};base64,${Buffer.from(row.data).toString("base64")}` : "",
+      }));
       if (process) detail.process = processAdminView(process);
       return json(detail);
     }
@@ -8234,11 +9509,19 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   const GUI_MORPHLEX_JS = GUI_RUNTIME
     ? Deno.readTextFileSync(join(ASSETS_DIR, "morphlex.js")).replace(/\nexport \{\n  morphInner,\n  morphDocument,\n  morph\n\};[\s\S]*$/, "")
     : "";
+  const GUI_JSONEDITOR_JS = GUI_RUNTIME ? Deno.readTextFileSync(join(ASSETS_DIR, "jsoneditor", "jsoneditor.min.js")) : "";
+  const GUI_JSONEDITOR_ICON_DATA_URL = GUI_RUNTIME
+    ? `data:image/svg+xml;base64,${Buffer.from(Deno.readFileSync(join(ASSETS_DIR, "jsoneditor", "img", "jsoneditor-icons.svg"))).toString("base64")}`
+    : "";
+  const GUI_JSONEDITOR_CSS = GUI_RUNTIME
+    ? Deno.readTextFileSync(join(ASSETS_DIR, "jsoneditor", "jsoneditor.min.css")).replaceAll("./img/jsoneditor-icons.svg", GUI_JSONEDITOR_ICON_DATA_URL)
+    : "";
   const UI_CSP = `default-src 'self';base-uri 'none';object-src 'none';frame-ancestors 'none';form-action 'self';style-src 'unsafe-inline';script-src 'self' 'nonce-${UI_SCRIPT_NONCE}';connect-src 'self' ipc: http://ipc.localhost;img-src 'self' data:`;
   const UI_TEMPLATE = GUI_RUNTIME ? String.raw`<!doctype html><html><head><meta charset=utf-8>
 <meta http-equiv="Content-Security-Policy" content="${UI_CSP}">
-<meta name=viewport content="width=device-width,initial-scale=1"><link rel=icon href="${GUI_LOGO_DATA_URL}"><title>MrMCP</title><style>
-:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}#app>aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}#app>aside button{display:block;width:100%;text-align:left;white-space:nowrap;margin:3px 0;padding-left:6px;padding-right:6px;background:transparent;border:0}#app>aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.notice-balloon{position:fixed;top:64px;right:16px;z-index:1900;max-width:min(520px,calc(100vw - 32px));padding:10px 12px;border:1px solid #7d3f47;border-radius:9px;background:#25191b;color:#ffb7bf;box-shadow:0 8px 28px #0008}.notice-balloon.info{border-color:#365a7d;background:#16202b;color:#a9d5ff}.notice-balloon.ok{border-color:#356849;background:#16241b;color:#9ce8b1}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.debug-toggle{font-weight:750;min-width:190px}.debug-toggle.enabled{background:#173f24;border-color:#347a49;color:#9ce8b1}.debug-toggle.disabled{background:#421d21;border-color:#7d3f47;color:#ffb7bf}.debug-toggle.enabled:hover{background:#20512f}.debug-toggle.disabled:hover{background:#53262b}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.settings-layout{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(300px,.75fr);gap:14px;align-items:start}.settings-main,.settings-side{min-width:0}.settings-side{position:sticky;top:70px}.settings-layout .card h3{margin-top:0}.settings-main input:not([type=checkbox]){width:100%}.settings-main textarea{min-height:96px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 18px 14px 28px;background:#111318}.detail-panel{border:1px solid #343944;border-left:3px solid #3984e8;border-radius:8px;background:#0d0f12;padding:14px 16px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.tool-detail-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:14px;align-items:start}.tool-detail-main{min-width:0}.tool-descriptor{min-width:0;position:sticky;top:10px;border:1px solid #343944;border-radius:8px;background:#111318;padding:12px}.tool-descriptor>.muted{margin-top:10px}.tool-descriptor p{margin:5px 0 10px;line-height:1.45}.tool-descriptor pre{margin:5px 0 10px;max-height:28vh}.descriptor-status{font-size:11px;font-weight:800;letter-spacing:.04em;padding:3px 6px;border-radius:5px}.descriptor-status.current{color:#75d58b;background:#16341f}.descriptor-status.outdated{color:#ffd166;background:#3a2f13}.http-detail-head{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #292d34}.http-detail-meta{display:flex;gap:7px 16px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:#89909b}.http-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.http-detail-block{min-width:0;border:1px solid #292d34;border-radius:8px;background:#0a0c0f;padding:10px}.http-detail-block h4{margin:0}.http-detail-block pre{max-height:30vh}.http-detail-error{margin-top:12px;border-color:#68353a;background:#1d1012}.http-detail-raw{margin-top:12px}.http-detail-raw summary{cursor:pointer;color:#89909b}@media(max-width:1100px){.tool-detail-grid,.http-detail-grid{grid-template-columns:1fr}.tool-descriptor{position:static}}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.tool-command-preview{margin-top:3px;max-width:440px;color:#c5cad3;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.http-session{white-space:nowrap}.workspace-label{margin-top:3px;color:#89909b;font-size:12px;font-weight:600}.menu-icon{display:inline-block;width:22px;text-align:center}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-call-card{padding:0;overflow:hidden;min-height:210px}.dashboard-call-table{margin:0;background:transparent}.dashboard-call-table thead{position:sticky;top:0;z-index:1;background:#181a1f}.dashboard-call-table tr{height:35px}.dashboard-call-table th,.dashboard-call-table td{padding:7px 9px}.dashboard-call-table tr[data-action=dashboard-tool-call]{cursor:pointer}.dashboard-call-table tr[data-action=dashboard-tool-call]:hover{background:#20242a}.dashboard-call-summary{max-width:720px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dashboard-call-recent{animation:dashboardCallFade var(--dashboard-call-ttl,5s) linear forwards}@keyframes dashboardCallFade{from{opacity:1}to{opacity:.18}}.progress-requested{color:#8fd3ff;white-space:nowrap}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}#publishedList{overflow-x:auto}.published-table{table-layout:fixed;min-width:850px}.published-table th:nth-child(1){width:130px}.published-table th:nth-child(2){width:165px}.published-table th:nth-child(3){width:135px}.published-table th:nth-child(4){width:185px}.published-table th:nth-child(5){width:105px}.published-table th:nth-child(7){width:80px}.published-id{min-width:0}.published-id code,.published-id .published-file-meta{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-reference{display:inline-flex;align-items:center;gap:4px;max-width:100%;margin:0 6px 4px 0}.published-reference .workspace-label{max-width:105px;margin-top:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-open{display:block;width:100%;max-width:100%;padding:0;border:0;background:transparent;text-align:left;color:#9ecbff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-open code{white-space:nowrap}.published-open:hover{background:transparent;text-decoration:underline}.published-file-meta{margin-top:3px;color:#89909b;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-activity{white-space:nowrap}.published-source{min-width:0}.published-source code{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout,.settings-layout{grid-template-columns:1fr}.default-root-card,.settings-side{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){#app>aside{width:130px}main{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
+<meta name=viewport content="width=device-width,initial-scale=1"><link rel=icon href="${GUI_LOGO_DATA_URL}"><title>MrMCP</title><style>${GUI_JSONEDITOR_CSS}
+
+:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}#app>aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}#app>aside button{display:block;width:100%;text-align:left;white-space:nowrap;margin:3px 0;padding-left:6px;padding-right:6px;background:transparent;border:0}#app>aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.notice-balloon{position:fixed;top:64px;right:16px;z-index:1900;max-width:min(520px,calc(100vw - 32px));padding:10px 12px;border:1px solid #7d3f47;border-radius:9px;background:#25191b;color:#ffb7bf;box-shadow:0 8px 28px #0008}.notice-balloon.info{border-color:#365a7d;background:#16202b;color:#a9d5ff}.notice-balloon.ok{border-color:#356849;background:#16241b;color:#9ce8b1}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.debug-toggle{font-weight:750;min-width:190px}.debug-toggle.enabled{background:#173f24;border-color:#347a49;color:#9ce8b1}.debug-toggle.disabled{background:#421d21;border-color:#7d3f47;color:#ffb7bf}.debug-toggle.enabled:hover{background:#20512f}.debug-toggle.disabled:hover{background:#53262b}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.settings-layout{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(300px,.75fr);gap:14px;align-items:start}.settings-main,.settings-side{min-width:0}.settings-side{position:sticky;top:70px}.settings-layout .card h3{margin-top:0}.settings-main input:not([type=checkbox]){width:100%}.settings-main textarea{min-height:96px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 18px 14px 28px;background:#111318}.detail-panel{border:1px solid #343944;border-left:3px solid #3984e8;border-radius:8px;background:#0d0f12;padding:14px 16px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.tool-detail-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:14px;align-items:start}.tool-detail-main{min-width:0}.tool-descriptor{min-width:0;position:sticky;top:10px;border:1px solid #343944;border-radius:8px;background:#111318;padding:12px}.tool-descriptor>.muted{margin-top:10px}.tool-descriptor p{margin:5px 0 10px;line-height:1.45}.tool-descriptor pre{margin:5px 0 10px;max-height:28vh}.descriptor-status{font-size:11px;font-weight:800;letter-spacing:.04em;padding:3px 6px;border-radius:5px}.descriptor-status.current{color:#75d58b;background:#16341f}.descriptor-status.outdated{color:#ffd166;background:#3a2f13}.http-detail-head{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #292d34}.http-detail-meta{display:flex;gap:7px 16px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:#89909b}.http-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.http-detail-block{min-width:0;border:1px solid #292d34;border-radius:8px;background:#0a0c0f;padding:10px}.http-detail-block h4{margin:0}.http-detail-block pre{max-height:30vh}.http-detail-error{margin-top:12px;border-color:#68353a;background:#1d1012}.http-detail-raw{margin-top:12px}.http-detail-raw summary{cursor:pointer;color:#89909b}@media(max-width:1100px){.tool-detail-grid,.http-detail-grid{grid-template-columns:1fr}.tool-descriptor{position:static}}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.tool-command-preview{margin-top:3px;max-width:440px;color:#c5cad3;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.tool-content-detail{margin-top:12px;padding:12px;border:1px solid #343944;border-radius:8px;background:#0a0c0f}.tool-content-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:9px;margin-top:9px}.tool-content-card{position:relative;min-width:0;padding:9px;border:1px solid #292d34;border-radius:7px;background:#111318}.tool-content-path{margin-top:4px;color:#89909b;font:11px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.tool-content-preview{display:block;max-width:180px;max-height:120px;margin-top:8px;border-radius:5px;object-fit:contain;background:#07080a;transition:transform .12s ease;transform-origin:left top;position:relative;z-index:1}.tool-content-preview:hover{transform:scale(1.75);z-index:20;box-shadow:0 8px 30px #000c}.tool-content-placeholder{margin-top:8px;padding:10px;border-radius:5px;background:#090a0c;color:#89909b;font-size:12px}.json-editor-host{height:320px;min-height:180px;margin-top:8px;border-radius:8px;overflow:hidden}.json-editor-host.compact{height:240px;min-height:150px;margin:5px 0 10px}.json-editor-host.memory{height:min(58vh,620px);min-height:320px}.json-editor-host .jsoneditor{border-color:#343944;background:#090a0c}.json-editor-host div.jsoneditor-tree{background:#090a0c;color:#e8e8e8}.json-editor-host div.jsoneditor-field,.json-editor-host div.jsoneditor-value{color:#e8e8e8}.json-editor-host div.jsoneditor-readonly{color:#89909b}.json-editor-host div.jsoneditor-value.jsoneditor-string{color:#9ce8b1}.json-editor-host div.jsoneditor-value.jsoneditor-number{color:#ffd166}.json-editor-host div.jsoneditor-value.jsoneditor-boolean{color:#c7a0ff}.json-editor-host div.jsoneditor-value.jsoneditor-null{color:#8fd3ff}.json-editor-host .jsoneditor-navigation-bar{background:#111318;color:#89909b;border-color:#292d34}.json-editor-host .jsoneditor-frame{background:#111318;border-color:#343944}.json-editor-host .jsoneditor-search input{color:#eee;background:#22252b}.json-editor-host tr.jsoneditor-highlight,.json-editor-host tr.jsoneditor-selected{background:#252a33}.json-editor-host .jsoneditor-menu{background:#2459a8;border-color:#2459a8}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.http-session{white-space:nowrap}.workspace-label{margin-top:3px;color:#89909b;font-size:12px;font-weight:600}.menu-icon{display:inline-block;width:22px;text-align:center}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-call-card{padding:0;overflow:hidden;min-height:210px}.dashboard-call-table{margin:0;background:transparent}.dashboard-call-table thead{position:sticky;top:0;z-index:1;background:#181a1f}.dashboard-call-table tr{height:35px}.dashboard-call-table th,.dashboard-call-table td{padding:7px 9px}.dashboard-call-table tr[data-action=dashboard-tool-call]{cursor:pointer}.dashboard-call-table tr[data-action=dashboard-tool-call]:hover{background:#20242a}.dashboard-call-summary{max-width:720px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dashboard-call-recent{animation:dashboardCallFade var(--dashboard-call-ttl,5s) linear forwards}@keyframes dashboardCallFade{from{opacity:1}to{opacity:.18}}.progress-requested{color:#8fd3ff;white-space:nowrap}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}#publishedList{overflow-x:auto}.published-table{table-layout:fixed;min-width:850px}.published-table th:nth-child(1){width:130px}.published-table th:nth-child(2){width:165px}.published-table th:nth-child(3){width:135px}.published-table th:nth-child(4){width:185px}.published-table th:nth-child(5){width:105px}.published-table th:nth-child(7){width:80px}.published-id{min-width:0}.published-id code,.published-id .published-file-meta{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-reference{display:inline-flex;align-items:center;gap:4px;max-width:100%;margin:0 6px 4px 0}.published-reference .workspace-label{max-width:105px;margin-top:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-open{display:block;width:100%;max-width:100%;padding:0;border:0;background:transparent;text-align:left;color:#9ecbff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-open code{white-space:nowrap}.published-open:hover{background:transparent;text-decoration:underline}.published-file-meta{margin-top:3px;color:#89909b;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-activity{white-space:nowrap}.published-source{min-width:0}.published-source code{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout,.settings-layout{grid-template-columns:1fr}.default-root-card,.settings-side{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){#app>aside{width:130px}main{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
 </style></head><body>
 <div id=app data-section=dashboard><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div><div class=status><span class=pending>starting…</span></div></header><main style="margin-left:0"><div class=card>Starting the local MrMCP UI…</div></main></div>
 <script nonce="${UI_SCRIPT_NONCE}">__MRMCP_BROWSER_JS__</script></body></html>` : "";
@@ -8332,8 +9615,62 @@ async function copyText(value) {
   }
 }
 const MORPH_OPTIONS = { preserveChanges: true };
+const jsonEditors = [];
+function destroyJsonEditors() {
+  while (jsonEditors.length) {
+    const entry = jsonEditors.pop();
+    try { entry.editor.destroy(); } catch {}
+  }
+}
+function jsonSourceText(source) {
+  return source instanceof HTMLTextAreaElement || source instanceof HTMLInputElement ? source.value : source.textContent || "";
+}
+function enhanceJsonEditors() {
+  if (typeof globalThis.JSONEditor !== "function") return;
+  for (const host of app.querySelectorAll("[data-json-source]")) {
+    const source = document.getElementById(String(host.dataset.jsonSource || ""));
+    if (!source) continue;
+    const errorNode = host.dataset.jsonError ? document.getElementById(host.dataset.jsonError) : null;
+    let value;
+    try {
+      value = JSON.parse(jsonSourceText(source));
+      source.hidden = true;
+      host.hidden = false;
+      if (errorNode) { errorNode.hidden = true; errorNode.textContent = ""; }
+    } catch (error) {
+      source.hidden = false;
+      host.hidden = true;
+      if (errorNode) { errorNode.hidden = false; errorNode.textContent = `Invalid JSON: ${String(error?.message || error)}`; }
+      continue;
+    }
+    const editable = host.dataset.jsonEdit === "memory";
+    let editor;
+    const options = editable ? {
+      mode: "tree", modes: ["tree"], mainMenuBar: true, navigationBar: true, statusBar: false,
+      search: true, history: true,
+      onChange: () => {
+        try {
+          const text = JSON.stringify(editor.get(), null, 2);
+          source.value = text;
+          if (errorNode) { errorNode.hidden = true; errorNode.textContent = ""; }
+          queueInput(source);
+        } catch (error) {
+          if (errorNode) { errorNode.hidden = false; errorNode.textContent = `Invalid JSON: ${String(error?.message || error)}`; }
+        }
+      },
+    } : {
+      mode: "view", modes: ["view"], mainMenuBar: false, navigationBar: true, statusBar: false,
+      search: true, onEditable: () => false,
+    };
+    host.replaceChildren();
+    editor = new globalThis.JSONEditor(host, options, value);
+    jsonEditors.push({ editor, host, source });
+  }
+}
 function applyRender(payload) {
+  destroyJsonEditors();
   morphInner(app, payload.html, MORPH_OPTIONS);
+  enhanceJsonEditors();
   app.dataset.section = String(payload.section || "dashboard");
   const scroll = Array.isArray(payload.scroll) ? payload.scroll : [0, 0];
   const revision = Math.max(0, Number(payload.revision) || 0);
@@ -8451,7 +9788,7 @@ listen(UI_RENDER_EVENT, event => {
   const BROWSER_JS = GUI_RUNTIME
     ? browserAppSource.toString().match(/\/\*([\s\S]*)\*\//)[1].replace('import { morphInner } from "/assets/morphlex.js";\n', "")
     : "";
-  const GUI_BROWSER_JS = GUI_RUNTIME ? `${GUI_MORPHLEX_JS}\n${BROWSER_JS}` : "";
+  const GUI_BROWSER_JS = GUI_RUNTIME ? `${GUI_JSONEDITOR_JS}\n${GUI_MORPHLEX_JS}\n${BROWSER_JS}` : "";
   const PAGE_TEMPLATE = UI_TEMPLATE;
   function ui() { return GUI_RUNTIME ? eta.renderString(PAGE_TEMPLATE, {}).replace("__MRMCP_BROWSER_JS__", GUI_BROWSER_JS) : ""; }
   restoreAcmeBackoff();
@@ -8483,6 +9820,11 @@ listen(UI_RENDER_EVENT, event => {
     if (headerActivityTimer) clearTimeout(headerActivityTimer);
     if (dashboardToolCallTimer) clearTimeout(dashboardToolCallTimer);
     for (const key of [...jsKernels.keys()]) destroyJsKernel(key, "server shutdown");
+    for (const record of cdpBrowsers.values()) {
+      try { record.ws.close(1000, "MrMCP shutdown"); } catch {}
+      cdpDisconnect(record, "MrMCP shutdown");
+    }
+    cdpBrowsers.clear(); cdpConnectPromises.clear(); cdpSubscriptions.clear();
     await Promise.allSettled(
       [...processes.values()]
         .filter(rec => ["starting", "running"].includes(rec.status))
