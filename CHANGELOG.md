@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.121
+
+- Moved Telegram Bot configuration out of general Settings into a dedicated `✈️ Telegram` sidebar page with its own validation, draft state and save action; `telegram_req` authentication behavior remains unchanged.
+- Simplified README presentation to keep only the current Tool Calls screenshot and removed the obsolete second administration screenshot asset.
+
 ## 0.10.120
 
 - Refreshed the README Tool Calls screenshot with the current interface while masking sensitive data in the captured log details.
