@@ -12,8 +12,8 @@ MrMCP is a stateless Model Context Protocol server implemented in Deno. It expos
 
 - MCP `2026-07-28` with explicit `context_handle` Session capabilities.
 - Named Workspaces with drag-and-drop Session assignment.
-- AAF desktop automation through `desktop_auto`, including zero/one/many model-visible WebP/PNG screenshots mixed with structured OCR, geometry and state output; the local Automation page reuses recorded Tool Calls/screenshots for inspection and one-click scenario replay.
-- Low-level dependency-free Chrome DevTools Protocol control through always-batched `cdp_call`, with persistent browser/profile and logical page labels plus subscription/poll access to CDP notifications; the local Browser page summarizes existing profile/target/ring/subscription state, filters recorded sends by browser/target/Session/activity and can replay an individual recorded operation.
+- AAF desktop automation through `desktop_auto`, including zero/one/many model-visible WebP/PNG screenshots mixed with structured OCR, geometry and state output; the local Automation page reuses recorded Tool Calls/screenshots for inspection and can replay a scenario directly as a local user action without creating another Tool Call.
+- Low-level dependency-free Chrome DevTools Protocol control through always-batched `cdp_call`, with persistent browser/profile and logical page labels plus subscription/poll access to CDP notifications; the local Browser page summarizes existing profile/target/ring/subscription state, filters recorded sends by browser/target/Session/activity and can replay an individual recorded operation directly without creating another Tool Call.
 - Explicit persistent Session/Workspace key-value memory through `memory_find` and `memory_set`, with explicitly typed JSON/text values, TTL and a local Memory manager.
 - Filesystem, text search/editing, reversible trash and generated-file publishing.
 - Foreground and persistent processes with progress streaming when requested.

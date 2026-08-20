@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.119
+
+- Decoupled desktop GUI Replay from MCP Tool Calls. Browser CDP replay and Automation AAF replay now read the selected historical input only as a source, then execute directly through the shared low-level CDP/Auto.js engines without `callTool()`/`executeTool()`, Tool Call logging, descriptor snapshots, Tool Call counters/notifications, `tool_call_content`, or any new database persistence. Replay is therefore a local operator action, not a new Tool Call.
+
 ## 0.10.118
 
 - Added dedicated Browser and Automation diagnostics to the desktop GUI without introducing parallel telemetry stores. Browser summarizes existing CDP profiles, logical/live targets, subscriptions, retained ring traffic, recorded sends/responses and Session origins with browser/target/Session/connection-state filters; Automation exposes paginated recorded AAF scenarios, ordered actions, returned state/results and retained screenshots.

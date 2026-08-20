@@ -95,7 +95,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.118";
+const VERSION = "0.10.119";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;
@@ -5865,6 +5865,56 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     return { selection, key, kernel: jsKernels.get(key) || createJsKernel(key) };
   }
 
+  const runDesktopScenario = yaml => auto.run(parseYaml(String(yaml)));
+  async function runCdpBatch(args) {
+    const wait = args.wait !== false, calls = Array.isArray(args.calls) ? args.calls : [];
+    if (!calls.length || calls.length > 100) throw new Error("cdp_call calls must contain 1-100 entries");
+    const results = await Promise.all(calls.map(async spec => {
+      const browserInput = String(spec?.browser ?? "main").trim() || "main", targetInput = spec?.target == null ? null : String(spec.target).trim();
+      let base = {
+        browser: browserInput, port: null, user_data_dir: null, target: targetInput, target_id: null, session_id: null,
+        id: null, queued: false, cdp: null, image: null, setup_errors: [], success: false, error: null,
+      };
+      try {
+        const rawMethod = String(spec?.call?.method || "").trim(), special = String(spec?.call?._mrmcp || "").trim();
+        if (!!rawMethod === !!special) throw new Error("call requires exactly one of method or _mrmcp");
+        const rawParams = spec?.call?.params == null ? {} : spec.call.params;
+        if (!rawParams || typeof rawParams !== "object" || Array.isArray(rawParams)) throw new Error("call.params must be an object");
+        if (special && spec.target === undefined) throw new Error(`_mrmcp.${special} requires target`);
+        if (spec._image && (!rawMethod || rawMethod !== "Page.captureScreenshot")) throw new Error("_image is supported only with standard Page.captureScreenshot");
+        if (spec._image && !wait) throw new Error("_image requires cdp_call wait=true");
+        if (spec._image && spec._image.return !== "base64") throw new Error("_image.return must be base64");
+        const operation = special ? cdpSpecialRequest(special, rawParams) : { wire_method: rawMethod, logical_method: rawMethod, params: rawParams, special: null };
+        const record = await ensureCdpBrowser(browserInput);
+        let target = null, targetId = null, sessionId = null;
+        if (spec.target !== undefined) {
+          const resolvedTarget = await cdpEnsureTarget(record, spec.target);
+          target = resolvedTarget.target; targetId = resolvedTarget.target_id; sessionId = resolvedTarget.session_id;
+        }
+        base = {
+          browser: record.browser, port: record.port, user_data_dir: record.user_data_dir,
+          target, target_id: targetId, session_id: sessionId, id: null, queued: false, cdp: null, image: null,
+          setup_errors: sessionId ? [...(record.session_setup_errors.get(sessionId) || [])] : [], success: false, error: null,
+        };
+        const request = cdpRequest(record, operation.wire_method, operation.params, sessionId || "", {
+          wait, expose: !spec._image, target, target_id: targetId, logical_method: operation.logical_method,
+        });
+        base.id = request.id;
+        if (!wait) return { ...base, queued: true, success: true };
+        const raw = await request.promise;
+        const processed = spec._image && !raw?.error ? await cdpProcessScreenshot(raw, spec._image, rawParams) : { cdp: raw, image: null };
+        if (spec._image) cdpRecordMessage(record, {
+          browser: record.browser, type: "response", id: request.id, method: operation.logical_method,
+          target, target_id: targetId, session_id: sessionId || null, cdp: processed.cdp,
+        });
+        return { ...base, ...processed, success: !processed.cdp?.error, error: processed.cdp?.error ? String(processed.cdp.error.message || processed.cdp.error) : null };
+      } catch (error) {
+        return { ...base, success: false, error: String(error?.message || error) };
+      }
+    }));
+    return { wait, results };
+  }
+
   async function executeTool(p, name, args, execution) {
     const selection = execution.selection;
     if (name === "list_workspaces") return {
@@ -5882,8 +5932,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     }
     if (!selection?.context || !selection?.root) throw new Error("Session Workspace selection is missing");
     if (name === "desktop_auto") {
-      const scenario = parseYaml(String(args.yaml));
-      const result = await auto.run(scenario);
+      const result = await runDesktopScenario(args.yaml);
       const images = [], seenImages = new WeakMap();
       const childPath = (path, key) => /^[$A-Z_a-z][$0-9A-Z_a-z]*$/.test(String(key))
         ? `${path}.${key}` : `${path}[${JSON.stringify(String(key))}]`;
@@ -6473,54 +6522,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       const bytes = args.text !== undefined ? enc.encode(String(args.text)) : decodePublishBase64(args.base64);
       return await publishContent({ bytes }, { ...options, source: args.text !== undefined ? "text" : "base64" });
     }
-    if (name === "cdp_call") {
-      const wait = args.wait !== false, calls = Array.isArray(args.calls) ? args.calls : [];
-      if (!calls.length || calls.length > 100) throw new Error("cdp_call calls must contain 1-100 entries");
-      const results = await Promise.all(calls.map(async spec => {
-        const browserInput = String(spec?.browser ?? "main").trim() || "main", targetInput = spec?.target == null ? null : String(spec.target).trim();
-        let base = {
-          browser: browserInput, port: null, user_data_dir: null, target: targetInput, target_id: null, session_id: null,
-          id: null, queued: false, cdp: null, image: null, setup_errors: [], success: false, error: null,
-        };
-        try {
-          const rawMethod = String(spec?.call?.method || "").trim(), special = String(spec?.call?._mrmcp || "").trim();
-          if (!!rawMethod === !!special) throw new Error("call requires exactly one of method or _mrmcp");
-          const rawParams = spec?.call?.params == null ? {} : spec.call.params;
-          if (!rawParams || typeof rawParams !== "object" || Array.isArray(rawParams)) throw new Error("call.params must be an object");
-          if (special && spec.target === undefined) throw new Error(`_mrmcp.${special} requires target`);
-          if (spec._image && (!rawMethod || rawMethod !== "Page.captureScreenshot")) throw new Error("_image is supported only with standard Page.captureScreenshot");
-          if (spec._image && !wait) throw new Error("_image requires cdp_call wait=true");
-          if (spec._image && spec._image.return !== "base64") throw new Error("_image.return must be base64");
-          const operation = special ? cdpSpecialRequest(special, rawParams) : { wire_method: rawMethod, logical_method: rawMethod, params: rawParams, special: null };
-          const record = await ensureCdpBrowser(browserInput);
-          let target = null, targetId = null, sessionId = null;
-          if (spec.target !== undefined) {
-            const resolvedTarget = await cdpEnsureTarget(record, spec.target);
-            target = resolvedTarget.target; targetId = resolvedTarget.target_id; sessionId = resolvedTarget.session_id;
-          }
-          base = {
-            browser: record.browser, port: record.port, user_data_dir: record.user_data_dir,
-            target, target_id: targetId, session_id: sessionId, id: null, queued: false, cdp: null, image: null,
-            setup_errors: sessionId ? [...(record.session_setup_errors.get(sessionId) || [])] : [], success: false, error: null,
-          };
-          const request = cdpRequest(record, operation.wire_method, operation.params, sessionId || "", {
-            wait, expose: !spec._image, target, target_id: targetId, logical_method: operation.logical_method,
-          });
-          base.id = request.id;
-          if (!wait) return { ...base, queued: true, success: true };
-          const raw = await request.promise;
-          const processed = spec._image && !raw?.error ? await cdpProcessScreenshot(raw, spec._image, rawParams) : { cdp: raw, image: null };
-          if (spec._image) cdpRecordMessage(record, {
-            browser: record.browser, type: "response", id: request.id, method: operation.logical_method,
-            target, target_id: targetId, session_id: sessionId || null, cdp: processed.cdp,
-          });
-          return { ...base, ...processed, success: !processed.cdp?.error, error: processed.cdp?.error ? String(processed.cdp.error.message || processed.cdp.error) : null };
-        } catch (error) {
-          return { ...base, success: false, error: String(error?.message || error) };
-        }
-      }));
-      return { wait, results };
-    }
+    if (name === "cdp_call") return await runCdpBatch(args);
     if (name === "cdp_subs") return await cdpSubs(args);
     if (name === "cdp_poll") return await cdpPoll(args);
     if (name === "memory_find") return memoryFindRows(p, selection, args);
@@ -8628,25 +8630,24 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         break;
     }
   }
-  async function replayAdminToolCall(logId, expectedTool, callIndex = null) {
-    const p = serverConfig(), row = one("SELECT id,tool,input_json,context_handle FROM logs WHERE id=?", Math.max(0, Number(logId) || 0));
+  async function replayAdminAction(logId, expectedTool, callIndex = null) {
+    const row = one("SELECT id,tool,input_json FROM logs WHERE id=?", Math.max(0, Number(logId) || 0));
     if (!row || row.tool !== expectedTool) throw new Error(`Recorded ${expectedTool} Tool Call not found`);
-    const context = contextByHandle(p, String(row.context_handle || ""));
-    if (!context) throw new Error("The original Session no longer exists, so this action cannot be replayed safely.");
-    let args = parseJson(row.input_json || "{}", {});
-    if (expectedTool === "cdp_call" && callIndex != null) {
-      const calls = Array.isArray(args.calls) ? args.calls : [], index = Math.max(0, Number(callIndex) || 0);
-      if (!calls[index]) throw new Error("Recorded CDP operation not found");
-      args = { calls: [structuredClone(calls[index])], wait: args.wait !== false, context_handle: context.handle };
-    } else args = { ...args, context_handle: context.handle };
-    const descriptor = serverTools(p, true).find(tool => tool.name === expectedTool);
-    const result = await callTool(p, expectedTool, args, {
-      authKind: "gui", contextHandle: context.handle, selection: { context, root: selectedContextRoot(p, context) },
-      descriptor, requestStream: null, progressRequested: false,
-    });
-    const error = result?.isError ? String(result?.structuredContent?.error || "Replay failed") : "";
-    if (error) throw new Error(error);
-    uiNotice(expectedTool === "cdp_call" ? "CDP operation replayed." : "Automation scenario replayed.", "ok");
+    const args = parseJson(row.input_json || "{}", {});
+    if (expectedTool === "desktop_auto") {
+      await runDesktopScenario(args.yaml);
+      uiNotice("Automation scenario replayed.", "ok");
+      return;
+    }
+    const calls = Array.isArray(args.calls) ? args.calls : [];
+    const replayCalls = callIndex == null ? calls : [calls[Math.max(0, Number(callIndex) || 0)]].filter(Boolean);
+    if (!replayCalls.length) throw new Error("Recorded CDP operation not found");
+    const result = await runCdpBatch({ calls: structuredClone(replayCalls), wait: args.wait !== false });
+    if (result.results.some(item => item?.success === false)) {
+      const failed = result.results.find(item => item?.success === false);
+      throw new Error(String(failed?.error || "CDP replay failed"));
+    }
+    uiNotice(callIndex == null ? "CDP batch replayed." : "CDP operation replayed.", "ok");
   }
   async function handleUiAction(event) {
     const action = String(event.action || ""), data = event.dataset || {}, values = event.values || {};
@@ -8858,11 +8859,11 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         break;
       case "replay-cdp":
         uiNotice("CDP replay started.", "info");
-        void replayAdminToolCall(data.id, "cdp_call", data.index).catch(error => uiNotice(`CDP replay failed: ${String(error?.message || error)}`));
+        void replayAdminAction(data.id, "cdp_call", data.index).catch(error => uiNotice(`CDP replay failed: ${String(error?.message || error)}`));
         return;
       case "replay-automation":
         uiNotice("Automation replay started.", "info");
-        void replayAdminToolCall(data.id, "desktop_auto").catch(error => uiNotice(`Automation replay failed: ${String(error?.message || error)}`));
+        void replayAdminAction(data.id, "desktop_auto").catch(error => uiNotice(`Automation replay failed: ${String(error?.message || error)}`));
         return;
       case "new-memory": {
         const p = serverConfig();
