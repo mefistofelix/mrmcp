@@ -6,8 +6,6 @@ MrMCP is a stateless Model Context Protocol server implemented in Deno. It expos
 
 ![MrMCP Tool Calls view](./assets/mrmcp-screenshot1.png)
 
-![MrMCP Workspaces and Sessions view](./assets/mrmcp-screenshot2.png)
-
 ## Features
 
 - MCP `2026-07-28` with explicit `context_handle` Session capabilities.
