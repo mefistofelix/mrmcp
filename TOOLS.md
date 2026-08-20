@@ -99,7 +99,7 @@ Arguments:
 
 The creation path remains name-only: the agent does not supply the filesystem path; MrMCP resolves the Desktop and final directory internally and performs the same name/path/existing-target collision checks used by the GUI workflow.
 
-Returns `workspace_name`, absolute `cwd`, `agent_guidance_path`, `workspace_created`, `memory_summary` and `context_handle`. `workspace_created` is true only when this exact call created the missing Workspace. `memory_summary.workspace` and `memory_summary.session` each contain the number of live memories plus up to five most recently set keys, giving the agent a small orientation hint without eagerly returning values. Guidance resolution checks only the Workspace root, preferring `AGENTS.md` / `agents.md` and then falling back to `CLAUDE.md` / `Claude.md` / `claude.md`.
+Returns `workspace_name`, absolute `cwd`, `agent_guidance_path`, `workspace_created`, `memory_summary` and `context_handle`. `workspace_created` is true only when this exact call created the missing Workspace. `memory_summary.global`, `memory_summary.workspace` and `memory_summary.session` each contain the number of live memories plus up to five most recently set keys, giving the agent a small orientation hint without eagerly returning values. Guidance resolution checks only the Workspace root, preferring `AGENTS.md` / `agents.md` and then falling back to `CLAUDE.md` / `Claude.md` / `claude.md`.
 
 ---
 
@@ -411,6 +411,7 @@ MrMCP exposes one small explicit persistent key-value memory surface: `memory_fi
 
 Every call explicitly chooses one scope:
 
+- `scope="global"` — memory is shared across the whole MrMCP server. `workspace` must be omitted.
 - `scope="session"` — memory belongs only to the current `context_handle`'s Session. `workspace` must be omitted.
 - `scope="workspace"` — `workspace` is required and names the Workspace whose shared memory is addressed. It does not depend on which Workspace the current Session happens to be using.
 
@@ -420,8 +421,8 @@ Finds live memories only in the selected scope. Expired TTL rows are removed bef
 
 Arguments:
 
-- `scope` — required `session|workspace`.
-- `workspace` — required only for Workspace scope.
+- `scope` — required `global|session|workspace`.
+- `workspace` — required only for Workspace scope; omit it for Global and Session scope.
 - `key` — optional exact key.
 - `key_prefix` — optional key prefix.
 - `query` — optional case-insensitive literal search across key plus stored JSON/text value.
@@ -430,7 +431,7 @@ Arguments:
 - `before_id` — stable backward-pagination cursor; `next_before_id` is returned when another page exists.
 - `context_handle`.
 
-Each result contains stable row `id`, scope, Session id or Workspace label, key, explicit `json` boolean, `value` (parsed JSON when true, ordinary string when false), `ttl_seconds`, ISO `set_at`, and nullable ISO `expires_at`.
+Each result contains stable row `id`, scope, nullable Session id and Workspace label, key, explicit `json` boolean, `value` (parsed JSON when true, ordinary string when false), `ttl_seconds`, ISO `set_at`, and nullable ISO `expires_at`. Global results have neither a Session id nor Workspace label.
 
 ### `memory_set`
 
@@ -446,9 +447,9 @@ Arguments:
 - `delete=true` — removes the key; omit both `value` and `json`.
 - `context_handle`.
 
-Replacing a key creates a fresh row identity and `set_at`; TTL is therefore restarted from the replacement time. Deleting a Session or Workspace also removes memories owned by it. **Clear Operational Data intentionally preserves Memory**, just as it preserves Sessions, Workspaces and CDP browser/profile state.
+Replacing a key creates a fresh row identity and `set_at`; TTL is therefore restarted from the replacement time. Deleting a Session or Workspace also removes memories owned by it; Global memory is independent of both. **Clear Operational Data intentionally preserves Memory**, just as it preserves Sessions, Workspaces and CDP browser/profile state.
 
-The desktop **Memory** page is a lazy administrative view over the same table. It filters by scope, Session, Workspace, set-date range and text, paginates results, labels JSON/TEXT, displays TTL/expiry, and supports creating entries for an explicitly selected existing Session or Workspace, inspecting/editing the complete value/type/key/TTL, and confirmed deletion. GUI creation rejects an already-existing key for that owner rather than silently replacing it; use View / Edit for replacement. JSON memories use the same vendored JSONEditor tree as Tool Call JSON and support node-level editing; text memories use a plain textarea. Switching TEXT ↔ JSON preserves the current draft byte-for-byte as text; invalid JSON remains visible/editable with an error instead of being discarded. JSONEditor writes back through the normal managed form field and Deno submit path, while backend JSON validation remains authoritative.
+The desktop **Memory** page is a lazy administrative view over the same table. It filters by scope, Session, Workspace, set-date range and text, paginates results, labels JSON/TEXT, displays TTL/expiry, and supports creating Global entries or entries for an explicitly selected existing Session/Workspace, inspecting/editing the complete value/type/key/TTL, and confirmed deletion. GUI creation rejects an already-existing key for that owner rather than silently replacing it; use View / Edit for replacement. JSON memories use the same vendored JSONEditor tree as Tool Call JSON and support node-level editing; text memories use a plain textarea. Switching TEXT ↔ JSON preserves the current draft byte-for-byte as text; invalid JSON remains visible/editable with an error instead of being discarded. JSONEditor writes back through the normal managed form field and Deno submit path, while backend JSON validation remains authoritative.
 
 ---
 
@@ -533,7 +534,7 @@ The call excludes its own current log row. Requests blocked before reaching MrMC
 
 ### `telegram_req`
 
-Sends one generic Telegram Bot API JSON request. The local user configures only the Bot token in **Settings → Telegram Bot**; the token is injected by MrMCP and is never an agent argument or returned value. The agent owns chat/channel ids and other application state, which can be kept in Memory when useful.
+Sends one generic Telegram Bot API JSON request. The local user configures only the Bot token on the dedicated **✈️ Telegram** sidebar page; the token is injected by MrMCP and is never an agent argument or returned value. The agent owns chat/channel ids and other application state, which can be kept in Memory when useful.
 
 Arguments:
 

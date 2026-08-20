@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.122
+
+- Added server-wide Global persistent Memory as a third explicit `memory_find` / `memory_set` scope alongside Session and Workspace, including Memory GUI filtering/create/edit support and Global/Workspace/Session summaries from `open_workspace`.
+- Improved the `cymbal` extra-command guidance so agents start with indexed semantic code navigation and use investigate/search/outline/show/trace/impact/changed appropriately.
+
 ## 0.10.121
 
 - Moved Telegram Bot configuration out of general Settings into a dedicated `✈️ Telegram` sidebar page with its own validation, draft state and save action; `telegram_req` authentication behavior remains unchanged.

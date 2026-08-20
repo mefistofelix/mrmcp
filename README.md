@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.121
+# MrMCP 0.10.122
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated `/mcp` endpoint, Workspace-scoped Sessions, filesystem and process tools, OAuth/Basic authentication, TLS automation, and a local Tauriless administration UI.
 
@@ -12,7 +12,7 @@ MrMCP is a stateless Model Context Protocol server implemented in Deno. It expos
 - Named Workspaces with drag-and-drop Session assignment.
 - AAF desktop automation through `desktop_auto`, including zero/one/many model-visible WebP/PNG screenshots mixed with structured OCR, geometry and state output; the local Automation page reuses recorded Tool Calls/screenshots for inspection and can replay a scenario directly as a local user action without creating another Tool Call.
 - Low-level dependency-free Chrome DevTools Protocol control through always-batched `cdp_call`, with persistent browser/profile and logical page labels plus subscription/poll access to CDP notifications; the local Browser page summarizes existing profile/target/ring/subscription state, filters recorded sends by browser/target/Session/activity and can replay an individual recorded operation directly without creating another Tool Call.
-- Explicit persistent Session/Workspace key-value memory through `memory_find` and `memory_set`, with explicitly typed JSON/text values, TTL and a local Memory manager.
+- Explicit persistent Global/Session/Workspace key-value memory through `memory_find` and `memory_set`, with explicitly typed JSON/text values, TTL and a local Memory manager.
 - Filesystem, text search/editing, reversible trash and generated-file publishing.
 - Foreground and persistent processes with progress streaming when requested.
 - Persistent JavaScript kernels scoped to Session + Workspace.
@@ -61,7 +61,7 @@ MrMCP keeps transport state stateless. Persistent application state is selected 
 3. Reuse the returned `context_handle` on later Session-bound tools.
 4. To move the same Session, call `open_workspace(name, current_context_handle)`.
 
-`open_workspace` also returns the Workspace name, absolute working directory, optional `agent_guidance_path`, whether this call created the Workspace, and a compact Memory summary containing live counts plus up to five latest keys for Workspace and Session scope. Guidance resolution prefers Workspace-root `AGENTS.md` / `agents.md` and falls back to `CLAUDE.md` / `Claude.md` / `claude.md`; when the returned path is present, read and follow it before repository work.
+`open_workspace` also returns the Workspace name, absolute working directory, optional `agent_guidance_path`, whether this call created the Workspace, and a compact Memory summary containing live counts plus up to five latest keys for Global, Workspace and Session scope. Guidance resolution prefers Workspace-root `AGENTS.md` / `agents.md` and falls back to `CLAUDE.md` / `Claude.md` / `claude.md`; when the returned path is present, read and follow it before repository work.
 
 The administration UI displays Sessions with short numeric ids. The opaque `ctx_...` value remains the MCP bearer capability. A Session may move between Workspaces, while historical Tool Calls retain the Workspace snapshot captured when each call started.
 
@@ -79,10 +79,10 @@ Desktop and browser automation:
 
 Memory:
 
-- `memory_find` — search the explicitly selected current-Session or named-Workspace memory by exact/prefix key, text, set date and stable pagination.
-- `memory_set` — set/replace/delete text values with explicit `json=true|false`; JSON text is validated before storage, with optional TTL in the selected Session or Workspace scope.
+- `memory_find` — search the explicitly selected Global, current-Session or named-Workspace memory by exact/prefix key, text, set date and stable pagination.
+- `memory_set` — set/replace/delete text values with explicit `json=true|false`; JSON text is validated before storage, with optional TTL in the selected Global, Session or Workspace scope.
 
-The desktop **Memory** page filters stored values by Session, Workspace, scope, set date and text, labels JSON vs TEXT, and allows creation, full value/type/TTL inspection, editing and confirmed deletion. New entries explicitly choose an existing Session or Workspace owner. JSON values use an editable JSON tree with node-level operations; text values use the plain text editor, and switching TEXT ↔ JSON never discards the current draft value. Expired TTL rows are removed automatically; Clear Operational Data preserves Memory.
+The desktop **Memory** page filters stored values by scope, Session, Workspace, set date and text, labels JSON vs TEXT, and allows creation, full value/type/TTL inspection, editing and confirmed deletion. New entries explicitly choose Global scope or an existing Session/Workspace owner. JSON values use an editable JSON tree with node-level operations; text values use the plain text editor, and switching TEXT ↔ JSON never discards the current draft value. Expired TTL rows are removed automatically; Clear Operational Data preserves Memory.
 
 Filesystem:
 
