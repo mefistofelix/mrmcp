@@ -105,7 +105,7 @@ const CONTEXT_HANDLE_OUTPUT_DESCRIPTION = "Opaque capability identifying a persi
 const CONTEXT_HANDLE_RULE = "Requires the exact Session context_handle returned by open_workspace.";
 const MCP_UI_EXTENSION = "io.modelcontextprotocol/ui";
 const MCP_UI_MIME_TYPE = "text/html;profile=mcp-app";
-const PUBLISH_UI_URI = "ui://mrmcp/publish-v1.html";
+const PUBLISH_UI_URI = "ui://mrmcp/publish-v3.html";
 const enc = new TextEncoder(), dec = new TextDecoder();
 const TOOL_RESULT_CONTENT = Symbol("tool-result-content");
 
@@ -1335,7 +1335,7 @@ async function backend({ addWorkspace = null } = {}) {
     uri,
     name: "mrmcp_publish",
     title: "MrMCP publish",
-    description: "Smart MCP App used by publish. It reads one persistent HTTPS content URL from structuredContent and chooses an inline preview or file action from MIME type plus the caller's presentation hint.",
+    description: "Smart MCP App used by publish. It reads one persistent HTTPS content URL from structuredContent, shows compact publication metadata, exposes Open original for inline previews, and otherwise uses the file card itself as the content action.",
     mimeType: MCP_UI_MIME_TYPE,
     _meta: publishUiMeta(),
   });
@@ -1353,13 +1353,16 @@ html, body, main { margin: 0; width: 100%; min-width: 0; background: transparent
 #header { display: none; padding: 8px 4px 10px; font-family: system-ui, sans-serif; }
 #title { font-size: 16px; font-weight: 700; line-height: 1.25; overflow-wrap: anywhere; }
 #description { margin-top: 4px; font-size: 13px; line-height: 1.4; opacity: .72; overflow-wrap: anywhere; white-space: pre-wrap; }
+#meta { margin-top: 5px; font-size: 11px; line-height: 1.35; opacity: .58; overflow-wrap: anywhere; }
+#originalOpen { display: inline-flex; align-items: center; margin-top: 7px; padding: 5px 8px; border: 1px solid #ffffff33; border-radius: 7px; color: inherit; font: 12px/1.2 system-ui, sans-serif; text-decoration: none; }
+#originalOpen[hidden] { display: none; }
 #imageStage { position: relative; display: none; width: 100%; place-items: center; overflow: hidden; }
 #image { display: block; width: 100%; height: auto; object-fit: contain; }
 #frameStage { position: relative; display: none; width: 100%; }
 #frame { display: block; width: 100%; min-height: 120px; border: 0; background: transparent; }
 .actions { position: absolute; top: 8px; right: 8px; display: flex; gap: 6px; opacity: .25; transition: opacity .15s; }
 #imageStage:hover .actions, #frameStage:hover .actions, .actions:focus-within { opacity: 1; }
-.actions button, .actions a { display: grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 1px solid #ffffff55; border-radius: 8px; color: white; background: #000b; font: 20px/1 system-ui, sans-serif; text-decoration: none; cursor: pointer; }
+.actions button { display: grid; place-items: center; width: 34px; height: 34px; padding: 0; border: 1px solid #ffffff55; border-radius: 8px; color: white; background: #000b; font: 20px/1 system-ui, sans-serif; cursor: pointer; }
 .actions [hidden] { display: none; }
 #fileStage { display: none; align-items: center; gap: 12px; padding: 14px; border: 1px solid #ffffff22; border-radius: 10px; font: 14px/1.35 system-ui, sans-serif; }
 #fileIcon { font-size: 28px; }
@@ -1380,19 +1383,17 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
 </head>
 <body>
 <main>
-  <div id="header"><div id="title"></div><div id="description"></div></div>
+  <div id="header"><div id="title"></div><div id="description"></div><div id="meta"></div><a id="originalOpen" target="_blank" rel="noopener noreferrer" hidden>Open original ↗</a></div>
   <div id="imageStage">
     <img id="image" alt="Published image">
     <div class="actions">
       <button id="imageFullscreen" type="button" title="Fullscreen" aria-label="Fullscreen" hidden>⛶</button>
-      <a id="imageOpen" target="_blank" rel="noopener noreferrer" title="Open original" aria-label="Open original">↗</a>
     </div>
   </div>
   <div id="frameStage">
     <iframe id="frame" title="Published content" sandbox="allow-scripts allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox" allow="fullscreen" referrerpolicy="no-referrer"></iframe>
     <div class="actions">
       <button id="frameFullscreen" type="button" title="Fullscreen" aria-label="Fullscreen" hidden>⛶</button>
-      <a id="frameOpen" target="_blank" rel="noopener noreferrer" title="Open original" aria-label="Open original">↗</a>
     </div>
   </div>
   <div id="fileStage">
@@ -1409,13 +1410,13 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   var header = document.getElementById('header');
   var title = document.getElementById('title');
   var description = document.getElementById('description');
+  var meta = document.getElementById('meta');
+  var originalOpen = document.getElementById('originalOpen');
   var imageStage = document.getElementById('imageStage');
   var frameStage = document.getElementById('frameStage');
   var fileStage = document.getElementById('fileStage');
   var image = document.getElementById('image');
   var frame = document.getElementById('frame');
-  var imageOpen = document.getElementById('imageOpen');
-  var frameOpen = document.getElementById('frameOpen');
   var fileName = document.getElementById('fileName');
   var fileMeta = document.getElementById('fileMeta');
   var fileOpen = document.getElementById('fileOpen');
@@ -1493,6 +1494,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     var mime = String(structured.mime_type || '').toLowerCase();
     var filename = String(structured.filename || 'Published content');
     var presentation = String(structured.presentation || 'auto').toLowerCase();
+    var source = String(structured.source || '').toLowerCase();
     var label = String(structured.title || '');
     var detail = String(structured.description || '');
     var height = Math.max(120, Math.min(Number(structured.height || 600), 2000));
@@ -1506,11 +1508,19 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     showError('');
     title.textContent = label;
     description.textContent = detail;
-    header.style.display = label || detail ? 'block' : 'none';
+    var sourceLabel = source === 'base64' ? 'Base64' : source === 'text' ? 'Text' : source === 'path' ? 'File' : '';
+    meta.textContent = [filename, mime, formatSize(structured.size), sourceLabel].filter(Boolean).join(' · ');
+    if (uri && kind) {
+      originalOpen.href = uri;
+      originalOpen.hidden = false;
+    } else {
+      originalOpen.removeAttribute('href');
+      originalOpen.hidden = true;
+    }
+    header.style.display = label || detail || meta.textContent || (uri && kind) ? 'block' : 'none';
     if (!uri) return;
     if (kind === 'image') {
       image.alt = label || filename;
-      imageOpen.href = uri;
       image.src = uri;
       imageStage.style.display = 'grid';
       imageFullscreen.hidden = !fullscreenAvailable;
@@ -1520,7 +1530,6 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     if (kind === 'frame') {
       frame.title = label || filename;
       frame.style.height = height + 'px';
-      frameOpen.href = uri;
       frame.src = uri;
       frameStage.style.display = 'block';
       frameFullscreen.hidden = !fullscreenAvailable;
@@ -1821,7 +1830,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       }
       return {
         id: record.id, content_id: contentKey, filename, mime_type: mimeType, size: Number(record.size || size),
-        uri: publishedUrl(record.id, filename), presentation, title, description, height,
+        source: String(options.source || ''), uri: publishedUrl(record.id, filename), presentation, title, description, height,
         created_at: new Date(record.created_at).toISOString(),
       };
     });
@@ -3804,6 +3813,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       }),
       publish: outputSchema({
         id: { type: "string" }, content_id: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" }, size: { type: "integer" },
+        source: { type: "string", enum: ["path", "text", "base64"], description: "Source form used by this publish call; useful only as presentation/debug metadata." },
         uri: { type: "string", description: "Persistent HTTPS URL of the published content itself. Browser-displayable MIME types open inline; opaque/binary MIME types are attachments." },
         presentation: { type: "string", enum: ["auto", "inline", "download"] }, title: { type: "string" }, description: { type: "string" },
         height: { type: "integer" }, created_at: { type: "string" },
@@ -3923,7 +3933,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         open_workspace: ["workspace_name", "cwd", "agent_guidance_path"],
         inspect_tools: ["tools", "missing"],
         query_tool_calls: ["calls"],
-        publish: ["id", "filename", "mime_type", "uri", "presentation", "title", "description", "height", "created_at"],
+        publish: ["id", "filename", "mime_type", "source", "uri", "presentation", "title", "description", "height", "created_at"],
         fs_glob: ["entries", "next_after_path", "truncated"],
         fs_grep: ["scanned_files", "matched_files", "files", "next_resume_after", "truncated"],
         fs_read: ["files"], fs_navigate: ["files"], fs_stat: ["entries"],
@@ -4003,8 +4013,12 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     if (!publishAppHtml().includes("ui/notifications/tool-result")) uiErrors.push("UI bridge listener missing");
     if (publishAppHtml().includes("data:")) uiErrors.push("publish UI must not embed data URLs");
     if (!publishAppHtml().includes("structured.uri") || !publishAppHtml().includes("structured.presentation") ||
-        !publishAppHtml().includes("structured.title") || !publishAppHtml().includes("structured.description"))
-      uiErrors.push("UI structuredContent presentation handling missing");
+        !publishAppHtml().includes("structured.title") || !publishAppHtml().includes("structured.description") ||
+        !publishAppHtml().includes("structured.source") || !publishAppHtml().includes("structured.size"))
+      uiErrors.push("UI structuredContent presentation/metadata handling missing");
+    if (!publishAppHtml().includes('id="originalOpen"') || !publishAppHtml().includes("if (uri && kind)") ||
+        !publishAppHtml().includes("originalOpen.href = uri") || !publishAppHtml().includes('target="_blank"'))
+      uiErrors.push("UI preview-only original-content action missing");
     if (!publishAppHtml().includes("publicationId")) uiErrors.push("UI publication identity pinning missing");
     if (publishAppHtml().includes("openai:set_globals") || publishAppHtml().includes("openai.toolOutput"))
       uiErrors.push("UI must not consume ChatGPT-global tool output");
@@ -5347,11 +5361,11 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       if (args.path !== undefined) {
         const target = await resolvePath(args.path);
         return await publishContent({ path: target.path }, {
-          ...options, filename: args.filename || basename(target.path), allowed_root: target.root.path,
+          ...options, source: "path", filename: args.filename || basename(target.path), allowed_root: target.root.path,
         });
       }
       const bytes = args.text !== undefined ? enc.encode(String(args.text)) : decodePublishBase64(args.base64);
-      return await publishContent({ bytes }, options);
+      return await publishContent({ bytes }, { ...options, source: args.text !== undefined ? "text" : "base64" });
     }
     if (name === "discover_commands") return await discoverCommands();
     if (name === "query_tool_calls") {
