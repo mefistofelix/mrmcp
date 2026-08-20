@@ -12,6 +12,7 @@ MrMCP is a stateless Model Context Protocol server implemented in Deno. It expos
 
 - MCP `2026-07-28` with explicit `context_handle` Session capabilities.
 - Named Workspaces with drag-and-drop Session assignment.
+- AAF desktop automation through `desktop_auto`, including zero/one/many model-visible WebP/PNG screenshots mixed with structured OCR, geometry and state output.
 - Filesystem, text search/editing, reversible trash and generated-file publishing.
 - Foreground and persistent processes with progress streaming when requested.
 - Persistent JavaScript kernels scoped to Session + Workspace.
@@ -70,6 +71,10 @@ Session and Workspace:
 
 - `list_workspaces`, `create_workspace`, `open_workspace`, `query_tool_calls`
 
+Desktop automation:
+
+- `desktop_auto` — execute one AAF YAML scenario through Auto.js; arbitrary final state is preserved and retained screenshots are returned directly as MCP image content for model vision.
+
 Filesystem:
 
 - `fs_glob`, `fs_grep`, `fs_read`, `fs_navigate`, `fs_stat`
@@ -108,7 +113,7 @@ ACME HTTP-01 is available only while the effective HTTP listener remains on port
 
 ## Desktop application
 
-Desktop mode uses Tauriless `0.1.17` and keeps the native event loop plus Deno backend Worker in one OS process. The window can be hidden to the tray without stopping MrMCP. Native directory drops can add Workspaces, and Session/Workspace/Tool Call notifications are configurable independently.
+Desktop mode uses Tauriless from npm latest and keeps the native event loop plus Deno backend Worker in one OS process. The window can be hidden to the tray without stopping MrMCP. Native directory drops can add Workspaces, and Session/Workspace/Tool Call notifications are configurable independently.
 
 Windows standalone builds use `--no-terminal` and the versioned application icon. macOS releases are Finder-launchable `MrMCP.app` bundles distributed inside DMG images.
 

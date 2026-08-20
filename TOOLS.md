@@ -6,7 +6,7 @@ This file documents the current built-in MCP tool surface, its arguments, semant
 
 ### Session capability
 
-Most tools require `context_handle`, the opaque `ctx_...` capability returned by `open_workspace`. Pass it unchanged. `list_workspaces` and `create_workspace` are sessionless; `open_workspace` creates or reuses a Session and returns the handle used afterward.
+Most tools require `context_handle`, the opaque `ctx_...` capability returned by `open_workspace`. Pass it unchanged. `list_workspaces`, `create_workspace` and the read-only diagnostic `inspect_tools` are sessionless; `open_workspace` creates or reuses a Session and returns the handle used afterward.
 
 ### Filesystem paths
 
@@ -37,9 +37,27 @@ Nested `.gitignore` discovery is always recursive when `gitignore=true`; there i
 
 ### Text representation
 
-Text tools support `auto`, UTF-8, UTF-16LE, UTF-16BE, Windows-1252 and Latin-1 input. Mutations support `preserve` or an explicit output encoding, BOM preservation/add/remove and `preserve|lf|crlf|cr` line endings.
+Text content and its physical representation are deliberately separate. The agent works on decoded text; MrMCP owns charset encoding, physical BOM bytes and CR/LF serialization.
 
-Returned text is normalized to LF for stable agent editing while the result reports the source `encoding`, `bom` and `line_endings`. Tool string arguments are already JSON-decoded text; MrMCP never applies a second C/JavaScript escape-decoding pass.
+Design rationale: agents are good at expressing the intended logical text but should not be forced to reproduce incidental byte-level representation exactly on every tool call. Requiring them to remember or emit the original charset, BOM and CR/LF convention would increase prompt/tool-call burden and create avoidable errors and retry round-trips. MrMCP therefore infers and preserves representation whenever the existing bytes provide one unambiguous answer, and normalizes harmless payload differences such as agent-supplied LF versus CRLF. It asks the agent for an explicit representation choice only when no unique answer can be derived, such as adding line breaks to a new/single-line file or rewriting a mixed-EOL file. This convenience never permits silent data loss: malformed input, unsupported characters, ambiguous representation choices and non-lossless conversions fail instead of being guessed or repaired.
+
+Character-set rules:
+
+- `encoding:"auto"` passes the complete original `Uint8Array` from `Deno.readFile()` to pinned `chardet` and uses only the charset it reports. BOM, UTF-8 validity, NUL patterns and other local heuristics never override or supplement that decision. If `chardet` returns no usable charset, auto decoding fails. An explicit input encoding bypasses `chardet` entirely and is decoded as requested.
+- Physical BOM inspection is independent metadata only. A recognized UTF-8/UTF-16/UTF-32 prefix produces `bom:true`; it never selects the charset. The selected decoder may consume a matching BOM according to that charset's normal decoding semantics (including the custom UTF-32 decoder), which is distinct from using BOM as a detector.
+- Native `TextDecoder` charsets decode with `fatal:true`; malformed data is not retried through a permissive decoder. A charset unavailable to `TextDecoder` may use `iconv-lite`, but only when decode/re-encode reproduces the original bytes exactly.
+- `output_encoding:"preserve"` reuses the detected source charset. On a new file, where there is nothing to preserve, it means UTF-8. A `chardet` result of ASCII remains strict ASCII; it is not silently promoted to UTF-8 or interpreted through the WHATWG Windows-1252 `ascii` alias. Encoding intent is not stored separately from file bytes: a newly written UTF-8 file containing only ASCII-compatible bytes may later be reported as `ascii` by `auto` if that is what `chardet` detects, because those bytes do not physically distinguish the two encodings. Encoding is checked by decoding the final bytes through MrMCP's own read path and comparing the exact text, so unsupported characters are rejected instead of becoming `?` or replacement characters. Auto-detected legacy encodings can therefore be preserved only when both decoding and encoding are lossless.
+- `bom:"preserve"` preserves physical recognized-BOM prefix presence, not a particular BOM byte sequence: converting a BOM-bearing UTF-16 file to UTF-8 therefore produces the UTF-8 BOM. A new file with `preserve` has no BOM. `add` requires a BOM-capable Unicode output encoding because adding Unicode BOM bytes to a legacy charset would change its decoded text. With an explicitly decoded legacy source whose ordinary text bytes already happen to begin with a recognized BOM sequence, `preserve` does not invent another prefix; the final byte-prefix check decides whether physical presence was actually retained. `remove` similarly fails rather than alter logical text if the requested text itself necessarily encodes to recognized BOM bytes at byte zero.
+
+Line-ending rules:
+
+- Read/search outputs are normalized to LF so matching and edits operate on one stable logical representation. Source metadata still reports `line_endings:"lf"|"crlf"|"cr"|"mixed"|"none"`. `none` means there is no CR or LF separator at all; it includes an empty file and a non-empty single-line file.
+- LF, CRLF, CR or mixed separators arriving in `content`, `old_text` or `new_text` are logical text, not an implicit declaration of the desired file format. `fs_edit` normalizes edit anchors/replacements to LF for matching. On output, an explicit `line_endings:"lf"|"crlf"|"cr"` normalizes every break to that requested style.
+- `line_endings:"preserve"` reuses an existing uniform source style (`lf`, `crlf` or `cr`) regardless of which separators the agent happened to send. This intentionally avoids needless retry round-trips for LF-vs-CRLF differences in tool payloads.
+- If the resulting text contains line breaks and there is no single source style to reuse, preservation is genuinely ambiguous: an existing `mixed` source returns `mixed_line_endings`; a new or `none` source returns `line_endings_required`. The agent must then choose `lf`, `crlf` or `cr`. If the resulting text has no line breaks, no choice is required even when the source was `mixed`, `none` or new, because the output style is factually `none`.
+- A terminating newline does not create a synthetic extra logical line; an empty file has `total_lines:0`.
+
+Tool string arguments are already JSON-decoded text. MrMCP never applies a second C/JavaScript-style escape-decoding pass, so e.g. `\\n` remains two literal characters unless the JSON value itself contains an actual newline.
 
 ### Fingerprints
 
@@ -115,13 +133,13 @@ Searches text across a selected set of files.
 
 Arguments:
 
-- `pattern` — non-empty literal or regex source.
+- `pattern` — non-empty literal substring or regex source. With `regex=false`, the entire supplied string is matched literally; spaces and punctuation are not tokenized.
 - shared path selection: `path`, `include[]`, `exclude[]`, `gitignore`, `hidden`.
 - `regex` — interpret `pattern` as JavaScript regex source; default false.
 - `case_sensitive` — default false.
 - `encoding` — input text encoding; default `auto`.
 - `context_lines_before` / `context_lines_after` — text context returned around each match; default 0.
-- `mode` — `matches`, `files` or `count`; default `matches`.
+- `mode` — `matches`, `files` or `count`; default `matches`. `count` follows grep `-c` semantics and reports matching lines per file, not total substring occurrences.
 - `max_file_bytes` — skip source files larger than this size; default 5 MiB, maximum 50 MiB.
 - `limit` — maximum returned matches in `matches` mode or matched files in the other modes; default 300, maximum 2000.
 - `resume_after` — optional stateless continuation object:
@@ -149,7 +167,7 @@ Arguments:
 - `max_output_bytes_per_file` — target maximum UTF-8 bytes of normalized text returned for each file result; default 1 MiB, maximum 5 MiB. A single complete line may exceed the target so line content is never split. This bounds response payload, not source file size.
 - `context_handle`.
 
-Successful results include normalized `content`, actual returned range, `total_lines`, source size, fingerprint and text metadata. A truncated result provides `next_start_line`.
+Successful results include normalized `content`, actual returned range, `total_lines`, source size, fingerprint and text metadata. A truncated requested range provides `next_start_line`. Under the byte budget, requested lines take priority over optional context: `fs_read` first fills the page from the requested range, then uses only remaining space for `context_lines_before` / `context_lines_after`. Context omission alone does not create a continuation cursor, and a truncated requested range always advances `next_start_line` beyond the requested start instead of repeating a context-only page.
 
 Rationale: a single multi-file read eliminates `read_file`/`read_files` duplication while per-file range and encoding options remain naturally scoped to the file they affect.
 
@@ -205,13 +223,15 @@ Arguments:
   - `path`.
   - `content`.
   - `expected_fingerprint` — optional optimistic concurrency token.
-  - `output_encoding` — `preserve` or explicit encoding; default `preserve`.
-  - `line_endings` — `preserve|lf|crlf|cr`; default `preserve`.
-  - `bom` — `preserve|add|remove`; default `preserve`.
+  - `output_encoding` — `preserve` or explicit encoding; default `preserve`. Existing files reuse the detected charset; new files use UTF-8.
+  - `line_endings` — `preserve|lf|crlf|cr`; default `preserve`. Preserve reuses a uniform source style; if output contains breaks and no such style exists, the result asks for an explicit choice.
+  - `bom` — `preserve|add|remove`; default `preserve`. Existing files preserve physical BOM presence; new files default to no BOM.
 - `create_parents` — create missing parent directories; default true.
 - `context_handle`.
 
-Returns per-file status plus before/after sizes, fingerprints and final text metadata when written, and top-level `succeeded` / `failed` counts.
+Returns per-file status plus before/after sizes, fingerprints and final text metadata when written, and top-level `succeeded` / `failed` counts. With `create_parents:false`, a missing parent is reported explicitly as `parent_missing` rather than as source `not_found`.
+
+An existing source is decoded only when a preserved property actually needs decoded text metadata: preserving the charset always needs detection, and preserving line endings needs decoding only when the replacement contains line breaks. Physical BOM preservation is read directly from raw prefix bytes. Therefore a complete replacement with explicit output encoding/EOL policy can replace otherwise undecodable source bytes without an irrelevant chardet/decode failure, while fingerprint and source-changed checks still protect concurrency.
 
 Rationale: whole-file replacement and anchored editing are different operations and remain separate tools; combining them would create a mode-dependent schema.
 
@@ -244,7 +264,7 @@ For each file MrMCP:
 
 If any occurrence check fails, that file receives `occurrence_mismatch` and is not written. The result includes compact ordered edit evidence `{index, expected_occurrences, occurrences}` without echoing the potentially large text arguments.
 
-When source line endings are mixed, `line_endings: preserve` is rejected with `mixed_line_endings`; exact mixed-EOL layout cannot be reconstructed after normalized editing. Choose an explicit output line-ending mode to make conversion intentional.
+When `line_endings: preserve` has no unique source style and the edited result still contains line breaks, the edit is not written: mixed sources return `mixed_line_endings`, while a source with `line_endings:none` returns `line_endings_required`. If the edit removes every line break, the result is unambiguously `none` and no explicit style is required.
 
 Rationale: this keeps multi-edit fast and safe without line-number drift. Edits are anchored by text, not absolute coordinates, so earlier edits may add/remove lines without invalidating later edit positions.
 
@@ -266,7 +286,7 @@ Existing directories are reported as `exists` and count as successful. Entries a
 
 ### `fs_copy`
 
-Copies one or many files/directories recursively.
+Copies one or many files, directories or symlinks recursively. Symlinks are recreated as symlinks with the same link target text rather than dereferenced into ordinary files/directories.
 
 Arguments:
 
@@ -282,7 +302,7 @@ Moves or renames one or many files/directories.
 
 Arguments are the same as `fs_copy`.
 
-MrMCP first uses native rename and falls back to copy/remove when a cross-filesystem move requires it. Destinations must not already exist. Entries run in order and are never reversed because a later entry fails.
+MrMCP first uses native rename and falls back to copy/remove when a cross-filesystem move requires it. The fallback preserves symlinks just like the native rename path. Destinations must not already exist. Entries run in order and are never reversed because a later entry fails.
 
 ### `fs_trash`
 
@@ -311,6 +331,25 @@ Arguments:
 - `context_handle`.
 
 Each payload is restored independently. Occupied destinations, missing parents, wrong-Workspace paths and unavailable payloads are reported per entry. Successful restores remain restored; failed payloads remain available for retry. The trash transaction is deleted only when no payload remains.
+
+---
+
+## Desktop automation
+
+### `desktop_auto`
+
+Runs one Automation Action Format (AAF) YAML scenario against the current desktop through `@mefistofelix/auto.js`.
+
+Arguments:
+
+- `yaml` — complete AAF YAML scenario. The top level is an ordered array and each item contains exactly one action. The authoritative specification and examples are at `https://github.com/mefistofelix/auto.js/blob/main/AAF_SPEC.md`.
+- `context_handle`.
+
+The returned `results` and `state` preserve Auto.js `run()` semantics. `results` is the ordered per-action result array; `state` is the arbitrary final structure built by the scenario and may freely mix OCR text, window/accessibility records, coordinates, arrays, objects, scalars and zero, one or many retained screenshots.
+
+Retained final-state screenshots remain at the exact nested state locations chosen by the scenario. MrMCP removes only their binary `data`, keeps their AAF metadata (`format`, absolute desktop `rect`, `grayscale`, `scale`), and inserts `image_id`. A top-level `images[]` transport index maps each distinct image id to every referencing `$.state` path and to its MCP `content_index`. The same retained image referenced from several state paths is emitted only once.
+
+The MCP result `content` is multimodal: index `0` is the JSON `TextContent` representation of the structured result, followed by one MCP `ImageContent` block per distinct retained image. Thus no-image scenarios return ordinary structured/text data, while scenarios with several images return all of them in the same tool result. The images are direct model input, not `publish_file`, Published storage, an MCP App or a `resource_link`. MCP encodes `ImageContent.data` as Base64 on the wire; Auto.js WebP plus `scale` is the intended size-control path. `rect` always remains the original absolute screen-space capture rectangle, so coordinates can be mapped back correctly after downscaling.
 
 ---
 
@@ -344,7 +383,7 @@ Remote dependencies remain subject to host/browser CSP and CORS. The whole MCP r
 
 ---
 
-## Command discovery and Tool Call history
+## Command discovery and diagnostics
 
 ### `discover_commands`
 
@@ -357,6 +396,20 @@ Arguments:
 Results contain `logical_name`, description and optional documentation URL. A returned logical name can be passed directly as `exec.program`; MrMCP resolves catalog names before normal PATH lookup.
 
 Rationale: user-provided command capability remains extensible without growing the built-in MCP surface.
+
+### `inspect_tools`
+
+Returns the canonical complete descriptor for one or more exact currently published tool names, directly from the same `serverTools()` source used by MCP `tools/list`.
+
+Arguments:
+
+- `names[]` — 1–50 unique exact published tool names.
+
+The result contains `tools[]` in requested order for names that exist and `missing[]` for names that are not currently published. Each returned item contains `name` plus `descriptor_json`, the exact canonical descriptor serialized losslessly as JSON, including `title`, full `description`, `inputSchema`, `outputSchema`, `annotations` and `_meta` when present. The string representation deliberately keeps the diagnostic tool's own output schema simple for connector compatibility. The tool is authenticated, read-only and sessionless because published descriptors are server-level contracts rather than Session/Workspace state.
+
+Publication-widget resource URIs are returned in canonical form. Normal `tools/list` intentionally adds a fresh `?instance=...` suffix to those View URIs for host cache busting; that suffix is the only intentionally dynamic descriptor difference and is not part of input/output schema semantics.
+
+Rationale: connector/tool wrappers may present a synthesized or abbreviated schema view. This diagnostic path lets an agent inspect the authoritative server descriptor itself when exact schema, descriptions, output statuses, annotations or metadata matter, without duplicating descriptor definitions in a second implementation.
 
 ### `query_tool_calls`
 

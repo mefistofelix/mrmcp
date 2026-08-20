@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.113 — Harden GUI rendering, command discovery and Tool Call filtering.
+MrMCP 0.10.114 — Harden filesystem tools, text detection, schema diagnostics and maintenance UI.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -9,6 +9,12 @@ GUI library: Tauriless, imported directly from npm by Deno.
 
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { Buffer } from "node:buffer";
+import chardet from "npm:chardet@2.1.1";
+import iconv from "npm:iconv-lite@0.7.0";
+import * as auto from "npm:@mefistofelix/auto.js";
+let sharpModulePromise;
+const loadSharp = () => sharpModulePromise ??= import("npm:sharp");
 import { inflateRawSync, inflateSync } from "node:zlib";
 import { Readable, Writable } from "node:stream";
 import { spawn as nodeSpawn } from "node:child_process";
@@ -80,17 +86,17 @@ const BASE_TOOLS = [
   "list_workspaces", "create_workspace", "open_workspace",
   "fs_glob", "fs_grep", "fs_read", "fs_navigate", "fs_stat",
   "fs_write", "fs_edit", "fs_mkdir", "fs_copy", "fs_move", "fs_trash", "fs_restore",
-  "publish_file", "publish_html", "discover_commands", "query_tool_calls", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
+  "desktop_auto", "publish_file", "publish_html", "discover_commands", "inspect_tools", "query_tool_calls", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
   "js", "js_add_node_module_dir", "js_reset",
 ];
 const READ_TOOLS = new Set([
   "list_workspaces", "fs_glob", "fs_grep", "fs_read", "fs_navigate", "fs_stat",
-  "discover_commands", "query_tool_calls", "exec_attach", "exec_list", "exec_status",
+  "discover_commands", "inspect_tools", "query_tool_calls", "exec_attach", "exec_list", "exec_status",
 ]);
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.113";
+const VERSION = "0.10.114";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;
@@ -102,6 +108,7 @@ const MCP_UI_MIME_TYPE = "text/html;profile=mcp-app";
 const FILE_PREVIEW_UI_URI = "ui://mrmcp/file-preview-v9.html";
 const HTML_PREVIEW_UI_URI = "ui://mrmcp/html-preview-v6.html";
 const enc = new TextEncoder(), dec = new TextDecoder();
+const TOOL_RESULT_CONTENT = Symbol("tool-result-content");
 
 const stringResponse = (body, status, type, headers = {}) => {
   body = String(body);
@@ -1230,6 +1237,8 @@ async function backend({ addWorkspace = null } = {}) {
         db.exec("ROLLBACK");
         throw error;
       }
+      db.exec("VACUUM");
+      db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
       await Deno.remove(PUBLISH_DIR, { recursive: true }).catch(error => {
         if (!(error instanceof Deno.errors.NotFound)) throw error;
       });
@@ -2438,6 +2447,10 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     for (let i = 0; i < bytes.length; i += 0x8000) out += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
     return out;
   }
+  function decodeAscii(bytes) {
+    for (const byte of bytes) if (byte > 0x7f) throw new Error(`Invalid ASCII byte 0x${byte.toString(16).toUpperCase().padStart(2, "0")}`);
+    return decodeLatin1(bytes);
+  }
   function decodeWindows1252(bytes) {
     let out = "";
     for (const byte of bytes) out += String.fromCodePoint(CP1252_DECODE.get(byte) ?? byte);
@@ -2453,6 +2466,15 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     }
     return new Uint8Array(bytes);
   }
+  function encodeAscii(value) {
+    const bytes = [];
+    for (const character of String(value)) {
+      const code = character.codePointAt(0);
+      if (code > 0x7f) throw new Error(`Character U+${code.toString(16).toUpperCase()} cannot be encoded as ascii`);
+      bytes.push(code);
+    }
+    return new Uint8Array(bytes);
+  }
   function encodeUtf16(value, bigEndian = false) {
     const text = String(value), bytes = new Uint8Array(text.length * 2);
     for (let i = 0; i < text.length; i++) {
@@ -2462,35 +2484,89 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     }
     return bytes;
   }
+  function encodeUtf32(value, bigEndian = false) {
+    const codePoints = [...String(value)], bytes = new Uint8Array(codePoints.length * 4);
+    let offset = 0;
+    for (const character of codePoints) {
+      const code = character.codePointAt(0);
+      if (bigEndian) {
+        bytes[offset++] = code >>> 24; bytes[offset++] = code >>> 16; bytes[offset++] = code >>> 8; bytes[offset++] = code;
+      } else {
+        bytes[offset++] = code; bytes[offset++] = code >>> 8; bytes[offset++] = code >>> 16; bytes[offset++] = code >>> 24;
+      }
+    }
+    return bytes;
+  }
+  function decodeUtf32(bytes, bigEndian = false) {
+    if (bytes.length % 4) throw new Error(`Invalid ${bigEndian ? "UTF-32BE" : "UTF-32LE"} byte length`);
+    let out = "";
+    for (let offset = 0; offset < bytes.length; offset += 4) {
+      const code = bigEndian
+        ? ((bytes[offset] << 24) >>> 0) + (bytes[offset + 1] << 16) + (bytes[offset + 2] << 8) + bytes[offset + 3]
+        : ((bytes[offset + 3] << 24) >>> 0) + (bytes[offset + 2] << 16) + (bytes[offset + 1] << 8) + bytes[offset];
+      if (code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) throw new Error(`Invalid UTF-32 code point U+${code.toString(16).toUpperCase()}`);
+      if (offset === 0 && code === 0xfeff) continue;
+      out += String.fromCodePoint(code);
+    }
+    return out;
+  }
+  function normalizeDetectedEncoding(value) {
+    const encoding = String(value || "").trim().toLowerCase().replaceAll("_", "-").replaceAll(" ", "");
+    if (!encoding) return "";
+    if (encoding === "utf8") return "utf-8";
+    if (["utf16le", "utf-16-le"].includes(encoding)) return "utf-16le";
+    if (["utf16be", "utf-16-be"].includes(encoding)) return "utf-16be";
+    if (["utf32le", "utf-32-le"].includes(encoding)) return "utf-32le";
+    if (["utf32be", "utf-32-be"].includes(encoding)) return "utf-32be";
+    if (encoding === "iso-8859-1") return "latin1";
+    return encoding;
+  }
+  function textBom(bytes) {
+    return (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xfe && bytes[2] === 0x00 && bytes[3] === 0x00)
+      || (bytes.length >= 4 && bytes[0] === 0x00 && bytes[1] === 0x00 && bytes[2] === 0xfe && bytes[3] === 0xff)
+      || (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf)
+      || (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe)
+      || (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff);
+  }
+  function sameBytes(left, right) {
+    if (left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index++) if (left[index] !== right[index]) return false;
+    return true;
+  }
+  function decodeTextBytes(bytes, encoding) {
+    if (encoding === "ascii") return decodeAscii(bytes);
+    if (encoding === "latin1") return decodeLatin1(bytes);
+    if (encoding === "windows-1252") return decodeWindows1252(bytes);
+    if (encoding === "utf-32le") return decodeUtf32(bytes, false);
+    if (encoding === "utf-32be") return decodeUtf32(bytes, true);
+    let decoder;
+    try { decoder = new TextDecoder(encoding, { fatal: true }); }
+    catch (error) {
+      if (!iconv.encodingExists(encoding)) throw new Error(`Unsupported detected text encoding: ${encoding}`, { cause: error });
+      const decoded = iconv.decode(Buffer.from(bytes), encoding);
+      if (!sameBytes(iconv.encode(decoded, encoding), bytes)) throw new Error(`Text cannot be decoded losslessly as ${encoding}`);
+      return decoded;
+    }
+    return decoder.decode(bytes);
+  }
   function encodeText(value, encoding) {
+    if (encoding === "ascii") return encodeAscii(value);
     if (encoding === "utf-8") return enc.encode(String(value));
     if (encoding === "utf-16le") return encodeUtf16(value, false);
     if (encoding === "utf-16be") return encodeUtf16(value, true);
+    if (encoding === "utf-32le") return encodeUtf32(value, false);
+    if (encoding === "utf-32be") return encodeUtf32(value, true);
     if (encoding === "windows-1252") return encodeLatin1(value, true);
     if (encoding === "latin1") return encodeLatin1(value, false);
+    if (iconv.encodingExists(encoding)) return new Uint8Array(iconv.encode(String(value), encoding));
     throw new Error(`Unsupported output encoding: ${encoding}`);
   }
   function decodeTextDocument(bytes, requested = "auto") {
     requested = textEncoding(requested, "auto");
-    let encoding = requested, offset = 0, bom = false;
-    if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
-      if (requested === "auto") encoding = "utf-8";
-      if (encoding === "utf-8") { offset = 3; bom = true; }
-    } else if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
-      if (requested === "auto") encoding = "utf-16le";
-      if (encoding === "utf-16le") { offset = 2; bom = true; }
-    } else if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
-      if (requested === "auto") encoding = "utf-16be";
-      if (encoding === "utf-16be") { offset = 2; bom = true; }
-    }
-    const payload = bytes.subarray(offset);
-    if (encoding === "auto") {
-      try { new TextDecoder("utf-8", { fatal: true }).decode(payload); encoding = "utf-8"; }
-      catch { encoding = "windows-1252"; }
-    }
-    const text = encoding === "latin1" ? decodeLatin1(payload)
-      : encoding === "windows-1252" ? decodeWindows1252(payload)
-      : new TextDecoder(encoding, { fatal: true }).decode(payload);
+    const bom = textBom(bytes);
+    const encoding = requested === "auto" ? normalizeDetectedEncoding(chardet.detect(bytes)) : requested;
+    if (!encoding) throw new Error("Unable to detect text encoding");
+    const text = decodeTextBytes(bytes, encoding);
     return { text, encoding, bom, line_endings: lineEndingKind(text), bytes };
   }
   async function readTextDocument(path, requested = "auto") {
@@ -2503,14 +2579,24 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const bomMode = String(options.bom || "preserve").toLowerCase();
     if (!["preserve", "add", "remove"].includes(bomMode)) throw new Error("bom must be preserve, add, or remove");
     const bom = bomMode === "add" || (bomMode === "preserve" && !!source?.bom);
-    if (bom && !["utf-8", "utf-16le", "utf-16be"].includes(encoding)) throw new Error(`BOM is unsupported for ${encoding}`);
+    const bomEncoding = ["utf-8", "utf-16le", "utf-16be", "utf-32le", "utf-32be"].includes(encoding);
+    if (bomMode === "add" && !bomEncoding) throw new Error(`BOM cannot be added for ${encoding}`);
     const payload = encodeText(text, encoding);
-    const prefix = !bom ? new Uint8Array() : encoding === "utf-8"
+    const emitBom = bom && bomEncoding;
+    const prefix = !emitBom ? new Uint8Array() : encoding === "utf-8"
       ? new Uint8Array([0xef, 0xbb, 0xbf]) : encoding === "utf-16le"
-      ? new Uint8Array([0xff, 0xfe]) : new Uint8Array([0xfe, 0xff]);
+      ? new Uint8Array([0xff, 0xfe]) : encoding === "utf-16be"
+      ? new Uint8Array([0xfe, 0xff]) : encoding === "utf-32le"
+      ? new Uint8Array([0xff, 0xfe, 0x00, 0x00]) : new Uint8Array([0x00, 0x00, 0xfe, 0xff]);
     const bytes = new Uint8Array(prefix.length + payload.length);
     bytes.set(prefix); bytes.set(payload, prefix.length);
-    return { bytes, encoding, bom, line_endings: lineEndingKind(text) };
+    const physicalBom = textBom(bytes);
+    if (physicalBom !== bom) throw new Error(`Requested BOM ${bom ? "presence" : "absence"} cannot be represented losslessly as ${encoding}`);
+    let decoded;
+    try { decoded = decodeTextBytes(bytes, encoding); }
+    catch (error) { throw new Error(`Text cannot be encoded losslessly as ${encoding}`, { cause: error }); }
+    if (decoded !== text) throw new Error(`Text cannot be encoded losslessly as ${encoding}`);
+    return { bytes, encoding, bom: physicalBom, line_endings: lineEndingKind(text) };
   }
   function globRegex(pattern = "**/*") {
     const source = String(pattern).replaceAll("\\", "/").replace(/^\.\//, "");
@@ -2607,7 +2693,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const displayPath = absolute => slashPath(relative(rootReal, absolute)) || ".";
     if (stat.isFile || stat.isSymlink) {
       const local = basename(base), display = displayPath(base);
-      if (inPage(display) && (!hidden || !basename(base).startsWith(".")) && matchesGlobs(local, include) && !excludedByGlobs(local, exclude)
+      if (inPage(display) && (hidden || !basename(base).startsWith(".")) && matchesGlobs(local, include) && !excludedByGlobs(local, exclude)
         && (!useGitignore || !gitignored(display, false, initialRules)))
         result.push({ path: display, type: stat.isSymlink ? "symlink" : "file", size: stat.size });
       return { entries: result, limited: false };
@@ -2640,8 +2726,15 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     return { entries: result, limited: result.length >= hardLimit };
   }
   async function copyRecursive(from, to) {
-    const st = await Deno.stat(from);
-    if (st.isDirectory) {
+    const st = await Deno.lstat(from);
+    if (st.isSymlink) {
+      await Deno.mkdir(dirname(to), { recursive: true });
+      const target = await Deno.readLink(from);
+      if (Deno.build.os === "windows") {
+        const targetStat = await Deno.stat(from).catch(() => null);
+        await Deno.symlink(target, to, { type: targetStat?.isDirectory ? "dir" : "file" });
+      } else await Deno.symlink(target, to);
+    } else if (st.isDirectory) {
       await Deno.mkdir(to, { recursive: true });
       for await (const e of Deno.readDir(from)) await copyRecursive(join(from, e.name), join(to, e.name));
     } else {
@@ -3343,15 +3436,17 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       type: "string",
       enum: ["auto", "utf-8", "utf-16le", "utf-16be", "windows-1252", "latin1"],
       default: "auto",
+      description: "Text decoding mode. auto passes the complete original byte buffer to chardet and uses only its detected charset; an explicit encoding bypasses chardet. Physical BOM presence is checked independently and returned only as bom metadata; it never influences charset detection.",
     };
     const outputText = {
       output_encoding: {
         type: "string",
         enum: ["preserve", "utf-8", "utf-16le", "utf-16be", "windows-1252", "latin1"],
         default: "preserve",
+        description: "Preserve the detected source charset or convert explicitly. For a new file, preserve means UTF-8. Writes fail rather than substitute characters when the requested/preserved charset cannot represent the text losslessly.",
       },
-      line_endings: { type: "string", enum: ["preserve", "lf", "crlf", "cr"], default: "preserve" },
-      bom: { type: "string", enum: ["preserve", "add", "remove"], default: "preserve" },
+      line_endings: { type: "string", enum: ["preserve", "lf", "crlf", "cr"], default: "preserve", description: "Preserve a uniform source line-ending style, or convert explicitly to lf, crlf, or cr. Incoming LF/CRLF/CR/mixed agent text is logical content and is normalized to the selected output style. If the result contains line breaks, preserve is rejected when the source is mixed or has no style (new/none); no explicit choice is needed when the result has no line breaks." },
+      bom: { type: "string", enum: ["preserve", "add", "remove"], default: "preserve", description: "Preserve, add or remove physical recognized Unicode BOM bytes independently of charset detection. A new file with preserve has no BOM; add requires a BOM-capable Unicode output encoding." },
     };
     const exactEdit = {
       type: "object", additionalProperties: false,
@@ -3434,12 +3529,12 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         } },
       ],
       fs_grep: [
-        "Search text across selected files. Returns whole-file fingerprints for matched files so a later fs_edit/fs_write can detect intervening changes. Pagination is explicit and stateless through resume_after.",
+        "Search text across selected files. With regex=false (the default), pattern is one literal substring exactly as supplied: spaces and punctuation are part of the same search string and are never tokenized. mode=count follows grep -c semantics and counts matching lines per file, not total substring occurrences. Returns whole-file fingerprints for matched files so a later fs_edit/fs_write can detect intervening changes. Pagination is explicit and stateless through resume_after.",
         { properties: {
-          pattern: { type: "string", minLength: 1 }, ...pathSelection,
+          pattern: { type: "string", minLength: 1, description: "Literal substring when regex=false, including any spaces exactly as supplied; regular expression source only when regex=true." }, ...pathSelection,
           regex: { type: "boolean", default: false }, case_sensitive: { type: "boolean", default: false },
           encoding: inputEncoding, ...lineContext,
-          mode: { type: "string", enum: ["matches", "files", "count"], default: "matches" },
+          mode: { type: "string", enum: ["matches", "files", "count"], default: "matches", description: "matches returns matching lines, files returns matching file metadata only, and count returns the number of matching lines in each file (not the number of substring occurrences)." },
           max_file_bytes: { type: "integer", minimum: 1, maximum: 52428800, default: 5242880 },
           limit: { type: "integer", minimum: 1, maximum: 2000, default: 300 },
           resume_after: {
@@ -3519,7 +3614,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         }, required: ["paths"] },
       ],
       fs_copy: [
-        "Copy one or many files/directories recursively. Destinations must not already exist. Batch entries are independent; successful copies remain in place when another entry fails.",
+        "Copy one or many files, directories or symlinks recursively while preserving symlinks as links instead of dereferencing them. Destinations must not already exist. Batch entries are independent; successful copies remain in place when another entry fails.",
         { properties: {
           entries: { type: "array", minItems: 1, maxItems: 100, items: {
             type: "object", additionalProperties: false,
@@ -3529,7 +3624,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         }, required: ["entries"] },
       ],
       fs_move: [
-        "Move or rename one or many files/directories, with cross-filesystem copy/remove fallback. Destinations must not already exist. Batch entries are independent; successful moves are never reversed because another entry fails.",
+        "Move or rename one or many files, directories or symlinks, with cross-filesystem copy/remove fallback that preserves symlinks. Destinations must not already exist. Batch entries are independent; successful moves are never reversed because another entry fails.",
         { properties: {
           entries: { type: "array", minItems: 1, maxItems: 100, items: {
             type: "object", additionalProperties: false,
@@ -3550,6 +3645,16 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         "Restore paths still present under one trash_id. Entries are independent: successful restores remain restored, failed entries stay in the trash for inspection or retry, and the trash transaction is removed only when no payload remains.",
         { properties: { trash_id: { type: "string", description: "Trash transaction identifier returned by fs_trash." }, ...contextInput }, required: ["trash_id"] },
       ],
+      desktop_auto: [
+        "Run one Automation Action Format (AAF) YAML scenario against the current desktop through @mefistofelix/auto.js. Actions execute sequentially in one run and may find/control windows and accessibility elements, send keyboard/mouse input, use the clipboard, capture screenshots, run OCR, wait on conditions, inspect displays, and control supported system state. AAF references such as $.prev, $.ret, and $.state compose steps without hidden persistent desktop state. The structured result preserves Auto.js run() output: ordered action results plus the arbitrary final state built by the scenario, so OCR text, window records, coordinates, arrays, objects and zero/one/many retained images may coexist. Every retained final-state image stays at its original nested state location with its metadata and an image_id replacing binary data; each distinct image is additionally emitted as an MCP image content block for direct model vision. Returned screenshot rect coordinates remain absolute desktop coordinates even when scale reduces the transported image.",
+        { properties: {
+          yaml: {
+            type: "string", minLength: 1, maxLength: 1000000,
+            description: "AAF scenario as YAML. The top level is an ordered array and every item contains exactly one action. Full AAF specification and examples: https://github.com/mefistofelix/auto.js/blob/main/AAF_SPEC.md . The scenario itself determines the final state shape and may mix ordinary JSON values with any number of retained screenshots. To make a screenshot directly visible to the model, retain its handle anywhere in final state, for example: `- screenshot: {scale: 50%}` followed by `- state: {shot: \"$.ret.image\"}`. MrMCP preserves that nesting, removes only the final WebP/PNG byte array, adds image_id at that same object, and emits the corresponding MCP image content block.",
+          },
+          ...contextInput,
+        }, required: ["yaml"] },
+      ],
       publish_file: [
         "Present an existing file to the user through the attached MCP App widget. The server snapshots the file into persistent private publish storage, reusing an existing snapshot when the same fast content fingerprint was already published, and returns an HTTPS URL in structuredContent; publications never expire automatically and survive server restarts as well as later changes, moves or deletion of the Workspace source. The widget renders image/* through an HTML img element or shows an Open File action for other MIME types. Do not read/Base64-encode the file and do not construct alternate preview payloads; simply call publish_file after creating the file.",
         { properties: {
@@ -3569,6 +3674,12 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       discover_commands: [
         "Read the complete catalog of extra executable commands intentionally made available to the agent. Call this proactively whenever a task might benefit from capabilities beyond MrMCP's built-in tools, before inventing a workaround, assuming a utility is unavailable, or choosing a generic alternative. When a listed command fits the task, prefer it: its presence reflects an explicit user choice. The whole available catalog is returned in one call with descriptions and documentation links, so normally call it once per Session and reuse what you learned; there is no search or pagination, which also avoids failures from guessed or misspelled command names. If the operator globally disables command discovery, this tool returns an empty commands array. Every returned logical_name is directly callable as exec.program. MrMCP resolves catalog logical names before normal platform PATH lookup; do not probe PATH or search the filesystem first.",
         { properties: { ...contextInput } },
+      ],
+      inspect_tools: [
+        "Return the canonical complete MCP tool descriptors generated by the same serverTools source used by tools/list for exact published tool names. This exposes name, title, full description, inputSchema, outputSchema, annotations and _meta without connector summarization. Publication View resource URIs are canonical here; tools/list may add a fresh ?instance suffix solely for cache busting. This authenticated diagnostic tool does not require a Session.",
+        { properties: {
+          names: { type: "array", minItems: 1, maxItems: 50, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 128 }, description: "Exact published tool names to inspect, returned in this order when present. Duplicate names are rejected at execution time." },
+        }, required: ["names"] },
       ],
       query_tool_calls: [
         "Query tool-call history that actually reached the server for this exact context_handle. Filters may be combined. query is a case-insensitive literal substring search across the complete stored log record; tool and status are exact filters; before_id pages backward by stable log id. Use this to diagnose tool behavior or distinguish server-side failures from requests blocked before MCP dispatch; an upstream-blocked request cannot appear here.",
@@ -3657,7 +3768,11 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     const fsEntry = (properties, required = ["path", "status"]) => ({ type: "object", additionalProperties: false, properties, required });
     const fsArray = items => ({ type: "array", items });
     const fsErrorProperty = { error: { type: "string" } };
-    const fsTextProperties = { encoding: { type: "string" }, bom: { type: "boolean" }, line_endings: { type: "string" } };
+    const fsTextProperties = {
+      encoding: { type: "string", description: "Character encoding actually used to decode or encode the file." },
+      bom: { type: "boolean", description: "Whether the original/resulting file physically contains a recognized Unicode BOM. This is detected from bytes independently of encoding heuristics." },
+      line_endings: { type: "string", description: "Physical CR/LF style: lf, crlf, cr, mixed, or none. none means the text contains no CR/LF separator, not necessarily that the file is empty." },
+    };
     const fsFingerprintProperties = {
       fingerprint: { type: "string" }, expected_fingerprint: { type: "string" },
       fingerprint_before: { type: "string" }, fingerprint_after: { type: "string" },
@@ -3687,12 +3802,12 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       modified_at: nullableString, created_at: nullableString, fingerprint: { type: "string" },
     });
     const fsWriteEntry = fsEntry({
-      path: { type: "string" }, status: fsStatus(["written", "fingerprint_mismatch", "source_changed", "not_found", "permission_denied", "failed"]), ...fsErrorProperty,
+      path: { type: "string" }, status: fsStatus(["written", "fingerprint_mismatch", "source_changed", "mixed_line_endings", "line_endings_required", "parent_missing", "not_found", "permission_denied", "failed"]), ...fsErrorProperty,
       size: { type: "integer", minimum: 0 }, size_before: { type: "integer", minimum: 0 }, size_after: { type: "integer", minimum: 0 },
       ...fsFingerprintProperties, ...fsTextProperties,
     });
     const fsEditEntry = fsEntry({
-      path: { type: "string" }, status: fsStatus(["edited", "fingerprint_mismatch", "source_changed", "occurrence_mismatch", "mixed_line_endings", "not_found", "permission_denied", "failed"]), ...fsErrorProperty,
+      path: { type: "string" }, status: fsStatus(["edited", "fingerprint_mismatch", "source_changed", "occurrence_mismatch", "mixed_line_endings", "line_endings_required", "not_found", "permission_denied", "failed"]), ...fsErrorProperty,
       size: { type: "integer", minimum: 0 }, size_before: { type: "integer", minimum: 0 }, size_after: { type: "integer", minimum: 0 },
       ...fsFingerprintProperties, ...fsTextProperties, replacements: { type: "integer", minimum: 0 }, edits: { type: "array", items: fsEditResult },
     });
@@ -3737,6 +3852,14 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       type: "object", additionalProperties: false,
       properties, required: Object.keys(properties),
     });
+    const inspectedToolOutput = {
+      type: "object", additionalProperties: false,
+      properties: {
+        name: { type: "string" },
+        descriptor_json: { type: "string", description: "Exact canonical published MCP tool descriptor serialized as JSON." },
+      },
+      required: ["name", "descriptor_json"],
+    };
     const processProperties = {
       exec_id: { type: "integer", minimum: 1, description: "Present for persistent processes created by exec_start; equals that exec_start Tool Call id." },
       status: { type: "string" },
@@ -3772,6 +3895,21 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       fs_move: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsMoveEntry) }),
       fs_trash: strictOutputSchema({ trash_id: nullableString, trash_path: nullableString, manifest_path: nullableString, succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsTrashEntry) }),
       fs_restore: strictOutputSchema({ trash_id: { type: "string" }, succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsRestoreEntry) }),
+      desktop_auto: strictOutputSchema({
+        results: { type: "array", items: {} },
+        state: { type: "object", additionalProperties: true },
+        images: { type: "array", items: {
+          type: "object", additionalProperties: false,
+          properties: {
+            id: { type: "string", description: "Transport id inserted into each corresponding retained image object as image_id." }, state_paths: { ...stringArray, description: "Every final $.state path referencing this same materialized image." },
+            format: { type: "string", enum: ["webp", "png"] }, mime_type: { type: "string" },
+            bytes: { type: "integer", minimum: 0 }, rect: { type: "object", additionalProperties: true },
+            grayscale: { type: "boolean" }, scale: { type: "number", exclusiveMinimum: 0, maximum: 1 },
+            content_index: { type: "integer", minimum: 1, description: "Zero-based index in the MCP CallToolResult.content array. Index 0 is the JSON TextContent; image blocks therefore start at 1." },
+          },
+          required: ["id", "state_paths", "format", "mime_type", "bytes", "rect", "grayscale", "scale", "content_index"],
+        } },
+      }),
       publish_file: outputSchema({ id: { type: "string" }, content_id: { type: "string" }, path: { type: "string" }, filename: { type: "string" }, mime_type: { type: "string" }, size: { type: "integer" }, uri: { type: "string", description: "Persistent HTTPS URL consumed by the attached MCP App widget; publications never expire automatically." } }),
       publish_html: outputSchema({ id: { type: "string" }, content_id: { type: "string" }, title: { type: "string" }, uri: { type: "string", description: "Persistent HTTPS URL loaded by the attached MCP App widget." }, height: { type: "integer" }, created_at: { type: "string" } }),
       discover_commands: outputSchema({ commands: {
@@ -3785,6 +3923,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
           required: ["logical_name", "description"],
         },
       } }),
+      inspect_tools: sessionlessOutputSchema({ tools: { type: "array", items: inspectedToolOutput }, missing: stringArray }),
       query_tool_calls: outputSchema({ calls: objectArray }),
       exec: outputSchema(processProperties),
       exec_start: outputSchema({
@@ -3817,16 +3956,16 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       list_workspaces: "List Workspaces", create_workspace: "Create Workspace", open_workspace: "Open Workspace",
       fs_glob: "FS Glob", fs_grep: "FS Grep", fs_read: "FS Read", fs_navigate: "FS Navigate", fs_stat: "FS Stat",
       fs_write: "FS Write", fs_edit: "FS Edit", fs_mkdir: "FS Mkdir", fs_copy: "FS Copy", fs_move: "FS Move", fs_trash: "FS Trash", fs_restore: "FS Restore",
-      publish_file: "Publish File", publish_html: "Publish HTML", discover_commands: "Discover Commands", query_tool_calls: "Query Tool Calls",
+      desktop_auto: "Desktop Auto", publish_file: "Publish File", publish_html: "Publish HTML", discover_commands: "Discover Commands", inspect_tools: "Query Tool Schema", query_tool_calls: "Query Tool Calls",
       exec: "Run Command", exec_start: "Start Persistent Command", exec_attach: "Attach Process Output", exec_write: "Write Stdin",
       exec_kill: "Terminate Process", exec_list: "List Processes", exec_status: "Process Status", js: "JavaScript Kernel",
       js_add_node_module_dir: "Add Module Directory", js_reset: "Reset JavaScript Kernel",
     };
     const annotations = name => ({
       readOnlyHint: READ_TOOLS.has(name) || name === "publish_file",
-      destructiveHint: ["fs_write", "fs_edit", "fs_move", "exec", "exec_start", "exec_write", "exec_kill", "js", "js_add_node_module_dir", "js_reset"].includes(name),
+      destructiveHint: ["desktop_auto", "fs_write", "fs_edit", "fs_move", "exec", "exec_start", "exec_write", "exec_kill", "js", "js_add_node_module_dir", "js_reset"].includes(name),
       idempotentHint: (READ_TOOLS.has(name) && name !== "publish_file") || ["fs_write", "fs_mkdir", "js_reset"].includes(name),
-      openWorldHint: name.startsWith("exec") || name === "js" || name === "publish_file" || name === "publish_html",
+      openWorldHint: name === "desktop_auto" || name.startsWith("exec") || name === "js" || name === "publish_file" || name === "publish_html",
     });
     const schema = value => ({
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -3837,7 +3976,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       required: [...new Set([...(value.required || []), "context_handle"])],
     });
     const tools = [...available].filter(name => defs[name]).map(name => {
-      const requiresContext = !["list_workspaces", "create_workspace", "open_workspace"].includes(name);
+      const requiresContext = !["list_workspaces", "create_workspace", "open_workspace", "inspect_tools"].includes(name);
       return {
         name,
         title: titles[name] || name.replaceAll("_", " ").replace(/\b\w/g, value => value.toUpperCase()),
@@ -3882,14 +4021,15 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     else {
       if (tool.outputSchema.type !== "object") errors.push("outputSchema.type must be object");
       if (tool.outputSchema.additionalProperties !== false) errors.push("outputSchema.additionalProperties must be false");
-      if (!["list_workspaces", "create_workspace"].includes(tool.name) && !tool.outputSchema.required?.includes("context_handle"))
+      if (!["list_workspaces", "create_workspace", "inspect_tools"].includes(tool.name) && !tool.outputSchema.required?.includes("context_handle"))
         errors.push("outputSchema missing required context_handle");
-      if (["list_workspaces", "create_workspace"].includes(tool.name) && tool.outputSchema.properties?.context_handle)
+      if (["list_workspaces", "create_workspace", "inspect_tools"].includes(tool.name) && tool.outputSchema.properties?.context_handle)
         errors.push(`${tool.name} output must not expose context_handle`);
       const expectedOutputs = {
         list_workspaces: ["workspaces"],
         create_workspace: ["created"],
         open_workspace: ["workspace_name", "cwd", "agent_guidance_path"],
+        inspect_tools: ["tools", "missing"],
         query_tool_calls: ["calls"],
         publish_html: ["id", "title", "uri", "height", "created_at"],
         fs_glob: ["entries", "next_after_path", "truncated"],
@@ -3898,6 +4038,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
         fs_write: ["succeeded", "failed", "files"], fs_edit: ["succeeded", "failed", "total_replacements", "files"],
         fs_mkdir: ["succeeded", "failed", "entries"], fs_copy: ["succeeded", "failed", "entries"], fs_move: ["succeeded", "failed", "entries"],
         fs_trash: ["trash_id", "succeeded", "failed", "entries"], fs_restore: ["trash_id", "succeeded", "failed", "entries"],
+        desktop_auto: ["results", "state", "images"],
         exec_start: ["exec_id"],
         exec_attach: ["exec_id", "output", "remaining_bytes"],
         exec_status: ["exec_id", "status", "output_mode"],
@@ -3912,7 +4053,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       if (tool.inputSchema?.properties?.context_handle) errors.push("open_workspace must not accept context_handle");
       if (!tool.inputSchema?.properties?.current_context_handle) errors.push("open_workspace missing optional current_context_handle");
       if (tool.inputSchema?.required?.includes("current_context_handle")) errors.push("open_workspace current_context_handle must be optional");
-    } else if (["list_workspaces", "create_workspace"].includes(tool.name)) {
+    } else if (["list_workspaces", "create_workspace", "inspect_tools"].includes(tool.name)) {
       if (tool.inputSchema?.properties?.context_handle) errors.push(`${tool.name} must not accept context_handle`);
     } else {
       if (!tool.inputSchema?.properties?.context_handle) errors.push("inputSchema missing context_handle");
@@ -3926,7 +4067,8 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       fs_read: ["files", "max_output_bytes_per_file"], fs_navigate: ["pattern", "files", "regex", "case_sensitive", "context_lines_before", "context_lines_after"], fs_stat: ["paths", "fingerprint"],
       fs_write: ["files", "create_parents"], fs_edit: ["files"], fs_mkdir: ["paths", "parents"],
       fs_copy: ["entries", "create_parents"], fs_move: ["entries", "create_parents"], fs_trash: ["paths", "selection"], fs_restore: ["trash_id"],
-      publish_html: ["html", "title", "height"],
+      desktop_auto: ["yaml"], publish_html: ["html", "title", "height"],
+      inspect_tools: ["names"],
       query_tool_calls: ["limit", "tool", "status", "query", "before_id"],
       exec_attach: ["exec_id"], exec_write: ["exec_id"], exec_kill: ["exec_id"], exec_status: ["exec_id", "output", "tail_lines"],
     };
@@ -4113,6 +4255,14 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     if (Array.isArray(value)) {
       if (schema.minItems != null && value.length < schema.minItems) return `${label} must contain at least ${schema.minItems} items`;
       if (schema.maxItems != null && value.length > schema.maxItems) return `${label} must contain at most ${schema.maxItems} items`;
+      if (schema.uniqueItems === true) {
+        const seen = new Set();
+        for (const item of value) {
+          const key = JSON.stringify(item);
+          if (seen.has(key)) return `${label} must contain unique items`;
+          seen.add(key);
+        }
+      }
       if (schema.items) for (let i = 0; i < value.length; i++) {
         const error = inputSchemaError(schema.items, value[i], path ? `${path}[${i}]` : `[${i}]`);
         if (error) return error;
@@ -4717,7 +4867,61 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     };
     if (name === "create_workspace") return await createDesktopWorkspace(p, args.name);
     if (name === "open_workspace") return await workspaceInfo(selection);
+    if (name === "inspect_tools") {
+      const published = new Map(serverTools(p, true).map(tool => [tool.name, tool]));
+      const names = (args.names || []).map(name => String(name));
+      if (new Set(names).size !== names.length) throw new Error("names must contain unique tool names");
+      return {
+        tools: names.flatMap(name => published.has(name) ? [{ name, descriptor_json: JSON.stringify(published.get(name)) }] : []),
+        missing: names.filter(name => !published.has(name)),
+      };
+    }
     if (!selection?.context || !selection?.root) throw new Error("Session Workspace selection is missing");
+    if (name === "desktop_auto") {
+      const scenario = parseYaml(String(args.yaml));
+      const result = await auto.run(scenario);
+      const images = [], seenImages = new WeakMap();
+      const childPath = (path, key) => /^[$A-Z_a-z][$0-9A-Z_a-z]*$/.test(String(key))
+        ? `${path}.${key}` : `${path}[${JSON.stringify(String(key))}]`;
+      const convert = (value, path) => {
+        if (!value || typeof value !== "object") return value;
+        if (value.data instanceof Uint8Array && value.rect && typeof value.format === "string") {
+          const format = value.format.toLowerCase();
+          if (format !== "webp" && format !== "png")
+            throw new Error(`desktop_auto cannot transport final image format ${value.format}; use WebP or PNG`);
+          let image = seenImages.get(value);
+          if (!image) {
+            const id = `image_${images.length + 1}`;
+            image = {
+              id, value, state_paths: [], format,
+              mime_type: `image/${format}`, bytes: value.data.byteLength,
+              rect: value.rect, grayscale: !!value.grayscale, scale: Number(value.scale ?? 1),
+            };
+            seenImages.set(value, image); images.push(image);
+          }
+          image.state_paths.push(path);
+          const { data: _data, ...metadata } = value;
+          return { ...metadata, image_id: image.id };
+        }
+        if (value instanceof Uint8Array) throw new Error(`desktop_auto returned unsupported binary data at ${path}`);
+        if (Array.isArray(value)) return value.map((item, index) => convert(item, `${path}[${index}]`));
+        return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, convert(item, childPath(path, key))]));
+      };
+      const state = convert(result?.state || {}, "$.state");
+      const content = images.map(image => ({
+        type: "image",
+        data: Buffer.from(image.value.data.buffer, image.value.data.byteOffset, image.value.data.byteLength).toString("base64"),
+        mimeType: image.mime_type,
+        annotations: { audience: ["assistant"], priority: 1 },
+        _meta: { "com.mefistofelix.mrmcp/imageId": image.id },
+      }));
+      const imageMetadata = images.map((image, index) => ({
+        id: image.id, state_paths: image.state_paths, format: image.format, mime_type: image.mime_type,
+        bytes: image.bytes, rect: image.rect, grayscale: image.grayscale, scale: image.scale,
+        content_index: index + 1,
+      }));
+      return { results: result?.results || [], state, images: imageMetadata, [TOOL_RESULT_CONTENT]: content };
+    }
     const resolvePath = path => resolveWorkspacePath(selection, path);
     const pathKey = path => Deno.build.os === "windows" ? resolve(path).toLowerCase() : resolve(path);
     const exists = async path => {
@@ -4726,7 +4930,13 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
     };
     const errorStatus = error => error instanceof Deno.errors.NotFound ? "not_found"
       : error instanceof Deno.errors.PermissionDenied ? "permission_denied" : "failed";
-    const textLines = document => normalizeLineEndings(document.text, "lf").split("\n");
+    const textLines = document => {
+      const normalized = normalizeLineEndings(document.text, "lf");
+      if (!normalized) return [];
+      const lines = normalized.split("\n");
+      if (normalized.endsWith("\n")) lines.pop();
+      return lines;
+    };
     const searchRegex = (pattern, regex, caseSensitive) => new RegExp(
       regex ? String(pattern) : String(pattern).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"),
       caseSensitive ? "" : "i",
@@ -4778,12 +4988,12 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
             if (regex.test(lines[index])) indexes.push(index);
           }
           if (!indexes.length) continue;
-          matchedFiles++;
           const fingerprint = await fingerprintBytes(document.bytes);
           const metadata = { size: stat.size, encoding: document.encoding, bom: document.bom, line_endings: document.line_endings };
           if (mode === "matches") {
             const eligible = indexes.filter(index => !cursor || entry.path !== cursor.path || index + 1 > Number(cursor.line));
             if (!eligible.length) continue;
+            matchedFiles++;
             const selected = eligible.slice(0, Math.max(0, limit - returned));
             if (selected.length) {
               files.push({
@@ -4802,6 +5012,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
               break;
             }
           } else {
+            matchedFiles++;
             files.push({ path: entry.path, status: "ok", fingerprint, ...metadata, ...(mode === "count" ? { count: indexes.length } : {}) });
             returned++;
             if (returned >= limit) {
@@ -4828,6 +5039,14 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
           if (!stat.isFile) { files.push({ path: target.display, status: "not_file", size: stat.size }); continue; }
           const document = await readTextDocument(target.path, file.encoding || "auto"), lines = textLines(document), total = lines.length;
           const requestedStart = Number(file.start_line || 1), requestedEnd = Number(file.end_line || total);
+          if (total === 0 && file.start_line == null && file.end_line == null) {
+            files.push({
+              path: target.display, status: "ok", content: "", start_line: 1, end_line: 0, total_lines: 0,
+              truncated: false, next_start_line: null, size: stat.size, fingerprint: await fingerprintBytes(document.bytes),
+              encoding: document.encoding, bom: document.bom, line_endings: document.line_endings,
+            });
+            continue;
+          }
           if (requestedStart > total || requestedEnd < requestedStart) {
             files.push({
               path: target.display, status: "range_out_of_bounds", total_lines: total, size: stat.size,
@@ -4835,19 +5054,36 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
             });
             continue;
           }
-          const start = Math.max(1, requestedStart - Number(file.context_lines_before || 0));
-          const end = Math.min(total, requestedEnd + Number(file.context_lines_after || 0));
-          const selected = []; let used = 0, last = start - 1;
-          for (let line = start; line <= end; line++) {
-            const text = lines[line - 1], bytes = enc.encode((selected.length ? "\n" : "") + text).length;
-            if (selected.length && used + bytes > maxBytes) break;
-            selected.push(text); used += bytes; last = line;
+          const contextStart = Math.max(1, requestedStart - Number(file.context_lines_before || 0));
+          const contextEnd = Math.min(total, requestedEnd + Number(file.context_lines_after || 0));
+          // Requested lines own the byte budget. Optional context may use only space left after
+          // the requested page, so context can never displace requested content or stall continuation.
+          const requested = []; let used = 0, requestedLast = requestedStart - 1;
+          for (let line = requestedStart; line <= requestedEnd; line++) {
+            const text = lines[line - 1], bytes = enc.encode((requested.length ? "\n" : "") + text).length;
+            if (requested.length && used + bytes > maxBytes) break;
+            requested.push(text); used += bytes; requestedLast = line;
             if (used >= maxBytes) break;
           }
-          const truncated = last < end;
+          const before = []; let start = requestedStart;
+          for (let line = requestedStart - 1; line >= contextStart; line--) {
+            const bytes = enc.encode(lines[line - 1]).length + 1;
+            if (used + bytes > maxBytes) break;
+            before.unshift(lines[line - 1]); used += bytes; start = line;
+          }
+          const after = []; let last = requestedLast;
+          if (requestedLast >= requestedEnd) {
+            for (let line = requestedEnd + 1; line <= contextEnd; line++) {
+              const bytes = enc.encode(lines[line - 1]).length + 1;
+              if (used + bytes > maxBytes) break;
+              after.push(lines[line - 1]); used += bytes; last = line;
+            }
+          }
+          const selected = [...before, ...requested, ...after];
+          const truncated = requestedLast < requestedEnd;
           files.push({
             path: target.display, status: "ok", content: selected.join("\n"), start_line: start, end_line: last, total_lines: total,
-            truncated, next_start_line: truncated ? last + 1 : null, size: stat.size, fingerprint: await fingerprintBytes(document.bytes),
+            truncated, next_start_line: truncated ? requestedLast + 1 : null, size: stat.size, fingerprint: await fingerprintBytes(document.bytes),
             encoding: document.encoding, bom: document.bom, line_endings: document.line_endings,
           });
         } catch (error) {
@@ -4910,7 +5146,12 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
             if (error instanceof Deno.errors.NotFound) return null;
             throw error;
           });
-          const source = before ? decodeTextDocument(before, "auto") : null;
+          const content = String(file.content);
+          const lineEndingMode = String(file.line_endings || "preserve").toLowerCase();
+          const outputEncodingMode = String(file.output_encoding || "preserve").toLowerCase();
+          const outputHasLineBreaks = lineEndingKind(content) !== "none";
+          const needsDecodedSource = !!before && (outputEncodingMode === "preserve" || (lineEndingMode === "preserve" && outputHasLineBreaks));
+          const source = before ? (needsDecodedSource ? decodeTextDocument(before, "auto") : { bom: textBom(before) }) : null;
           const fingerprintBefore = before ? await fingerprintBytes(before) : "";
           if (file.expected_fingerprint && file.expected_fingerprint !== fingerprintBefore) {
             files.push({
@@ -4919,7 +5160,25 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
             });
             continue;
           }
-          const output = encodeTextDocument(String(file.content), source, file);
+          if (lineEndingMode === "preserve" && outputHasLineBreaks && source?.line_endings === "mixed") {
+            files.push({
+              path: target.display, status: "mixed_line_endings", fingerprint: fingerprintBefore, size: before.length,
+              error: "The result contains line breaks, but a mixed source has no single line-ending style to preserve; choose lf, crlf, or cr explicitly",
+            });
+            continue;
+          }
+          if (lineEndingMode === "preserve" && outputHasLineBreaks && (!source || source.line_endings === "none")) {
+            files.push({
+              path: target.display, status: "line_endings_required", ...(fingerprintBefore ? { fingerprint: fingerprintBefore } : {}), size: before?.length || 0,
+              error: "The result introduces line breaks, but the source has no line-ending style to preserve; choose lf, crlf, or cr explicitly",
+            });
+            continue;
+          }
+          if (args.create_parents === false && !await exists(dirname(target.path))) {
+            files.push({ path: target.display, status: "parent_missing", size: before?.length || 0 });
+            continue;
+          }
+          const output = encodeTextDocument(content, source, file);
           const currentBytes = await Deno.readFile(target.path).catch(error => {
             if (error instanceof Deno.errors.NotFound) return null;
             throw error;
@@ -4964,13 +5223,6 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
             });
             continue;
           }
-          if (document.line_endings === "mixed" && String(file.line_endings || "preserve").toLowerCase() === "preserve") {
-            files.push({
-              path: target.display, status: "mixed_line_endings", fingerprint: fingerprintBefore, size: document.bytes.length,
-              error: "Mixed source line endings cannot be preserved exactly through normalized text editing; choose lf, crlf, or cr explicitly",
-            });
-            continue;
-          }
           let current = normalizeLineEndings(document.text, "lf"), replacements = 0, failed = null;
           const editResults = [];
           for (let index = 0; index < (file.edits || []).length; index++) {
@@ -4987,6 +5239,24 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
               path: target.display, status: "occurrence_mismatch", fingerprint: fingerprintBefore, size: document.bytes.length,
               replacements, edits: editResults,
               error: `Edit ${failed.index} expected ${failed.expected} occurrences, found ${failed.occurrences}`,
+            });
+            continue;
+          }
+          const lineEndingMode = String(file.line_endings || "preserve").toLowerCase();
+          const outputHasLineBreaks = lineEndingKind(current) !== "none";
+          if (lineEndingMode === "preserve" && outputHasLineBreaks && document.line_endings === "mixed") {
+            files.push({
+              path: target.display, status: "mixed_line_endings", fingerprint: fingerprintBefore, size: document.bytes.length,
+              replacements, edits: editResults,
+              error: "The edited result contains line breaks, but a mixed source has no single line-ending style to preserve; choose lf, crlf, or cr explicitly",
+            });
+            continue;
+          }
+          if (lineEndingMode === "preserve" && outputHasLineBreaks && document.line_endings === "none") {
+            files.push({
+              path: target.display, status: "line_endings_required", fingerprint: fingerprintBefore, size: document.bytes.length,
+              replacements, edits: editResults,
+              error: "The edited result introduces line breaks, but the source has no line-ending style to preserve; choose lf, crlf, or cr explicitly",
             });
             continue;
           }
@@ -5383,24 +5653,26 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       updateLog(id, { status: "running" });
       const result = await executeTool(p, name, args, executionState);
       const publicResult = result && typeof result === "object" ? result : { value: result };
-      const publicLogResult = redactPublishedCapabilityUrls(publicResult);
+      const extraContent = Array.isArray(publicResult[TOOL_RESULT_CONTENT]) ? publicResult[TOOL_RESULT_CONTENT] : [];
+      const structuredResult = Object.fromEntries(Object.entries(publicResult));
+      const publicLogResult = redactPublishedCapabilityUrls(structuredResult);
       const stdout = typeof publicLogResult.output === "string" ? publicLogResult.output
         : typeof publicLogResult.stdout === "string" ? publicLogResult.stdout
         : JSON.stringify(publicLogResult, null, 2);
       const stderr = typeof publicLogResult.stderr === "string" ? publicLogResult.stderr : "";
-      const status = publicResult.success === false ? "failed" : "completed";
-      const includeContext = !["list_workspaces", "create_workspace"].includes(name);
+      const status = structuredResult.success === false ? "failed" : "completed";
+      const includeContext = !["list_workspaces", "create_workspace", "inspect_tools"].includes(name);
       const envelope = includeContext ? contextEnvelope(callInfo.contextHandle) : {};
-      const structuredContent = { ...publicResult, ...envelope };
-      const full = typeof publicResult.content === "string"
-        ? includeContext ? `${publicResult.content}\n\ncontext_handle: ${envelope.context_handle}` : publicResult.content
+      const structuredContent = { ...structuredResult, ...envelope };
+      const full = typeof structuredResult.content === "string"
+        ? includeContext ? `${structuredResult.content}\n\ncontext_handle: ${envelope.context_handle}` : structuredResult.content
         : JSON.stringify(structuredContent, null, 2);
       const max = 1024 * 1024, rendered = full.length > max
         ? full.slice(0, max) + `\n\n[truncated; full output in log ${id}]` : full;
       const resultUiResourceUri = name === "publish_file" ? freshUiResourceUri(FILE_PREVIEW_UI_URI)
         : name === "publish_html" ? freshUiResourceUri(HTML_PREVIEW_UI_URI) : "";
       const toolResult = {
-        content: [{ type: "text", text: rendered }], structuredContent, isError: status !== "completed",
+        content: [{ type: "text", text: rendered }, ...extraContent], structuredContent, isError: status !== "completed",
         ...(resultUiResourceUri ? { _meta: { ui: { resourceUri: resultUiResourceUri } } } : {}),
       };
       updateLog(id, {
@@ -5418,7 +5690,7 @@ html[data-mode="fullscreen"] #frame { flex: 1; height: 100% !important; min-heig
       return toolResult;
     } catch (error) {
       const message = String(error?.stack || error);
-      const includeContext = !["list_workspaces", "create_workspace"].includes(name);
+      const includeContext = !["list_workspaces", "create_workspace", "inspect_tools"].includes(name);
       const envelope = includeContext ? contextEnvelope(callInfo.contextHandle) : {};
       const structuredContent = { error: String(error?.message || error), ...envelope };
       const text = includeContext
@@ -6070,8 +6342,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const serverInfoMeta = { "io.modelcontextprotocol/serverInfo": mcpServerInfo() };
     const instructions = fullAccess
       ? "Use list_workspaces when you need to discover enabled Workspace names. Use create_workspace with only a name when you need a new empty Workspace; MrMCP creates and registers its Desktop directory internally, then call open_workspace with that same name. If you already have the current Session handle, pass it as current_context_handle to move that same Session to the Workspace; if it is omitted, empty, unknown or expired, open_workspace creates a new Session. The result includes workspace_name, absolute cwd and agent_guidance_path; when that path is non-null, read and follow that Workspace guidance file before repository work. MrMCP prefers AGENTS.md/agents.md and falls back to CLAUDE.md/Claude.md/claude.md. Pass the returned context_handle unchanged on every later Session-bound tool call. " +
-        "Use fs_glob, fs_grep, fs_read, fs_navigate, fs_stat, fs_write and fs_edit directly for filesystem discovery, inspection, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. " +
-        "When work may benefit from command-line capability beyond the structured tools, call discover_commands proactively before inventing workarounds or assuming a utility is unavailable. It returns the complete user-chosen available command catalog in one call; prefer a listed command when it fits, remember the catalog for the Session, and invoke its logical_name directly through exec.program without PATH probes. " +
+        "Use fs_glob, fs_grep, fs_read, fs_navigate, fs_stat, fs_write and fs_edit directly for filesystem discovery, inspection, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. Use desktop_auto for desktop observation and interaction through AAF YAML; when the model needs to see a screenshot, retain its image handle anywhere in the scenario's final state so the tool returns that image directly as MCP image content. Multiple retained screenshots and ordinary OCR/text/geometry/state values may coexist in one result. " +
+        "When work may benefit from command-line capability beyond the structured tools, call discover_commands proactively before inventing workarounds or assuming a utility is unavailable. It returns the complete user-chosen available command catalog in one call; prefer a listed command when it fits, remember the catalog for the Session, and invoke its logical_name directly through exec.program without PATH probes. Use inspect_tools when exact live tool descriptor data is needed instead of relying on a connector-synthesized schema view. " +
         "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; cancelling/disconnecting exec terminates its child. For persistent or interactive work, call exec_start; it immediately returns exec_id, which is the stable integer Tool Call id of that start. Pass that exec_id together with the same context_handle to exec_attach, exec_write, exec_kill or exec_status; ids from other Sessions are inaccessible. exec_list shows only currently running persistent executions in this Session. exec_status is the non-consuming way to inspect running or recently completed/killed executions and optionally retrieve all output or a tail. exec_attach with progressToken streams unread backlog plus live output through progress until process exit and then returns that complete unread transcript; without progressToken it long-polls and returns at most 16 KiB of unread output plus remaining_bytes, so call it repeatedly to drain buffered output and call it again with remaining_bytes=0/status=running to wait for future output. Disconnecting exec_attach only detaches and never kills the persistent process. " +
         "Use publish_file to present existing files through its MCP App widget, and publish_html when an interactive self-contained HTML/CSS/JavaScript visualization is more appropriate. " +
         "Every authenticated client can invoke every published tool; context_handle is the bearer capability selecting the persistent Session and its current Workspace."
@@ -6195,7 +6467,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
             const toolArgs = { ...rawToolArgs };
             const invokeTool = async requestStream => {
               let toolResult;
-              if (["list_workspaces", "create_workspace"].includes(x.params.name)) {
+              if (["list_workspaces", "create_workspace", "inspect_tools"].includes(x.params.name)) {
                 toolResult = await callTool(
                   p, x.params.name, toolArgs,
                   { authKind: auth.kind, contextHandle: "", selection: null, descriptor, requestStream, progressRequested },
@@ -6639,7 +6911,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     oauth: `<table class=oauth-table><tr><th>Client</th><th>Sessions</th><th>Tokens</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td class=oauth-client><b><?= c.name ?></b><div class=oauth-client-id title="<?= c.client_id ?>"><code><?= c.client_id ?></code></div><div class=oauth-meta><span class=muted>Created</span> <?= it.logdt(c.created_at) ?></div></td><td class=oauth-meta><div class=oauth-count><b><?= c.session_count||0 ?></b> total</div><div><span class=muted>First</span> <?= c.first_session_at ? it.logdt(c.first_session_at) : "—" ?></div><div><span class=muted>Last</span> <?= c.last_session_at ? it.logdt(c.last_session_at) : "—" ?></div></td><td><div class=oauth-tokens><div class=oauth-token><b><?= c.token_count||0 ?></b> <span>Access</span><div class=oauth-meta><span class=muted>Issued</span> <?= c.last_token_at ? it.logdt(c.last_token_at) : "—" ?></div></div><div class=oauth-token><b><?= c.refresh_token_count||0 ?></b> <span>Refresh</span><div class=oauth-meta><span class=muted>Used</span> <?= c.last_refresh_at ? it.logdt(c.last_refresh_at) : "—" ?></div></div></div></td><td class=oauth-actions><button class=small data-action=oauth-sessions data-id="<?= c.client_id ?>">💬 View Sessions</button><button class="small danger" data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> Available Tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,
     logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=http-session><? if(l.context_id){ ?><div class=idcell>#<?= l.context_id ?></div><? if(l.root_id&&l.root_name){ ?><div class=workspace-label>📁 <?= l.root_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><code><?= l.tool ?></code><? if(l.call_preview){ ?><div class=tool-command-preview>↳ <?= l.call_preview ?></div><? } ?><? if(l.progress_requested){ ?><div class=progress-requested>📡 Progress requested</div><? } ?></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Kill</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><? if(x.progress_requested){ ?><span class=progress-requested>📡 Progress requested</span><? } ?><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><div class=tool-detail-grid><div class=tool-detail-main><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>"><?= it.prettyParsed(x.input_json) ?></pre></section><? if(x.resolved_json){ ?><section class=json-detail><div class=row><b class=grow>Tool Return Value JSON</b><button class=small data-action=copy-detail data-target="tool-return-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-return-<?= l.id ?>"><?= it.prettyParsed(x.resolved_json) ?></pre></section><? } ?><section class=json-detail><div class=row><b class=grow>MCP Result JSON</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>"><?= it.prettyParsed(x.result_json||x.resolved_json||x.stdout||{}) ?></pre></section><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div><aside class=tool-descriptor><div class=row><b class=grow>Agent Tool Definition</b><? if(x.tool_descriptor){ ?><span class="descriptor-status <?= x.tool_descriptor_matches_current?'current':'outdated' ?>"><?= x.tool_descriptor_matches_current?'CURRENT':'OUTDATED' ?></span><button class=small data-action=copy-detail data-target="tool-descriptor-<?= l.id ?>">📋 Copy JSON</button><? } ?></div><? if(x.tool_descriptor){ ?><pre id="tool-descriptor-<?= l.id ?>" hidden><?= it.pretty(x.tool_descriptor) ?></pre><? if(x.tool_descriptor.title){ ?><div class=muted>Title</div><div><?= x.tool_descriptor.title ?></div><? } ?><div class=muted>Description</div><p><?= x.tool_descriptor.description||"—" ?></p><div class=muted>Input Schema</div><pre><?= it.pretty(x.tool_descriptor.inputSchema||{}) ?></pre><div class=muted>Output Schema</div><pre><?= it.pretty(x.tool_descriptor.outputSchema||{}) ?></pre><? } else { ?><p class=muted>No descriptor snapshot was recorded for this call.</p><? } ?></aside></div></div></td></tr><? } }) ?></tbody></table>`,
-    published: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class=row><select id=publishedKind><option value="">All types</option><option value=file<?= d.kind==='file'?' selected':'' ?>>File</option><option value=html<?= d.kind==='html'?' selected':'' ?>>HTML</option></select><select id=publishedContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=publishedSize><option value="">All sizes</option><option value=small<?= d.size==='small'?' selected':'' ?>>&lt; 1 MB</option><option value=medium<?= d.size==='medium'?' selected':'' ?>>1–10 MB</option><option value=large<?= d.size==='large'?' selected':'' ?>>10–100 MB</option><option value=huge<?= d.size==='huge'?' selected':'' ?>>≥ 100 MB</option></select><button data-action=clear-published-filters>🧹 Clear Filters</button></div><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> publication<?= d.total===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Published Pages"><button class=page-button data-action=published-page data-published-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=published-page data-published-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=published-page data-published-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No published items match the current filters.</p></div><? } else { ?><table class=published-table><thead><tr><th>Created</th><th>ID</th><th>Type</th><th>Published By</th><th>Published File</th><th>Requests</th><th>Size</th><th>Source</th><th></th></tr></thead><tbody><? rows.forEach(r=>{ ?><tr><td class=nowrap><?= it.logdt(r.created_at) ?></td><td class=context-id><code><?= r.id ?></code><? if(r.content_key){ ?><div class=published-file-meta><?= r.content_key ?></div><? } ?></td><td class=nowrap><?= r.kind==='html'?'🌐 HTML':'📄 File' ?></td><td class=http-session><? const refs=r.references||[]; if(refs.length){ refs.forEach(u=>{ ?><div class=published-reference><span class=idcell>#<?= u.context_id ?></span><? if(u.root_name){ ?> <span class=workspace-label>📁 <?= u.root_name ?></span><? } ?></div><? }); } else { ?>—<? } ?></td><td><button class=published-open data-action=open-published data-id="<?= r.id ?>" title="Open public URL in browser"><code><?= r.published_name ?></code></button><? if(r.kind==='html'&&r.title){ ?><div class=published-file-meta><?= r.title ?></div><? } else if(r.filename&&r.filename!==r.source_filename){ ?><div class=published-file-meta>Download name: <?= r.filename ?></div><? } ?></td><td class=nowrap><b><?= r.request_count||0 ?></b><? if(r.last_request_at){ ?><div class=published-file-meta>last <?= it.logdt(r.last_request_at) ?></div><? } ?></td><td class=nowrap><?= it.bytes(r.size) ?></td><td class=published-source><? const latest=(r.references||[])[0]; if(latest?.source_path){ ?><code><?= latest.source_path ?></code><? } else if(r.source_path){ ?><code><?= r.source_path ?></code><? } else { ?><span class=muted>Generated HTML</span><? } ?><? if((r.reference_count||0)>1){ ?><div class=published-file-meta><?= r.reference_count ?> references</div><? } ?></td><td class=nowrap><button class="small danger" data-action=delete-published data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></tbody></table><? } ?>`,
+    published: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class=row><select id=publishedKind><option value="">All types</option><option value=file<?= d.kind==='file'?' selected':'' ?>>File</option><option value=html<?= d.kind==='html'?' selected':'' ?>>HTML</option></select><select id=publishedContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=publishedSize><option value="">All sizes</option><option value=small<?= d.size==='small'?' selected':'' ?>>&lt; 1 MB</option><option value=medium<?= d.size==='medium'?' selected':'' ?>>1–10 MB</option><option value=large<?= d.size==='large'?' selected':'' ?>>10–100 MB</option><option value=huge<?= d.size==='huge'?' selected':'' ?>>≥ 100 MB</option></select><button data-action=clear-published-filters>🧹 Clear Filters</button></div><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> publication<?= d.total===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Published Pages"><button class=page-button data-action=published-page data-published-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=published-page data-published-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=published-page data-published-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No published items match the current filters.</p></div><? } else { ?><table class=published-table><thead><tr><th>Created</th><th>Resource</th><th>Published By</th><th>Published File</th><th>Activity</th><th>Source</th><th></th></tr></thead><tbody><? rows.forEach(r=>{ ?><tr><td class=nowrap><?= it.logdt(r.created_at) ?></td><td class=published-id><div class=nowrap><?= r.kind==='html'?'🌐 HTML':'📄 File' ?></div><code title="<?= r.id ?>"><?= r.id ?></code><? if(r.content_key){ ?><div class=published-file-meta title="<?= r.content_key ?>">key <?= r.content_key ?></div><? } ?></td><td class=http-session><? const refs=r.references||[]; if(refs.length){ refs.forEach(u=>{ ?><div class=published-reference><span class=idcell>#<?= u.context_id ?></span><? if(u.root_name){ ?> <span class=workspace-label title="<?= u.root_name ?>">📁 <?= u.root_name ?></span><? } ?></div><? }); } else { ?>—<? } ?></td><td><button class=published-open data-action=open-published data-id="<?= r.id ?>" title="<?= r.published_name ?> · Open public URL in browser"><code><?= r.published_name ?></code></button><? if(r.kind==='html'&&r.title){ ?><div class=published-file-meta><?= r.title ?></div><? } else if(r.filename&&r.filename!==r.source_filename){ ?><div class=published-file-meta>Download name: <?= r.filename ?></div><? } ?></td><td class=published-activity><b><?= r.request_count||0 ?> req</b><div class=published-file-meta><?= it.bytes(r.size) ?></div><? if(r.last_request_at){ ?><div class=published-file-meta>last <?= it.logdt(r.last_request_at) ?></div><? } ?></td><td class=published-source><? const latest=(r.references||[])[0]; if(latest?.source_path){ ?><code title="<?= latest.source_path ?>"><?= latest.source_path ?></code><? } else if(r.source_path){ ?><code title="<?= r.source_path ?>"><?= r.source_path ?></code><? } else { ?><span class=muted>Generated HTML</span><? } ?><? if((r.reference_count||0)>1){ ?><div class=published-file-meta><?= r.reference_count ?> references</div><? } ?></td><td class=nowrap><button class="small danger" data-action=delete-published data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></tbody></table><? } ?>`,
     debug: `<? const d=it.data||{},rows=d.rows||[]; ?><p class="<?= d.enabled?'ok':'failed' ?>"><b><?= d.enabled?'● Recording enabled':'● Recording disabled' ?></b><? if(!d.enabled){ ?> · showing stored requests<? } ?></p><? if(!rows.length){ ?><p class=muted>No stored HTTP debug requests match the current filters.</p><? } else { ?><table><tr><th>ID</th><th>Time</th><th>Session</th><th>Client</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>IP</th><th>Error</th></tr><? rows.forEach(r => { ?><tr data-action=select-debug data-id="<?= r.id ?>" title="Click to expand"><td class=idcell>#<?= r.id ?></td><td class=nowrap><?= it.logdt(r.ts) ?></td><td class=http-session><? if(r.context_id){ ?><div class=idcell>#<?= r.context_id ?></div><? if(r.workspace_name){ ?><div class=workspace-label>📁 <?= r.workspace_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><? if(r.client_id){ ?><code><?= r.client_id ?></code><? } else { ?>—<? } ?></td><td><b><?= r.method ?></b></td><td><code><?= r.path ?></code></td><td class="<?= !r.status?'pending':(r.status>=400?'failed':'ok') ?>"><?= r.status||"…" ?></td><td><?= r.status ? r.duration_ms+"ms" : "in flight" ?></td><td class=nowrap><?= r.remote_addr||"—" ?><? if(r.remote_addr){ ?> (<?= r.remote_count||1 ?>)<? } ?></td><td><?= r.error_preview ?></td></tr><? if(String(d.openRowId||"")===String(r.id)&&d.openDetail){ const x=d.openDetail; ?><tr class=detail-row data-detail-kind=http data-detail-id="<?= r.id ?>"><td colspan=10><div class="detail-panel http-detail-panel"><div class="row http-detail-head"><div class=grow><b>HTTP Request #<?= r.id ?></b><div class=http-detail-meta><span><?= it.logdt(x.ts) ?></span><span><? if(x.context_id){ ?>Session #<?= x.context_id ?><? } else { ?>No Session<? } ?></span><? if(x.workspace_name){ ?><span>📁 <?= x.workspace_name ?></span><? } ?><span><? if(x.client_id){ ?>Client <code><?= x.client_id ?></code><? } else { ?>No client id<? } ?></span><span><?= x.remote_addr||"unknown IP" ?><? if(x.remote_addr){ ?> · <?= x.remote_count||1 ?> total request<?= Number(x.remote_count||1)===1?'':'s' ?><? } ?></span><span><?= x.status ? x.duration_ms+"ms" : "in flight" ?></span></div></div><button class=small data-action=copy-detail data-target="http-json-<?= r.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=http>✕ Close</button></div><div class=http-detail-grid><section class=http-detail-block><div class=row><h4 class=grow>→ Request</h4><b><?= x.method ?></b> <code><?= x.path ?></code></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.request_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.request_body||{}) ?></pre></section><section class=http-detail-block><div class=row><h4 class=grow>← Response</h4><b class="<?= !x.status?'pending':(x.status>=400?'failed':'ok') ?>"><?= x.status||"in flight" ?></b></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.response_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.response_body||{}) ?></pre></section></div><? if(x.error){ ?><section class="http-detail-block http-detail-error"><h4 class=failed>Error</h4><pre><?= x.error ?></pre></section><? } ?><details class=http-detail-raw><summary>Raw record</summary><pre id="http-json-<?= r.id ?>"><?= it.pretty(x) ?></pre></details></div></td></tr><? } }) ?></table><? } ?>`,
   } : {};
   const fragmentBytes = value => {
@@ -8088,7 +8360,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   const UI_TEMPLATE = GUI_RUNTIME ? String.raw`<!doctype html><html><head><meta charset=utf-8>
 <meta http-equiv="Content-Security-Policy" content="${UI_CSP}">
 <meta name=viewport content="width=device-width,initial-scale=1"><link rel=icon href="${GUI_LOGO_DATA_URL}"><title>MrMCP</title><style>
-:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}#app>aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}#app>aside button{display:block;width:100%;text-align:left;margin:3px 0;background:transparent;border:0}#app>aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.notice-balloon{position:fixed;top:64px;right:16px;z-index:1900;max-width:min(520px,calc(100vw - 32px));padding:10px 12px;border:1px solid #7d3f47;border-radius:9px;background:#25191b;color:#ffb7bf;box-shadow:0 8px 28px #0008}.notice-balloon.info{border-color:#365a7d;background:#16202b;color:#a9d5ff}.notice-balloon.ok{border-color:#356849;background:#16241b;color:#9ce8b1}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.debug-toggle{font-weight:750;min-width:190px}.debug-toggle.enabled{background:#173f24;border-color:#347a49;color:#9ce8b1}.debug-toggle.disabled{background:#421d21;border-color:#7d3f47;color:#ffb7bf}.debug-toggle.enabled:hover{background:#20512f}.debug-toggle.disabled:hover{background:#53262b}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.settings-layout{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(300px,.75fr);gap:14px;align-items:start}.settings-main,.settings-side{min-width:0}.settings-side{position:sticky;top:70px}.settings-layout .card h3{margin-top:0}.settings-main input:not([type=checkbox]){width:100%}.settings-main textarea{min-height:96px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 18px 14px 28px;background:#111318}.detail-panel{border:1px solid #343944;border-left:3px solid #3984e8;border-radius:8px;background:#0d0f12;padding:14px 16px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.tool-detail-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:14px;align-items:start}.tool-detail-main{min-width:0}.tool-descriptor{min-width:0;position:sticky;top:10px;border:1px solid #343944;border-radius:8px;background:#111318;padding:12px}.tool-descriptor>.muted{margin-top:10px}.tool-descriptor p{margin:5px 0 10px;line-height:1.45}.tool-descriptor pre{margin:5px 0 10px;max-height:28vh}.descriptor-status{font-size:11px;font-weight:800;letter-spacing:.04em;padding:3px 6px;border-radius:5px}.descriptor-status.current{color:#75d58b;background:#16341f}.descriptor-status.outdated{color:#ffd166;background:#3a2f13}.http-detail-head{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #292d34}.http-detail-meta{display:flex;gap:7px 16px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:#89909b}.http-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.http-detail-block{min-width:0;border:1px solid #292d34;border-radius:8px;background:#0a0c0f;padding:10px}.http-detail-block h4{margin:0}.http-detail-block pre{max-height:30vh}.http-detail-error{margin-top:12px;border-color:#68353a;background:#1d1012}.http-detail-raw{margin-top:12px}.http-detail-raw summary{cursor:pointer;color:#89909b}@media(max-width:1100px){.tool-detail-grid,.http-detail-grid{grid-template-columns:1fr}.tool-descriptor{position:static}}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.tool-command-preview{margin-top:3px;max-width:440px;color:#c5cad3;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.http-session{white-space:nowrap}.workspace-label{margin-top:3px;color:#89909b;font-size:12px;font-weight:600}.menu-icon{display:inline-block;width:22px;text-align:center}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-call-card{padding:0;overflow:hidden;min-height:210px}.dashboard-call-table{margin:0;background:transparent}.dashboard-call-table thead{position:sticky;top:0;z-index:1;background:#181a1f}.dashboard-call-table tr{height:35px}.dashboard-call-table th,.dashboard-call-table td{padding:7px 9px}.dashboard-call-table tr[data-action=dashboard-tool-call]{cursor:pointer}.dashboard-call-table tr[data-action=dashboard-tool-call]:hover{background:#20242a}.dashboard-call-summary{max-width:720px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dashboard-call-recent{animation:dashboardCallFade var(--dashboard-call-ttl,5s) linear forwards}@keyframes dashboardCallFade{from{opacity:1}to{opacity:.18}}.progress-requested{color:#8fd3ff;white-space:nowrap}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}.published-table{table-layout:auto}.published-table .context-id{max-width:230px}.published-open{max-width:360px;padding:0;border:0;background:transparent;text-align:left;color:#9ecbff;overflow-wrap:anywhere}.published-open:hover{background:transparent;text-decoration:underline}.published-file-meta{margin-top:3px;color:#89909b;font-size:12px}.published-source{max-width:420px;overflow-wrap:anywhere}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout,.settings-layout{grid-template-columns:1fr}.default-root-card,.settings-side{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){#app>aside{width:130px}main{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
+:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}#app>aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}#app>aside button{display:block;width:100%;text-align:left;white-space:nowrap;margin:3px 0;padding-left:6px;padding-right:6px;background:transparent;border:0}#app>aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.notice-balloon{position:fixed;top:64px;right:16px;z-index:1900;max-width:min(520px,calc(100vw - 32px));padding:10px 12px;border:1px solid #7d3f47;border-radius:9px;background:#25191b;color:#ffb7bf;box-shadow:0 8px 28px #0008}.notice-balloon.info{border-color:#365a7d;background:#16202b;color:#a9d5ff}.notice-balloon.ok{border-color:#356849;background:#16241b;color:#9ce8b1}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.debug-toggle{font-weight:750;min-width:190px}.debug-toggle.enabled{background:#173f24;border-color:#347a49;color:#9ce8b1}.debug-toggle.disabled{background:#421d21;border-color:#7d3f47;color:#ffb7bf}.debug-toggle.enabled:hover{background:#20512f}.debug-toggle.disabled:hover{background:#53262b}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.settings-layout{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(300px,.75fr);gap:14px;align-items:start}.settings-main,.settings-side{min-width:0}.settings-side{position:sticky;top:70px}.settings-layout .card h3{margin-top:0}.settings-main input:not([type=checkbox]){width:100%}.settings-main textarea{min-height:96px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 18px 14px 28px;background:#111318}.detail-panel{border:1px solid #343944;border-left:3px solid #3984e8;border-radius:8px;background:#0d0f12;padding:14px 16px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.tool-detail-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:14px;align-items:start}.tool-detail-main{min-width:0}.tool-descriptor{min-width:0;position:sticky;top:10px;border:1px solid #343944;border-radius:8px;background:#111318;padding:12px}.tool-descriptor>.muted{margin-top:10px}.tool-descriptor p{margin:5px 0 10px;line-height:1.45}.tool-descriptor pre{margin:5px 0 10px;max-height:28vh}.descriptor-status{font-size:11px;font-weight:800;letter-spacing:.04em;padding:3px 6px;border-radius:5px}.descriptor-status.current{color:#75d58b;background:#16341f}.descriptor-status.outdated{color:#ffd166;background:#3a2f13}.http-detail-head{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #292d34}.http-detail-meta{display:flex;gap:7px 16px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:#89909b}.http-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.http-detail-block{min-width:0;border:1px solid #292d34;border-radius:8px;background:#0a0c0f;padding:10px}.http-detail-block h4{margin:0}.http-detail-block pre{max-height:30vh}.http-detail-error{margin-top:12px;border-color:#68353a;background:#1d1012}.http-detail-raw{margin-top:12px}.http-detail-raw summary{cursor:pointer;color:#89909b}@media(max-width:1100px){.tool-detail-grid,.http-detail-grid{grid-template-columns:1fr}.tool-descriptor{position:static}}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.tool-command-preview{margin-top:3px;max-width:440px;color:#c5cad3;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.http-session{white-space:nowrap}.workspace-label{margin-top:3px;color:#89909b;font-size:12px;font-weight:600}.menu-icon{display:inline-block;width:22px;text-align:center}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-call-card{padding:0;overflow:hidden;min-height:210px}.dashboard-call-table{margin:0;background:transparent}.dashboard-call-table thead{position:sticky;top:0;z-index:1;background:#181a1f}.dashboard-call-table tr{height:35px}.dashboard-call-table th,.dashboard-call-table td{padding:7px 9px}.dashboard-call-table tr[data-action=dashboard-tool-call]{cursor:pointer}.dashboard-call-table tr[data-action=dashboard-tool-call]:hover{background:#20242a}.dashboard-call-summary{max-width:720px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dashboard-call-recent{animation:dashboardCallFade var(--dashboard-call-ttl,5s) linear forwards}@keyframes dashboardCallFade{from{opacity:1}to{opacity:.18}}.progress-requested{color:#8fd3ff;white-space:nowrap}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}#publishedList{overflow-x:auto}.published-table{table-layout:fixed;min-width:850px}.published-table th:nth-child(1){width:130px}.published-table th:nth-child(2){width:165px}.published-table th:nth-child(3){width:135px}.published-table th:nth-child(4){width:185px}.published-table th:nth-child(5){width:105px}.published-table th:nth-child(7){width:80px}.published-id{min-width:0}.published-id code,.published-id .published-file-meta{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-reference{display:inline-flex;align-items:center;gap:4px;max-width:100%;margin:0 6px 4px 0}.published-reference .workspace-label{max-width:105px;margin-top:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-open{display:block;width:100%;max-width:100%;padding:0;border:0;background:transparent;text-align:left;color:#9ecbff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-open code{white-space:nowrap}.published-open:hover{background:transparent;text-decoration:underline}.published-file-meta{margin-top:3px;color:#89909b;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-activity{white-space:nowrap}.published-source{min-width:0}.published-source code{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout,.settings-layout{grid-template-columns:1fr}.default-root-card,.settings-side{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){#app>aside{width:130px}main{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
 </style></head><body>
 <div id=app data-section=dashboard><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div><div class=status><span class=pending>starting…</span></div></header><main style="margin-left:0"><div class=card>Starting the local MrMCP UI…</div></main></div>
 <script nonce="${UI_SCRIPT_NONCE}">__MRMCP_BROWSER_JS__</script></body></html>` : "";
@@ -8410,7 +8682,7 @@ async function stopBackendWorker(worker) {
 }
 async function desktop() {
   const { worker: backendWorker, payload, earlyMessages } = await spawnBackendWorker();
-  const { Tauriless } = await import("npm:@mefistofelix/tauriless@0.1.17");
+  const { Tauriless } = await import("npm:@mefistofelix/tauriless");
   const tauriless = new Tauriless(), pending = new Map();
   const nativeIcon = () => {
     const ico = Deno.readFileSync(join(ASSETS_DIR, "mrmcp.ico"));
