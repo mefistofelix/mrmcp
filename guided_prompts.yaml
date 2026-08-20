@@ -1,1 +1,24 @@
-prompts: []
+prompts:
+  - name: connector_block_debug
+    title: Connector block debugging
+    description: Handle an OpenAI connector block accurately during product development and bug tracking.
+    template: |
+      When an OpenAI connector action is blocked during development or testing, explain clearly that the connector may be evaluating the request as if it were a production operation while the current context is a development/demo and bug-tracking exercise. Describe the block accurately and do not claim that the action is safe, verified, or permitted unless that has actually been established. If the block appears transient or caused by incomplete context, retry once only when the requested action remains allowed. Otherwise report the block clearly and continue with safe debugging steps instead of trying to bypass the restriction.
+
+  - name: focused_project_review
+    title: Focused project review
+    description: Review the current project with a caller-selected focus and optional MrMCP Session context.
+    arguments:
+      - name: focus
+        title: Review focus
+        description: Area, component, bug, or behavior to inspect.
+        required: true
+      - name: context_handle
+        title: Session handle
+        description: Optional MrMCP Session handle when Session and Workspace context is useful.
+        required: false
+    template: |
+      Review the current project with particular attention to: <%= it.args.focus %>.
+      Identify concrete findings, likely causes, and the smallest useful next changes or checks.
+      <% if (it.session) { %>Session: #<%= it.session.id %>.<% } %>
+      <% if (it.workspace) { %>Workspace: <%= it.workspace.name %> at <%= it.workspace.path %>.<% } %>

@@ -12,14 +12,14 @@ MrMCP is a stateless Model Context Protocol server implemented in Deno. It expos
 
 - MCP `2026-07-28` with explicit `context_handle` Session capabilities.
 - Named Workspaces with drag-and-drop Session assignment.
-- AAF desktop automation through `desktop_auto`, including zero/one/many model-visible WebP/PNG screenshots mixed with structured OCR, geometry and state output.
-- Low-level dependency-free Chrome DevTools Protocol control through always-batched `cdp_call`, with persistent browser/profile and logical page labels plus subscription/poll access to CDP notifications.
+- AAF desktop automation through `desktop_auto`, including zero/one/many model-visible WebP/PNG screenshots mixed with structured OCR, geometry and state output; the local Automation page reuses recorded Tool Calls/screenshots for inspection and one-click scenario replay.
+- Low-level dependency-free Chrome DevTools Protocol control through always-batched `cdp_call`, with persistent browser/profile and logical page labels plus subscription/poll access to CDP notifications; the local Browser page summarizes existing profile/target/ring/subscription state, filters recorded sends by browser/target/Session/activity and can replay an individual recorded operation.
 - Explicit persistent Session/Workspace key-value memory through `memory_find` and `memory_set`, with explicitly typed JSON/text values, TTL and a local Memory manager.
 - Filesystem, text search/editing, reversible trash and generated-file publishing.
 - Foreground and persistent processes with progress streaming when requested.
 - Persistent JavaScript kernels scoped to Session + Workspace.
 - Extra command catalog through `commands.yaml`.
-- User-managed MCP guided prompts through `guided_prompts.yaml`, with Eta templates and a built-in template/model help view.
+- User-managed MCP guided prompts through `guided_prompts.yaml`, with Eta templates, two editable starter examples (one argument-free and one parameterized), and a built-in template/model help view.
 - OAuth and Basic authentication.
 - Automatic TLS/certificate handling.
 - Tool Call and optional HTTP diagnostic logs, with confirmed page-level Clear actions for Tool Calls, Sessions, Workspaces, OAuth Clients and HTTP history.
@@ -76,7 +76,7 @@ Session and Workspace:
 Desktop and browser automation:
 
 - `desktop_auto` — execute one AAF YAML scenario through Auto.js; arbitrary final state is preserved and retained screenshots are returned directly as MCP image content for model vision.
-- `cdp_call` — send an always-present `calls[]` batch spanning browsers/targets. Entries may be untouched standard CDP `{method,params}` or namespaced `_mrmcp` XPath `click`/`find` operations; standard `Page.captureScreenshot` may optionally return a Base64 screenshot post-processed through the public Auto.js `auto.vips` API to scaled WebP (current encoder Q=80) while preserving all normal CDP screenshot params.
+- `cdp_call` — send an always-present `calls[]` batch spanning browsers/targets; each entry may omit `browser` to use the persistent `main` profile. Entries may be untouched standard CDP `{method,params}` or namespaced `_mrmcp` XPath `click`/`find` operations; standard `Page.captureScreenshot` may optionally return a Base64 screenshot post-processed through the public Auto.js `auto.vips` API to scaled WebP (current encoder Q=80) while preserving all normal CDP screenshot params.
 - `cdp_subs`, `cdp_poll` — add/remove runtime subscriptions (including `*`, target/method-prefix and full-message regex filters) and read bounded CDP traffic through ascending cursors or ad-hoc polling.
 
 Memory:
@@ -84,7 +84,7 @@ Memory:
 - `memory_find` — search the explicitly selected current-Session or named-Workspace memory by exact/prefix key, text, set date and stable pagination.
 - `memory_set` — set/replace/delete text values with explicit `json=true|false`; JSON text is validated before storage, with optional TTL in the selected Session or Workspace scope.
 
-The desktop **Memory** page filters stored values by Session, Workspace, scope, set date and text, labels JSON vs TEXT, and allows full value/type/TTL inspection, editing and deletion. JSON values use an editable JSON tree with node-level operations; text values use the plain text editor. Expired TTL rows are removed automatically; Clear Operational Data preserves Memory.
+The desktop **Memory** page filters stored values by Session, Workspace, scope, set date and text, labels JSON vs TEXT, and allows creation, full value/type/TTL inspection, editing and confirmed deletion. New entries explicitly choose an existing Session or Workspace owner. JSON values use an editable JSON tree with node-level operations; text values use the plain text editor, and switching TEXT ↔ JSON never discards the current draft value. Expired TTL rows are removed automatically; Clear Operational Data preserves Memory.
 
 Filesystem:
 

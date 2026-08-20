@@ -344,6 +344,8 @@ Retained final-state screenshots remain at the exact nested state locations chos
 
 The MCP result `content` is multimodal: index `0` is the JSON `TextContent` representation of the structured result, followed by one MCP `ImageContent` block per distinct retained image. Thus no-image scenarios return ordinary structured/text data, while scenarios with several images return all of them in the same tool result. The images are direct model input, not `publish`, Published storage, an MCP App or a `resource_link`. MCP encodes `ImageContent.data` as Base64 on the wire; Auto.js WebP plus `scale` is the intended size-control path. `rect` always remains the original absolute screen-space capture rectangle, so coordinates can be mapped back correctly after downscaling.
 
+The desktop **Automation** page is a derived diagnostic view over existing `desktop_auto` Tool Call rows plus their retained `tool_call_content`. It can filter by originating Session, show the exact YAML scenario, parsed scenario, returned state/results and retained input/output image previews, and replay the original recorded scenario. Replay uses the same `desktop_auto` execution path and creates a new normal Tool Call row; it does not introduce a separate automation history or engine.
+
 ---
 
 ## Chrome DevTools Protocol
@@ -352,12 +354,12 @@ The CDP surface is deliberately small: `cdp_call`, `cdp_subs`, and `cdp_poll`. I
 
 ### `cdp_call`
 
-Sends one or more CDP operations. The input is **always** a `calls[]` array, including the one-call case. Each entry independently selects a persistent global browser/profile label, an optional logical page target and one operation, so one Tool Call may span several targets and browsers. MrMCP stores each browser profile under `.mrmcp/cdp/<browser>/`, assigns a stable unique loopback debugging port, reconnects to a still-running browser when possible, and otherwise launches a compatible Chromium browser automatically. Browser state is global, not Session-owned, and a launched browser may outlive MrMCP.
+Sends one or more CDP operations. The input is **always** a `calls[]` array, including the one-call case. Each entry may select a persistent global browser/profile label, an optional logical page target and one operation; if `browser` is omitted, MrMCP uses the persistent profile label `main`. One Tool Call may span several targets and browsers. MrMCP stores each browser profile under `.mrmcp/cdp/<browser>/`, assigns a stable unique loopback debugging port, reconnects to a still-running browser when possible, and otherwise launches a compatible Chromium browser automatically. Browser state is global, not Session-owned, and a launched browser may outlive MrMCP.
 
 Arguments:
 
 - `calls[]` — required, 1–100 entries, returned in the same order.
-  - `browser` — required persistent browser/profile label for this entry.
+  - `browser` — optional persistent browser/profile label for this entry; defaults to `main` when omitted.
   - `target` — optional persistent logical page label. If its saved page still exists, MrMCP resolves a current flattened `sessionId`; if it disappeared, MrMCP creates a new paused `about:blank` page, initializes/resumes it and replaces the persisted `targetId`. `_mrmcp` operations require a target; standard browser-level CDP methods may omit it.
   - `call` — exactly one of:
     - `method` — exact standard CDP method such as `Page.navigate`, `Runtime.evaluate`, `Network.getResponseBody` or `Page.captureScreenshot`; `params` is passed to CDP unchanged. Never supply transport `id` or `sessionId`.
@@ -369,6 +371,8 @@ Arguments:
 The result is `{wait, results[]}` in input order. Each row reports browser/target/session diagnostics, assigned request `id`, `queued`, `cdp`, nullable `image`, setup errors, `success` and a compact row error. For private `_mrmcp` operations, the ring/response envelope remembers logical method names such as `_mrmcp.click` even though the wire command is `Runtime.evaluate`.
 
 The persistent database stores browser-to-port and `(browser,target)`-to-CDP-`targetId`; `sessionId` remains runtime-only. Reconnecting to a still-running browser reconstructs sessions through CDP. A missing page/browser incarnation is repaired lazily the next time its logical target is used.
+
+The desktop **Browser** page is a derived debug view over this existing state: persisted browser/profile rows and logical targets, currently live connection/ring/subscription data, plus recorded `cdp_call` Tool Calls. It filters by browser label, target label, originating Session and current browser active/inactive state; summarizes retained ring counts/bytes/drop state, notification/response counts, pending requests and subscriptions; shows recent retained CDP payloads through the shared JSON viewer; and exposes recorded sends including `_mrmcp.click`/`find` and screenshots. Replaying one recorded send reruns only that original batch item through `cdp_call` and records the replay as a new ordinary Tool Call. The page adds no new CDP telemetry or persistence.
 
 New page sessions use flattened auto-attach with `waitForDebuggerOnStart:true`. While paused, MrMCP enables `Runtime`, `Page`, `Network`, best-effort `ServiceWorker`, focus emulation, `_send_to_cdp` via `Runtime.addBinding`, and best-effort push-messaging `BackgroundService` observation. It sends `Runtime.disable` before `Runtime.runIfWaitingForDebugger`; this disables execution-context reporting but does not remove the binding or prevent later `Runtime.evaluate`. JavaScript may call `_send_to_cdp("...")`, producing the standard `Runtime.bindingCalled` event. Optional setup failures are exposed in `setup_errors`.
 
@@ -444,7 +448,7 @@ Arguments:
 
 Replacing a key creates a fresh row identity and `set_at`; TTL is therefore restarted from the replacement time. Deleting a Session or Workspace also removes memories owned by it. **Clear Operational Data intentionally preserves Memory**, just as it preserves Sessions, Workspaces and CDP browser/profile state.
 
-The desktop **Memory** page is a lazy administrative view over the same table. It filters by scope, Session, Workspace, set-date range and text, paginates results, labels JSON/TEXT, displays TTL/expiry, and allows the complete value, type, key and TTL to be inspected/edited or the entry to be deleted. JSON memories use the same vendored JSONEditor tree as Tool Call JSON and support node-level editing; text memories use a plain textarea. JSONEditor writes back through the normal managed form field and Deno submit path, while backend JSON validation remains authoritative.
+The desktop **Memory** page is a lazy administrative view over the same table. It filters by scope, Session, Workspace, set-date range and text, paginates results, labels JSON/TEXT, displays TTL/expiry, and supports creating entries for an explicitly selected existing Session or Workspace, inspecting/editing the complete value/type/key/TTL, and confirmed deletion. GUI creation rejects an already-existing key for that owner rather than silently replacing it; use View / Edit for replacement. JSON memories use the same vendored JSONEditor tree as Tool Call JSON and support node-level editing; text memories use a plain textarea. Switching TEXT ↔ JSON preserves the current draft byte-for-byte as text; invalid JSON remains visible/editable with an error instead of being discarded. JSONEditor writes back through the normal managed form field and Deno submit path, while backend JSON validation remains authoritative.
 
 ---
 

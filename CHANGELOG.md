@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.118
+
+- Added dedicated Browser and Automation diagnostics to the desktop GUI without introducing parallel telemetry stores. Browser summarizes existing CDP profiles, logical/live targets, subscriptions, retained ring traffic, recorded sends/responses and Session origins with browser/target/Session/connection-state filters; Automation exposes paginated recorded AAF scenarios, ordered actions, returned state/results and retained screenshots.
+- Added GUI replay for recorded automation scenarios and CDP operations. Browser can replay one entry from a recorded `cdp_call`, Automation replays the original `desktop_auto` YAML, and expanded Tool Call details expose whole-call replay shortcuts; every replay runs through the normal tool engine and creates a normal new Tool Call record.
+- Made each `cdp_call.calls[].browser` optional with the persistent lowercase `main` profile as the default, while explicit browser labels continue to override it.
+- Expanded Memory administration with GUI creation in addition to edit/delete, including explicit Session/Workspace ownership, duplicate-key protection and non-destructive TEXT/JSON switching that preserves the current draft even when JSON is temporarily invalid.
+- Added two versioned guided-prompt examples: a no-argument connector-block debugging prompt that accurately frames development/testing context without asserting unsupported safety claims, and an argument-driven focused project review demonstrating Eta arguments plus optional Session/Workspace context.
+
 ## 0.10.117
 
 - Renamed the server diagnostics to the uniform `tools_schema` and `tools_log` names with no compatibility aliases. `tools_schema` remains sessionless and returns canonical live descriptors; `tools_log` remains Session-scoped and queries only Tool Calls that reached MrMCP.
