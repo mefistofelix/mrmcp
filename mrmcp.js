@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.122 — Add server-wide Global persistent Memory.
+MrMCP 0.10.123 — Expand Memory search and rename FS Untrash.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -84,7 +84,7 @@ const UI_INPUT_EVENT = "tauriless://webview-message", UI_RENDER_EVENT = "mrmcp:/
 const BASE_TOOLS = [
   "list_workspaces", "open_workspace",
   "fs_glob", "fs_grep", "fs_read", "fs_navigate", "fs_stat",
-  "fs_write", "fs_edit", "fs_mkdir", "fs_copy", "fs_move", "fs_trash", "fs_restore",
+  "fs_write", "fs_edit", "fs_mkdir", "fs_copy", "fs_move", "fs_trash", "fs_untrash",
   "desktop_auto", "publish", "cdp_call", "cdp_subs", "cdp_poll", "memory_find", "memory_set", "telegram_req", "discover_commands", "tools_schema", "tools_log", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
   "js", "js_add_node_module_dir", "js_reset",
 ];
@@ -95,7 +95,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.122";
+const VERSION = "0.10.123";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;
@@ -1882,13 +1882,34 @@ async function backend({ addWorkspace = null } = {}) {
 
   function memoryFindRows(p, selection, args) {
     memoryPurgeExpired();
-    const owner = memoryScopeOwner(p, selection, args.scope, args.workspace);
+    const rawScope = args.scope;
+    const scopes = rawScope === "*"
+      ? ["global", "session", "workspace"]
+      : Array.isArray(rawScope) ? rawScope.map(value => String(value).trim()) : [String(rawScope || "").trim()];
+    if (!scopes.length || scopes.some(scope => !["global", "session", "workspace"].includes(scope)) || new Set(scopes).size !== scopes.length)
+      throw new Error("memory_find scope must be '*', one scope, or a unique array of global/session/workspace scopes");
+    const workspace = String(args.workspace || "").trim();
+    if (workspace && !scopes.includes("workspace")) throw new Error("workspace requires workspace scope");
+    const ownerConditions = [], ownerValues = [];
+    if (scopes.includes("global")) ownerConditions.push("(scope='workspace' AND owner_id=0)");
+    if (scopes.includes("session")) {
+      ownerConditions.push("(scope='session' AND owner_id=?)");
+      ownerValues.push(Number(selection.context.id));
+    }
+    if (scopes.includes("workspace")) {
+      if (workspace) {
+        const root = one("SELECT id,name FROM roots WHERE server_id=? AND name=?", p.id, workspace);
+        if (!root) throw new Error(`Workspace not found: ${workspace}`);
+        ownerConditions.push("(scope='workspace' AND owner_id=?)");
+        ownerValues.push(Number(root.id));
+      } else { ownerConditions.push("(scope='workspace' AND owner_id IN (SELECT id FROM roots WHERE server_id=?))"); ownerValues.push(p.id); }
+    }
     const limit = Math.max(1, Math.min(Number(args.limit || 20), 100));
-    const conditions = ["scope=?", "owner_id=?"], values = [owner.storage_scope || memoryStorageScope(owner.scope), owner.owner_id];
-    const key = String(args.key || ""), keyPrefix = String(args.key_prefix || ""), query = String(args.query || "").trim();
+    const conditions = [`(${ownerConditions.join(" OR ")})`], values = [...ownerValues];
+    const key = String(args.key || ""), keyPrefix = String(args.key_prefix || ""), query = String(args.query || "");
+    const regex = args.regex === true, caseSensitive = args.case_sensitive === true;
     if (key) { conditions.push("key=?"); values.push(key); }
     if (keyPrefix) { conditions.push("substr(key,1,length(?))=?"); values.push(keyPrefix, keyPrefix); }
-    if (query) { conditions.push("instr(lower(key||char(10)||value_json),lower(?))>0"); values.push(query); }
     if (args.set_after) {
       const value = Date.parse(String(args.set_after));
       if (!Number.isFinite(value)) throw new Error("set_after must be an ISO date/time");
@@ -1899,9 +1920,37 @@ async function backend({ addWorkspace = null } = {}) {
       if (!Number.isFinite(value)) throw new Error("set_before must be an ISO date/time");
       conditions.push("set_at<=?"); values.push(value);
     }
-    if (args.before_id != null) { conditions.push("id<?"); values.push(Math.max(1, Number(args.before_id))); }
-    const rows = all(`SELECT * FROM memories WHERE ${conditions.join(" AND ")} ORDER BY id DESC LIMIT ?`, ...values, limit + 1);
-    const page = rows.slice(0, limit), hasMore = rows.length > limit;
+    const beforeId = args.before_id == null ? null : Math.max(1, Number(args.before_id));
+    if (!regex) {
+      if (query) {
+        conditions.push(caseSensitive
+          ? "instr(key||char(10)||value_json,?)>0"
+          : "instr(lower(key||char(10)||value_json),lower(?))>0");
+        values.push(query);
+      }
+      if (beforeId != null) { conditions.push("id<?"); values.push(beforeId); }
+      const rows = all(`SELECT * FROM memories WHERE ${conditions.join(" AND ")} ORDER BY id DESC LIMIT ?`, ...values, limit + 1);
+      const page = rows.slice(0, limit), hasMore = rows.length > limit;
+      return { memories: page.map(memoryPublicRow), next_before_id: hasMore && page.length ? Number(page.at(-1).id) : null };
+    }
+    let matcher;
+    try { matcher = new RegExp(query, caseSensitive ? "" : "i"); }
+    catch (error) { throw new Error(`memory_find query regex is invalid: ${String(error?.message || error)}`); }
+    const matched = [], batchSize = 500;
+    let scanBefore = beforeId;
+    while (matched.length < limit + 1) {
+      const scanConditions = [...conditions], scanValues = [...values];
+      if (scanBefore != null) { scanConditions.push("id<?"); scanValues.push(scanBefore); }
+      const rows = all(`SELECT * FROM memories WHERE ${scanConditions.join(" AND ")} ORDER BY id DESC LIMIT ?`, ...scanValues, batchSize);
+      if (!rows.length) break;
+      for (const row of rows) {
+        if (matcher.test(`${String(row.key)}\n${String(row.value_json ?? "")}`)) matched.push(row);
+        if (matched.length >= limit + 1) break;
+      }
+      scanBefore = Number(rows.at(-1).id);
+      if (rows.length < batchSize) break;
+    }
+    const page = matched.slice(0, limit), hasMore = matched.length > limit;
     return { memories: page.map(memoryPublicRow), next_before_id: hasMore && page.length ? Number(page.at(-1).id) : null };
   }
 
@@ -4416,7 +4465,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           ...contextInput,
         } },
       ],
-      fs_restore: [
+      fs_untrash: [
         "Restore paths still present under one trash_id. Entries are independent: successful restores remain restored, failed entries stay in the trash for inspection or retry, and the trash transaction is removed only when no payload remains.",
         { properties: { trash_id: { type: "string", description: "Trash transaction identifier returned by fs_trash." }, ...contextInput }, required: ["trash_id"] },
       ],
@@ -4507,13 +4556,18 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         } },
       ],
       memory_find: [
-        "Find persistent key-value memories in exactly one explicitly selected scope. global scope is shared across the whole MrMCP server, session scope searches only the current context_handle's Session, and workspace scope requires a Workspace name and searches that shared Workspace memory. Each result explicitly reports json=true for validated JSON text or json=false for ordinary text. Expired TTL entries are removed before searching. key is exact, key_prefix matches the start of keys, query is a case-insensitive literal search across key plus stored value text, set_after/set_before filter the set timestamp, and before_id provides stable backward pagination. Exact-key lookup through this tool replaces a separate memory_get surface.",
+        "Find persistent key-value memories across one or more explicitly selected scopes. scope accepts global, session, workspace, an array of those scopes, or '*' for all three. Session results are always restricted to the current context_handle's Session. Workspace scope searches every registered Workspace when workspace is omitted, or one named Workspace when supplied. Each result reports its stable id, public scope/owner, key, explicit json type, value, TTL and set/expiry timestamps. Expired TTL entries are removed before searching. key is exact, key_prefix matches the start of keys, and query searches key plus stored value text as a case-insensitive literal by default or as a JavaScript regex when regex=true. set_after/set_before filter the set timestamp and before_id provides stable backward pagination. Exact-key lookup through this tool replaces a separate memory_get surface.",
         { properties: {
-          scope: { type: "string", enum: ["global", "session", "workspace"], description: "Required explicit memory scope." },
-          workspace: { type: "string", minLength: 1, maxLength: 128, description: "Workspace label required only when scope=workspace; omit for global and session scope." },
+          scope: { anyOf: [
+            { type: "string", enum: ["global", "session", "workspace", "*"] },
+            { type: "array", minItems: 1, maxItems: 3, uniqueItems: true, items: { type: "string", enum: ["global", "session", "workspace"] } },
+          ], description: "Required memory scope selector: one scope, a unique array of scopes, or '*' for global + current Session + every Workspace." },
+          workspace: { type: "string", minLength: 1, maxLength: 128, description: "Optional Workspace filter when workspace scope is selected. Omit to search every registered Workspace included by the scope selector." },
           key: { type: "string", maxLength: 512, description: "Optional exact key filter." },
           key_prefix: { type: "string", maxLength: 512, description: "Optional key-prefix filter." },
-          query: { type: "string", maxLength: 2000, description: "Case-insensitive literal search across key and stored JSON/text value." },
+          query: { type: "string", maxLength: 2000, description: "Optional search across key plus stored JSON/text value. Literal by default; JavaScript regex source when regex=true." },
+          regex: { type: "boolean", default: false, description: "Interpret query as a JavaScript regular expression instead of a literal substring." },
+          case_sensitive: { type: "boolean", default: false, description: "Use case-sensitive matching for query. Applies to both literal and regex search." },
           set_after: { type: "string", description: "Optional ISO date/time lower bound for when the memory was last set." },
           set_before: { type: "string", description: "Optional ISO date/time upper bound for when the memory was last set." },
           limit: { type: "integer", minimum: 1, maximum: 100, default: 20 },
@@ -4698,7 +4752,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const fsTrashEntry = fsEntry({
       path: { type: "string" }, status: fsStatus(["trashed", "not_found", "invalid_target", "failed_partial", "permission_denied", "failed"]), ...fsErrorProperty,
     });
-    const fsRestoreEntry = fsEntry({
+    const fsUntrashEntry = fsEntry({
       path: { type: "string" }, status: fsStatus(["restored", "wrong_workspace", "invalid_payload", "not_in_trash", "destination_exists", "parent_missing", "failed_partial", "permission_denied", "failed"]), ...fsErrorProperty,
     });
     const fsResumePoint = {
@@ -4806,7 +4860,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       fs_copy: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsCopyEntry) }),
       fs_move: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsMoveEntry) }),
       fs_trash: strictOutputSchema({ trash_id: nullableString, trash_path: nullableString, manifest_path: nullableString, succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsTrashEntry) }),
-      fs_restore: strictOutputSchema({ trash_id: { type: "string" }, succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsRestoreEntry) }),
+      fs_untrash: strictOutputSchema({ trash_id: { type: "string" }, succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsUntrashEntry) }),
       desktop_auto: strictOutputSchema({
         results: { type: "array", items: {} },
         state: { type: "object", additionalProperties: true },
@@ -4890,7 +4944,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const titles = {
       list_workspaces: "List Workspaces", open_workspace: "Open Workspace",
       fs_glob: "FS Glob", fs_grep: "FS Grep", fs_read: "FS Read", fs_navigate: "FS Navigate", fs_stat: "FS Stat",
-      fs_write: "FS Write", fs_edit: "FS Edit", fs_mkdir: "FS Mkdir", fs_copy: "FS Copy", fs_move: "FS Move", fs_trash: "FS Trash", fs_restore: "FS Restore",
+      fs_write: "FS Write", fs_edit: "FS Edit", fs_mkdir: "FS Mkdir", fs_copy: "FS Copy", fs_move: "FS Move", fs_trash: "FS Trash", fs_untrash: "FS Untrash",
       desktop_auto: "Desktop Auto", publish: "Publish to User", cdp_call: "CDP Call", cdp_subs: "CDP Subscriptions", cdp_poll: "CDP Poll", memory_find: "Memory Find", memory_set: "Memory Set", telegram_req: "Telegram Request", discover_commands: "Discover Commands", tools_schema: "Tools Schema", tools_log: "Tools Log",
       exec: "Run Command", exec_start: "Start Persistent Command", exec_attach: "Attach Process Output", exec_write: "Write Stdin",
       exec_kill: "Terminate Process", exec_list: "List Processes", exec_status: "Process Status", js: "JavaScript Kernel",
@@ -4971,7 +5025,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         fs_read: ["files"], fs_navigate: ["files"], fs_stat: ["entries"],
         fs_write: ["succeeded", "failed", "files"], fs_edit: ["succeeded", "failed", "total_replacements", "files"],
         fs_mkdir: ["succeeded", "failed", "entries"], fs_copy: ["succeeded", "failed", "entries"], fs_move: ["succeeded", "failed", "entries"],
-        fs_trash: ["trash_id", "succeeded", "failed", "entries"], fs_restore: ["trash_id", "succeeded", "failed", "entries"],
+        fs_trash: ["trash_id", "succeeded", "failed", "entries"], fs_untrash: ["trash_id", "succeeded", "failed", "entries"],
         desktop_auto: ["results", "state", "images"],
         exec_start: ["exec_id"],
         exec_attach: ["exec_id", "output", "remaining_bytes"],
@@ -5001,12 +5055,12 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       fs_grep: ["pattern", "path", "include", "exclude", "gitignore", "hidden", "regex", "case_sensitive", "encoding", "context_lines_before", "context_lines_after", "mode", "max_file_bytes", "limit", "resume_after"],
       fs_read: ["files", "max_output_bytes_per_file"], fs_navigate: ["pattern", "files", "regex", "case_sensitive", "context_lines_before", "context_lines_after"], fs_stat: ["paths", "fingerprint"],
       fs_write: ["files", "create_parents"], fs_edit: ["files"], fs_mkdir: ["paths", "parents"],
-      fs_copy: ["entries", "create_parents"], fs_move: ["entries", "create_parents"], fs_trash: ["paths", "selection"], fs_restore: ["trash_id"],
+      fs_copy: ["entries", "create_parents"], fs_move: ["entries", "create_parents"], fs_trash: ["paths", "selection"], fs_untrash: ["trash_id"],
       desktop_auto: ["yaml"], publish: ["path", "text", "base64", "mime_type", "filename", "presentation", "title", "description", "height"],
       cdp_call: ["wait", "calls"],
       cdp_subs: ["browser", "add", "remove"],
       cdp_poll: ["subscription", "browser", "target", "type", "id", "methods", "method_prefixes", "limit", "advance"],
-      memory_find: ["scope", "workspace", "key", "key_prefix", "query", "set_after", "set_before", "limit", "before_id"],
+      memory_find: ["scope", "workspace", "key", "key_prefix", "query", "regex", "case_sensitive", "set_after", "set_before", "limit", "before_id"],
       memory_set: ["scope", "workspace", "key", "value", "json", "delete", "ttl_seconds"],
       telegram_req: ["request"],
       tools_schema: ["names"],
@@ -5073,7 +5127,10 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       uiErrors.push("CDP subscription/poll schema is incomplete");
     if (!memoryFindTool || !memorySetTool || tools.some(tool => tool.name === "memory_get") ||
         !memoryFindTool?.inputSchema?.required?.includes("scope") || !memorySetTool?.inputSchema?.required?.includes("scope") ||
-        !memoryFindTool?.inputSchema?.properties?.scope?.enum?.includes("global") || !memorySetTool?.inputSchema?.properties?.scope?.enum?.includes("global") ||
+        !JSON.stringify(memoryFindTool?.inputSchema?.properties?.scope || {}).includes('"*"') ||
+        !JSON.stringify(memoryFindTool?.inputSchema?.properties?.scope || {}).includes('"uniqueItems":true') ||
+        !memoryFindTool?.inputSchema?.properties?.regex || !memoryFindTool?.inputSchema?.properties?.case_sensitive ||
+        !memorySetTool?.inputSchema?.properties?.scope?.enum?.includes("global") ||
         !memorySetTool?.inputSchema?.required?.includes("key") || !memorySetTool?.inputSchema?.properties?.ttl_seconds)
       uiErrors.push("memory tool surface/schema is invalid");
     if (!matchesUiResourceUri(freshPublishA, PUBLISH_UI_URI) || freshPublishA === PUBLISH_UI_URI || freshPublishA === freshPublishB)
@@ -6419,7 +6476,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       const succeeded = entries.filter(entry => entry.status === wanted).length;
       return { succeeded, failed: entries.length - succeeded, entries };
     }
-    if (name === "fs_trash" || name === "fs_restore") {
+    if (name === "fs_trash" || name === "fs_untrash") {
       const rootReal = await Deno.realPath(selection.root.path), metadataRoot = resolve(DATA), trashRoot = resolve(TRASH_ROOT);
       const slash = path => slashPath(relative(rootReal, path)) || ".";
       if (name === "fs_trash") {
@@ -7780,7 +7837,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     if (!row) return { count, last_at: null, trash_id: "", trash_path: "" };
     const result = parseJson(row.resolved_json, {}), trashId = String(result?.trash_id || "");
     let relativeTrashPath = String(result?.trash_path || "");
-    if (!relativeTrashPath && tool === "fs_restore" && trashId) {
+    if (!relativeTrashPath && tool === "fs_untrash" && trashId) {
       const original = one(`SELECT resolved_json FROM logs
         WHERE server_id=? AND tool='fs_trash' AND status='completed' AND instr(resolved_json,?)>0
         ORDER BY id DESC LIMIT 1`, p.id, `\"trash_id\":\"${trashId}\"`);
@@ -7852,7 +7909,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       };
       result.trash_activity = {
         trash: liveTrashProjection(),
-        untrash: trashActivityProjection(p, "fs_restore"),
+        untrash: trashActivityProjection(p, "fs_untrash"),
       };
     }
     if (["all", "oauth"].includes(section)) result.oauth_clients = oauthProjection();

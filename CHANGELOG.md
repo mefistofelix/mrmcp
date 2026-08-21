@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.123
+
+- Renamed the reversible filesystem restore tool from `fs_restore` to `fs_untrash` across the published MCP surface, Dashboard history projection and documentation.
+- Expanded `memory_find` to search one scope, multiple scopes or `*` across Global + current Session + registered Workspaces, with optional Workspace filtering, literal/JavaScript-regex query matching, case sensitivity and stable backward pagination while returning complete scope/owner/value/TTL timestamps per result.
+
 ## 0.10.122
 
 - Added server-wide Global persistent Memory as a third explicit `memory_find` / `memory_set` scope alongside Session and Workspace, including Memory GUI filtering/create/edit support and Global/Workspace/Session summaries from `open_workspace`.

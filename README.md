@@ -79,7 +79,7 @@ Desktop and browser automation:
 
 Memory:
 
-- `memory_find` — search the explicitly selected Global, current-Session or named-Workspace memory by exact/prefix key, text, set date and stable pagination.
+- `memory_find` — search one or many memory scopes, or `*` for Global + current Session + all Workspaces, by exact/prefix key, literal or regex text, set date and stable pagination.
 - `memory_set` — set/replace/delete text values with explicit `json=true|false`; JSON text is validated before storage, with optional TTL in the selected Global, Session or Workspace scope.
 
 The desktop **Memory** page filters stored values by scope, Session, Workspace, set date and text, labels JSON vs TEXT, and allows creation, full value/type/TTL inspection, editing and confirmed deletion. New entries explicitly choose Global scope or an existing Session/Workspace owner. JSON values use an editable JSON tree with node-level operations; text values use the plain text editor, and switching TEXT ↔ JSON never discards the current draft value. Expired TTL rows are removed automatically; Clear Operational Data preserves Memory.
@@ -88,7 +88,7 @@ Filesystem:
 
 - `fs_glob`, `fs_grep`, `fs_read`, `fs_navigate`, `fs_stat`
 - `fs_write`, `fs_edit`
-- `fs_mkdir`, `fs_copy`, `fs_move`, `fs_trash`, `fs_restore`
+- `fs_mkdir`, `fs_copy`, `fs_move`, `fs_trash`, `fs_untrash`
 - `publish` — publish exactly one Workspace path, text string or Base64 payload with a required MIME type, optional filename/title/description and an `auto|inline|download` presentation hint.
 
 The `fs_*` surface is multi-file where appropriate, stateless for navigation/pagination, uses opaque file fingerprints for optimistic concurrency, and reports independent per-entry outcomes instead of cross-entry rollback. See `TOOLS.md` for the complete tool contracts and rationale.
@@ -101,7 +101,7 @@ Commands and execution:
 - `tools_schema` — inspect canonical live MCP descriptors; `tools_log` — query Tool Calls that reached the current Session.
 - `telegram_req` — make one generic pre-authenticated Telegram Bot API JSON request using the Bot token configured by the user on the dedicated **✈️ Telegram** sidebar page.
 
-Filesystem removal is reversible: `fs_trash`/`fs_restore` use explicit `trash_id` transactions instead of a permanent delete tool. All Workspaces share the single MrMCP-managed `APP_DIR/.mrmcp/trash/` store; MrMCP never creates `.mrmcp` metadata directories inside named Workspaces.
+Filesystem removal is reversible: `fs_trash`/`fs_untrash` use explicit `trash_id` transactions instead of a permanent delete tool. All Workspaces share the single MrMCP-managed `APP_DIR/.mrmcp/trash/` store; MrMCP never creates `.mrmcp` metadata directories inside named Workspaces.
 
 Persistent processes use the integer `exec_id` returned by `exec_start`; follow-up process tools require the same Session `context_handle`.
 

@@ -71,7 +71,7 @@ Mutation tools also recheck the source immediately before writing and report `so
 
 Batch entries are independent. There is no public `atomic` option and no cross-entry rollback. If three entries succeed and the fourth fails, the three successful operations remain applied and the structured result reports all four outcomes.
 
-This avoids best-effort rollback becoming a second failure mode. A single recursive copy/move/trash/restore can report `failed_partial` when it leaves a destination or payload after failing.
+This avoids best-effort rollback becoming a second failure mode. A single recursive copy/move/trash/untrash can report `failed_partial` when it leaves a destination or payload after failing.
 
 `fs_edit` has one important local invariant: all edits for one file are validated and applied to an evolving in-memory document before that file is written once. A validation failure means that file is not written; other files remain independent.
 
@@ -314,7 +314,7 @@ Returns `trash_id`, physical trash/manifest paths, `succeeded`, `failed` and per
 
 Rationale: removal is intentionally reversible; there is no permanent filesystem-delete tool.
 
-### `fs_restore`
+### `fs_untrash`
 
 Restores payloads still present under one trash transaction.
 
@@ -409,23 +409,25 @@ Each browser has one shared ring rather than one copy per subscription. It is ca
 
 MrMCP exposes one small explicit persistent key-value memory surface: `memory_find` and `memory_set`. There is deliberately no separate `memory_get`; exact lookup is `memory_find` with `key`. Values are explicitly either validated JSON text or ordinary text and are stored in SQLite, not in hidden model state.
 
-Every call explicitly chooses one scope:
+`memory_set` explicitly chooses one scope. `memory_find` can choose one scope, a unique array of scopes, or `"*"` for Global + current Session + all Workspaces:
 
-- `scope="global"` — memory is shared across the whole MrMCP server. `workspace` must be omitted.
-- `scope="session"` — memory belongs only to the current `context_handle`'s Session. `workspace` must be omitted.
-- `scope="workspace"` — `workspace` is required and names the Workspace whose shared memory is addressed. It does not depend on which Workspace the current Session happens to be using.
+- Global memory is shared across the whole MrMCP server.
+- Session memory always means only the current `context_handle`'s Session.
+- Workspace memory is shared by Workspace. For `memory_set`, `workspace` is required. For `memory_find`, `workspace` is an optional filter; when omitted, every registered Workspace included by the scope selector is searched.
 
 ### `memory_find`
 
-Finds live memories only in the selected scope. Expired TTL rows are removed before the query.
+Finds live memories across the selected scope set. Expired TTL rows are removed before the query.
 
 Arguments:
 
-- `scope` — required `global|session|workspace`.
-- `workspace` — required only for Workspace scope; omit it for Global and Session scope.
+- `scope` — required: one of `global|session|workspace`, a unique array of those scopes, or `"*"` for all three.
+- `workspace` — optional filter when Workspace scope is included; omit it to search all registered Workspaces.
 - `key` — optional exact key.
 - `key_prefix` — optional key prefix.
-- `query` — optional case-insensitive literal search across key plus stored JSON/text value.
+- `query` — optional search across key plus stored JSON/text value. It is a case-insensitive literal by default.
+- `regex=true` — interpret `query` as a JavaScript regular expression.
+- `case_sensitive=true` — use case-sensitive literal or regex matching.
 - `set_after`, `set_before` — optional ISO date/time bounds on `set_at`.
 - `limit` — 1–100, default 20.
 - `before_id` — stable backward-pagination cursor; `next_before_id` is returned when another page exists.
