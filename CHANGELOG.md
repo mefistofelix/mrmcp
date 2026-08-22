@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.126
+
+- Added `fs_text_convert_encoding_eol` for explicit lossless conversion of named existing text files across character encoding, line-ending convention and BOM without changing logical text content.
+- The tool uses authoritative automatic source detection with optional per-file `input_encoding`, supports optimistic fingerprints and source-change checks, preserves mixed/none EOL when requested, and reports `before`/`after` representation metadata.
+- Already-conforming byte streams return `unchanged` without a rewrite; non-regular files and unrepresentable target encodings fail per entry, and an all-`preserve` request is rejected so the tool cannot be used as a passive detection API or proactive repository normalizer.
+
 ## 0.10.125
 
 - Added `workspace_dev_preferences_write`, an explicit-user-request-only Workspace tool that materializes the physical sidecar `DEV_PREF.md` beside MrMCP into the current Workspace only when the project file is absent.

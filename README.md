@@ -88,7 +88,7 @@ The desktop **Memory** page filters stored values by scope, Session, Workspace, 
 Filesystem:
 
 - `fs_glob`, `fs_grep`, `fs_read`, `fs_navigate`, `fs_stat`
-- `fs_write`, `fs_edit`
+- `fs_write`, `fs_edit`, `fs_text_convert_encoding_eol` — explicit lossless charset/EOL/BOM conversion for named existing text files, with unchanged detection and no implicit repository normalization.
 - `fs_mkdir`, `fs_copy`, `fs_move`, `fs_trash`, `fs_untrash`
 - `publish` — publish exactly one Workspace path, text string or Base64 payload with a required MIME type, optional filename/title/description and an `auto|inline|download` presentation hint.
 

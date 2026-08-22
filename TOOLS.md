@@ -271,6 +271,22 @@ When `line_endings: preserve` has no unique source style and the edited result s
 
 Rationale: this keeps multi-edit fast and safe without line-number drift. Edits are anchored by text, not absolute coordinates, so earlier edits may add/remove lines without invalidating later edit positions.
 
+### `fs_text_convert_encoding_eol`
+
+Explicitly converts only the physical text representation of existing regular files while preserving logical text content. This is the direct operation for requested charset, line-ending or BOM conversion; it is not a formatter and must not be used proactively to "normalize" a repository.
+
+Arguments:
+
+- `files[]` — explicit Workspace-relative paths only; there is no glob/discovery mode. Each entry contains `path`, optional `expected_fingerprint`, and optional `input_encoding` (`auto` by default) to override charset detection when the source encoding is already known.
+- `encoding` — target `preserve|utf-8|utf-16le|utf-16be|windows-1252|latin1`; default `preserve`.
+- `line_endings` — target `preserve|lf|crlf|cr`; default `preserve`. Here preserve means preserve the actual source convention exactly, including `mixed` or `none`.
+- `bom` — `preserve|add|remove`; default `preserve`. `add` requires a BOM-capable Unicode resulting encoding.
+- `context_handle`.
+
+At least one of `encoding`, `line_endings` or `bom` must request a real conversion rather than `preserve`; an all-preserve call is rejected so this tool cannot be abused as a read/detection API. Source encoding is detected with the same chardet-based path as the other filesystem text tools unless that file explicitly supplies `input_encoding`. Conversion is lossless: a wrong/ambiguous automatic detection fails rather than silently guessing, and if the requested target charset cannot represent the text that file fails rather than substituting characters.
+
+Each result reports `path`, `status` and, when decoding succeeded, `before` / `after` objects containing detected/effective `encoding`, `line_endings` and physical `bom`. `converted` means bytes were rewritten; `unchanged` means the current bytes already represent the requested result and no write occurred. Optional fingerprints protect against concurrent changes, and MrMCP rechecks the source immediately before deciding unchanged or writing. Directories and symlinks are `not_file`; entries are independent.
+
 ---
 
 ## Filesystem structural mutation

@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.125 — Add opt-in Workspace development preferences materialization.
+MrMCP 0.10.126 — Add explicit text encoding and line-ending conversion.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -86,7 +86,7 @@ const UI_INPUT_EVENT = "tauriless://webview-message", UI_RENDER_EVENT = "mrmcp:/
 const BASE_TOOLS = [
   "list_workspaces", "open_workspace", "workspace_dev_preferences_write",
   "fs_glob", "fs_grep", "fs_read", "fs_navigate", "fs_stat",
-  "fs_write", "fs_edit", "fs_mkdir", "fs_copy", "fs_move", "fs_trash", "fs_untrash",
+  "fs_write", "fs_edit", "fs_text_convert_encoding_eol", "fs_mkdir", "fs_copy", "fs_move", "fs_trash", "fs_untrash",
   "desktop_auto", "publish", "cdp_call", "cdp_subs", "cdp_poll", "memory_find", "memory_set", "telegram_req", "discover_commands", "tools_schema", "tools_log", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
   "js", "js_add_node_module_dir", "js_reset",
 ];
@@ -97,7 +97,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.125";
+const VERSION = "0.10.126";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;
@@ -4448,6 +4448,19 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           ...contextInput,
         }, required: ["files"] },
       ],
+      fs_text_convert_encoding_eol: [
+        "Explicitly convert the physical text representation of existing regular files without changing their logical text content. Use only explicit files[] paths: this tool never discovers or globs files. Set one or more targets among encoding, line_endings and bom; preserve leaves that property unchanged, including mixed/none line endings. Source encoding is detected with the same authoritative chardet path used by the other text tools. Files whose bytes already match the requested representation return unchanged and are not rewritten. Each file is independent and may include expected_fingerprint for optimistic concurrency. Use this tool when the user explicitly requests an encoding/EOL/BOM conversion or when the current task specifically requires that representation; do not call it proactively to normalize a repository or treat one text representation as universally preferred.",
+        { properties: {
+          files: { type: "array", minItems: 1, maxItems: 100, items: {
+            type: "object", additionalProperties: false,
+            properties: { path: { type: "string" }, expected_fingerprint: fingerprintInput, input_encoding: inputEncoding }, required: ["path"],
+          } },
+          encoding: { type: "string", enum: ["preserve", "utf-8", "utf-16le", "utf-16be", "windows-1252", "latin1"], default: "preserve", description: "Target character encoding. preserve keeps the detected source encoding." },
+          line_endings: { type: "string", enum: ["preserve", "lf", "crlf", "cr"], default: "preserve", description: "Target line-ending convention. preserve keeps the source exactly, including mixed or none." },
+          bom: { type: "string", enum: ["preserve", "add", "remove"], default: "preserve", description: "Preserve, add or remove a recognized Unicode BOM. add requires a BOM-capable Unicode target encoding." },
+          ...contextInput,
+        }, required: ["files"] },
+      ],
       fs_mkdir: [
         "Create one or many directories. parents=true creates missing parents. Batch entries are independent; successful directories remain in place when another entry fails.",
         { properties: {
@@ -4754,6 +4767,20 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       size: { type: "integer", minimum: 0 }, size_before: { type: "integer", minimum: 0 }, size_after: { type: "integer", minimum: 0 },
       ...fsFingerprintProperties, ...fsTextProperties, replacements: { type: "integer", minimum: 0 }, edits: { type: "array", items: fsEditResult },
     });
+    const fsTextRepresentation = {
+      type: "object", additionalProperties: false,
+      properties: {
+        encoding: { type: "string" },
+        line_endings: { type: "string", enum: ["lf", "crlf", "cr", "mixed", "none"] },
+        bom: { type: "boolean" },
+      },
+      required: ["encoding", "line_endings", "bom"],
+    };
+    const fsTextConvertEntry = fsEntry({
+      path: { type: "string" }, status: fsStatus(["converted", "unchanged", "fingerprint_mismatch", "source_changed", "not_found", "not_file", "permission_denied", "failed"]), ...fsErrorProperty,
+      size: { type: "integer", minimum: 0 }, size_before: { type: "integer", minimum: 0 }, size_after: { type: "integer", minimum: 0 },
+      ...fsFingerprintProperties, before: fsTextRepresentation, after: fsTextRepresentation,
+    });
     const fsMkdirEntry = fsEntry({
       path: { type: "string" }, status: fsStatus(["created", "exists", "not_directory", "parent_missing", "permission_denied", "failed"]), ...fsErrorProperty,
       type: fsStatus(["directory"]), size: { type: "integer", minimum: 0 },
@@ -4875,6 +4902,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       fs_stat: strictOutputSchema({ entries: fsArray(fsStatEntry) }),
       fs_write: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, files: fsArray(fsWriteEntry) }),
       fs_edit: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, total_replacements: { type: "integer" }, files: fsArray(fsEditEntry) }),
+      fs_text_convert_encoding_eol: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, files: fsArray(fsTextConvertEntry) }),
       fs_mkdir: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsMkdirEntry) }),
       fs_copy: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsCopyEntry) }),
       fs_move: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsMoveEntry) }),
@@ -4973,12 +5001,12 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       exec: "Run Command", exec_start: "Start Persistent Command", exec_attach: "Attach Process Output", exec_write: "Write Stdin",
       exec_kill: "Terminate Process", exec_list: "List Processes", exec_status: "Process Status", js: "JavaScript Kernel",
       js_add_node_module_dir: "Add Module Directory", js_reset: "Reset JavaScript Kernel",
-      workspace_dev_preferences_write: "Write Workspace Dev Preferences",
+      workspace_dev_preferences_write: "Write Workspace Dev Preferences", fs_text_convert_encoding_eol: "Convert Text Encoding / EOL",
     };
     const annotations = name => ({
       readOnlyHint: READ_TOOLS.has(name) || name === "publish" || name === "cdp_poll" || name === "memory_find",
-      destructiveHint: ["desktop_auto", "cdp_call", "memory_set", "telegram_req", "fs_write", "fs_edit", "fs_move", "exec", "exec_start", "exec_write", "exec_kill", "js", "js_add_node_module_dir", "js_reset"].includes(name),
-      idempotentHint: (READ_TOOLS.has(name) && name !== "publish") || ["fs_write", "fs_mkdir", "js_reset", "workspace_dev_preferences_write"].includes(name),
+      destructiveHint: ["desktop_auto", "cdp_call", "memory_set", "telegram_req", "fs_write", "fs_edit", "fs_text_convert_encoding_eol", "fs_move", "exec", "exec_start", "exec_write", "exec_kill", "js", "js_add_node_module_dir", "js_reset"].includes(name),
+      idempotentHint: (READ_TOOLS.has(name) && name !== "publish") || ["fs_write", "fs_mkdir", "fs_text_convert_encoding_eol", "js_reset", "workspace_dev_preferences_write"].includes(name),
       openWorldHint: name === "desktop_auto" || name.startsWith("cdp_") || name.startsWith("exec") || name === "js" || name === "publish" || name === "telegram_req",
     });
     const schema = value => ({
@@ -5049,6 +5077,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         fs_grep: ["scanned_files", "matched_files", "files", "next_resume_after", "truncated"],
         fs_read: ["files"], fs_navigate: ["files"], fs_stat: ["entries"],
         fs_write: ["succeeded", "failed", "files"], fs_edit: ["succeeded", "failed", "total_replacements", "files"],
+        fs_text_convert_encoding_eol: ["succeeded", "failed", "files"],
         fs_mkdir: ["succeeded", "failed", "entries"], fs_copy: ["succeeded", "failed", "entries"], fs_move: ["succeeded", "failed", "entries"],
         fs_trash: ["trash_id", "succeeded", "failed", "entries"], fs_untrash: ["trash_id", "succeeded", "failed", "entries"],
         workspace_dev_preferences_write: ["path", "status", "created"],
@@ -5080,7 +5109,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       fs_glob: ["path", "include", "exclude", "gitignore", "hidden", "limit", "after_path"],
       fs_grep: ["pattern", "path", "include", "exclude", "gitignore", "hidden", "regex", "case_sensitive", "encoding", "context_lines_before", "context_lines_after", "mode", "max_file_bytes", "limit", "resume_after"],
       fs_read: ["files", "max_output_bytes_per_file"], fs_navigate: ["pattern", "files", "regex", "case_sensitive", "context_lines_before", "context_lines_after"], fs_stat: ["paths", "fingerprint"],
-      fs_write: ["files", "create_parents"], fs_edit: ["files"], fs_mkdir: ["paths", "parents"],
+      fs_write: ["files", "create_parents"], fs_edit: ["files"], fs_text_convert_encoding_eol: ["files", "encoding", "line_endings", "bom"], fs_mkdir: ["paths", "parents"],
       fs_copy: ["entries", "create_parents"], fs_move: ["entries", "create_parents"], fs_trash: ["paths", "selection"], fs_untrash: ["trash_id"],
       desktop_auto: ["yaml"], publish: ["path", "text", "base64", "mime_type", "filename", "presentation", "title", "description", "height"],
       cdp_call: ["wait", "calls"],
@@ -6439,6 +6468,74 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       const succeeded = files.filter(file => file.status === "written").length;
       return { succeeded, failed: files.length - succeeded, files };
     }
+    if (name === "fs_text_convert_encoding_eol") {
+      const encodingMode = textEncoding(args.encoding || "preserve", "preserve", true);
+      const lineEndingMode = String(args.line_endings || "preserve").toLowerCase();
+      const bomMode = String(args.bom || "preserve").toLowerCase();
+      if (!["preserve", "lf", "crlf", "cr"].includes(lineEndingMode)) throw new Error("line_endings must be preserve, lf, crlf, or cr");
+      if (!["preserve", "add", "remove"].includes(bomMode)) throw new Error("bom must be preserve, add, or remove");
+      if (encodingMode === "preserve" && lineEndingMode === "preserve" && bomMode === "preserve")
+        throw new Error("At least one conversion target must differ from preserve");
+      const seen = new Set(), files = [];
+      for (const file of args.files || []) {
+        let target, before;
+        try {
+          target = await resolvePath(file.path);
+          const key = pathKey(target.path);
+          if (seen.has(key)) throw new Error(`Duplicate file path: ${file.path}`);
+          seen.add(key);
+          const stat = await exists(target.path);
+          if (!stat) { files.push({ path: target.display, status: "not_found" }); continue; }
+          if (!stat.isFile) { files.push({ path: target.display, status: "not_file", size: stat.size }); continue; }
+          const beforeBytes = await Deno.readFile(target.path);
+          const fingerprintBefore = await fingerprintBytes(beforeBytes);
+          if (file.expected_fingerprint && file.expected_fingerprint !== fingerprintBefore) {
+            files.push({
+              path: target.display, status: "fingerprint_mismatch", expected_fingerprint: file.expected_fingerprint,
+              fingerprint: fingerprintBefore, size: beforeBytes.length,
+            });
+            continue;
+          }
+          const source = decodeTextDocument(beforeBytes, file.input_encoding || "auto");
+          before = { encoding: source.encoding, line_endings: source.line_endings, bom: source.bom };
+          const output = encodeTextDocument(source.text, source, {
+            output_encoding: encodingMode, line_endings: lineEndingMode, bom: bomMode,
+          });
+          const after = { encoding: output.encoding, line_endings: output.line_endings, bom: output.bom };
+          const currentBytes = await Deno.readFile(target.path).catch(error => {
+            if (error instanceof Deno.errors.NotFound) return null;
+            throw error;
+          });
+          const currentFingerprint = currentBytes ? await fingerprintBytes(currentBytes) : "";
+          if (currentFingerprint !== fingerprintBefore) {
+            files.push({
+              path: target.display, status: "source_changed", fingerprint_before: fingerprintBefore,
+              ...(currentFingerprint ? { fingerprint: currentFingerprint } : {}), size: currentBytes?.length || 0, before,
+            });
+            continue;
+          }
+          if (sameBytes(beforeBytes, output.bytes)) {
+            files.push({
+              path: target.display, status: "unchanged", size_before: beforeBytes.length, size_after: beforeBytes.length,
+              fingerprint_before: fingerprintBefore, fingerprint_after: fingerprintBefore, before, after,
+            });
+            continue;
+          }
+          await Deno.writeFile(target.path, output.bytes);
+          files.push({
+            path: target.display, status: "converted", size_before: beforeBytes.length, size_after: output.bytes.length,
+            fingerprint_before: fingerprintBefore, fingerprint_after: await fingerprintBytes(output.bytes), before, after,
+          });
+        } catch (error) {
+          files.push({
+            path: target?.display || String(file.path), status: errorStatus(error), error: String(error?.message || error),
+            ...(before ? { before } : {}),
+          });
+        }
+      }
+      const succeeded = files.filter(file => file.status === "converted" || file.status === "unchanged").length;
+      return { succeeded, failed: files.length - succeeded, files };
+    }
     if (name === "fs_edit") {
       const seen = new Set(), files = []; let totalReplacements = 0;
       for (const file of args.files || []) {
@@ -7577,7 +7674,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const serverInfoMeta = { "io.modelcontextprotocol/serverInfo": mcpServerInfo() };
     const instructions = fullAccess
       ? "Use list_workspaces when you need to discover enabled Workspace names. Use open_workspace(name) to open one; only pass create=true when you explicitly want a missing Workspace created as a new empty Desktop folder. If you already have the current Session handle, pass it as current_context_handle to move that same Session; omitted, empty, unknown or expired creates a new Session. The result includes workspace_name, absolute cwd, agent_guidance_path, whether this call created the Workspace, and a compact count/latest-key Memory summary for Global, Workspace and Session scopes. When guidance is non-null, read and follow it before repository work. Pass the returned context_handle unchanged on every later Session-bound tool call. " +
-        "Use fs_glob, fs_grep, fs_read, fs_navigate, fs_stat, fs_write and fs_edit directly for filesystem discovery, inspection, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. Use desktop_auto for desktop observation and interaction through AAF YAML; when the model needs to see a screenshot, retain its image handle anywhere in the scenario's final state so the tool returns that image directly as MCP image content. Multiple retained screenshots and ordinary OCR/text/geometry/state values may coexist in one result. " +
+        "Use fs_glob, fs_grep, fs_read, fs_navigate, fs_stat, fs_write and fs_edit directly for filesystem discovery, inspection, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. Use fs_text_convert_encoding_eol only for explicit encoding/EOL/BOM representation conversion of named files when requested or specifically required by the task; never use it proactively to normalize a repository. Use desktop_auto for desktop observation and interaction through AAF YAML; when the model needs to see a screenshot, retain its image handle anywhere in the scenario's final state so the tool returns that image directly as MCP image content. Multiple retained screenshots and ordinary OCR/text/geometry/state values may coexist in one result. " +
         "workspace_dev_preferences_write is strictly opt-in: call it only when the user explicitly asks to copy/save/materialize their development preferences into the current Workspace. Never call it proactively, for preference discovery, or merely because DEV_PREF.md might exist; the tool returns no preference content and calling it does not imply that DEV_PREF.md should then be read or applied. " +
         "When work may benefit from command-line capability beyond the structured tools, call discover_commands proactively before inventing workarounds or assuming a utility is unavailable. It returns the complete user-chosen available command catalog in one call; prefer a listed command when it fits, remember the catalog for the Session, and invoke its logical_name directly through exec.program without PATH probes. Use tools_schema when exact live tool descriptor data is needed instead of relying on a connector-synthesized schema view. " +
         "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; cancelling/disconnecting exec terminates its child. For persistent or interactive work, call exec_start; it immediately returns exec_id, which is the stable integer Tool Call id of that start. Pass that exec_id together with the same context_handle to exec_attach, exec_write, exec_kill or exec_status; ids from other Sessions are inaccessible. exec_list shows only currently running persistent executions in this Session. exec_status is the non-consuming way to inspect running or recently completed/killed executions and optionally retrieve all output or a tail. exec_attach with progressToken streams unread backlog plus live output through progress until process exit and then returns that complete unread transcript; without progressToken it long-polls and returns at most 16 KiB of unread output plus remaining_bytes, so call it repeatedly to drain buffered output and call it again with remaining_bytes=0/status=running to wait for future output. Disconnecting exec_attach only detaches and never kills the persistent process. " +
