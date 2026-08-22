@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.124 — Improve filesystem text safety and managed process environment.
+MrMCP 0.10.125 — Add opt-in Workspace development preferences materialization.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -79,10 +79,12 @@ const COMMANDS_TEMPLATE_PATH = join(MODULE_DIR, "commands.yaml");
 const COMMANDS_PATH = join(APP_DIR, "commands.yaml");
 const GUIDED_PROMPTS_TEMPLATE_PATH = join(MODULE_DIR, "guided_prompts.yaml");
 const GUIDED_PROMPTS_PATH = join(APP_DIR, "guided_prompts.yaml");
+const DEV_PREF_FILENAME = "DEV_PREF.md";
+const DEV_PREF_SOURCE_PATH = join(Deno.build.standalone ? STANDALONE_DIR : MODULE_DIR, DEV_PREF_FILENAME);
 const PORT_FALLBACK_STEP = 50;
 const UI_INPUT_EVENT = "tauriless://webview-message", UI_RENDER_EVENT = "mrmcp://ui-render";
 const BASE_TOOLS = [
-  "list_workspaces", "open_workspace",
+  "list_workspaces", "open_workspace", "workspace_dev_preferences_write",
   "fs_glob", "fs_grep", "fs_read", "fs_navigate", "fs_stat",
   "fs_write", "fs_edit", "fs_mkdir", "fs_copy", "fs_move", "fs_trash", "fs_untrash",
   "desktop_auto", "publish", "cdp_call", "cdp_subs", "cdp_poll", "memory_find", "memory_set", "telegram_req", "discover_commands", "tools_schema", "tools_log", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
@@ -95,7 +97,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.124";
+const VERSION = "0.10.125";
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;
@@ -4355,6 +4357,10 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           },
         }, required: ["name"] },
       ],
+      workspace_dev_preferences_write: [
+        "Copy the operator's DEV_PREF.md into the current Workspace only when the user explicitly asks you to save, copy, or materialize their development preferences in that project. Never call this tool proactively, while opening a Workspace, to discover preferences, or to decide which instructions to follow. This is not a preferences read API and it returns no preference content. It copies the physical DEV_PREF.md stored beside the running MrMCP executable (beside mrmcp.js in source mode) to Workspace-root DEV_PREF.md only when that destination is absent. If the Workspace already contains DEV_PREF.md, that project file is authoritative for this operation and is left byte-for-byte untouched; the source is not read, compared, merged, or used. Calling this tool does not mean the agent should read or apply DEV_PREF.md afterward; existing project/user guidance controls that separately.",
+        { properties: { ...contextInput } },
+      ],
       fs_glob: [
         "Discover files, directories and symlinks with globstar include/exclude patterns. This is also the filesystem tree navigator. Every entry includes type, size, modification/creation timestamps, and symlinks additionally include their stored link target. Results are deterministically ordered and statelessly paginated with after_path. .gitignore handling follows applicable parent rules and nested .gitignore files recursively.",
         { properties: {
@@ -4874,6 +4880,11 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       fs_move: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsMoveEntry) }),
       fs_trash: strictOutputSchema({ trash_id: nullableString, trash_path: nullableString, manifest_path: nullableString, succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsTrashEntry) }),
       fs_untrash: strictOutputSchema({ trash_id: { type: "string" }, succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsUntrashEntry) }),
+      workspace_dev_preferences_write: strictOutputSchema({
+        path: { type: "string", enum: ["DEV_PREF.md"] },
+        status: { type: "string", enum: ["created", "already_exists"] },
+        created: { type: "boolean" },
+      }),
       desktop_auto: strictOutputSchema({
         results: { type: "array", items: {} },
         state: { type: "object", additionalProperties: true },
@@ -4962,11 +4973,12 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       exec: "Run Command", exec_start: "Start Persistent Command", exec_attach: "Attach Process Output", exec_write: "Write Stdin",
       exec_kill: "Terminate Process", exec_list: "List Processes", exec_status: "Process Status", js: "JavaScript Kernel",
       js_add_node_module_dir: "Add Module Directory", js_reset: "Reset JavaScript Kernel",
+      workspace_dev_preferences_write: "Write Workspace Dev Preferences",
     };
     const annotations = name => ({
       readOnlyHint: READ_TOOLS.has(name) || name === "publish" || name === "cdp_poll" || name === "memory_find",
       destructiveHint: ["desktop_auto", "cdp_call", "memory_set", "telegram_req", "fs_write", "fs_edit", "fs_move", "exec", "exec_start", "exec_write", "exec_kill", "js", "js_add_node_module_dir", "js_reset"].includes(name),
-      idempotentHint: (READ_TOOLS.has(name) && name !== "publish") || ["fs_write", "fs_mkdir", "js_reset"].includes(name),
+      idempotentHint: (READ_TOOLS.has(name) && name !== "publish") || ["fs_write", "fs_mkdir", "js_reset", "workspace_dev_preferences_write"].includes(name),
       openWorldHint: name === "desktop_auto" || name.startsWith("cdp_") || name.startsWith("exec") || name === "js" || name === "publish" || name === "telegram_req",
     });
     const schema = value => ({
@@ -5039,6 +5051,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         fs_write: ["succeeded", "failed", "files"], fs_edit: ["succeeded", "failed", "total_replacements", "files"],
         fs_mkdir: ["succeeded", "failed", "entries"], fs_copy: ["succeeded", "failed", "entries"], fs_move: ["succeeded", "failed", "entries"],
         fs_trash: ["trash_id", "succeeded", "failed", "entries"], fs_untrash: ["trash_id", "succeeded", "failed", "entries"],
+        workspace_dev_preferences_write: ["path", "status", "created"],
         desktop_auto: ["results", "state", "images"],
         exec_start: ["exec_id"],
         exec_attach: ["exec_id", "output", "remaining_bytes"],
@@ -6137,6 +6150,42 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       };
     });
 
+    if (name === "workspace_dev_preferences_write") {
+      const destination = join(selection.root.path, DEV_PREF_FILENAME);
+      if (await exists(destination))
+        return { path: DEV_PREF_FILENAME, status: "already_exists", created: false };
+      let sourceStat;
+      try { sourceStat = await Deno.stat(DEV_PREF_SOURCE_PATH); }
+      catch (error) {
+        if (error instanceof Deno.errors.NotFound)
+          throw new Error(`${DEV_PREF_FILENAME} was not found beside the running MrMCP executable`);
+        throw error;
+      }
+      if (!sourceStat.isFile)
+        throw new Error(`${DEV_PREF_FILENAME} beside the running MrMCP executable is not a regular file`);
+      const bytes = await Deno.readFile(DEV_PREF_SOURCE_PATH);
+      let file;
+      try { file = await Deno.open(destination, { write: true, createNew: true }); }
+      catch (error) {
+        if (error instanceof Deno.errors.AlreadyExists)
+          return { path: DEV_PREF_FILENAME, status: "already_exists", created: false };
+        throw error;
+      }
+      let complete = false;
+      try {
+        let offset = 0;
+        while (offset < bytes.length) {
+          const written = await file.write(bytes.subarray(offset));
+          if (!written) throw new Error(`Failed to write ${DEV_PREF_FILENAME}`);
+          offset += written;
+        }
+        complete = true;
+      } finally {
+        file.close();
+        if (!complete) await Deno.remove(destination).catch(() => {});
+      }
+      return { path: DEV_PREF_FILENAME, status: "created", created: true };
+    }
     if (name === "fs_glob") {
       const limit = Math.min(Number(args.limit || 500), 10000);
       const walked = await fsWalk(selection.root.path, args.path || ".", { ...args, after_path: args.after_path, hard_limit: limit + 1 });
@@ -7529,6 +7578,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const instructions = fullAccess
       ? "Use list_workspaces when you need to discover enabled Workspace names. Use open_workspace(name) to open one; only pass create=true when you explicitly want a missing Workspace created as a new empty Desktop folder. If you already have the current Session handle, pass it as current_context_handle to move that same Session; omitted, empty, unknown or expired creates a new Session. The result includes workspace_name, absolute cwd, agent_guidance_path, whether this call created the Workspace, and a compact count/latest-key Memory summary for Global, Workspace and Session scopes. When guidance is non-null, read and follow it before repository work. Pass the returned context_handle unchanged on every later Session-bound tool call. " +
         "Use fs_glob, fs_grep, fs_read, fs_navigate, fs_stat, fs_write and fs_edit directly for filesystem discovery, inspection, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. Use desktop_auto for desktop observation and interaction through AAF YAML; when the model needs to see a screenshot, retain its image handle anywhere in the scenario's final state so the tool returns that image directly as MCP image content. Multiple retained screenshots and ordinary OCR/text/geometry/state values may coexist in one result. " +
+        "workspace_dev_preferences_write is strictly opt-in: call it only when the user explicitly asks to copy/save/materialize their development preferences into the current Workspace. Never call it proactively, for preference discovery, or merely because DEV_PREF.md might exist; the tool returns no preference content and calling it does not imply that DEV_PREF.md should then be read or applied. " +
         "When work may benefit from command-line capability beyond the structured tools, call discover_commands proactively before inventing workarounds or assuming a utility is unavailable. It returns the complete user-chosen available command catalog in one call; prefer a listed command when it fits, remember the catalog for the Session, and invoke its logical_name directly through exec.program without PATH probes. Use tools_schema when exact live tool descriptor data is needed instead of relying on a connector-synthesized schema view. " +
         "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; cancelling/disconnecting exec terminates its child. For persistent or interactive work, call exec_start; it immediately returns exec_id, which is the stable integer Tool Call id of that start. Pass that exec_id together with the same context_handle to exec_attach, exec_write, exec_kill or exec_status; ids from other Sessions are inaccessible. exec_list shows only currently running persistent executions in this Session. exec_status is the non-consuming way to inspect running or recently completed/killed executions and optionally retrieve all output or a tail. exec_attach with progressToken streams unread backlog plus live output through progress until process exit and then returns that complete unread transcript; without progressToken it long-polls and returns at most 16 KiB of unread output plus remaining_bytes, so call it repeatedly to drain buffered output and call it again with remaining_bytes=0/status=running to wait for future output. Disconnecting exec_attach only detaches and never kills the persistent process. " +
         "Use publish to present content to the user from exactly one of path, text or base64. Supply the real MIME type and optional filename; presentation=auto lets the smart MCP App choose an inline preview or file action, while inline/download are presentation hints. title and description appear above the published element. " +

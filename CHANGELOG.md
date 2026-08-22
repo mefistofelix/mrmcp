@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.125
+
+- Added `workspace_dev_preferences_write`, an explicit-user-request-only Workspace tool that materializes the physical sidecar `DEV_PREF.md` beside MrMCP into the current Workspace only when the project file is absent.
+- The tool is create-only and idempotent: an existing Workspace-root `DEV_PREF.md` is left untouched and reported as `already_exists`; otherwise the sidecar is copied byte-for-byte without exposing, interpreting, merging or normalizing its contents.
+- Kept development preferences outside automatic Workspace guidance: `open_workspace` does not discover or advertise `DEV_PREF.md`, and the tool descriptor/server instructions explicitly prohibit proactive preference discovery or assuming the copied file should be read/applied.
+
 ## 0.10.124
 
 - Expanded `fs_glob` results with modification/creation timestamps and symlink targets while keeping complete Workspace-relative paths and entry type/size metadata.

@@ -99,7 +99,17 @@ Arguments:
 
 The creation path remains name-only: the agent does not supply the filesystem path; MrMCP resolves the Desktop and final directory internally and performs the same name/path/existing-target collision checks used by the GUI workflow.
 
-Returns `workspace_name`, absolute `cwd`, `agent_guidance_path`, `workspace_created`, `memory_summary` and `context_handle`. `workspace_created` is true only when this exact call created the missing Workspace. `memory_summary.global`, `memory_summary.workspace` and `memory_summary.session` each contain the number of live memories plus up to five most recently set keys, giving the agent a small orientation hint without eagerly returning values. Guidance resolution checks only the Workspace root, preferring `AGENTS.md` / `agents.md` and then falling back to `CLAUDE.md` / `Claude.md` / `claude.md`.
+Returns `workspace_name`, absolute `cwd`, `agent_guidance_path`, `workspace_created`, `memory_summary` and `context_handle`. `workspace_created` is true only when this exact call created the missing Workspace. `memory_summary.global`, `memory_summary.workspace` and `memory_summary.session` each contain the number of live memories plus up to five most recently set keys, giving the agent a small orientation hint without eagerly returning values. Guidance resolution checks only the Workspace root, preferring `AGENTS.md` / `agents.md` and then falling back to `CLAUDE.md` / `Claude.md` / `claude.md`. `DEV_PREF.md` is intentionally not guidance-discovered by `open_workspace`.
+
+### `workspace_dev_preferences_write`
+
+Opt-in materialization of the operator's development preferences into the current Workspace. Use this tool only when the user explicitly asks to save/copy/materialize their development preferences in that project. It must never be called proactively, during Workspace opening, for preference discovery, or to decide what instructions to follow.
+
+The source is the physical `DEV_PREF.md` beside the running MrMCP executable; source mode uses the file beside `mrmcp.js`. The destination is exactly Workspace-root `DEV_PREF.md`. If the destination already exists, the tool returns `already_exists` immediately and does not read, compare, merge or overwrite either file. Otherwise it copies the source bytes exactly. The tool returns only `path`, `status`, `created` and the normal `context_handle`; it never returns preference content.
+
+Calling this tool does not itself instruct the agent to read or apply `DEV_PREF.md`. Existing user/project guidance controls that separately.
+
+Arguments: only `context_handle`.
 
 ---
 

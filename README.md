@@ -70,6 +70,7 @@ The administration UI displays Sessions with short numeric ids. The opaque `ctx_
 Session and Workspace:
 
 - `list_workspaces`, `open_workspace`, `tools_log`
+- `workspace_dev_preferences_write` — only on explicit user request, copy sidecar `DEV_PREF.md` from beside MrMCP into the current Workspace when that file is absent; never overwrite an existing project file or return preference content.
 
 Desktop and browser automation:
 
