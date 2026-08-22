@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.10.124
+
+- Expanded `fs_glob` results with modification/creation timestamps and symlink targets while keeping complete Workspace-relative paths and entry type/size metadata.
+- Made new-file `line_endings: preserve` deterministically default to LF, including empty/new files, while existing uniform files remain normalized to their source style and pre-existing mixed files are rejected instead of propagated.
+- Added persistent Process Environment settings applied to every managed `exec`/`exec_start`, with `NAME=value` entries, dynamic `${MRMCP_DIR}`, `${MRMCP_BIN}`, `${WORKSPACE}` and `${CWD}` placeholders, and per-call `env` as the highest user override.
+- Added the default-on Git working-tree line-ending protection for managed processes by injecting `core.autocrlf=false` through runtime `GIT_CONFIG_*` variables without modifying machine/user Git config; repository `.gitattributes` and explicit `git -c` overrides remain authoritative.
+- Reorganized Settings into Deno-owned Network, Security, Process, Notifications and Maintenance tabs while preserving one whole-page settings draft/save flow.
+
 ## 0.10.123
 
 - Renamed the reversible filesystem restore tool from `fs_restore` to `fs_untrash` across the published MCP surface, Dashboard history projection and documentation.

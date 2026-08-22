@@ -39,7 +39,7 @@ Nested `.gitignore` discovery is always recursive when `gitignore=true`; there i
 
 Text content and its physical representation are deliberately separate. The agent works on decoded text; MrMCP owns charset encoding, physical BOM bytes and CR/LF serialization.
 
-Design rationale: agents are good at expressing the intended logical text but should not be forced to reproduce incidental byte-level representation exactly on every tool call. Requiring them to remember or emit the original charset, BOM and CR/LF convention would increase prompt/tool-call burden and create avoidable errors and retry round-trips. MrMCP therefore infers and preserves representation whenever the existing bytes provide one unambiguous answer, and normalizes harmless payload differences such as agent-supplied LF versus CRLF. It asks the agent for an explicit representation choice only when no unique answer can be derived, such as adding line breaks to a new/single-line file or rewriting a mixed-EOL file. This convenience never permits silent data loss: malformed input, unsupported characters, ambiguous representation choices and non-lossless conversions fail instead of being guessed or repaired.
+Design rationale: agents are good at expressing the intended logical text but should not be forced to reproduce incidental byte-level representation exactly on every tool call. Requiring them to remember or emit the original charset, BOM and CR/LF convention would increase prompt/tool-call burden and create avoidable errors and retry round-trips. MrMCP therefore infers and preserves representation whenever the existing bytes provide one unambiguous answer, and normalizes harmless payload differences such as agent-supplied LF versus CRLF. New files use LF when no line-ending style exists yet; an explicit representation choice is required only for a genuinely ambiguous existing source such as a single-line/empty file that is being expanded or a mixed-EOL file. This convenience never permits silent data loss: malformed input, unsupported characters, ambiguous representation choices and non-lossless conversions fail instead of being guessed or repaired.
 
 Character-set rules:
 
@@ -53,8 +53,8 @@ Line-ending rules:
 
 - Read/search outputs are normalized to LF so matching and edits operate on one stable logical representation. Source metadata still reports `line_endings:"lf"|"crlf"|"cr"|"mixed"|"none"`. `none` means there is no CR or LF separator at all; it includes an empty file and a non-empty single-line file.
 - LF, CRLF, CR or mixed separators arriving in `content`, `old_text` or `new_text` are logical text, not an implicit declaration of the desired file format. `fs_edit` normalizes edit anchors/replacements to LF for matching. On output, an explicit `line_endings:"lf"|"crlf"|"cr"` normalizes every break to that requested style.
-- `line_endings:"preserve"` reuses an existing uniform source style (`lf`, `crlf` or `cr`) regardless of which separators the agent happened to send. This intentionally avoids needless retry round-trips for LF-vs-CRLF differences in tool payloads.
-- If the resulting text contains line breaks and there is no single source style to reuse, preservation is genuinely ambiguous: an existing `mixed` source returns `mixed_line_endings`; a new or `none` source returns `line_endings_required`. The agent must then choose `lf`, `crlf` or `cr`. If the resulting text has no line breaks, no choice is required even when the source was `mixed`, `none` or new, because the output style is factually `none`.
+- `line_endings:"preserve"` reuses an existing uniform source style (`lf`, `crlf` or `cr`) regardless of which separators the agent happened to send. For a new file, where there is no source style to preserve, it defaults to LF and normalizes any incoming LF/CRLF/CR/mixed separators to LF. This intentionally avoids needless retry round-trips and guarantees that a successful new-file write does not inherit mixed line endings from the tool payload.
+- If an existing source is `mixed`, `preserve` returns `mixed_line_endings` when the result contains line breaks; if an existing source is `none` and the result introduces line breaks, it returns `line_endings_required`. The agent must then choose `lf`, `crlf` or `cr`. New files are not ambiguous: `preserve` means LF. If the resulting text has no line breaks, no choice is required because the output style is factually `none`.
 - A terminating newline does not create a synthetic extra logical line; an empty file has `total_lines:0`.
 
 Tool string arguments are already JSON-decoded text. MrMCP never applies a second C/JavaScript-style escape-decoding pass, so e.g. `\\n` remains two literal characters unless the JSON value itself contains an actual newline.
@@ -116,7 +116,7 @@ Arguments:
 - `after_path` — final Workspace-relative path from the previous page. Only lexically later entries are returned.
 - `context_handle`.
 
-Results are deterministically ordered. When truncated, `next_after_path` is the value to send as the next `after_path`.
+Results are deterministically ordered. Every entry reports `path`, `type` (`file`, `directory` or `symlink`), `size`, `modified_at` and `created_at`; timestamps are ISO strings or `null` when the filesystem does not expose them. Symlink entries additionally report `link_target` as the target string stored in the link, without dereferencing it. When truncated, `next_after_path` is the value to send as the next `after_path`.
 
 Rationale: globstar plus directory entries covers both ordinary globbing and tree browsing without a separate `tree` tool.
 
@@ -217,7 +217,7 @@ Arguments:
   - `content`.
   - `expected_fingerprint` — optional optimistic concurrency token.
   - `output_encoding` — `preserve` or explicit encoding; default `preserve`. Existing files reuse the detected charset; new files use UTF-8.
-  - `line_endings` — `preserve|lf|crlf|cr`; default `preserve`. Preserve reuses a uniform source style; if output contains breaks and no such style exists, the result asks for an explicit choice.
+  - `line_endings` — `preserve|lf|crlf|cr`; default `preserve`. Preserve reuses a uniform existing source style; for a new file it defaults to LF. An existing mixed or no-style source still requires an explicit choice when the result contains line breaks.
   - `bom` — `preserve|add|remove`; default `preserve`. Existing files preserve physical BOM presence; new files default to no BOM.
 - `create_parents` — create missing parent directories; default true.
 - `context_handle`.
@@ -560,7 +560,7 @@ Additional fields:
 
 - `args[]` — verbatim ordered argv for `program`; default empty.
 - `cwd` — Workspace-relative directory; default `.`.
-- `env` — string environment overrides.
+- `env` — per-call string environment overrides. Before those overrides, every managed child receives the global Settings → Process Environment `NAME=value` entries. Their values may use `${MRMCP_DIR}` (MrMCP data directory), `${MRMCP_BIN}` (managed bin directory), `${WORKSPACE}` (current Workspace root) and `${CWD}` (effective exec directory); placeholders are expanded when the process starts so Workspace/CWD remain dynamic. Precedence is system environment → global configured environment → per-call `env`. The Process Environment Git line-ending option is enabled by default and appends runtime `core.autocrlf=false` to every managed child, so direct and nested Git invocations ignore machine/platform `core.autocrlf` conversion without changing the user's Git config. Disabling the option stops that injection. Repository `.gitattributes` remains authoritative, and explicit `git -c core.autocrlf=...` can override the runtime default.
 - `stdin` — initial stdin data.
 - `stdin_encoding` — `text|base64`; default `text`.
 - `timeout_ms` — tool-specific timeout.
