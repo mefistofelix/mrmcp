@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.122
+# MrMCP 0.10.127
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated `/mcp` endpoint, Workspace-scoped Sessions, filesystem and process tools, OAuth/Basic authentication, TLS automation, and a local Tauriless administration UI.
 
@@ -10,8 +10,8 @@ MrMCP is a stateless Model Context Protocol server implemented in Deno. It expos
 
 - MCP `2026-07-28` with explicit `context_handle` Session capabilities.
 - Named Workspaces with drag-and-drop Session assignment.
-- AAF desktop automation through `desktop_auto`, including zero/one/many model-visible WebP/PNG screenshots mixed with structured OCR, geometry and state output; the local Automation page reuses recorded Tool Calls/screenshots for inspection and can replay a scenario directly as a local user action without creating another Tool Call.
-- Low-level dependency-free Chrome DevTools Protocol control through always-batched `cdp_call`, with persistent browser/profile and logical page labels plus subscription/poll access to CDP notifications; the local Browser page summarizes existing profile/target/ring/subscription state, filters recorded sends by browser/target/Session/activity and can replay an individual recorded operation directly without creating another Tool Call.
+- AAF desktop automation through `desktop_auto`, including zero/one/many model-visible WebP/PNG screenshots mixed with structured OCR, geometry and state output; the local Automation page reuses **Full-retained** Tool Calls/screenshots for inspection and can replay a scenario directly as a local user action without creating another Tool Call.
+- Low-level dependency-free Chrome DevTools Protocol control through always-batched `cdp_call`, with persistent browser/profile and logical page labels plus subscription/poll access to CDP notifications; the local Browser page summarizes existing profile/target/ring/subscription state; recorded request/response inspection and Replay are available for **Full-retained** Tool Calls only.
 - Explicit persistent Global/Session/Workspace key-value memory through `memory_find` and `memory_set`, with explicitly typed JSON/text values, TTL and a local Memory manager.
 - Filesystem, text search/editing, reversible trash and generated-file publishing.
 - Foreground and persistent processes with progress streaming when requested.
@@ -20,7 +20,7 @@ MrMCP is a stateless Model Context Protocol server implemented in Deno. It expos
 - User-managed MCP guided prompts through `guided_prompts.yaml`, with Eta templates, two editable starter examples (one argument-free and one parameterized), and a built-in template/model help view.
 - OAuth and Basic authentication.
 - Automatic TLS/certificate handling.
-- Tool Call and optional HTTP diagnostic logs, with configurable Tool Call history retention in whole hours (`0` keeps indefinitely) plus confirmed page-level Clear actions for Tool Calls, Sessions, Workspaces, OAuth Clients and HTTP history.
+- Tool Call and optional HTTP diagnostic logs. Tool Call history has independent **Disk / Memory** storage and **Full / Light / Metadata** payload policies. Disk history survives restart; Memory history uses volatile SQLite TEMP storage. Full retains complete diagnostic payloads/binary content, Light keeps bounded previews, and Metadata keeps no Tool Call request/response payload copies. Disk retention is configured in hours and Memory retention in minutes. Functional process/CDP/Memory/Published/Trash state, authentication, Sessions, Workspaces and configuration are never disabled or made volatile by the Tool Call logging policy.
 - Local desktop UI with system tray and native notifications.
 - One MIME-aware `publish` MCP App helper for Workspace paths, direct text and Base64 bytes, with persistent deduplicated `.mrmcp/publish/` files, inline/download presentation hints, multi-Workspace publication references and a local Published manager for filtering, native opening and deletion.
 
@@ -69,7 +69,7 @@ The administration UI displays Sessions with short numeric ids. The opaque `ctx_
 
 Session and Workspace:
 
-- `list_workspaces`, `open_workspace`, `tools_log`
+- `list_workspaces`, `open_workspace`, `tools_log` — Tool Call history inspection defaults to compact summaries and exposes the retention mode/availability of each persisted row.
 - `workspace_dev_preferences_write` — only on explicit user request, copy sidecar `DEV_PREF.md` from beside MrMCP into the current Workspace when that file is absent; never overwrite an existing project file or return preference content.
 
 Desktop and browser automation:
@@ -92,17 +92,17 @@ Filesystem:
 - `fs_mkdir`, `fs_copy`, `fs_move`, `fs_trash`, `fs_untrash`
 - `publish` — publish exactly one Workspace path, text string or Base64 payload with a required MIME type, optional filename/title/description and an `auto|inline|download` presentation hint.
 
-The `fs_*` surface is multi-file where appropriate, stateless for navigation/pagination, uses opaque file fingerprints for optimistic concurrency, and reports independent per-entry outcomes instead of cross-entry rollback. See `TOOLS.md` for the complete tool contracts and rationale.
+The `fs_*` surface is multi-file where appropriate, stateless for navigation/pagination, uses opaque file fingerprints for optimistic concurrency, and reports independent per-entry outcomes instead of cross-entry rollback. `fs_glob` defaults to lightweight path/type pages and adds size/timestamps/link targets only with `metadata=true`; `fs_grep` has a 1 MiB default page budget and `fs_read` a 2 MiB default aggregate batch budget, both with explicit stateless continuation. See `TOOLS.md` for the complete tool contracts and rationale.
 
 Commands and execution:
 
 - `discover_commands` returns the complete available extra-command catalog in YAML order, with descriptions and documentation links. Agent discovery can be globally enabled/disabled from the Commands page without changing the catalog or executables.
 - `exec`, `exec_start`, `exec_attach`, `exec_write`, `exec_kill`, `exec_list`, `exec_status`
 - `js`, `js_add_node_module_dir`, `js_reset`
-- `tools_schema` — inspect canonical live MCP descriptors; `tools_log` — query Tool Calls that reached the current Session.
+- `tools_schema` — inspect canonical live MCP descriptors; `tools_log` — query Tool Calls that reached the current Session across both Disk and Memory history, using `detail=summary` by default or `detail=full` when retained payload bodies are actually needed.
 - `telegram_req` — make one generic pre-authenticated Telegram Bot API JSON request using the Bot token configured by the user on the dedicated **✈️ Telegram** sidebar page.
 
-Filesystem removal is reversible: `fs_trash`/`fs_untrash` use explicit `trash_id` transactions instead of a permanent delete tool. All Workspaces share the single MrMCP-managed `APP_DIR/.mrmcp/trash/` store; MrMCP never creates `.mrmcp` metadata directories inside named Workspaces.
+Filesystem removal is reversible: `fs_trash`/`fs_untrash` use explicit `trash_id` transactions instead of a permanent delete tool. All Workspaces share the single MrMCP-managed `APP_DIR/.mrmcp/trash/` store; MrMCP never creates `.mrmcp` metadata directories inside named Workspaces. The desktop **Trash** page is backed directly by those manifests/payloads, shows a sidebar badge for items currently in Trash, lists original paths/type/size, and supports per-item or per-transaction restore/delete plus Empty Trash independently of Tool Call logging.
 
 Persistent processes use the integer `exec_id` returned by `exec_start`; follow-up process tools require the same Session `context_handle`.
 
