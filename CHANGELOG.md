@@ -10,6 +10,7 @@
 - Made `structuredContent` the canonical structured MCP result and replaced the old large pretty-JSON text mirror with a concise required text block for structured tools; tools that intentionally return text keep their actual text content.
 - Made Browser recorded-operation reconstruction consume canonical Payload-retained `cdp_call` packets lazily in small batches, stopping once enough matching operations are collected, and replaced whole-`uiState` cloning with an explicit active-section render projection. No persistent GUI result cache was added.
 - Removed the newly-added arbitrary `fs_grep` response-byte budget and `fs_read` aggregate batch budget. `fs_grep` uses its explicit result-count/stateless cursor, while `fs_read` retains only its existing independent per-file text ceiling and continuation.
+- Simplified runtime persistence and UI projections: write side effects are explicit instead of inferred from statement text, Session Tool Call statistics use indexed queries rather than a mutable cache, the tool descriptor list/name caches are unified, UI rendering is separated into shell plus active-page projections, Published references load in one batch per page, and recent-Session header statistics use one indexed statement.
 
 ## 0.10.127
 

@@ -604,24 +604,6 @@ async function backend({ addWorkspace = null } = {}) {
       if (uiRenderQueued && uiRenderVisible) queueUiRender("coalesced", 0);
     }
   }
-  function uiScopesForSql(sql) {
-    const statement = String(sql || "").trim().toLowerCase();
-    if (!/^(?:insert|update|delete|replace)\b/.test(statement)) return [];
-    const scopes = new Set();
-    if (/\blogs(?:_memory)?\b/.test(statement)) ["logs", "sessions", "dashboard"].forEach(scope => scopes.add(scope));
-    if (/\bcontexts\b/.test(statement)) ["sessions", "roots", "logs", "memory", "dashboard"].forEach(scope => scopes.add(scope));
-    if (/\broots\b/.test(statement)) ["roots", "sessions", "memory", "dashboard"].forEach(scope => scopes.add(scope));
-    if (/\bdebug_logs\b/.test(statement)) scopes.add("debug");
-    if (/\bprocess_runs(?:_memory)?\b/.test(statement)) ["processes", "logs"].forEach(scope => scopes.add(scope));
-    if (/\bpublished(?:_uses)?\b/.test(statement)) scopes.add("published");
-    if (/\bmemories\b/.test(statement)) scopes.add("memory");
-    if (/\bcustom_tools\b/.test(statement)) ["commands", "dashboard", "endpoints"].forEach(scope => scopes.add(scope));
-    if (/\boauth_(?:clients|tokens|refresh_tokens|codes)\b/.test(statement)) ["oauth", "dashboard"].forEach(scope => scopes.add(scope));
-    if (/\bserver_config\b/.test(statement)) ["dashboard", "endpoints", "settings", "oauth"].forEach(scope => scopes.add(scope));
-    if (/\bconfig\b/.test(statement)) ["dashboard", "settings", "commands", "debug", "tls", "endpoints"].forEach(scope => scopes.add(scope));
-    if (/\bmetrics\b/.test(statement)) scopes.add("dashboard");
-    return [...scopes];
-  }
   db.exec(`
     PRAGMA journal_mode=WAL;
     PRAGMA foreign_keys=ON;
@@ -910,9 +892,13 @@ async function backend({ addWorkspace = null } = {}) {
   };
   const one = (sql, ...args) => statement(sql).get(...args);
   const all = (sql, ...args) => statement(sql).all(...args);
-  const serverToolsCache = new Map(), serverToolMapCache = new Map(), sessionToolStatsCache = new Map();
+  const serverToolCache = new Map();
   const descriptorJsonCache = new WeakMap();
   let serverConfigCache = null;
+  const changed = ({ ui = [], serverTools = false } = {}, reason = "database") => {
+    if (serverTools) serverToolCache.clear();
+    if (ui.length) emitUiChange(ui, reason);
+  };
   const sessionToolCountProjection = serverId => new Map(
     all("SELECT context_id,COUNT(*) n FROM logs WHERE server_id=? AND context_id>0 GROUP BY context_id", Number(serverId || 0))
       .map(row => [Number(row.context_id), Number(row.n || 0)]),
@@ -921,20 +907,7 @@ async function backend({ addWorkspace = null } = {}) {
     const row = one("SELECT COUNT(*) total, SUM(status='failed') errors, SUM(status='invalid') invalid FROM logs WHERE server_id=?", p.id) || {};
     return { total: Number(row.total || 0), errors: Number(row.errors || 0), invalid: Number(row.invalid || 0) };
   };
-  const run = (sql, ...args) => {
-    const result = statement(sql).run(...args);
-    const sqlText = String(sql || "");
-    if (/^(?:\s*)(?:insert|update|delete|replace)\b/i.test(sqlText) && /\bcustom_tools\b/i.test(sqlText)) {
-      serverToolsCache.clear();
-      serverToolMapCache.clear();
-    }
-    if (/^(?:\s*)(?:insert|update|delete|replace)\b/i.test(sqlText) && /\bserver_config\b/i.test(sqlText))
-      serverConfigCache = null;
-    if (/^\s*delete\b/i.test(sqlText) && /\blogs\b/i.test(sqlText)) sessionToolStatsCache.clear();
-    const scopes = uiScopesForSql(sql);
-    if (scopes.length) emitUiChange(scopes, "database");
-    return result;
-  };
+  const run = (sql, ...args) => statement(sql).run(...args);
   const configCache = new Map(all("SELECT key,value FROM config").map(row => [String(row.key), String(row.value)]));
   const getCfg = (key, fallback) => configCache.has(String(key)) ? configCache.get(String(key)) : fallback;
   const desktopNotificationEnabled = type => getCfg(`desktop_notifications_${type}`, getCfg("desktop_notifications", "1")) === "1";
@@ -1018,16 +991,9 @@ async function backend({ addWorkspace = null } = {}) {
     const preview = compactToolCallPreview(p, tool, args);
     return `${tool}${preview ? ` · ${preview}` : ""}`;
   };
-  const sessionToolStatsKey = (p, contextId) => `${Number(p.id || 0)}:${Number(contextId || 0)}`;
   const sessionToolStats = (p, contextId) => {
-    const key = sessionToolStatsKey(p, contextId);
-    let stats = sessionToolStatsCache.get(key);
-    if (!stats) {
-      const row = one("SELECT COUNT(*) tool_calls, MAX(started_at) last_call_at FROM logs WHERE server_id=? AND context_id=?", p.id, contextId) || {};
-      stats = { tool_calls: Number(row.tool_calls || 0), last_call_at: Number(row.last_call_at || 0) };
-      sessionToolStatsCache.set(key, stats);
-    }
-    return stats;
+    const row = one("SELECT COUNT(*) tool_calls, MAX(started_at) last_call_at FROM logs WHERE server_id=? AND context_id=?", p.id, contextId) || {};
+    return { tool_calls: Number(row.tool_calls || 0), last_call_at: Number(row.last_call_at || 0) };
   };
   const sessionNotificationLabel = (p, context, toolCalls = null, now = Date.now(), workspaceName = "") => {
     const count = toolCalls == null ? sessionToolStats(p, context.id).tool_calls : Number(toolCalls || 0);
@@ -1057,6 +1023,7 @@ async function backend({ addWorkspace = null } = {}) {
       key, text,
     );
     configCache.set(String(key), text);
+    changed({ ui: ["dashboard", "settings", "commands", "debug", "tls", "endpoints"] }, "config");
     return result;
   };
   if (addWorkspace) {
@@ -1940,6 +1907,7 @@ async function backend({ addWorkspace = null } = {}) {
     const storageScope = owner.storage_scope || memoryStorageScope(owner.scope);
     if (args.delete === true) {
       const result = run("DELETE FROM memories WHERE scope=? AND owner_id=? AND key=?", storageScope, owner.owner_id, key);
+      if (Number(result.changes || 0)) changed({ ui: ["memory"] }, "memory-delete");
       return { memory: null, deleted: Number(result.changes || 0) > 0 };
     }
     if (!Object.prototype.hasOwnProperty.call(args, "value")) throw new Error("memory_set requires value unless delete=true");
@@ -1956,6 +1924,7 @@ async function backend({ addWorkspace = null } = {}) {
     const inserted = run("INSERT INTO memories(scope,owner_id,owner_name,key,value_json,is_json,ttl_seconds,set_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)",
       storageScope, owner.owner_id, owner.owner_name, key, valueJson, args.json ? 1 : 0, ttlSeconds, setAt, expiresAt);
     const row = one("SELECT * FROM memories WHERE id=?", Number(inserted.lastInsertRowid));
+    changed({ ui: ["memory"] }, "memory-set");
     return { memory: memoryPublicRow(row), deleted: false };
   }
   const telegramChatMigrations = new Map();
@@ -2114,14 +2083,17 @@ async function backend({ addWorkspace = null } = {}) {
   }
   function headerActivityProjection(p) {
     const now = Date.now(), rows = all(`
-      SELECT l.context_id, MAX(l.started_at) last_at
-      FROM logs l
-      JOIN contexts c ON c.id=l.context_id AND c.server_id=l.server_id
-      WHERE l.server_id=? AND l.started_at>=?
-      GROUP BY l.context_id
-      ORDER BY last_at DESC
-    `, p.id, now - SESSION_ACTIVE_MS).map(row => ({
-      ...row, tool_calls: sessionToolStats(p, row.context_id).tool_calls,
+      WITH recent AS (
+        SELECT l.context_id,MAX(l.started_at) last_at
+        FROM logs l JOIN contexts c ON c.id=l.context_id AND c.server_id=l.server_id
+        WHERE l.server_id=? AND l.started_at>=? AND l.context_id>0
+        GROUP BY l.context_id
+      )
+      SELECT r.context_id,r.last_at,
+        (SELECT COUNT(*) FROM logs x WHERE x.server_id=? AND x.context_id=r.context_id) tool_calls
+      FROM recent r ORDER BY r.last_at DESC
+    `, p.id, now - SESSION_ACTIVE_MS, p.id).map(row => ({
+      ...row, tool_calls: Number(row.tool_calls || 0), last_at: Number(row.last_at || 0),
     }));
     if (headerActivityTimer) clearTimeout(headerActivityTimer);
     headerActivityTimer = null;
@@ -2185,7 +2157,6 @@ async function backend({ addWorkspace = null } = {}) {
     if (fts) { statement("DELETE FROM main.logs_fts").run(); statement("DELETE FROM logs_fts_memory").run(); }
     statement("DELETE FROM main.process_runs").run();
     statement("DELETE FROM main.logs").run();
-    sessionToolStatsCache.clear();
     descriptorIdCache.clear();
     return cleared;
   }
@@ -2810,6 +2781,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       }
     }
     run("DELETE FROM published WHERE id=?", id);
+    changed({ ui: ["published"] }, "published-delete");
     return true;
   }
   async function openPublished(id) {
@@ -2891,6 +2863,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         if (created) await cleanupPublished(record.id).catch(() => {});
         throw error;
       }
+      changed({ ui: ["published"] }, "published");
       return {
         id: record.id, content_id: contentKey, filename, mime_type: mimeType, size: Number(record.size || size),
         source: String(options.source || ''), uri: publishedUrl(record.id, filename), presentation, title, description, height,
@@ -2925,6 +2898,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       return text("Published content not found", 404, "text/plain; charset=utf-8", { "cache-control": "no-store" });
     }
     run("UPDATE published SET request_count=request_count+1,last_request_at=? WHERE id=?", Date.now(), token);
+    changed({ ui: ["published"] }, "published-request");
     const inlinePreview = isInlinePreviewMime(effectiveMime);
     const essence = mimeEssence(effectiveMime);
     const activeDocument = isActiveDocumentMime(effectiveMime);
@@ -3852,7 +3826,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       throw new Error("Unable to create Desktop folder.");
     }
     run("INSERT INTO roots(server_id,name,path,enabled,created_at) VALUES(?,?,?,?,?)", p.id, value, path, 1, Date.now());
-    emitUiChange(["dashboard", "roots"], "workspace-created");
+    changed({ ui: ["dashboard", "roots", "sessions", "memory"] }, "workspace-created");
     return { created: true };
   }
   async function addDroppedRoots(paths) {
@@ -3881,6 +3855,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       labels.add(name.toLowerCase());
       added.push(name);
     }
+    if (added.length) changed({ ui: ["dashboard", "roots", "sessions", "memory"] }, "workspace-drop");
     return { added, existing };
   }
   function contextByHandle(p, handle) {
@@ -3908,6 +3883,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, handle, p.id, Number(workspace.id), "", now, now, now, String(protocolVersion || ""),
       String(client.auth_kind || ""), String(client.oauth_client_id || ""), String(client.client_name || ""),
       String(client.user_agent || "").slice(0, 512));
+    changed({ ui: ["sessions", "roots", "logs", "memory", "dashboard", "oauth"] }, "session-created");
     const record = one("SELECT * FROM contexts WHERE handle=?", handle);
     const clientLabel = String(record.client_name || record.oauth_client_id || record.user_agent || record.auth_kind || "remote client").slice(0, 120);
     postOsNotification("session", "✨ New Session", `${sessionNotificationLabel(p, record, 0, now, workspace.name)}\n• 👤 ${clientLabel}`);
@@ -3924,6 +3900,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     if (contextExpired(context)) return { kind: "expired", record: context, supplied_handle: handle };
     const now = Date.now(), observed = String(protocolVersion || context.protocol_version || "");
     run("UPDATE contexts SET last_active_at=?,protocol_version=? WHERE handle=?", now, observed, context.handle);
+    changed({ ui: ["sessions", "roots"] }, "session-activity");
     context.last_active_at = now;
     context.protocol_version = observed;
     return { kind: "active", record: context, supplied_handle: handle };
@@ -3939,6 +3916,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const root = rootId ? serverRoots(p).find(item => item.id === rootId) : null;
     if (rootId && !root) {
       run("UPDATE contexts SET root_id=0,updated_at=? WHERE handle=?", Date.now(), context.handle);
+      changed({ ui: ["sessions", "roots"] }, "session-workspace-repair");
       context.root_id = 0;
     }
     return root ? runtimeWorkspaceRoot(root) : fallbackWorkspaceRoot(p);
@@ -3968,6 +3946,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const root = rootId ? serverRoots(p).find(item => item.id === rootId) : null;
     if (rootId && !root) throw new Error(`Unknown or disabled Workspace id: ${rootId}`);
     run("UPDATE contexts SET root_id=?,updated_at=? WHERE handle=?", root?.id || 0, Date.now(), context.handle);
+    changed({ ui: ["sessions", "roots", "dashboard"] }, "session-workspace");
     return contextSnapshot(p, getContextRecord(p, context.handle));
   }
   function selectedRoot(p, args = {}) {
@@ -4440,8 +4419,8 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         ? { ...tool, _meta: { ...(tool._meta || {}), ui: { ...(tool._meta?.ui || {}), resourceUri } } }
         : tool);
     }
-    const cached = serverToolsCache.get(cacheKey);
-    if (cached) return cached;
+    const cached = serverToolCache.get(cacheKey);
+    if (cached) return cached.list;
     const available = new Set(BASE_TOOLS);
     const publishUiResourceUri = PUBLISH_UI_URI;
     const workspaceNameInput = {
@@ -5226,18 +5205,17 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       outputSchema: processOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     });
-    serverToolsCache.set(cacheKey, tools);
-    serverToolMapCache.set(cacheKey, new Map(tools.map(tool => [tool.name, tool])));
+    serverToolCache.set(cacheKey, { list: tools, byName: new Map(tools.map(tool => [tool.name, tool])) });
     return tools;
   }
   function serverToolDescriptor(p, name) {
     const cacheKey = Number(p.id || 0);
-    let map = serverToolMapCache.get(cacheKey);
-    if (!map) {
+    let cached = serverToolCache.get(cacheKey);
+    if (!cached) {
       serverTools(p, true, false);
-      map = serverToolMapCache.get(cacheKey);
+      cached = serverToolCache.get(cacheKey);
     }
-    return map?.get(String(name || "")) || null;
+    return cached?.byName.get(String(name || "")) || null;
   }
   function descriptorJson(descriptor) {
     if (!descriptor || typeof descriptor !== "object") return "";
@@ -5553,7 +5531,6 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     toolCallPolicyById.set(id, policy);
     const currentCalls = previousCalls + 1, sessionLabel = context
       ? sessionNotificationLabel(p, context, currentCalls, now, root?.name || "") : "";
-    if (contextId) sessionToolStatsCache.set(sessionToolStatsKey(p, contextId), { tool_calls: currentCalls, last_call_at: now });
     if (context && previousCalls && now - lastCallAt >= SESSION_ACTIVE_MS) postOsNotification("session", "🟢 Session Active", sessionLabel);
     if (notifyStart) postOsNotification("tool_call", `🛠️ Tool Call #${id}`, toolCallNotificationBody(p, tool, args, contextHandle, root, "", progressRequested, context, currentCalls));
     return id;
@@ -5608,7 +5585,6 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   }
   function invalidateToolCallHistoryCaches(reason) {
     descriptorIdCache.clear();
-    sessionToolStatsCache.clear();
     emitUiChange(["dashboard", "logs", "sessions", "roots", "settings"], reason);
   }
   function pruneDiskToolCallRetention(now = Date.now()) {
@@ -6326,11 +6302,12 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     cleanupProcesses();
     for (const [key, kernel] of jsKernels)
       if (now - kernel.last_used > 60 * 60 * 1000) destroyJsKernel(key, "expired");
-    run("DELETE FROM oauth_codes WHERE expires_at<?", now);
-    run("DELETE FROM oauth_tokens WHERE expires_at<?", now);
-    run(`DELETE FROM oauth_clients WHERE created_at<? AND client_id NOT IN
-      (SELECT DISTINCT client_id FROM oauth_tokens UNION SELECT DISTINCT client_id FROM oauth_refresh_tokens)`,
-      now - 30 * 24 * 60 * 60 * 1000);
+    const oauthChanges = Number(run("DELETE FROM oauth_codes WHERE expires_at<?", now).changes || 0)
+      + Number(run("DELETE FROM oauth_tokens WHERE expires_at<?", now).changes || 0)
+      + Number(run(`DELETE FROM oauth_clients WHERE created_at<? AND client_id NOT IN
+        (SELECT DISTINCT client_id FROM oauth_tokens UNION SELECT DISTINCT client_id FROM oauth_refresh_tokens)`,
+        now - 30 * 24 * 60 * 60 * 1000).changes || 0);
+    if (oauthChanges) changed({ ui: ["oauth", "dashboard"] }, "oauth-maintenance");
     for (const [token, consent] of oauthConsents)
       if (consent.expires_at < now) oauthConsents.delete(token);
     for (const [key, bucket] of rateBuckets)
@@ -7602,8 +7579,12 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         started, req.method, debugUrl(req.url), 0, 0, remoteHost,
         debugHeaders(req.headers), "", "", "", "");
       debugId = Number(inserted.lastInsertRowid);
+      changed({ ui: ["debug"] }, "http-log-start");
       requestBodyPromise.then(body => {
-        if (debugId) run("UPDATE debug_logs SET request_body=? WHERE id=?", body, debugId);
+        if (debugId) {
+          run("UPDATE debug_logs SET request_body=? WHERE id=?", body, debugId);
+          changed({ ui: ["debug"] }, "http-log-body");
+        }
       }).catch(() => {});
     }
 
@@ -7661,6 +7642,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           .filter(Boolean).join("\n");
         run(`UPDATE debug_logs SET status=?,duration_ms=?,request_body=?,response_headers=?,response_body=?,error=? WHERE id=?`,
           response.status, Date.now() - started, requestBody, debugHeaders(headers), responseBody, errors, debugId);
+        changed({ ui: ["debug"] }, "http-log-complete");
       };
       Promise.resolve(info?.completed).then(() => finalize(null), error => finalize(error)).catch(() => {});
     }
@@ -7711,12 +7693,14 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     if (!client && mayRecover) {
       run("INSERT OR IGNORE INTO oauth_clients(client_id,name,redirects_json,created_at) VALUES(?,?,?,?)",
         clientId, "ChatGPT", JSON.stringify([redirect]), Date.now());
+      changed({ ui: ["oauth", "dashboard"] }, "oauth-client");
       client = one("SELECT * FROM oauth_clients WHERE client_id=?", clientId);
       redirects = client ? parseJson(client.redirects_json, []) : [];
     } else if (client && !redirects.includes(redirect) && mayRecover) {
       redirects = [...new Set([...redirects, redirect])].slice(-20);
       run("UPDATE oauth_clients SET redirects_json=? WHERE client_id=?",
         JSON.stringify(redirects), clientId);
+      changed({ ui: ["oauth", "dashboard"] }, "oauth-client");
       client = one("SELECT * FROM oauth_clients WHERE client_id=?", clientId);
     }
     if (!client) return { error: "unknown client registration" };
@@ -7844,6 +7828,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       const clientId = randomToken(18), issuedAt = Math.floor(Date.now() / 1000);
       run("INSERT INTO oauth_clients(client_id,name,redirects_json,created_at) VALUES(?,?,?,?)",
         clientId, x.client_name || "MCP client", JSON.stringify(redirects), issuedAt * 1000);
+      changed({ ui: ["oauth", "dashboard"] }, "oauth-client");
       return json({
         client_id: clientId,
         client_id_issued_at: issuedAt,
@@ -7897,6 +7882,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         run(`INSERT INTO oauth_codes(code_hash,client_id,redirect_uri,code_challenge,server_id,resource,scope,expires_at)
           VALUES(?,?,?,?,?,?,?,?)`, await sha256(code), auth.client.client_id, auth.redirect, auth.challenge,
           auth.p.id, auth.resource, auth.scope, Date.now() + 300000);
+        changed({ ui: ["oauth", "dashboard"] }, "oauth-code");
         out.searchParams.set("code", code);
       }
       if (q.get("state")) out.searchParams.set("state", q.get("state"));
@@ -7922,6 +7908,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           now + OAUTH_ACCESS_TOKEN_TTL_SECONDS * 1000);
         run(`INSERT INTO oauth_refresh_tokens(token_hash,client_id,server_id,resource,scope,created_at,last_used_at)
           VALUES(?,?,?,?,?,?,?)`, await sha256(refreshToken), c.client_id, c.server_id, c.resource, c.scope, now, now);
+        changed({ ui: ["oauth", "dashboard"] }, "oauth-token");
         return json({ access_token: accessToken, refresh_token: refreshToken, token_type: "Bearer",
           expires_in: OAUTH_ACCESS_TOKEN_TTL_SECONDS, scope: c.scope });
       }
@@ -7940,6 +7927,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         run("INSERT INTO oauth_tokens(token_hash,client_id,server_id,scope,created_at,expires_at) VALUES(?,?,?,?,?,?)",
           await sha256(accessToken), r.client_id, r.server_id, r.scope, now,
           now + OAUTH_ACCESS_TOKEN_TTL_SECONDS * 1000);
+        changed({ ui: ["oauth", "dashboard"] }, "oauth-token");
         return json({ access_token: accessToken, refresh_token: suppliedRefreshToken, token_type: "Bearer",
           expires_in: OAUTH_ACCESS_TOKEN_TTL_SECONDS, scope: r.scope });
       }
@@ -8209,6 +8197,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
                   let record;
                   if (current.kind === "active") {
                     run("UPDATE contexts SET root_id=?,updated_at=? WHERE handle=?", workspace.id, Date.now(), current.record.handle);
+                    changed({ ui: ["sessions", "roots", "dashboard"] }, "workspace-opened");
                     record = getContextRecord(p, current.record.handle);
                   } else {
                     record = createContext(p, workspace, observedProtocol, {
@@ -8549,16 +8538,19 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     };
   };
 
-  // The UI asks for only the active section. Database projections are evaluated lazily so
-  // inactive pages do not query their tables during Eta -> Morphlex rerenders.
-  const state = (section = "all") => {
-    const valid = new Set(["all", "dashboard", "sessions", "processes", "logs", "browser", "automation", "published", "trash", "memory", "roots", "commands", "prompts", "prompt_help", "debug", "oauth", "telegram", "settings", "help"]);
-    section = valid.has(section) ? section : "dashboard";
-    const p = serverConfig();
-    if (!p) throw new Error("MrMCP server configuration is missing");
-    const result = { version: VERSION, settings: settingsProjection(), mcp_protocols: MCP_PROTOCOLS,
-      maintenance: maintenanceProjection(), header_activity: headerActivityProjection(p), trash_summary: trashSummaryProjection(),
-      process_summary: { active: [...processes.values()].filter(processIsRunning).length } };
+  // Every render has a small shell projection (header/sidebar/settings state) plus exactly one
+  // active-page projection. Inactive pages never query their tables during Eta -> Morphlex rerenders.
+  const shellProjection = p => ({
+    version: VERSION,
+    settings: settingsProjection(),
+    mcp_protocols: MCP_PROTOCOLS,
+    maintenance: maintenanceProjection(),
+    header_activity: headerActivityProjection(p),
+    trash_summary: trashSummaryProjection(),
+    process_summary: { active: [...processes.values()].filter(processIsRunning).length },
+  });
+  const pageProjection = (p, section, shell) => {
+    const result = {};
     let roots;
     if (["all", "sessions", "roots"].includes(section)) {
       roots = rootsProjection(p.id);
@@ -8572,7 +8564,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     if (["all", "dashboard"].includes(section)) {
       result.server = serverProjection(p);
       result.active_tool_calls = dashboardToolCallsProjection(p);
-      const toolCalls = result.header_activity;
+      const toolCalls = shell.header_activity;
       result.stats = {
         context_values: one("SELECT COUNT(*) n FROM contexts WHERE server_id=? AND handle LIKE 'ctx_%'", p.id)?.n || 0,
         roots: one("SELECT COUNT(*) n FROM roots WHERE server_id=? AND enabled=1", p.id)?.n || 0,
@@ -8584,6 +8576,14 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     }
     if (["all", "oauth"].includes(section)) result.oauth_clients = oauthProjection();
     return result;
+  };
+  const state = (section = "all") => {
+    const valid = new Set(["all", "dashboard", "sessions", "processes", "logs", "browser", "automation", "published", "trash", "memory", "roots", "commands", "prompts", "prompt_help", "debug", "oauth", "telegram", "settings", "help"]);
+    section = valid.has(section) ? section : "dashboard";
+    const p = serverConfig();
+    if (!p) throw new Error("MrMCP server configuration is missing");
+    const shell = shellProjection(p);
+    return { ...shell, ...pageProjection(p, section, shell) };
   };
   const publishedAdminFilter = (serverId, current = {}) => {
     const conditions = ["p.server_id=?"], values = [serverId];
@@ -8606,12 +8606,22 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const page = Math.min(pages, Math.max(1, Number(current.page) || 1)), offset = (page - 1) * pageSize;
     const rows = all(`SELECT p.id,p.content_key,p.context_id,p.root_id,p.root_name,p.root_path,p.source_path,p.source_filename,p.published_name,p.filename,p.mime_type,p.size,p.title,p.description,p.presentation,p.height,p.created_at,p.request_count,p.last_request_at
       FROM published p WHERE ${where} ORDER BY p.created_at DESC,p.id DESC LIMIT ? OFFSET ?`, ...values, pageSize, offset);
-    for (const row of rows) {
-      row.references = all(`SELECT u.context_id,u.root_id,u.root_name,u.root_path,u.source_path,u.source_filename,u.filename,u.mime_type,u.title,u.description,u.presentation,u.height,u.published_at
+    const referencesByPublication = new Map();
+    if (rows.length) {
+      const ids = rows.map(row => String(row.id)), placeholders = ids.map(() => "?").join(",");
+      const references = all(`SELECT u.published_id,u.context_id,u.root_id,u.root_name,u.root_path,u.source_path,u.source_filename,u.filename,u.mime_type,u.title,u.description,u.presentation,u.height,u.published_at
         FROM published_uses u
-        WHERE u.published_id=? AND u.id=(SELECT MAX(u2.id) FROM published_uses u2
+        WHERE u.published_id IN (${placeholders}) AND u.id=(SELECT MAX(u2.id) FROM published_uses u2
           WHERE u2.published_id=u.published_id AND u2.context_id=u.context_id AND u2.root_id=u.root_id)
-        ORDER BY u.published_at DESC,u.id DESC`, row.id);
+        ORDER BY u.published_at DESC,u.id DESC`, ...ids);
+      for (const reference of references) {
+        const key = String(reference.published_id), group = referencesByPublication.get(key) || [];
+        group.push(reference);
+        referencesByPublication.set(key, group);
+      }
+    }
+    for (const row of rows) {
+      row.references = referencesByPublication.get(String(row.id)) || [];
       if (!row.references.length && row.context_id) row.references = [{
         context_id: row.context_id, root_id: row.root_id, root_name: row.root_name, root_path: row.root_path,
         source_path: row.source_path, source_filename: row.source_filename, filename: row.filename, mime_type: row.mime_type,
@@ -9484,6 +9494,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       case "delete-memory": {
         const result = run("DELETE FROM memories WHERE id=?", Number(data.id));
         if (!Number(result.changes || 0)) throw new Error("Memory not found");
+        changed({ ui: ["memory"] }, "memory-delete");
         uiNotice("Memory deleted.", "ok");
         break;
       }
@@ -10364,6 +10375,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           Date.now(), p.id, rootId);
       } else run("INSERT INTO roots(server_id,name,path,enabled,created_at) VALUES(?,?,?,?,?)",
         p.id, name, path, +enabled, Date.now());
+      changed({ ui: ["roots", "sessions", "memory", "dashboard"] }, "workspace-save");
       return json({ ok: true });
     }
     if (u.pathname === "/api/roots/delete" && req.method === "POST") {
@@ -10374,6 +10386,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       run("UPDATE contexts SET root_id=0,updated_at=? WHERE server_id=? AND root_id=?",
         Date.now(), p.id, root.id);
       run("DELETE FROM roots WHERE id=?", root.id);
+      changed({ ui: ["roots", "sessions", "memory", "dashboard"] }, "workspace-delete");
       return json({ ok: true });
     }
     if (u.pathname === "/api/roots/clear" && req.method === "POST") {
@@ -10389,6 +10402,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       const x = await bodyJson(req), p = serverConfig(), context = contextById(p, Number(x.id));
       if (!context) return json({ error: "Session not found" }, 404);
       run("DELETE FROM contexts WHERE id=?", context.id);
+      changed({ ui: ["sessions", "roots", "logs", "memory", "dashboard", "oauth"] }, "session-delete");
       for (const key of [...jsKernels.keys()])
         if (key.startsWith(`${p.id}:${context.handle}:`)) destroyJsKernel(key, "context deleted");
       return json({ ok: true });
@@ -10428,10 +10442,14 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         x.server_id, x.name, x.description || "", x.command, x.id);
       else run(`INSERT INTO custom_tools(server_id,name,description,command,created_at)
         VALUES(?,?,?,?,?)`, x.server_id, x.name, x.description || "", x.command, Date.now());
+      changed({ serverTools: true, ui: ["commands", "dashboard", "endpoints"] }, "custom-tools");
       return json({ ok: true });
     }
     if (u.pathname === "/api/tools/delete" && req.method === "POST") {
-      const x = await bodyJson(req); run("DELETE FROM custom_tools WHERE id=?", x.id); return json({ ok: true });
+      const x = await bodyJson(req);
+      run("DELETE FROM custom_tools WHERE id=?", x.id);
+      changed({ serverTools: true, ui: ["commands", "dashboard", "endpoints"] }, "custom-tools");
+      return json({ ok: true });
     }
     if (u.pathname === "/api/mcp/self-test" && req.method === "GET")
       return json(mcpSelfTest(serverConfig()));
@@ -10612,6 +10630,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       try {
         const cleared = deleteDebugLogRecords();
         db.exec("COMMIT");
+        changed({ ui: ["debug"] }, "http-log-clear");
         return json({ ok: true, cleared });
       } catch (error) {
         db.exec("ROLLBACK");
@@ -10731,6 +10750,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       run("DELETE FROM oauth_refresh_tokens WHERE client_id=?", x.client_id);
       run("DELETE FROM oauth_codes WHERE client_id=?", x.client_id);
       run("DELETE FROM oauth_clients WHERE client_id=?", x.client_id);
+      changed({ ui: ["oauth", "dashboard"] }, "oauth-client-revoked");
       return json({ ok: true });
     }
     if (u.pathname === "/api/oauth/clear" && req.method === "POST") {
