@@ -148,17 +148,16 @@ Arguments:
 - `mode` — `matches`, `files` or `count`; default `matches`. `count` follows grep `-c` semantics and reports matching lines per file, not total substring occurrences.
 - `max_file_bytes` — skip source files larger than this size; default 5 MiB, maximum 50 MiB.
 - `limit` — maximum matching lines in `matches` mode or matched files in `files`/`count`; default 300, maximum 2000.
-- `max_output_bytes` — approximate UTF-8 payload target for one page; default 1 MiB, maximum 16 MiB. A single indivisible match/file record may exceed the target so the cursor always advances.
 - `resume_after` — optional stateless continuation object:
   - `{path}` means continue after the whole file.
   - `{path, line}` means continue after that line within the file.
 - `context_handle`.
 
-Matched files include a whole-file `fingerprint`, size and text metadata. Match rows contain `line`, `column`, `text`, optional `context_before[]` and `context_after[]`. The page also reports `returned`, the effective `limit`, `output_bytes`, `max_output_bytes` and nullable `truncation_reason` (`limit`, `output_bytes` or `walk_limit`).
+Matched files include a whole-file `fingerprint`, size and text metadata. Match rows contain `line`, `column`, `text`, optional `context_before[]` and `context_after[]`. The page also reports `returned`, the effective `limit` and nullable `truncation_reason` (`limit` or `walk_limit`).
 
 When `truncated=true`, `next_resume_after` is directly reusable as the next `resume_after`. Search remains stateless; MrMCP does not retain hidden grep cursors.
 
-Rationale: repository-wide search belongs in one tool, but response size should stay bounded by explicit stateless paging rather than by silently clipping stored results.
+Rationale: repository-wide search belongs in one tool. Paging is governed by the explicit result-count limit and stateless cursor rather than an additional arbitrary response-byte target.
 
 ### `fs_read`
 
@@ -172,14 +171,13 @@ Arguments:
   - `context_lines_before` / `context_lines_after` — optional surrounding lines.
   - `encoding` — per-file input encoding; default `auto`.
 - `max_output_bytes_per_file` — per-file UTF-8 ceiling, default 1 MiB, maximum 5 MiB. A single complete line may exceed it so line content is never split.
-- `max_output_bytes` — aggregate target for the whole batch, default 2 MiB, maximum 16 MiB. Remaining budget is shared across remaining files and unused quota rolls forward.
 - `context_handle`.
 
-Successful results include normalized `content`, actual returned range, `total_lines`, source size, fingerprint and text metadata. The batch reports `output_bytes`, both effective byte limits, `truncated` and `truncated_files`. A truncated requested range provides `next_start_line`.
+Successful per-file results include normalized `content`, actual returned range, `total_lines`, source size, fingerprint, text metadata, `truncated` and nullable `next_start_line`. A truncated requested range provides `next_start_line`; each requested file is bounded independently by `max_output_bytes_per_file`.
 
-Under each file's current budget, requested lines take priority over optional context: `fs_read` fills the requested range first and only then uses remaining space for `context_lines_before` / `context_lines_after`. Context omission alone does not create a continuation cursor, and every truncated requested range advances `next_start_line` beyond the requested start. A single indivisible line may make the aggregate result exceed the nominal target; this is intentional so text is never split and continuation always progresses.
+Under each file's budget, requested lines take priority over optional context: `fs_read` fills the requested range first and only then uses remaining space for `context_lines_before` / `context_lines_after`. Context omission alone does not create a continuation cursor, and every truncated requested range advances `next_start_line` beyond the requested start. A single indivisible line may exceed the per-file ceiling; this is intentional so text is never split and continuation always progresses.
 
-Rationale: one multi-file read remains convenient for common batches while the aggregate budget prevents the default response from growing roughly linearly with file count.
+Rationale: one multi-file read remains convenient for common batches while each file keeps an explicit independent text ceiling and continuation cursor; there is no hidden cross-file aggregate budget.
 
 ### `fs_navigate`
 
@@ -379,7 +377,7 @@ Retained final-state screenshots remain at the exact nested state locations chos
 
 The MCP result `content` is multimodal: index `0` is the JSON `TextContent` representation of the structured result, followed by one MCP `ImageContent` block per distinct retained image. Thus no-image scenarios return ordinary structured/text data, while scenarios with several images return all of them in the same tool result. The images are direct model input, not `publish`, Published storage, an MCP App or a `resource_link`. MCP encodes `ImageContent.data` as Base64 on the wire; Auto.js WebP plus `scale` is the intended size-control path. `rect` always remains the original absolute screen-space capture rectangle, so coordinates can be mapped back correctly after downscaling.
 
-The desktop **Automation** page is a derived diagnostic view over `desktop_auto` Tool Calls recorded in **Full** payload mode. Only Full rows are complete replay sources: the page can filter by originating Session, show the exact YAML scenario, parsed scenario, returned state/results and retained input/output images, then replay the original scenario through the shared low-level Auto.js engine. Light/Metadata rows remain visible in ordinary Tool Call history but are intentionally not replay sources. Replay itself stays a local action below the MCP dispatcher and creates no Tool Call, notification or replay-history row.
+The desktop **Automation** page is a derived diagnostic view over `desktop_auto` Tool Calls recorded in **Payload** mode. Only Payload rows are replay sources: the page can filter by originating Session, show the exact YAML scenario, parsed scenario, returned state/results and retained input/output images, then replay the original scenario through the shared low-level Auto.js engine. Metadata rows remain visible in ordinary Tool Call history but are intentionally not replay sources. Replay itself stays a local action below the MCP dispatcher and creates no Tool Call, notification or replay-history row.
 
 ---
 
@@ -407,7 +405,7 @@ The result is `{wait, results[]}` in input order. Each row reports browser/targe
 
 The persistent database stores browser-to-port and `(browser,target)`-to-CDP-`targetId`; `sessionId` remains runtime-only. Reconnecting to a still-running browser reconstructs sessions through CDP. A missing page/browser incarnation is repaired lazily the next time its logical target is used.
 
-The desktop **Browser** page combines persistent browser/profile + logical-target state with current connection/ring/subscription diagnostics. Historical request/response inspection and Replay use only `cdp_call` Tool Calls recorded in **Full** payload mode, because Light/Metadata deliberately do not retain a complete replay source. A replay reruns only the selected recorded batch item through the shared low-level CDP engine; it does not enter the MCP dispatcher, create a Tool Call, write replay history or emit Tool Call notifications. The page adds no new CDP telemetry or replay persistence.
+The desktop **Browser** page combines persistent browser/profile + logical-target state with current connection/ring/subscription diagnostics. Historical request/response inspection and Replay use only `cdp_call` Tool Calls recorded in **Payload** mode, because Metadata deliberately does not retain a replay source. A replay reruns only the selected recorded batch item through the shared low-level CDP engine; it does not enter the MCP dispatcher, create a Tool Call, write replay history or emit Tool Call notifications. The page adds no new CDP telemetry or replay persistence.
 
 New page sessions use flattened auto-attach with `waitForDebuggerOnStart:true`. While paused, MrMCP enables `Runtime`, `Page`, `Network`, best-effort `ServiceWorker`, focus emulation, `_send_to_cdp` via `Runtime.addBinding`, and best-effort push-messaging `BackgroundService` observation. It sends `Runtime.disable` before `Runtime.runIfWaitingForDebugger`; this disables execution-context reporting but does not remove the binding or prevent later `Runtime.evaluate`. JavaScript may call `_send_to_cdp("...")`, producing the standard `Runtime.bindingCalled` event. Optional setup failures are exposed in `setup_errors`.
 
@@ -523,7 +521,6 @@ Tool Call history has two independent operator settings and every row exposes th
 - **Storage: Disk** — history lives in the main SQLite database and survives restart.
 - **Storage: Memory** — history lives in SQLite TEMP tables/FTS on the active connection and disappears on restart. It has a separate retention in minutes.
 - **Payload: Full** — complete request/raw-return JSON and actual text output, plus detectable binary input/output content in the Tool Call content store.
-- **Payload: Light** — bounded JSON/text previews (up to 64 KiB per stored field) and no retained Tool Call binary copy. Truncated JSON is represented explicitly with `_mrmcp_payload_truncated`.
 - **Payload: Metadata** — no Tool Call request/response JSON, stdout/stderr or binary copies; identity, Session/Workspace snapshot, status/timing, progress flag and bounded errors remain.
 
 Storage and payload are orthogonal: `Memory + Full`, `Disk + Metadata`, etc. are all valid. The payload policy is diagnostic only and cannot remove state required by another feature. In particular persistent-process command/transcript state remains owned by the process subsystem so `exec_attach` / `exec_status` keep working; Browser ring, explicit Memory, Published and CDP state likewise keep their own authoritative storage. Expanded Tool Calls render only fields/capabilities actually present on that row, and Browser/Automation replay is limited to Full rows. No third-party JSON viewer is loaded.
@@ -565,7 +562,7 @@ Queries Tool Calls that actually reached MrMCP for the current Session across bo
 Arguments:
 
 - `id` — optional exact stable Tool Call id; when supplied, at most one matching row is returned and `before_id` is ignored.
-- `detail` — `summary|full`, default `summary`. Summary avoids payload bodies; Full returns whatever JSON/text that row actually retained.
+- `detail` — `summary|full`, default `summary`. Summary avoids packet bodies; Full returns the retained canonical MCP request and response packets.
 - `limit` — 1–50, default 10. Exact-id lookup effectively returns at most one.
 - `tool` — exact tool-name filter.
 - `status` — exact `received|running|completed|failed|invalid|orphaned` filter.
@@ -573,7 +570,7 @@ Arguments:
 - `before_id` — stateless backward-pagination cursor when `id` is absent.
 - `context_handle`.
 
-Every returned row includes `storage` and `payload_mode`. Summary rows include `payload_retained`, retained input/result/output sizes and an optional bounded error preview. Full-detail rows expose payload bodies only when the row retained them; `payload_complete` distinguishes complete Full data from a Light preview. Metadata rows return no Tool Call payload bodies. The result echoes `detail`, `returned`, effective `limit`, `truncated` and `next_before_id`; when truncated, pass `next_before_id` back as `before_id` with the same filters. The call excludes its own current row. Requests blocked before reaching MrMCP cannot appear here.
+Every returned row includes `storage` and `payload_mode` (`payload|metadata`). Summary rows include `payload_retained`, `request_bytes`, `response_bytes` and an optional bounded error preview. Full-detail Payload rows expose complete `mcp_request` and `mcp_response` packet objects with `payload_complete=true`; Metadata rows return no packet bodies. MrMCP does not persist separate argument/result/stdout/stderr/binary copies for Tool Call history. The result echoes `detail`, `returned`, effective `limit`, `truncated` and `next_before_id`; when truncated, pass `next_before_id` back as `before_id` with the same filters. The call excludes its own current row. Requests blocked before reaching MrMCP cannot appear here.
 
 ---
 
@@ -628,7 +625,7 @@ Starts a persistent interactive/background process and returns immediately.
 
 - `timeout_ms` default 0 (no timeout), maximum 604800000.
 
-Returns `exec_id`, which is always the stable integer Tool Call id of the originating `exec_start`, independent of Disk/Memory history storage or Full/Light/Metadata payload mode. Pass it unchanged with the same `context_handle` to the follow-up exec tools. Runtime process state and complete normalized transcript are owned by the process subsystem and remain available for the process lifetime/retention even when Tool Call payload mode is Metadata; process runtime state does not survive server restart.
+Returns `exec_id`, which is always the stable integer Tool Call id of the originating `exec_start`, independent of Disk/Memory history storage or Payload/Metadata retention mode. Pass it unchanged with the same `context_handle` to the follow-up exec tools. Runtime process state and complete normalized transcript are owned by the process subsystem and remain available for the process lifetime/retention even when Tool Call payload mode is Metadata; process runtime state does not survive server restart.
 
 ### `exec_attach`
 

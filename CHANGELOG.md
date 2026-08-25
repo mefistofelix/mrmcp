@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Simplified Tool Call payload retention to two explicit modes: `payload` stores exactly one canonical MCP JSON-RPC request packet and one canonical MCP JSON-RPC response packet, while `metadata` keeps only Tool Call metadata/bounded errors. Removed the intermediate Light mode; Disk/Memory history storage remains an independent setting.
+- Replaced the Tool Call payload schema with `mcp_request_json` / `mcp_response_json` as the only persisted request/response bodies. Removed duplicate argument/result/stdout/stderr/transport copies and the separate extracted-binary table; historical tool descriptors remain deduplicated schema snapshots.
+- Changed Tool Call row inspection from an inline expanded table row to a fullscreen content-area debug overlay. The viewer keeps raw MCP packets directly copyable while recursively interpreting nested JSON, YAML, multiline text, readable Base64 and inline images only for that render; decoded representations are never persisted.
+- Added explicit `schema_meta` / `DB_SCHEMA_VERSION=2` fail-fast validation. There is no migration/backfill path: unversioned or differently-versioned development databases are rejected with instructions to delete `.mrmcp/mrmcp.sqlite` and restart cleanly.
+- Switched Tool Call search indexing to contentless FTS5 over canonical MCP request/response packets plus metadata/error, so full-text search keeps token indexing without storing another source-text copy. Combined Tool + generic search remains on FTS; `tools_log.query` retains its public literal-substring semantics.
+- Made `structuredContent` the canonical structured MCP result and replaced the old large pretty-JSON text mirror with a concise required text block for structured tools; tools that intentionally return text keep their actual text content.
+- Made Browser recorded-operation reconstruction consume canonical Payload-retained `cdp_call` packets lazily in small batches, stopping once enough matching operations are collected, and replaced whole-`uiState` cloning with an explicit active-section render projection. No persistent GUI result cache was added.
+- Removed the newly-added arbitrary `fs_grep` response-byte budget and `fs_read` aggregate batch budget. `fs_grep` uses its explicit result-count/stateless cursor, while `fs_read` retains only its existing independent per-file text ceiling and continuation.
+
 ## 0.10.127
 
 - Split Tool Call history policy into two independent Settings → Maintenance controls: **Disk / Memory** storage and **Full / Light / Metadata** payload retention. Memory uses SQLite TEMP history/FTS with its own minute retention and disappears on restart; Disk uses the main SQLite database with hour retention. Each row exposes the storage tier and payload capability that actually applied. Payload retention affects diagnostic copies only and never disables functional process/CDP/Memory/Published state.

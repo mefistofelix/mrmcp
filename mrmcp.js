@@ -98,6 +98,7 @@ const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
 const VERSION = "0.10.127";
+const DB_SCHEMA_VERSION = 2;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;
@@ -458,6 +459,15 @@ async function backend({ addWorkspace = null } = {}) {
     Deno.mkdirSync(CDP_DIR, { recursive: true });
   }
   const db = new DatabaseSync(DB_PATH);
+  const existingUserTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1").get();
+  if (existingUserTable) {
+    const schemaTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_meta'").get();
+    const storedVersion = schemaTable ? Number(db.prepare("SELECT version FROM schema_meta WHERE id=1").get()?.version) : NaN;
+    if (storedVersion !== DB_SCHEMA_VERSION) {
+      db.close();
+      throw new Error(`Database schema version mismatch (found ${Number.isFinite(storedVersion) ? storedVersion : "unversioned"}, expected ${DB_SCHEMA_VERSION}). Delete .mrmcp/mrmcp.sqlite and restart.`);
+    }
+  }
   let uiRevision = 0, uiRenderConnected = false, uiRenderVisible = false, uiRenderVisibilityEpoch = 0;
   const deliverUiRender = payload => {
     if (IS_BACKEND_WORKER) self.postMessage({ type: "ui-render", payload });
@@ -617,6 +627,11 @@ async function backend({ addWorkspace = null } = {}) {
     PRAGMA foreign_keys=ON;
     PRAGMA busy_timeout=5000;
     PRAGMA temp_store=MEMORY;
+    CREATE TABLE IF NOT EXISTS schema_meta(
+      id INTEGER PRIMARY KEY CHECK(id=1),
+      version INTEGER NOT NULL
+    );
+    INSERT OR IGNORE INTO schema_meta(id,version) VALUES(1,${DB_SCHEMA_VERSION});
     CREATE TABLE IF NOT EXISTS config(
       key TEXT PRIMARY KEY, value TEXT NOT NULL
     );
@@ -647,12 +662,9 @@ async function backend({ addWorkspace = null } = {}) {
       server_name TEXT NOT NULL,
       tool TEXT NOT NULL,
       status TEXT NOT NULL,
-      input_json TEXT NOT NULL,
-      resolved_json TEXT NOT NULL DEFAULT '',
-      stdout TEXT NOT NULL DEFAULT '',
-      stderr TEXT NOT NULL DEFAULT '',
+      mcp_request_json TEXT NOT NULL DEFAULT '',
+      mcp_response_json TEXT NOT NULL DEFAULT '',
       error TEXT NOT NULL DEFAULT '',
-      result_json TEXT NOT NULL DEFAULT '',
       duration_ms INTEGER,
       context_id INTEGER NOT NULL DEFAULT 0,
       context_handle TEXT NOT NULL DEFAULT '',
@@ -660,7 +672,7 @@ async function backend({ addWorkspace = null } = {}) {
       root_name TEXT NOT NULL DEFAULT '',
       root_path TEXT NOT NULL DEFAULT '',
       progress_requested INTEGER NOT NULL DEFAULT 0,
-      payload_mode TEXT NOT NULL DEFAULT 'full' CHECK(payload_mode IN ('full','light','metadata'))
+      payload_mode TEXT NOT NULL DEFAULT 'payload' CHECK(payload_mode IN ('payload','metadata'))
     );
     CREATE INDEX IF NOT EXISTS logs_time ON logs(started_at DESC);
     CREATE INDEX IF NOT EXISTS logs_server ON logs(server_name,started_at DESC);
@@ -821,18 +833,6 @@ async function backend({ addWorkspace = null } = {}) {
     );
     CREATE INDEX IF NOT EXISTS memories_owner_time ON memories(scope,owner_id,set_at DESC,id DESC);
     CREATE INDEX IF NOT EXISTS memories_expiry ON memories(expires_at) WHERE expires_at>0;
-    CREATE TABLE IF NOT EXISTS tool_call_content(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      log_id INTEGER NOT NULL,
-      direction TEXT NOT NULL CHECK(direction IN ('input','output')),
-      json_path TEXT NOT NULL DEFAULT '',
-      content_type TEXT NOT NULL DEFAULT 'binary',
-      mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
-      bytes INTEGER NOT NULL DEFAULT 0,
-      data BLOB NOT NULL,
-      FOREIGN KEY(log_id) REFERENCES logs(id) ON DELETE CASCADE
-    );
-    CREATE INDEX IF NOT EXISTS tool_call_content_log ON tool_call_content(log_id,direction,id);
     CREATE TRIGGER IF NOT EXISTS memories_context_delete AFTER DELETE ON contexts BEGIN
       DELETE FROM memories WHERE scope='session' AND owner_id=OLD.id;
     END;
@@ -912,19 +912,14 @@ async function backend({ addWorkspace = null } = {}) {
   const all = (sql, ...args) => statement(sql).all(...args);
   const serverToolsCache = new Map(), serverToolMapCache = new Map(), sessionToolStatsCache = new Map();
   const descriptorJsonCache = new WeakMap();
-  let toolCallAggregateCache = null, serverConfigCache = null;
+  let serverConfigCache = null;
   const sessionToolCountProjection = serverId => new Map(
     all("SELECT context_id,COUNT(*) n FROM logs WHERE server_id=? AND context_id>0 GROUP BY context_id", Number(serverId || 0))
       .map(row => [Number(row.context_id), Number(row.n || 0)]),
   );
   const toolCallAggregates = p => {
-    if (!toolCallAggregateCache) {
-      const row = one("SELECT COUNT(*) total, SUM(status='failed') errors, SUM(status='invalid') invalid FROM logs WHERE server_id=?", p.id) || {};
-      toolCallAggregateCache = {
-        total: Number(row.total || 0), errors: Number(row.errors || 0), invalid: Number(row.invalid || 0),
-      };
-    }
-    return toolCallAggregateCache;
+    const row = one("SELECT COUNT(*) total, SUM(status='failed') errors, SUM(status='invalid') invalid FROM logs WHERE server_id=?", p.id) || {};
+    return { total: Number(row.total || 0), errors: Number(row.errors || 0), invalid: Number(row.invalid || 0) };
   };
   const run = (sql, ...args) => {
     const result = statement(sql).run(...args);
@@ -935,10 +930,7 @@ async function backend({ addWorkspace = null } = {}) {
     }
     if (/^(?:\s*)(?:insert|update|delete|replace)\b/i.test(sqlText) && /\bserver_config\b/i.test(sqlText))
       serverConfigCache = null;
-    if (/^\s*delete\b/i.test(sqlText) && /\blogs\b/i.test(sqlText)) {
-      sessionToolStatsCache.clear();
-      toolCallAggregateCache = null;
-    }
+    if (/^\s*delete\b/i.test(sqlText) && /\blogs\b/i.test(sqlText)) sessionToolStatsCache.clear();
     const scopes = uiScopesForSql(sql);
     if (scopes.length) emitUiChange(scopes, "database");
     return result;
@@ -1067,32 +1059,6 @@ async function backend({ addWorkspace = null } = {}) {
     configCache.set(String(key), text);
     return result;
   };
-  const requiredSchema = {
-    server_config: ["oauth", "basic_enabled", "basic_username", "basic_secret_enc"],
-    roots: ["server_id", "name", "path", "enabled"],
-    contexts: ["id", "handle", "server_id", "root_id", "created_at", "updated_at", "last_active_at", "protocol_version", "auth_kind", "oauth_client_id", "client_name", "user_agent"],
-    process_runs: ["log_id", "context_id", "context_handle", "root_id", "root_name", "root_path", "stdout_tail", "stderr_tail"],
-    cdp_browsers: ["browser", "port", "created_at", "updated_at"],
-    cdp_targets: ["browser", "target", "target_id", "created_at", "updated_at"],
-    memories: ["id", "scope", "owner_id", "owner_name", "key", "value_json", "is_json", "ttl_seconds", "set_at", "expires_at"],
-    tool_call_content: ["id", "log_id", "direction", "json_path", "content_type", "mime_type", "bytes", "data"],
-    logs: ["id", "server_name", "tool", "status", "input_json", "context_id", "context_handle", "root_id", "root_name", "root_path", "progress_requested", "payload_mode"],
-    tool_descriptors: ["id", "descriptor_json"],
-    tool_call_descriptors: ["log_id", "descriptor_id"],
-    debug_log_workspaces: ["debug_log_id", "context_id", "root_id", "root_name", "root_path"],
-    oauth_refresh_tokens: ["token_hash", "client_id", "server_id", "resource", "scope", "last_used_at"],
-    published: ["id", "server_id", "content_key", "context_handle", "context_id", "root_id", "root_name", "root_path", "source_path", "source_filename", "published_name", "filename", "mime_type", "size", "title", "description", "presentation", "height", "created_at", "request_count", "last_request_at"],
-    published_uses: ["id", "published_id", "context_handle", "context_id", "root_id", "root_name", "root_path", "source_path", "source_filename", "filename", "mime_type", "title", "description", "presentation", "height", "published_at"],
-  };
-  const schemaErrors = [];
-  for (const [table, columns] of Object.entries(requiredSchema)) {
-    const present = new Set(all(`PRAGMA table_info(${table})`).map(column => column.name));
-    if (!present.size) schemaErrors.push(`missing table ${table}`);
-    else for (const column of columns) if (!present.has(column)) schemaErrors.push(`${table}.${column}`);
-  }
-  if (schemaErrors.length) throw new Error(
-    `Invalid clean database schema (${schemaErrors.join(", ")}). Delete .mrmcp/mrmcp.sqlite and restart.`,
-  );
   if (addWorkspace) {
     const name = String(addWorkspace.name || "").trim(), path = String(addWorkspace.path || "");
     if (!validWorkspaceName(name)) throw new Error("Workspace name must be 1-128 characters and cannot contain slashes or control characters.");
@@ -1115,12 +1081,9 @@ async function backend({ addWorkspace = null } = {}) {
       server_name TEXT NOT NULL,
       tool TEXT NOT NULL,
       status TEXT NOT NULL,
-      input_json TEXT NOT NULL,
-      resolved_json TEXT NOT NULL DEFAULT '',
-      stdout TEXT NOT NULL DEFAULT '',
-      stderr TEXT NOT NULL DEFAULT '',
+      mcp_request_json TEXT NOT NULL DEFAULT '',
+      mcp_response_json TEXT NOT NULL DEFAULT '',
       error TEXT NOT NULL DEFAULT '',
-      result_json TEXT NOT NULL DEFAULT '',
       duration_ms INTEGER,
       context_id INTEGER NOT NULL DEFAULT 0,
       context_handle TEXT NOT NULL DEFAULT '',
@@ -1128,7 +1091,7 @@ async function backend({ addWorkspace = null } = {}) {
       root_name TEXT NOT NULL DEFAULT '',
       root_path TEXT NOT NULL DEFAULT '',
       progress_requested INTEGER NOT NULL DEFAULT 0,
-      payload_mode TEXT NOT NULL DEFAULT 'full' CHECK(payload_mode IN ('full','light','metadata'))
+      payload_mode TEXT NOT NULL DEFAULT 'payload' CHECK(payload_mode IN ('payload','metadata'))
     );
     CREATE INDEX logs_memory_time ON logs_memory(started_at DESC);
     CREATE INDEX logs_memory_server ON logs_memory(server_name,started_at DESC);
@@ -1159,27 +1122,16 @@ async function backend({ addWorkspace = null } = {}) {
       error TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX process_runs_memory_time ON process_runs_memory(started_at DESC);
-    CREATE TEMP TABLE tool_call_content_memory(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      log_id INTEGER NOT NULL,
-      direction TEXT NOT NULL CHECK(direction IN ('input','output')),
-      json_path TEXT NOT NULL DEFAULT '',
-      content_type TEXT NOT NULL DEFAULT 'binary',
-      mime_type TEXT NOT NULL DEFAULT 'application/octet-stream',
-      bytes INTEGER NOT NULL DEFAULT 0,
-      data BLOB NOT NULL
-    );
-    CREATE INDEX tool_call_content_memory_log ON tool_call_content_memory(log_id,direction,id);
     CREATE TEMP TABLE tool_call_descriptors_memory(
       log_id INTEGER PRIMARY KEY,
       descriptor_json TEXT NOT NULL
     );
     CREATE TEMP VIEW logs AS
-      SELECT id,started_at,completed_at,server_id,server_name,tool,status,input_json,resolved_json,stdout,stderr,error,result_json,
+      SELECT id,started_at,completed_at,server_id,server_name,tool,status,mcp_request_json,mcp_response_json,error,
         duration_ms,context_id,context_handle,root_id,root_name,root_path,progress_requested,payload_mode,'disk' storage
       FROM main.logs
       UNION ALL
-      SELECT id,started_at,completed_at,server_id,server_name,tool,status,input_json,resolved_json,stdout,stderr,error,result_json,
+      SELECT id,started_at,completed_at,server_id,server_name,tool,status,mcp_request_json,mcp_response_json,error,
         duration_ms,context_id,context_handle,root_id,root_name,root_path,progress_requested,payload_mode,'memory' storage
       FROM logs_memory;
     CREATE TEMP VIEW process_runs AS
@@ -1190,10 +1142,6 @@ async function backend({ addWorkspace = null } = {}) {
       SELECT id,log_id,pid,server_id,server_name,context_id,context_handle,root_id,root_name,root_path,command_json,cwd,status,started_at,
         completed_at,exit_code,signal,timeout_ms,stdout_tail,stderr_tail,error,'memory' storage
       FROM process_runs_memory;
-    CREATE TEMP VIEW tool_call_content_all AS
-      SELECT id,log_id,direction,json_path,content_type,mime_type,bytes,data,'disk' storage FROM main.tool_call_content
-      UNION ALL
-      SELECT id,log_id,direction,json_path,content_type,mime_type,bytes,data,'memory' storage FROM tool_call_content_memory;
     CREATE TEMP VIEW tool_call_descriptor_records AS
       SELECT calls.log_id,descriptors.descriptor_json,'disk' storage
       FROM main.tool_call_descriptors calls JOIN main.tool_descriptors descriptors ON descriptors.id=calls.descriptor_id
@@ -1203,12 +1151,12 @@ async function backend({ addWorkspace = null } = {}) {
   let fts = true;
   try {
     db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS main.logs_fts USING fts5(
-      log_id UNINDEXED, server, tool, input, output, stderr, error,
-      tokenize='unicode61'
+      server, tool, request, response, error,
+      content='', contentless_delete=1, tokenize='unicode61'
     )`);
     db.exec(`CREATE VIRTUAL TABLE temp.logs_fts_memory USING fts5(
-      log_id UNINDEXED, server, tool, input, output, stderr, error,
-      tokenize='unicode61'
+      server, tool, request, response, error,
+      content='', contentless_delete=1, tokenize='unicode61'
     )`);
   } catch { fts = false; }
   run("INSERT OR IGNORE INTO metrics(name,value) VALUES('requests',0)");
@@ -1254,7 +1202,7 @@ async function backend({ addWorkspace = null } = {}) {
     ["tls_next_attempt_at", "0"], ["tls_rate_limit_reset_at", "0"], ["tls_renewal_due_at", "0"],
     ["tls_self_signed_created_at", "0"], ["debug_http_log", "0"],
     ["inherit_system_path", "1"], ["git_preserve_line_endings", "1"], ["exec_environment", ""],
-    ["tool_call_storage", "disk"], ["tool_call_payload_mode", "full"],
+    ["tool_call_storage", "disk"], ["tool_call_payload_mode", "payload"],
     ["tool_call_retention_hours", "0"], ["tool_call_memory_retention_minutes", "60"],
     ["command_discovery_enabled", "1"], ["telegram_bot_token", ""],
   ]) if (!configCache.has(k)) setCfg(k, v);
@@ -2014,7 +1962,7 @@ async function backend({ addWorkspace = null } = {}) {
   async function telegramRequest(args) {
     const token = String(getCfg("telegram_bot_token", "") || "").trim();
     if (!token) throw new Error("Telegram Bot token is not configured on the Telegram page");
-    const request = structuredClone(args.request || {}), method = String(request.method || "").trim();
+    const request = { ...(args.request || {}) }, method = String(request.method || "").trim();
     if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(method)) throw new Error("telegram_req request.method is required and must be a Bot API method name");
     delete request.method;
     const migrationKey = value => `${token.slice(0, 8)}:${String(value)}`;
@@ -2138,15 +2086,15 @@ async function backend({ addWorkspace = null } = {}) {
   }
   function dashboardToolCallsProjection(p) {
     const now = Date.now(), cutoff = now - DASHBOARD_TOOL_CALL_TTL_MS;
-    const rows = all(`SELECT l.id,l.started_at,l.completed_at,l.context_id,l.tool,l.status,l.duration_ms,l.input_json,l.progress_requested,l.payload_mode,l.storage
+    const rows = all(`SELECT l.id,l.started_at,l.completed_at,l.context_id,l.tool,l.status,l.duration_ms,l.mcp_request_json,l.progress_requested,l.payload_mode,l.storage
       FROM logs l
       WHERE l.server_id=? AND (l.status IN ('received','running') OR l.completed_at>=?)
       ORDER BY l.started_at DESC`, p.id, cutoff).map(row => {
       const active = !row.completed_at && ["received", "running"].includes(row.status);
       return {
         id: Number(row.id), started_at: Number(row.started_at), context_id: Number(row.context_id) || 0, tool: row.tool, status: row.status,
-        call_summary: compactToolCallSummary(p, row.tool, parseJson(row.input_json || "{}", {})),
-        progress_requested: !!row.progress_requested, payload_mode: String(row.payload_mode || "full"), storage: String(row.storage || "disk"), active,
+        call_summary: compactToolCallSummary(p, row.tool, mcpToolArgsFromPacket(row.mcp_request_json)),
+        progress_requested: !!row.progress_requested, payload_mode: String(row.payload_mode || "payload"), storage: String(row.storage || "disk"), active,
         elapsed_ms: Math.max(0, (active ? now : Number(row.completed_at || now)) - Number(row.started_at || now)),
         completed_age_ms: active ? null : Math.max(0, now - Number(row.completed_at || now)),
         ttl_ms: active ? null : Math.max(0, Number(row.completed_at || now) + DASHBOARD_TOOL_CALL_TTL_MS - now),
@@ -2230,7 +2178,6 @@ async function backend({ addWorkspace = null } = {}) {
       process_runs: one("SELECT COUNT(*) n FROM process_runs")?.n || 0,
     };
     statement("DELETE FROM tool_call_descriptors_memory").run();
-    statement("DELETE FROM tool_call_content_memory").run();
     statement("DELETE FROM process_runs_memory").run();
     statement("DELETE FROM logs_memory").run();
     statement("DELETE FROM main.tool_call_descriptors").run();
@@ -2240,20 +2187,18 @@ async function backend({ addWorkspace = null } = {}) {
     statement("DELETE FROM main.logs").run();
     sessionToolStatsCache.clear();
     descriptorIdCache.clear();
-    toolCallAggregateCache = null;
     return cleared;
   }
   function deleteToolCallRecordById(id) {
     const logId = Math.max(0, Number(id) || 0), row = one("SELECT storage FROM logs WHERE id=?", logId);
     if (!row) return false;
     if (row.storage === "memory") {
-      if (fts) statement("DELETE FROM logs_fts_memory WHERE log_id=?").run(logId);
-      statement("DELETE FROM tool_call_content_memory WHERE log_id=?").run(logId);
+      if (fts) statement("DELETE FROM logs_fts_memory WHERE rowid=?").run(logId);
       statement("DELETE FROM tool_call_descriptors_memory WHERE log_id=?").run(logId);
       statement("DELETE FROM process_runs_memory WHERE log_id=?").run(logId);
       statement("DELETE FROM logs_memory WHERE id=?").run(logId);
     } else {
-      if (fts) statement("DELETE FROM main.logs_fts WHERE log_id=?").run(logId);
+      if (fts) statement("DELETE FROM main.logs_fts WHERE rowid=?").run(logId);
       statement("DELETE FROM main.process_runs WHERE log_id=?").run(logId);
       statement("DELETE FROM main.logs WHERE id=?").run(logId);
       statement("DELETE FROM main.tool_descriptors WHERE NOT EXISTS (SELECT 1 FROM main.tool_call_descriptors calls WHERE calls.descriptor_id=main.tool_descriptors.id)").run();
@@ -4616,7 +4561,6 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           mode: { type: "string", enum: ["matches", "files", "count"], default: "matches", description: "matches returns matching lines, files returns matching file metadata only, and count returns the number of matching lines in each file (not the number of substring occurrences)." },
           max_file_bytes: { type: "integer", minimum: 1, maximum: 52428800, default: 5242880 },
           limit: { type: "integer", minimum: 1, maximum: 2000, default: 300, description: "Maximum matching lines in mode=matches or matched files in mode=files/count." },
-          max_output_bytes: { type: "integer", minimum: 1024, maximum: 16777216, default: 1048576, description: "Approximate maximum UTF-8 bytes of returned match/file payload on this page. A single indivisible match may exceed it so pagination always makes progress." },
           resume_after: {
             type: "object", additionalProperties: false,
             properties: { path: { type: "string" }, line: { type: "integer", minimum: 1 } }, required: ["path"],
@@ -4636,7 +4580,6 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
             }, required: ["path"],
           } },
           max_output_bytes_per_file: { type: "integer", minimum: 1, maximum: 5242880, default: 1048576, description: "Per-file ceiling for normalized text. A single complete line may exceed it so line content is never split." },
-          max_output_bytes: { type: "integer", minimum: 1024, maximum: 16777216, default: 2097152, description: "Aggregate target across this batch. MrMCP shares remaining budget fairly across remaining files and rolls unused quota forward; each truncated file returns next_start_line, so continuation stays stateless." },
           ...contextInput,
         }, required: ["files"] },
       ],
@@ -4876,10 +4819,10 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         }, required: ["names"] },
       ],
       tools_log: [
-        "Query Tool Call history for this exact context_handle across both Disk and Memory storage. summary is the default. Every row reports storage and payload_mode: full keeps complete diagnostic payloads, light keeps bounded previews, and metadata keeps no request/response payload. detail=full returns only fields actually retained by that row; payload_retained and payload_complete make availability explicit. Filters may be combined. query is a case-insensitive literal substring search across retained fields; before_id pages backward by stable Tool Call id. When truncated=true, pass next_before_id back as before_id with the same filters. An upstream-blocked request cannot appear here.",
+        "Query Tool Call history for this exact context_handle across both Disk and Memory storage. summary is the default. Every row reports storage and payload_mode: payload retains the canonical MCP JSON-RPC request and response packets, while metadata retains no MCP payload. detail=full returns mcp_request and mcp_response only when retained; payload_retained and payload_complete make availability explicit. Filters may be combined. query is a case-insensitive literal substring search across retained MCP packets and metadata; before_id pages backward by stable Tool Call id. When truncated=true, pass next_before_id back as before_id with the same filters. An upstream-blocked request cannot appear here.",
         { properties: {
           id: { type: "integer", minimum: 1, description: "Inspect one exact stable Tool Call id. When present, before_id is ignored and at most one matching call is returned." },
-          detail: { type: "string", enum: ["summary", "full"], default: "summary", description: "summary avoids returning stored payload bodies; full includes input/result/output fields." },
+          detail: { type: "string", enum: ["summary", "full"], default: "summary", description: "summary avoids returning stored packet bodies; full includes retained mcp_request and mcp_response packets." },
           limit: { type: "integer", minimum: 1, maximum: 50, default: 10 },
           tool: { type: "string", maxLength: 128, description: "Exact tool-name filter." },
           status: { type: "string", enum: ["received", "running", "completed", "failed", "invalid", "orphaned"] },
@@ -5137,8 +5080,8 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         memory_summary: { type: "object", additionalProperties: false, properties: { global: memorySummaryOutput, workspace: memorySummaryOutput, session: memorySummaryOutput }, required: ["global", "workspace", "session"] },
       }),
       fs_glob: strictOutputSchema({ metadata: { type: "boolean" }, returned: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1 }, entries: fsArray(fsGlobEntry), next_after_path: nullableString, truncated: { type: "boolean" } }),
-      fs_grep: strictOutputSchema({ mode: { type: "string", enum: ["matches", "files", "count"] }, scanned_files: { type: "integer" }, matched_files: { type: "integer" }, returned: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1 }, output_bytes: { type: "integer", minimum: 0 }, max_output_bytes: { type: "integer", minimum: 1 }, truncation_reason: { anyOf: [{ type: "string", enum: ["limit", "output_bytes", "walk_limit"] }, { type: "null" }] }, files: fsArray(fsGrepEntry), next_resume_after: { anyOf: [fsResumePoint, { type: "null" }] }, truncated: { type: "boolean" } }),
-      fs_read: strictOutputSchema({ output_bytes: { type: "integer", minimum: 0 }, max_output_bytes: { type: "integer", minimum: 1 }, max_output_bytes_per_file: { type: "integer", minimum: 1 }, truncated: { type: "boolean" }, truncated_files: { type: "integer", minimum: 0 }, files: fsArray(fsReadEntry) }),
+      fs_grep: strictOutputSchema({ mode: { type: "string", enum: ["matches", "files", "count"] }, scanned_files: { type: "integer" }, matched_files: { type: "integer" }, returned: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1 }, truncation_reason: { anyOf: [{ type: "string", enum: ["limit", "walk_limit"] }, { type: "null" }] }, files: fsArray(fsGrepEntry), next_resume_after: { anyOf: [fsResumePoint, { type: "null" }] }, truncated: { type: "boolean" } }),
+      fs_read: strictOutputSchema({ files: fsArray(fsReadEntry) }),
       fs_navigate: strictOutputSchema({ files: fsArray(fsNavigateEntry) }),
       fs_stat: strictOutputSchema({ entries: fsArray(fsStatEntry) }),
       fs_write: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, files: fsArray(fsWriteEntry) }),
@@ -5335,8 +5278,8 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         cdp_poll: ["browser", "subscription", "messages", "cursor", "dropped", "stream_resets", "oldest_seq", "newest_seq"],
         memory_find: ["memories", "next_before_id"], memory_set: ["memory", "deleted"], telegram_req: ["method", "response", "migrated_chat_id"],
         fs_glob: ["metadata", "returned", "limit", "entries", "next_after_path", "truncated"],
-        fs_grep: ["scanned_files", "matched_files", "returned", "limit", "output_bytes", "max_output_bytes", "truncation_reason", "files", "next_resume_after", "truncated"],
-        fs_read: ["output_bytes", "max_output_bytes", "max_output_bytes_per_file", "truncated", "truncated_files", "files"], fs_navigate: ["files"], fs_stat: ["entries"],
+        fs_grep: ["scanned_files", "matched_files", "returned", "limit", "truncation_reason", "files", "next_resume_after", "truncated"],
+        fs_read: ["files"], fs_navigate: ["files"], fs_stat: ["entries"],
         fs_write: ["succeeded", "failed", "files"], fs_edit: ["succeeded", "failed", "total_replacements", "files"],
         fs_text_convert_encoding_eol: ["succeeded", "failed", "files"],
         fs_mkdir: ["succeeded", "failed", "entries"], fs_copy: ["succeeded", "failed", "entries"], fs_move: ["succeeded", "failed", "entries"],
@@ -5368,8 +5311,8 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const expectedInputs = {
       open_workspace: ["name", "create", "current_context_handle"],
       fs_glob: ["path", "include", "exclude", "gitignore", "hidden", "metadata", "limit", "after_path"],
-      fs_grep: ["pattern", "path", "include", "exclude", "gitignore", "hidden", "regex", "case_sensitive", "encoding", "context_lines_before", "context_lines_after", "mode", "max_file_bytes", "limit", "max_output_bytes", "resume_after"],
-      fs_read: ["files", "max_output_bytes_per_file", "max_output_bytes"], fs_navigate: ["pattern", "files", "regex", "case_sensitive", "context_lines_before", "context_lines_after"], fs_stat: ["paths", "fingerprint"],
+      fs_grep: ["pattern", "path", "include", "exclude", "gitignore", "hidden", "regex", "case_sensitive", "encoding", "context_lines_before", "context_lines_after", "mode", "max_file_bytes", "limit", "resume_after"],
+      fs_read: ["files", "max_output_bytes_per_file"], fs_navigate: ["pattern", "files", "regex", "case_sensitive", "context_lines_before", "context_lines_after"], fs_stat: ["paths", "fingerprint"],
       fs_write: ["files", "create_parents"], fs_edit: ["files"], fs_text_convert_encoding_eol: ["files", "encoding", "line_endings", "bom"], fs_mkdir: ["paths", "parents"],
       fs_copy: ["entries", "create_parents"], fs_move: ["entries", "create_parents"], fs_trash: ["paths", "selection"], fs_untrash: ["trash_id"],
       desktop_auto: ["yaml"], publish: ["path", "text", "base64", "mime_type", "filename", "presentation", "title", "description", "height"],
@@ -5538,142 +5481,13 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const usable = prefix.slice(0, prefix.length - (prefix.length % 4));
     try { return sniffLogBinaryMime(Buffer.from(usable, "base64")); } catch { return ""; }
   };
-  function recordToolCallContent(logId, direction, value, storage = "disk") {
-    const seen = new WeakSet(), saved = new Set();
-    const save = (path, contentType, mimeType, base64) => {
-      const bytes = decodeLogBase64(base64);
-      if (!bytes?.length) return;
-      const mime = String(mimeType || sniffLogBinaryMime(bytes) || "application/octet-stream").split(";")[0].trim().toLowerCase();
-      const key = `${direction}\n${path}\n${mime}\n${bytes.length}`;
-      if (saved.has(key)) return;
-      saved.add(key);
-      statement(`INSERT INTO ${contentTableForStorage(storage)}(log_id,direction,json_path,content_type,mime_type,bytes,data) VALUES(?,?,?,?,?,?,?)`)
-        .run(Number(logId), direction, path, contentType, mime, bytes.length, bytes);
-    };
-    const visit = (item, path = "$") => {
-      if (typeof item === "string") {
-        const dataUrl = item.startsWith("data:")
-          ? item.match(/^data:([^;,\s]+)(?:;[^,]*)?;base64,([A-Za-z0-9+/=\s]+)$/i)
-          : null;
-        if (dataUrl) save(path, "data_url", dataUrl[1], dataUrl[2]);
-        else {
-          const mime = sniffLogBase64ValueMime(item);
-          if (mime) save(path, "base64", mime, item);
-        }
-        return;
-      }
-      if (!item || typeof item !== "object") return;
-      if (seen.has(item)) return;
-      seen.add(item);
-      if (item.type === "image" && typeof item.data === "string") {
-        save(`${path}.data`, "mcp_image", item.mimeType || item.mime_type || "image/png", item.data);
-        return;
-      }
-      if (item.type === "audio" && typeof item.data === "string") {
-        save(`${path}.data`, "mcp_audio", item.mimeType || item.mime_type || "audio/mpeg", item.data);
-        return;
-      }
-      if (item.type === "resource" && item.resource && typeof item.resource.blob === "string") {
-        save(`${path}.resource.blob`, "mcp_resource", item.resource.mimeType || item.resource.mime_type || "application/octet-stream", item.resource.blob);
-        return;
-      }
-      if (typeof item.base64 === "string" && (item.mime_type || item.mimeType || item.mime))
-        save(`${path}.base64`, "base64", item.mime_type || item.mimeType || item.mime, item.base64);
-      for (const [key, child] of Object.entries(item)) {
-        if (key === "base64" && typeof item.base64 === "string" && (item.mime_type || item.mimeType || item.mime)) continue;
-        visit(child, `${path}.${key}`);
-      }
-    };
-    visit(value);
-  }
-
-  function boundedJsonStringify(value, maxChars, pretty = false, replacer = null) {
-    const limit = Math.max(64, Number(maxChars) || 64), chunks = [];
-    let length = 0, truncated = false;
-    const append = text => {
-      if (truncated) return false;
-      text = String(text);
-      const remaining = limit - length;
-      if (text.length <= remaining) { chunks.push(text); length += text.length; return true; }
-      if (remaining > 0) { chunks.push(text.slice(0, remaining)); length += remaining; }
-      truncated = true;
-      return false;
-    };
-    const indent = depth => pretty ? "  ".repeat(depth) : "";
-    const writeString = text => {
-      text = String(text);
-      if (!append('"')) return false;
-      for (let offset = 0; offset < text.length;) {
-        let end = Math.min(text.length, offset + 4096);
-        if (end < text.length) {
-          const code = text.charCodeAt(end - 1);
-          if (code >= 0xD800 && code <= 0xDBFF) end--;
-        }
-        if (end <= offset) end = Math.min(text.length, offset + 1);
-        const escaped = JSON.stringify(text.slice(offset, end)).slice(1, -1);
-        if (!append(escaped)) return false;
-        offset = end;
-      }
-      return append('"');
-    };
-    const seen = new Set();
-    const write = (item, depth, arrayItem = false, key = "", holder = null, transformed = false) => {
-      if (replacer && !transformed) item = replacer.call(holder, key, item);
-      if (item && typeof item === "object" && typeof item.toJSON === "function") item = item.toJSON();
-      const type = typeof item;
-      if (item === null) return append("null");
-      if (type === "string") return writeString(item);
-      if (type === "number") return append(Number.isFinite(item) ? String(item) : "null");
-      if (type === "boolean") return append(item ? "true" : "false");
-      if (type === "bigint") throw new TypeError("Do not know how to serialize a BigInt");
-      if (["undefined", "function", "symbol"].includes(type)) return arrayItem ? append("null") : true;
-      if (seen.has(item)) throw new TypeError("Converting circular structure to JSON");
-      seen.add(item);
-      try {
-        if (Array.isArray(item)) {
-          if (!append("[")) return false;
-          for (let index = 0; index < item.length; index++) {
-            if (index && !append(",")) return false;
-            if (pretty && !append("\n" + indent(depth + 1))) return false;
-            if (!write(item[index], depth + 1, true, String(index), item)) return false;
-          }
-          if (pretty && item.length && !append("\n" + indent(depth))) return false;
-          return append("]");
-        }
-        if (!append("{")) return false;
-        let count = 0;
-        for (const key in item) {
-          if (!Object.prototype.hasOwnProperty.call(item, key)) continue;
-          let child = item[key];
-          if (replacer) child = replacer.call(item, key, child);
-          const childType = typeof child;
-          if (["undefined", "function", "symbol"].includes(childType)) continue;
-          if (count++ && !append(",")) return false;
-          if (pretty && !append("\n" + indent(depth + 1))) return false;
-          if (!writeString(key) || !append(pretty ? ": " : ":")) return false;
-          if (!write(child, depth + 1, false, key, item, true)) return false;
-        }
-        if (pretty && count && !append("\n" + indent(depth))) return false;
-        return append("}");
-      } finally { seen.delete(item); }
-    };
-    write(value, 0, false);
-    return { text: chunks.join(""), truncated };
-  }
-  function boundedPrettyToolText(value, maxChars = 1024 * 1024) {
-    const rendered = boundedJsonStringify(value, maxChars, true);
-    return rendered.truncated
-      ? rendered.text + "\n\n[text rendering truncated at " + maxChars + " characters; structuredContent contains the complete result]"
-      : rendered.text;
-  }
-
-  const TOOL_CALL_PAYLOAD_MODES = new Set(["full", "light", "metadata"]), TOOL_CALL_STORAGES = new Set(["disk", "memory"]);
-  const LIGHT_LOG_PAYLOAD_CHARS = 65536, LIGHT_LOG_TEXT_CHARS = 65536, METADATA_ERROR_CHARS = 2000;
+  const TOOL_CALL_PAYLOAD_MODES = new Set(["payload", "metadata"]), TOOL_CALL_STORAGES = new Set(["disk", "memory"]);
+  const METADATA_ERROR_CHARS = 2000;
   const toolCallPolicyById = new Map();
   let lastToolCallId = Math.max(Number(one("SELECT MAX(id) id FROM main.logs")?.id || 0), Date.now() * 1000);
   function toolCallPayloadMode() {
-    const mode = String(getCfg("tool_call_payload_mode", "full")).toLowerCase();
-    return TOOL_CALL_PAYLOAD_MODES.has(mode) ? mode : "full";
+    const mode = String(getCfg("tool_call_payload_mode", "payload")).toLowerCase();
+    return TOOL_CALL_PAYLOAD_MODES.has(mode) ? mode : "payload";
   }
   function toolCallStorage() {
     const storage = String(getCfg("tool_call_storage", "disk")).toLowerCase();
@@ -5684,45 +5498,41 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     if (!Number.isSafeInteger(lastToolCallId)) throw new Error("Tool Call id space exhausted");
     return lastToolCallId;
   }
-  const toolCallModeKeepsJson = mode => mode === "full" || mode === "light";
-  const toolCallModeKeepsBinary = mode => mode === "full";
+  const toolCallModeKeepsJson = mode => mode === "payload";
   const logTableForStorage = storage => storage === "memory" ? "logs_memory" : "main.logs";
   const processTableForStorage = storage => storage === "memory" ? "process_runs_memory" : "main.process_runs";
-  const contentTableForStorage = storage => storage === "memory" ? "tool_call_content_memory" : "main.tool_call_content";
-  function lightLogJson(value) {
-    const rendered = boundedJsonStringify(value, LIGHT_LOG_PAYLOAD_CHARS, false);
-    if (!rendered.truncated) return rendered.text;
-    let preview = rendered.text, envelope = JSON.stringify({ _mrmcp_payload_truncated: true, preview });
-    while (envelope.length > LIGHT_LOG_PAYLOAD_CHARS && preview.length) {
-      const excess = envelope.length - LIGHT_LOG_PAYLOAD_CHARS;
-      preview = preview.slice(0, Math.max(0, preview.length - Math.max(excess, 256)));
-      envelope = JSON.stringify({ _mrmcp_payload_truncated: true, preview });
-    }
-    return envelope;
-  }
   function toolCallJsonForMode(mode, value) {
-    if (mode === "full") return JSON.stringify(value);
-    if (mode === "light") return lightLogJson(value);
-    return "";
+    if (mode !== "payload") return "";
+    return JSON.stringify(value, (_key, item) => typeof item === "string" ? redactPublishedText(item) : item);
   }
-  function toolCallTextForMode(mode, value) {
-    const text = String(value || "");
-    if (mode === "full") return text;
-    if (mode === "light") return text.length > LIGHT_LOG_TEXT_CHARS
-      ? `${text.slice(0, LIGHT_LOG_TEXT_CHARS)}\n[light log truncated ${text.length - LIGHT_LOG_TEXT_CHARS} characters]` : text;
-    return "";
+  function toolCallMcpRequest(tool, args, packet = null) {
+    return packet && typeof packet === "object" ? packet : {
+      jsonrpc: "2.0", id: null, method: "tools/call", params: { name: String(tool || ""), arguments: args || {} },
+    };
+  }
+  function toolCallMcpResponse(result, packet = undefined) {
+    return packet !== undefined ? packet : { jsonrpc: "2.0", id: null, result };
+  }
+  function mcpPacketObject(value) {
+    return typeof value === "string" ? parseJson(value, null) : (value && typeof value === "object" ? value : null);
+  }
+  function mcpToolArgsFromPacket(value) {
+    const packet = mcpPacketObject(value), args = packet?.params?.arguments;
+    return args && typeof args === "object" ? args : {};
+  }
+  function mcpToolStructuredResultFromPacket(value) {
+    const packet = mcpPacketObject(value), structured = packet?.result?.structuredContent;
+    return structured && typeof structured === "object" ? structured : {};
   }
   function toolCallErrorForMode(mode, value) {
-    const text = String(value || "");
-    if (mode === "full") return text;
-    if (mode === "light") return toolCallTextForMode(mode, text);
-    return text.slice(0, METADATA_ERROR_CHARS);
+    const text = redactPublishedText(value);
+    return mode === "payload" ? text : text.slice(0, METADATA_ERROR_CHARS);
   }
   function finishToolCallRuntime(id) {
     toolCallPolicyById.delete(Number(id || 0));
   }
 
-  function beginLog(p, tool, args, contextHandle = "", root = null, descriptor = null, notifyStart = true, progressRequested = false, contextRecord = null) {
+  function beginLog(p, tool, args, contextHandle = "", root = null, descriptor = null, notifyStart = true, progressRequested = false, contextRecord = null, mcpRequest = null) {
     const context = contextRecord || contextByHandle(p, contextHandle), contextId = Number(context?.id || 0), now = Date.now();
     const previous = contextId ? sessionToolStats(p, contextId) : null;
     const previousCalls = Number(previous?.tool_calls || 0), lastCallAt = Number(previous?.last_call_at || 0);
@@ -5730,9 +5540,9 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const table = logTableForStorage(policy.storage), begin = policy.storage === "disk" ? "BEGIN IMMEDIATE" : "BEGIN";
     db.exec(begin);
     try {
-      run(`INSERT INTO ${table}(id,started_at,server_id,server_name,tool,status,input_json,
+      run(`INSERT INTO ${table}(id,started_at,server_id,server_name,tool,status,mcp_request_json,
         context_id,context_handle,root_id,root_name,root_path,progress_requested,payload_mode) VALUES(?,?,?,?,?,'running',?,?,?,?,?,?,?,?)`,
-        id, now, p.id, "mcp", tool, toolCallJsonForMode(policy.payloadMode, args), contextId, String(contextHandle || ""),
+        id, now, p.id, "mcp", tool, toolCallJsonForMode(policy.payloadMode, toolCallMcpRequest(tool, args, mcpRequest)), contextId, String(contextHandle || ""),
         Number(root?.id || 0), String(root?.name || ""), String(root?.path || ""), progressRequested ? 1 : 0, policy.payloadMode);
       if (descriptor) recordToolCallDescriptor(id, descriptorJson(descriptor), policy.storage);
       db.exec("COMMIT");
@@ -5741,11 +5551,9 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       throw error;
     }
     toolCallPolicyById.set(id, policy);
-    if (toolCallModeKeepsBinary(policy.payloadMode)) scheduleLogDiagnostic({ kind: "content", log_id: id, direction: "input", value: args, ...policy });
     const currentCalls = previousCalls + 1, sessionLabel = context
       ? sessionNotificationLabel(p, context, currentCalls, now, root?.name || "") : "";
     if (contextId) sessionToolStatsCache.set(sessionToolStatsKey(p, contextId), { tool_calls: currentCalls, last_call_at: now });
-    if (toolCallAggregateCache) toolCallAggregateCache.total++;
     if (context && previousCalls && now - lastCallAt >= SESSION_ACTIVE_MS) postOsNotification("session", "🟢 Session Active", sessionLabel);
     if (notifyStart) postOsNotification("tool_call", `🛠️ Tool Call #${id}`, toolCallNotificationBody(p, tool, args, contextHandle, root, "", progressRequested, context, currentCalls));
     return id;
@@ -5756,11 +5564,8 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const keys = Object.keys(fields);
     if (!keys.length) return;
     run(`UPDATE ${logTableForStorage(policy.storage)} SET ${keys.map(k => `${k}=?`).join(",")} WHERE id=?`, ...keys.map(k => fields[k]), logId);
-    if (toolCallAggregateCache && fields.status === "failed") toolCallAggregateCache.errors++;
-    if (toolCallAggregateCache && fields.status === "invalid") toolCallAggregateCache.invalid++;
   }
-  const deferredLogIndexes = new Map(), deferredLogDiagnostics = [], descriptorIdCache = new Map();
-  const MAX_DEFERRED_LOG_DIAGNOSTICS = 8;
+  const deferredLogIndexes = new Map(), descriptorIdCache = new Map();
   let deferredLogMaintenanceTimer = null, nextToolCallRetentionSweepAt = 0, nextToolCallMemorySweepAt = 0;
   function recordToolCallDescriptor(logId, descriptorJsonText, storage) {
     if (storage === "memory") {
@@ -5775,25 +5580,9 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     }
     if (descriptorId) statement("INSERT INTO main.tool_call_descriptors(log_id,descriptor_id) VALUES(?,?)").run(logId, descriptorId);
   }
-  function runLogDiagnostic(task) {
-    if (!task) return;
-    const mode = String(task.payloadMode || "full"), storage = String(task.storage || "disk");
-    try {
-      if (task.kind === "content" && toolCallModeKeepsBinary(mode)) recordToolCallContent(task.log_id, task.direction, task.value, storage);
-      else if (task.kind === "mcp_result" && toolCallModeKeepsJson(mode))
-        statement(`UPDATE ${logTableForStorage(storage)} SET result_json=? WHERE id=?`).run(toolTransportJsonForMode(mode, task.value), task.log_id);
-    } catch (error) { console.error("Deferred Tool Call diagnostic failed:", error); }
-  }
-  function scheduleLogDiagnostic(task) {
-    if (!task) return;
-    if (deferredLogDiagnostics.length >= MAX_DEFERRED_LOG_DIAGNOSTICS) runLogDiagnostic(deferredLogDiagnostics.shift());
-    deferredLogDiagnostics.push(task);
-    if (!deferredLogMaintenanceTimer) deferredLogMaintenanceTimer = setTimeout(flushDeferredLogMaintenance, 0);
-  }
   function flushDeferredLogWork() {
     if (deferredLogMaintenanceTimer) clearTimeout(deferredLogMaintenanceTimer);
     deferredLogMaintenanceTimer = null;
-    while (deferredLogDiagnostics.length) runLogDiagnostic(deferredLogDiagnostics.shift());
     for (const [id, storage] of deferredLogIndexes) indexLog(id, storage);
     deferredLogIndexes.clear();
   }
@@ -5801,11 +5590,11 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     if (!fts) return;
     try {
       const source = logTableForStorage(storage), target = storage === "memory" ? "logs_fts_memory" : "main.logs_fts";
-      const l = one(`SELECT server_name,tool,input_json,result_json,resolved_json,stdout,stderr,error FROM ${source} WHERE id=?`, id);
+      const l = one(`SELECT server_name,tool,mcp_request_json,mcp_response_json,error FROM ${source} WHERE id=?`, id);
       if (!l) return;
-      statement(`DELETE FROM ${target} WHERE log_id=?`).run(id);
-      statement(`INSERT INTO ${target}(log_id,server,tool,input,output,stderr,error) VALUES(?,?,?,?,?,?,?)`).run(
-        id, l.server_name, l.tool, l.input_json, l.resolved_json || l.stdout || l.result_json || "", l.stderr, l.error,
+      statement(`DELETE FROM ${target} WHERE rowid=?`).run(id);
+      statement(`INSERT INTO ${target}(rowid,server,tool,request,response,error) VALUES(?,?,?,?,?,?)`).run(
+        id, l.server_name, l.tool, l.mcp_request_json, l.mcp_response_json, l.error,
       );
     } catch {}
   }
@@ -5820,7 +5609,6 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   function invalidateToolCallHistoryCaches(reason) {
     descriptorIdCache.clear();
     sessionToolStatsCache.clear();
-    toolCallAggregateCache = null;
     emitUiChange(["dashboard", "logs", "sessions", "roots", "settings"], reason);
   }
   function pruneDiskToolCallRetention(now = Date.now()) {
@@ -5833,7 +5621,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     )`;
     db.exec("BEGIN IMMEDIATE");
     try {
-      if (fts) statement(`DELETE FROM main.logs_fts WHERE CAST(log_id AS INTEGER) IN (SELECT id FROM main.logs WHERE ${eligible})`).run(cutoff);
+      if (fts) statement(`DELETE FROM main.logs_fts WHERE rowid IN (SELECT id FROM main.logs WHERE ${eligible})`).run(cutoff);
       statement(`DELETE FROM main.process_runs WHERE log_id IN (SELECT id FROM main.logs WHERE ${eligible})`).run(cutoff);
       const result = statement(`DELETE FROM main.logs WHERE ${eligible}`).run(cutoff);
       statement("DELETE FROM main.tool_descriptors WHERE NOT EXISTS (SELECT 1 FROM main.tool_call_descriptors calls WHERE calls.descriptor_id=main.tool_descriptors.id)").run();
@@ -5858,8 +5646,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const placeholders = ids.map(() => "?").join(",");
     db.exec("BEGIN");
     try {
-      if (fts) statement(`DELETE FROM logs_fts_memory WHERE CAST(log_id AS INTEGER) IN (${placeholders})`).run(...ids);
-      statement(`DELETE FROM tool_call_content_memory WHERE log_id IN (${placeholders})`).run(...ids);
+      if (fts) statement(`DELETE FROM logs_fts_memory WHERE rowid IN (${placeholders})`).run(...ids);
       statement(`DELETE FROM tool_call_descriptors_memory WHERE log_id IN (${placeholders})`).run(...ids);
       statement(`DELETE FROM process_runs_memory WHERE log_id IN (${placeholders})`).run(...ids);
       const result = statement(`DELETE FROM logs_memory WHERE id IN (${placeholders})`).run(...ids);
@@ -5874,15 +5661,13 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   }
   function flushDeferredLogMaintenance() {
     deferredLogMaintenanceTimer = null;
-    const diagnostic = deferredLogDiagnostics.shift();
-    if (diagnostic) runLogDiagnostic(diagnostic);
     const next = deferredLogIndexes.entries().next();
     if (!next.done) {
       const [id, storage] = next.value;
       deferredLogIndexes.delete(id);
       indexLog(id, storage);
     }
-    if (deferredLogDiagnostics.length || deferredLogIndexes.size) {
+    if (deferredLogIndexes.size) {
       deferredLogMaintenanceTimer = setTimeout(flushDeferredLogMaintenance, 0);
       return;
     }
@@ -5905,13 +5690,13 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   }
   requestToolCallRetentionSweep();
 
-  function rejectToolCall(p, tool, args, message, contextHandle = "", status = "failed", result = { error: message }, descriptor = null, progressRequested = false) {
+  function rejectToolCall(p, tool, args, message, contextHandle = "", status = "failed", result = { error: message }, descriptor = null, progressRequested = false, mcpRequest = null, mcpResponse = undefined) {
     const context = contextByHandle(p, contextHandle);
-    const id = beginLog(p, tool, args, contextHandle, null, descriptor, false, progressRequested, context), completed = Date.now();
-    const policy = toolCallPolicyById.get(id) || { storage: "disk", payloadMode: "full" }, mode = policy.payloadMode;
+    const id = beginLog(p, tool, args, contextHandle, null, descriptor, false, progressRequested, context, mcpRequest), completed = Date.now();
+    const policy = toolCallPolicyById.get(id) || { storage: "disk", payloadMode: "payload" }, mode = policy.payloadMode;
     updateLog(id, {
       completed_at: completed, duration_ms: 0, status,
-      error: toolCallErrorForMode(mode, message), resolved_json: toolCallJsonForMode(mode, result),
+      error: toolCallErrorForMode(mode, message), mcp_response_json: toolCallJsonForMode(mode, toolCallMcpResponse(result, mcpResponse)),
     });
     scheduleLogIndex(id, policy.storage);
     postOsNotification(
@@ -6819,12 +6604,10 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       const before = Math.min(Number(args.context_lines_before || 0), 100), afterContext = Math.min(Number(args.context_lines_after || 0), 100);
       const mode = String(args.mode || "matches"), limit = Math.min(Number(args.limit || 300), 2000);
       const maxFileBytes = Math.min(Number(args.max_file_bytes || 5 * 1024 * 1024), 50 * 1024 * 1024);
-      const maxOutputBytes = Math.min(Math.max(Number(args.max_output_bytes || 1048576), 1024), 16777216);
       const cursor = args.resume_after || null, walked = await fsWalk(selection.root.path, args.path || ".", { ...args, from_path: cursor?.path, metadata: false });
-      const files = []; let scannedFiles = 0, matchedFiles = 0, returned = 0, outputBytes = 0;
+      const files = []; let scannedFiles = 0, matchedFiles = 0, returned = 0;
       let truncated = false, truncationReason = null, nextAfter = null, lastWalkedPath = null;
       let lastReturned = cursor ? { ...cursor } : null;
-      const resultBytes = value => enc.encode(JSON.stringify(value)).length;
       for (let entryIndex = 0; entryIndex < walked.entries.length; entryIndex++) {
         const entry = walked.entries[entryIndex];
         lastWalkedPath = entry.path;
@@ -6860,17 +6643,13 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
             for (let eligibleIndex = 0; eligibleIndex < eligible.length; eligibleIndex++) {
               if (returned >= limit) { truncated = true; truncationReason = "limit"; break; }
               const lineIndex = eligible[eligibleIndex], match = contextMatches(lines, [lineIndex], before, afterContext, regex)[0];
-              const bytes = resultBytes(match);
-              if (returned > 0 && outputBytes + bytes > maxOutputBytes) {
-                truncated = true; truncationReason = "output_bytes"; break;
-              }
-              matches.push(match); returned++; outputBytes += bytes;
+              matches.push(match); returned++;
               const moreInFile = eligibleIndex < eligible.length - 1;
               lastReturned = moreInFile ? { path: entry.path, line: lineIndex + 1 } : { path: entry.path };
               const more = moreInFile || entryIndex < walked.entries.length - 1 || walked.limited;
-              if (more && (returned >= limit || outputBytes >= maxOutputBytes)) {
+              if (more && returned >= limit) {
                 truncated = true;
-                truncationReason = returned >= limit ? "limit" : "output_bytes";
+                truncationReason = "limit";
                 break;
               }
             }
@@ -6880,15 +6659,11 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           } else {
             matchedFiles++;
             const result = { path: entry.path, status: "ok", fingerprint, ...metadata, ...(mode === "count" ? { count: indexes.length } : {}) };
-            const bytes = resultBytes(result);
-            if (returned > 0 && outputBytes + bytes > maxOutputBytes) {
-              truncated = true; truncationReason = "output_bytes"; nextAfter = lastReturned; break;
-            }
-            files.push(result); returned++; outputBytes += bytes; lastReturned = { path: entry.path };
+            files.push(result); returned++; lastReturned = { path: entry.path };
             const more = entryIndex < walked.entries.length - 1 || walked.limited;
-            if (more && (returned >= limit || outputBytes >= maxOutputBytes)) {
+            if (more && returned >= limit) {
               truncated = true;
-              truncationReason = returned >= limit ? "limit" : "output_bytes";
+              truncationReason = "limit";
               nextAfter = lastReturned;
               break;
             }
@@ -6901,21 +6676,16 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         truncated = true; truncationReason = "walk_limit"; nextAfter = { path: lastWalkedPath };
       }
       return {
-        mode, scanned_files: scannedFiles, matched_files: matchedFiles, returned, limit,
-        output_bytes: outputBytes, max_output_bytes: maxOutputBytes, truncation_reason: truncationReason,
+        mode, scanned_files: scannedFiles, matched_files: matchedFiles, returned, limit, truncation_reason: truncationReason,
         files, next_resume_after: nextAfter, truncated,
       };
     }
     if (name === "fs_read") {
       const requests = args.files || [];
       const maxBytesPerFile = Math.min(Number(args.max_output_bytes_per_file || 1048576), 5242880);
-      const maxOutputBytes = Math.min(Math.max(Number(args.max_output_bytes || 2097152), 1024), 16777216);
-      const files = []; let outputBytes = 0, truncatedFiles = 0;
-      for (let requestIndex = 0; requestIndex < requests.length; requestIndex++) {
-        const file = requests[requestIndex];
-        const remainingFiles = requests.length - requestIndex;
-        const remainingBytes = Math.max(1, maxOutputBytes - outputBytes);
-        const fileBudget = Math.max(1, Math.min(maxBytesPerFile, Math.floor(remainingBytes / Math.max(1, remainingFiles))));
+      const files = [];
+      for (const file of requests) {
+        const fileBudget = maxBytesPerFile;
         try {
           const target = await resolvePath(file.path), stat = await Deno.stat(target.path);
           if (!stat.isFile) { files.push({ path: target.display, status: "not_file", size: stat.size }); continue; }
@@ -6963,8 +6733,6 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           }
           const selected = [...before, ...requested, ...after], content = selected.join("\n");
           const truncated = requestedLast < requestedEnd;
-          outputBytes += enc.encode(content).length;
-          if (truncated) truncatedFiles++;
           files.push({
             path: target.display, status: "ok", content, start_line: start, end_line: last, total_lines: total,
             truncated, next_start_line: truncated ? requestedLast + 1 : null, size: stat.size, fingerprint: await fingerprintBytes(document.bytes),
@@ -6974,11 +6742,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           files.push({ path: String(file.path), status: errorStatus(error), error: String(error?.message || error) });
         }
       }
-      return {
-        output_bytes: outputBytes, max_output_bytes: maxOutputBytes,
-        max_output_bytes_per_file: maxBytesPerFile,
-        truncated: truncatedFiles > 0, truncated_files: truncatedFiles, files,
-      };
+      return { files };
     }
     if (name === "fs_navigate") {
       const pattern = String(args.pattern || "");
@@ -7454,22 +7218,21 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         conditions.push(`instr(lower(
           CAST(id AS TEXT)||char(10)||COALESCE(CAST(started_at AS TEXT),'')||char(10)||
           COALESCE(CAST(completed_at AS TEXT),'')||char(10)||COALESCE(CAST(server_id AS TEXT),'')||char(10)||
-          server_name||char(10)||tool||char(10)||status||char(10)||payload_mode||char(10)||input_json||char(10)||resolved_json||char(10)||
-          stdout||char(10)||stderr||char(10)||error||char(10)||result_json||char(10)||
+          server_name||char(10)||tool||char(10)||status||char(10)||payload_mode||char(10)||mcp_request_json||char(10)||mcp_response_json||char(10)||
+          error||char(10)||
           COALESCE(CAST(duration_ms AS TEXT),'')||char(10)||CAST(context_id AS TEXT)||char(10)||context_handle||char(10)||
           CAST(root_id AS TEXT)||char(10)||root_name||char(10)||root_path
         ), lower(?)) > 0`);
         values.push(query);
       }
       const select = detail === "full"
-        ? "id,started_at,completed_at,tool,status,storage,payload_mode,input_json,resolved_json,stdout,stderr,error,duration_ms,root_name,root_path"
+        ? "id,started_at,completed_at,tool,status,storage,payload_mode,mcp_request_json,mcp_response_json,error,duration_ms,root_name,root_path"
         : `id,started_at,completed_at,tool,status,storage,payload_mode,duration_ms,root_name,root_path,
-           length(input_json) input_bytes,length(resolved_json) result_bytes,
-           length(stdout)+length(stderr) output_bytes,substr(error,1,1000) error_preview`;
+           length(mcp_request_json) request_bytes,length(mcp_response_json) response_bytes,substr(error,1,1000) error_preview`;
       const rows = all(`SELECT ${select} FROM logs WHERE ${conditions.join(" AND ")} ORDER BY id DESC LIMIT ?`, ...values, limit + 1);
       const truncated = !exactId && rows.length > limit, page = rows.slice(0, limit);
       const calls = page.map(row => {
-        const payloadMode = String(row.payload_mode || "full");
+        const payloadMode = String(row.payload_mode || "payload");
         const summary = {
           id: row.id, started_at: new Date(row.started_at).toISOString(),
           completed_at: row.completed_at ? new Date(row.completed_at).toISOString() : null,
@@ -7478,19 +7241,18 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         };
         if (detail === "summary") return {
           ...summary, payload_retained: toolCallModeKeepsJson(payloadMode),
-          input_bytes: Number(row.input_bytes || 0), result_bytes: Number(row.result_bytes || 0), output_bytes: Number(row.output_bytes || 0),
+          request_bytes: Number(row.request_bytes || 0), response_bytes: Number(row.response_bytes || 0),
           ...(row.error_preview ? { error_preview: row.error_preview } : {}),
         };
         if (!toolCallModeKeepsJson(payloadMode)) return {
           ...summary, payload_retained: false,
           ...(row.error ? { error: row.error } : {}),
         };
-        const input = parseJson(row.input_json, row.input_json), result = parseJson(row.resolved_json, row.resolved_json || null);
-        const partial = input?._mrmcp_payload_truncated === true || result?._mrmcp_payload_truncated === true;
         return {
-          ...summary, payload_retained: true, payload_complete: !partial,
-          input, result, output: row.stdout || row.resolved_json || "",
-          ...(row.stderr ? { stderr: row.stderr } : {}), ...(row.error ? { error: row.error } : {}),
+          ...summary, payload_retained: true, payload_complete: true,
+          mcp_request: parseJson(row.mcp_request_json, row.mcp_request_json),
+          mcp_response: parseJson(row.mcp_response_json, row.mcp_response_json || null),
+          ...(row.error ? { error: row.error } : {}),
         };
       });
       return { detail, returned: calls.length, limit, calls, next_before_id: truncated && page.length ? Number(page.at(-1).id) : null, truncated };
@@ -7568,72 +7330,11 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     return processView(record, args);
   }
 
-  function redactPublishedCapabilityUrls(value) {
-    if (typeof value === "string") {
-      if (!value.includes("/published/")) return value;
-      return value.replace(/\/published\/[A-Za-z0-9_-]{24,}\//g, "/published/[REDACTED]/");
-    }
-    if (Array.isArray(value)) {
-      let copy = null;
-      for (let index = 0; index < value.length; index++) {
-        const redacted = redactPublishedCapabilityUrls(value[index]);
-        if (redacted !== value[index]) {
-          copy ||= value.slice();
-          copy[index] = redacted;
-        }
-      }
-      return copy || value;
-    }
-    if (value && typeof value === "object") {
-      let copy = null;
-      for (const [key, item] of Object.entries(value)) {
-        const redacted = redactPublishedCapabilityUrls(item);
-        if (redacted !== item) {
-          copy ||= { ...value };
-          copy[key] = redacted;
-        }
-      }
-      return copy || value;
-    }
-    return value;
+  function redactPublishedText(value) {
+    const text = String(value ?? "");
+    if (!text.includes("/published/")) return text;
+    return text.replace(/\/published\/[A-Za-z0-9_-]{24,}\//g, "/published/[REDACTED]/");
   }
-  function toolTransportJsonForLog(value) {
-    const additions = {};
-    const extraContent = Array.isArray(value?.content) ? value.content.slice(1) : [];
-    if (extraContent.length) additions.content = extraContent;
-    if (value?._meta && typeof value._meta === "object") additions._meta = value._meta;
-    if (!Object.keys(additions).length) return "";
-    return JSON.stringify(additions, function (key, item) {
-      const type = String(this?.type || "");
-      if (typeof item === "string" && ((type === "image" && key === "data") || key === "blob"))
-        return `[binary payload omitted: ${item.length} base64 characters]`;
-      return typeof item === "string" ? redactPublishedCapabilityUrls(item) : item;
-    });
-  }
-  function toolTransportJsonForMode(mode, value) {
-    if (mode === "full") return toolTransportJsonForLog(value);
-    if (mode !== "light") return "";
-    const additions = {};
-    const extraContent = Array.isArray(value?.content) ? value.content.slice(1) : [];
-    if (extraContent.length) additions.content = extraContent;
-    if (value?._meta && typeof value._meta === "object") additions._meta = value._meta;
-    if (!Object.keys(additions).length) return "";
-    const rendered = boundedJsonStringify(additions, LIGHT_LOG_PAYLOAD_CHARS, false, function (key, item) {
-      const type = String(this?.type || "");
-      if (typeof item === "string" && ((type === "image" && key === "data") || key === "blob"))
-        return `[binary payload omitted: ${item.length} base64 characters]`;
-      return typeof item === "string" ? redactPublishedCapabilityUrls(item) : item;
-    });
-    if (!rendered.truncated) return rendered.text;
-    let preview = rendered.text, envelope = JSON.stringify({ _mrmcp_payload_truncated: true, preview });
-    while (envelope.length > LIGHT_LOG_PAYLOAD_CHARS && preview.length) {
-      const excess = envelope.length - LIGHT_LOG_PAYLOAD_CHARS;
-      preview = preview.slice(0, Math.max(0, preview.length - Math.max(excess, 256)));
-      envelope = JSON.stringify({ _mrmcp_payload_truncated: true, preview });
-    }
-    return envelope;
-  }
-
   function contextEnvelope(handle, extras = {}) {
     return { context_handle: String(handle || ""), ...extras };
   }
@@ -7643,17 +7344,17 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     if (kind === "invalid") return "The Session context_handle is invalid. Reuse a valid handle or call open_workspace with a Workspace name.";
     return "";
   }
-  function contextControlToolResult(p, name, args, resolution, descriptor = null, progressRequested = false) {
+  function contextControlToolResult(p, name, args, resolution, descriptor = null, progressRequested = false, mcpRequest = null, mcpResponse = null) {
     const handle = resolution.record?.handle || resolution.supplied_handle || "";
     const error = contextControlMessage(resolution.kind);
     const structuredContent = contextEnvelope(handle, { error });
-    const id = beginLog(p, name, args, handle, null, descriptor, false, progressRequested, resolution.record || null);
-    const policy = toolCallPolicyById.get(id) || { storage: "disk", payloadMode: "full" }, mode = policy.payloadMode;
+    const id = beginLog(p, name, args, handle, null, descriptor, false, progressRequested, resolution.record || null, mcpRequest);
+    const policy = toolCallPolicyById.get(id) || { storage: "disk", payloadMode: "payload" }, mode = policy.payloadMode;
     const toolResult = { content: [{ type: "text", text: error }], structuredContent, isError: true };
+    const responsePacket = typeof mcpResponse === "function" ? mcpResponse(toolResult) : toolCallMcpResponse(toolResult, mcpResponse ?? undefined);
     updateLog(id, {
       completed_at: Date.now(), duration_ms: 0, status: "invalid",
-      resolved_json: toolCallJsonForMode(mode, structuredContent), stdout: toolCallTextForMode(mode, error),
-      error: toolCallErrorForMode(mode, error),
+      mcp_response_json: toolCallJsonForMode(mode, responsePacket), error: toolCallErrorForMode(mode, error),
     });
     scheduleLogIndex(id, policy.storage);
     postOsNotification("tool_call", `⚠️ Invalid Tool Call #${id}`, toolCallNotificationBody(p, name, args, handle, null, error, progressRequested, resolution.record || null));
@@ -7665,8 +7366,8 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     await waitForToolCallGate();
     const id = beginLog(
       p, name, args, callInfo.contextHandle, callInfo.selection?.root, callInfo.descriptor, true, !!callInfo.progressRequested,
-      callInfo.selection?.context || null,
-    ), started = Date.now(), policy = toolCallPolicyById.get(id) || { storage: "disk", payloadMode: "full" }, payloadMode = policy.payloadMode;
+      callInfo.selection?.context || null, callInfo.mcpRequest || null,
+    ), started = Date.now(), policy = toolCallPolicyById.get(id) || { storage: "disk", payloadMode: "payload" }, payloadMode = policy.payloadMode;
     if (!activeCallControls.size) toolCallsIdle = new Promise(resolve => { resolveToolCallsIdle = resolve; });
     const control = { log_id: id, cancel: null, kind: "", process_id: "", kernel_id: "", progress_requested: !!callInfo.progressRequested };
     activeCallControls.set(id, control);
@@ -7685,41 +7386,31 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       const result = await executeTool(p, name, args, executionState);
       const publicResult = result && typeof result === "object" ? result : { value: result };
       const extraContent = Array.isArray(publicResult[TOOL_RESULT_CONTENT]) ? publicResult[TOOL_RESULT_CONTENT] : [];
-      const structuredResult = Object.fromEntries(Object.entries(publicResult));
-      const publicLogResult = redactPublishedCapabilityUrls(structuredResult);
-      const stdout = typeof publicLogResult.output === "string" ? publicLogResult.output
-        : typeof publicLogResult.stdout === "string" ? publicLogResult.stdout : "";
-      const stderr = typeof publicLogResult.stderr === "string" ? publicLogResult.stderr : "";
+      const { [TOOL_RESULT_CONTENT]: _toolResultContent, ...structuredResult } = publicResult;
       const status = structuredResult.success === false ? "failed" : "completed";
       const includeContext = !["list_workspaces", "tools_schema"].includes(name);
       const envelope = includeContext ? contextEnvelope(callInfo.contextHandle) : {};
       const structuredContent = { ...structuredResult, ...envelope };
-      const max = 1024 * 1024, rendered = typeof structuredResult.content === "string"
-        ? (() => {
-          const text = includeContext ? `${structuredResult.content}\n\ncontext_handle: ${envelope.context_handle}` : structuredResult.content;
-          return text.length > max ? text.slice(0, max) + "\n\n[text rendering truncated; structuredContent contains the complete result]" : text;
-        })()
-        : boundedPrettyToolText(structuredContent, max);
+      const rendered = typeof structuredResult.content === "string"
+        ? (includeContext ? `${structuredResult.content}\n\ncontext_handle: ${envelope.context_handle}` : structuredResult.content)
+        : `${name} ${status}. Complete result is available in structuredContent.${includeContext ? `\ncontext_handle: ${envelope.context_handle}` : ""}`;
       const resultUiResourceUri = name === "publish" ? freshUiResourceUri(PUBLISH_UI_URI) : "";
       const toolResult = {
         content: [{ type: "text", text: rendered }, ...extraContent], structuredContent, isError: status !== "completed",
         ...(resultUiResourceUri ? { _meta: { ui: { resourceUri: resultUiResourceUri } } } : {}),
       };
+      const responsePacket = typeof callInfo.mcpResponse === "function"
+        ? callInfo.mcpResponse(toolResult) : toolCallMcpResponse(toolResult, callInfo.mcpResponse);
       updateLog(id, {
         completed_at: Date.now(), duration_ms: Date.now() - started, status,
-        resolved_json: toolCallJsonForMode(payloadMode, publicLogResult),
-        stdout: toolCallTextForMode(payloadMode, stdout), stderr: toolCallTextForMode(payloadMode, stderr),
+        mcp_response_json: toolCallJsonForMode(payloadMode, responsePacket),
       });
-      if (toolCallModeKeepsBinary(payloadMode))
-        scheduleLogDiagnostic({ kind: "content", log_id: id, direction: "output", value: { structuredContent, content: [null, ...extraContent] }, ...policy });
-      if (toolCallModeKeepsJson(payloadMode) && (extraContent.length || resultUiResourceUri))
-        scheduleLogDiagnostic({ kind: "mcp_result", log_id: id, value: toolResult, ...policy });
       scheduleLogIndex(id, policy.storage);
       if (status === "failed") {
-        const failure = publicLogResult.error || publicLogResult.stderr ||
-          (publicLogResult.exit_code != null ? `Exit code ${publicLogResult.exit_code}${publicLogResult.signal ? ` · ${publicLogResult.signal}` : ""}` : "Tool returned an error");
+        const failure = structuredResult.error || structuredResult.stderr ||
+          (structuredResult.exit_code != null ? `Exit code ${structuredResult.exit_code}${structuredResult.signal ? ` · ${structuredResult.signal}` : ""}` : "Tool returned an error");
         postOsNotification("tool_call", `❌ Tool Call Failed #${id}`,
-          toolCallNotificationBody(p, name, args, callInfo.contextHandle, callInfo.selection?.root, failure, !!callInfo.progressRequested, callInfo.selection?.context || null));
+          toolCallNotificationBody(p, name, args, callInfo.contextHandle, callInfo.selection?.root, redactPublishedText(failure), !!callInfo.progressRequested, callInfo.selection?.context || null));
       }
       return toolResult;
     } catch (error) {
@@ -7729,9 +7420,11 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       const structuredContent = { error: String(error?.message || error), ...envelope };
       const text = includeContext ? `${String(error?.message || error)}\ncontext_handle: ${envelope.context_handle}` : String(error?.message || error);
       const toolResult = { content: [{ type: "text", text }], structuredContent, isError: true };
+      const responsePacket = typeof callInfo.mcpResponse === "function"
+        ? callInfo.mcpResponse(toolResult) : toolCallMcpResponse(toolResult, callInfo.mcpResponse);
       updateLog(id, {
         completed_at: Date.now(), duration_ms: Date.now() - started, status: "failed",
-        resolved_json: toolCallJsonForMode(payloadMode, structuredContent), error: toolCallErrorForMode(payloadMode, message),
+        mcp_response_json: toolCallJsonForMode(payloadMode, responsePacket), error: toolCallErrorForMode(payloadMode, message),
       });
       scheduleLogIndex(id, policy.storage);
       postOsNotification("tool_call", `❌ Tool Call Failed #${id}`,
@@ -8305,7 +7998,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       const descriptor = fullAccess ? serverToolDescriptor(p, toolName) : null;
       return rejectToolCall(
         p, toolName, x.params?.arguments || x.params || {}, message,
-        String(x.params?.arguments?.context_handle || ""), "invalid", result, descriptor, progressRequested,
+        String(x.params?.arguments?.context_handle || ""), "invalid", result, descriptor, progressRequested, x, result,
       );
     };
     const rpcError = (status, code, message, data = undefined, logInvalid = false) => {
@@ -8360,7 +8053,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     }
 
     if (x.id == null) {
-      rejectParsedToolCall("tools/call notifications are not executed", { http_status: 202, response_body: null });
+      rejectParsedToolCall("tools/call notifications are not executed", null);
       return new Response(null, { status: 202 });
     }
 
@@ -8456,20 +8149,19 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         if (!fullAccess) {
           const toolName = typeof x.params?.name === "string" && x.params.name
             ? x.params.name : "(invalid tools/call)";
+          r.error = { code: -32001, message: "Authentication required for tool execution" };
           const logId = rejectToolCall(
-            p, toolName, x.params?.arguments || x.params || {},
-            "Authentication required for tool execution", String(x.params?.arguments?.context_handle || ""),
-            "failed", { error: "Authentication required for tool execution" }, null, progressRequested,
+            p, toolName, x.params?.arguments || x.params || {}, r.error.message,
+            String(x.params?.arguments?.context_handle || ""), "failed", r.error, null, progressRequested,
+            x, { jsonrpc: "2.0", id: x.id, error: r.error },
           );
-          r.error = {
-            code: -32001, message: "Authentication required for tool execution",
-          };
           responseStatus = 403;
         } else if (!x.params?.name || typeof x.params.name !== "string") {
           r.error = { code: -32602, message: "tools/call requires params.name" };
           rejectToolCall(
             p, "(invalid tools/call)", x.params || {}, r.error.message,
-            String(x.params?.arguments?.context_handle || ""), "invalid", { jsonrpc: "2.0", id: x.id, error: r.error }, null, progressRequested,
+            String(x.params?.arguments?.context_handle || ""), "invalid", r.error, null, progressRequested,
+            x, { jsonrpc: "2.0", id: x.id, error: r.error },
           );
         } else {
           const rawToolArgs = x.params?.arguments ?? {};
@@ -8481,16 +8173,21 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
             r.error = { code: -32602, message: validationError };
             rejectToolCall(
               p, x.params.name, rawToolArgs, validationError,
-              String(rawToolArgs?.context_handle || ""), "invalid", { jsonrpc: "2.0", id: x.id, error: r.error }, descriptor, progressRequested,
+              String(rawToolArgs?.context_handle || ""), "invalid", r.error, descriptor, progressRequested,
+              x, { jsonrpc: "2.0", id: x.id, error: r.error },
             );
           } else {
             const toolArgs = { ...rawToolArgs };
+            const wrapResult = toolResult => ({
+              jsonrpc: "2.0", id: x.id,
+              result: { resultType: "complete", ...toolResult, _meta: serverInfoMeta },
+            });
             const invokeTool = async requestStream => {
               let toolResult;
               if (["list_workspaces", "tools_schema"].includes(x.params.name)) {
                 toolResult = await callTool(
                   p, x.params.name, toolArgs,
-                  { authKind: auth.kind, contextHandle: "", selection: null, descriptor, requestStream, progressRequested },
+                  { authKind: auth.kind, contextHandle: "", selection: null, descriptor, requestStream, progressRequested, mcpRequest: x, mcpResponse: wrapResult },
                 );
               } else if (x.params.name === "open_workspace") {
                 delete toolArgs.context_handle;
@@ -8506,7 +8203,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
                   const error = `Unknown or disabled Workspace: ${String(toolArgs.name || "")}`;
                   const structuredContent = contextEnvelope(handle, { error });
                   toolResult = { content: [{ type: "text", text: error }], structuredContent, isError: true };
-                  rejectToolCall(p, x.params.name, toolArgs, error, handle, "invalid", toolResult, descriptor, progressRequested);
+                  rejectToolCall(p, x.params.name, toolArgs, error, handle, "invalid", toolResult, descriptor, progressRequested, x, wrapResult(toolResult));
                 } else {
                   const current = resolveContext(p, toolArgs.current_context_handle, observedProtocol);
                   let record;
@@ -8525,7 +8222,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
                   const selection = { context: record, root: runtimeWorkspaceRoot(workspace) };
                   toolResult = await callTool(
                     p, x.params.name, toolArgs,
-                    { authKind: auth.kind, contextHandle: record.handle, selection, descriptor, requestStream, progressRequested, workspaceCreated },
+                    { authKind: auth.kind, contextHandle: record.handle, selection, descriptor, requestStream, progressRequested, workspaceCreated, mcpRequest: x, mcpResponse: wrapResult },
                   );
                 }
               } else {
@@ -8534,9 +8231,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
                   const selection = { context: resolution.record, root: selectedContextRoot(p, resolution.record) };
                   toolResult = await callTool(
                     p, x.params.name, toolArgs,
-                    { authKind: auth.kind, contextHandle: resolution.record.handle, selection, descriptor, requestStream, progressRequested },
+                    { authKind: auth.kind, contextHandle: resolution.record.handle, selection, descriptor, requestStream, progressRequested, mcpRequest: x, mcpResponse: wrapResult },
                   );
-                } else toolResult = contextControlToolResult(p, x.params.name, toolArgs, resolution, descriptor, progressRequested);
+                } else toolResult = contextControlToolResult(p, x.params.name, toolArgs, resolution, descriptor, progressRequested, x, wrapResult);
               }
               return toolResult;
             };
@@ -8544,10 +8241,6 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
             const streamingTool = x.params.name === "exec_attach" ||
               (progressRequested && (x.params.name === "exec" || customProcessTool));
             const acceptsSse = acceptsMediaType(req.headers.get("accept"), "text/event-stream");
-            const wrapResult = toolResult => ({
-              jsonrpc: "2.0", id: x.id,
-              result: { resultType: "complete", ...toolResult, _meta: serverInfoMeta },
-            });
             if (streamingTool && acceptsSse) {
               return mcpSseResponse(
                 x.id, requestMeta.progressToken,
@@ -8879,13 +8572,13 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     if (["all", "dashboard"].includes(section)) {
       result.server = serverProjection(p);
       result.active_tool_calls = dashboardToolCallsProjection(p);
-      const toolCalls = toolCallAggregates(p);
+      const toolCalls = result.header_activity;
       result.stats = {
         context_values: one("SELECT COUNT(*) n FROM contexts WHERE server_id=? AND handle LIKE 'ctx_%'", p.id)?.n || 0,
         roots: one("SELECT COUNT(*) n FROM roots WHERE server_id=? AND enabled=1", p.id)?.n || 0,
-        logs: toolCalls.total,
+        logs: toolCalls.tool_calls_total,
         in_flight: activeCallControls.size,
-        failures: toolCalls.errors,
+        failures: toolCalls.tool_calls_errors,
         total_requests: requestMetricValue,
       };
     }
@@ -8960,25 +8653,43 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const workspaces = all("SELECT name FROM roots WHERE server_id=? ORDER BY name COLLATE NOCASE", serverId).map(row => String(row.name));
     return { rows, total, page, pages, page_size: pageSize, sessions, workspaces, scope, context: context || "", workspace, query, from, to };
   };
-  const adminContentView = row => ({
-    id: Number(row.id), direction: String(row.direction), json_path: String(row.json_path), content_type: String(row.content_type),
-    mime_type: String(row.mime_type), bytes: Number(row.bytes || 0),
-    data_url: String(row.mime_type || "").startsWith("image/") ? `data:${row.mime_type};base64,${Buffer.from(row.data).toString("base64")}` : "",
-  });
-  const adminContentRowsForLogs = logIds => {
-    const ids = [...new Set((logIds || []).map(Number).filter(id => Number.isInteger(id) && id > 0))], byLog = new Map(ids.map(id => [id, []]));
-    if (!ids.length) return byLog;
-    const rows = all(`SELECT log_id,id,direction,json_path,content_type,mime_type,bytes,data FROM tool_call_content_all
-      WHERE log_id IN (${ids.map(() => "?").join(",")}) ORDER BY log_id,direction,id`, ...ids);
-    for (const row of rows) byLog.get(Number(row.log_id))?.push(adminContentView(row));
-    return byLog;
+  const adminInlineImages = (value, direction = "output") => {
+    const images = [], seen = new WeakSet();
+    const add = (path, mimeType, base64) => {
+      const bytes = decodeLogBase64(base64);
+      if (!bytes?.length) return;
+      const mime = String(mimeType || sniffLogBinaryMime(bytes) || "").split(";")[0].trim().toLowerCase();
+      if (!mime.startsWith("image/")) return;
+      images.push({
+        direction, json_path: path, content_type: "inline", mime_type: mime, bytes: bytes.length,
+        data_url: `data:${mime};base64,${Buffer.from(bytes).toString("base64")}`,
+      });
+    };
+    const visit = (item, path = "$") => {
+      if (typeof item === "string") {
+        const dataUrl = item.startsWith("data:") ? item.match(/^data:([^;,\s]+)(?:;[^,]*)?;base64,([A-Za-z0-9+/=\s]+)$/i) : null;
+        if (dataUrl) add(path, dataUrl[1], dataUrl[2]);
+        else {
+          const mime = sniffLogBase64ValueMime(item);
+          if (mime.startsWith("image/")) add(path, mime, item);
+        }
+        return;
+      }
+      if (!item || typeof item !== "object" || seen.has(item)) return;
+      seen.add(item);
+      if (item.type === "image" && typeof item.data === "string")
+        add(`${path}.data`, item.mimeType || item.mime_type || "image/png", item.data);
+      for (const [key, child] of Object.entries(item)) visit(child, `${path}.${key}`);
+    };
+    visit(value);
+    return images;
   };
   const cdpAdminMessage = message => {
-    const value = structuredClone(cdpPublicMessage(message));
-    const data = value?.cdp?.result?.data;
-    if (typeof data === "string" && data.length > 256)
-      value.cdp.result.data = `[base64 payload omitted from Browser JSON: ${data.length} characters]`;
-    return value;
+    const value = cdpPublicMessage(message), data = value?.cdp?.result?.data;
+    if (typeof data !== "string" || data.length <= 256) return value;
+    return { ...value, cdp: { ...value.cdp, result: {
+      ...value.cdp.result, data: `[base64 payload omitted from Browser JSON: ${data.length} characters]`,
+    } } };
   };
   const browserAdminProjection = (current = {}) => {
     const p = serverConfig(), browserFilter = String(current.browser || ""), targetFilter = String(current.target || ""),
@@ -8987,39 +8698,47 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const browserSet = new Set(persistent.map(row => String(row.browser)));
     for (const name of cdpBrowsers.keys()) browserSet.add(String(name));
     const targetSet = new Set(all("SELECT DISTINCT target FROM cdp_targets ORDER BY target COLLATE NOCASE").map(row => String(row.target)));
-    const logRows = all(`SELECT id,started_at,completed_at,context_id,context_handle,root_name,status,duration_ms,input_json,resolved_json
-      FROM logs WHERE server_id=? AND tool='cdp_call' AND payload_mode='full' AND (?=0 OR context_id=?) ORDER BY started_at DESC,id DESC LIMIT 500`, p.id, contextFilter, contextFilter);
-    const allOperations = [];
-    for (const row of logRows) {
-      const input = parseJson(row.input_json || "{}", {}), resolved = parseJson(row.resolved_json || "{}", {}), calls = Array.isArray(input.calls) ? input.calls : [];
-      calls.forEach((spec, index) => {
-        const browser = String(spec?.browser ?? "main").trim() || "main", target = spec?.target == null ? "" : String(spec.target),
-          call = spec?.call && typeof spec.call === "object" ? spec.call : {}, live = cdpBrowsers.get(browser),
-          active = !!(live?.open && live.ws?.readyState === WebSocket.OPEN),
-          operationResult = Array.isArray(resolved?.results) ? resolved.results[index] : null;
-        browserSet.add(browser); if (target) targetSet.add(target);
-        allOperations.push({
-          log_id: Number(row.id), call_index: index, batch_size: calls.length, started_at: Number(row.started_at), completed_at: Number(row.completed_at || 0),
-          context_id: Number(row.context_id) || 0, root_name: String(row.root_name || ""), status: String(row.status), duration_ms: row.duration_ms,
-          browser, target, active, method: call._mrmcp ? `_mrmcp.${call._mrmcp}` : String(call.method || ""),
-          wait: input.wait !== false, call: spec, response: operationResult ? cdpAdminMessage(operationResult) : null,
-          success: operationResult ? operationResult.success !== false && !operationResult.error : null, images: [],
-        });
-      });
+    const scannedOperations = [], operations = [], scanBatchSize = 50, scanLimit = 500, operationLimit = 200;
+    let scannedToolCalls = 0, beforeId = Number.MAX_SAFE_INTEGER, scanExhausted = false;
+    const operationMatchesFilters = operation =>
+      (!browserFilter || operation.browser === browserFilter) && (!targetFilter || operation.target === targetFilter) &&
+      (!contextFilter || operation.context_id === contextFilter) && (!activeFilter || (activeFilter === "active") === operation.active);
+    while (scannedToolCalls < scanLimit && operations.length < operationLimit) {
+      const batchLimit = Math.min(scanBatchSize, scanLimit - scannedToolCalls);
+      const logRows = all(`SELECT id,started_at,completed_at,context_id,root_name,status,duration_ms,mcp_request_json,mcp_response_json
+        FROM logs WHERE server_id=? AND tool='cdp_call' AND payload_mode='payload' AND (?=0 OR context_id=?) AND id<?
+        ORDER BY id DESC LIMIT ?`, p.id, contextFilter, contextFilter, beforeId, batchLimit);
+      if (!logRows.length) { scanExhausted = true; break; }
+      scannedToolCalls += logRows.length;
+      beforeId = Number(logRows.at(-1).id);
+      for (const row of logRows) {
+        const input = mcpToolArgsFromPacket(row.mcp_request_json), resolved = mcpToolStructuredResultFromPacket(row.mcp_response_json), calls = Array.isArray(input.calls) ? input.calls : [];
+        for (let index = 0; index < calls.length; index++) {
+          const spec = calls[index], browser = String(spec?.browser ?? "main").trim() || "main", target = spec?.target == null ? "" : String(spec.target),
+            call = spec?.call && typeof spec.call === "object" ? spec.call : {}, live = cdpBrowsers.get(browser),
+            active = !!(live?.open && live.ws?.readyState === WebSocket.OPEN),
+            operationResult = Array.isArray(resolved?.results) ? resolved.results[index] : null;
+          browserSet.add(browser); if (target) targetSet.add(target);
+          const operation = {
+            log_id: Number(row.id), call_index: index, batch_size: calls.length, started_at: Number(row.started_at), completed_at: Number(row.completed_at || 0),
+            context_id: Number(row.context_id) || 0, root_name: String(row.root_name || ""), status: String(row.status), duration_ms: row.duration_ms,
+            browser, target, active, method: call._mrmcp ? `_mrmcp.${call._mrmcp}` : String(call.method || ""),
+            wait: input.wait !== false, call: spec, response: operationResult ? cdpAdminMessage(operationResult) : null,
+            success: operationResult ? operationResult.success !== false && !operationResult.error : null,
+            images: operationResult ? adminInlineImages(operationResult, "output") : [],
+          };
+          scannedOperations.push(operation);
+          if (operationMatchesFilters(operation)) operations.push(operation);
+          if (operations.length >= operationLimit) break;
+        }
+        if (operations.length >= operationLimit) break;
+      }
+      if (logRows.length < batchLimit) { scanExhausted = true; break; }
     }
-    const originBrowserMatches = new Set(allOperations.filter(operation =>
+    const originBrowserMatches = new Set(scannedOperations.filter(operation =>
       (!contextFilter || operation.context_id === contextFilter) && (!targetFilter || operation.target === targetFilter)
     ).map(operation => operation.browser));
-    const operationMatches = allOperations.filter(operation =>
-      (!browserFilter || operation.browser === browserFilter) && (!targetFilter || operation.target === targetFilter) &&
-      (!contextFilter || operation.context_id === contextFilter) && (!activeFilter || (activeFilter === "active") === operation.active)
-    );
-    const operations = operationMatches.slice(0, 200), contentByLog = adminContentRowsForLogs(operations.map(operation => operation.log_id));
-    for (const operation of operations) {
-      const contents = contentByLog.get(operation.log_id) || [];
-      operation.images = contents.filter(content => content.data_url && new RegExp(`(?:^|\\.)results\\.${operation.call_index}(?:\\.|$)`).test(content.json_path));
-      if (!operation.images.length && operation.batch_size === 1) operation.images = contents.filter(content => content.data_url);
-    }
+    const operationHasMore = !scanExhausted && (operations.length >= operationLimit || scannedToolCalls >= scanLimit);
     const browserRows = [...browserSet].sort((a, b) => a.localeCompare(b)).map(browser => {
       const saved = persistent.find(row => String(row.browser) === browser) || {}, live = cdpBrowsers.get(browser);
       const active = !!(live?.open && live.ws?.readyState === WebSocket.OPEN);
@@ -9045,7 +8764,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         stream_resets: subscriptions.reduce((sum, subscription) => sum + Number(subscription.stream_resets || 0), 0),
         live_target_count: liveTargets.length, logical_target_count: targets.length, live_targets: liveTargets,
         subscription_count: subscriptions.length,
-        session_ids: [...new Set(allOperations.filter(operation => operation.browser === browser && operation.context_id).map(operation => operation.context_id))].sort((a, b) => b - a),
+        session_ids: [...new Set(scannedOperations.filter(operation => operation.browser === browser && operation.context_id).map(operation => operation.context_id))].sort((a, b) => b - a),
         targets, subscriptions: subscriptions.map(subscription => ({
           id: subscription.id, targets: subscription.targets, methods: subscription.methods, method_prefixes: subscription.method_prefixes,
           include_browser: subscription.include_browser, regex: subscription.regex_source || "", regex_flags: subscription.regex_flags || "",
@@ -9075,23 +8794,23 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       if (!added) break;
     }
     return {
-      browsers: browserRows, browser_total: browserSet.size, operations, operation_matches: operationMatches.length, ring,
+      browsers: browserRows, browser_total: browserSet.size, operations, operation_matches: operations.length, operation_has_more: operationHasMore,
+      operation_scan_calls: scannedToolCalls, operation_scan_limit: scanLimit, ring,
       browser_values: [...browserSet].sort((a, b) => a.localeCompare(b)), target_values: [...targetSet].sort((a, b) => a.localeCompare(b)),
-      sessions: all("SELECT DISTINCT context_id FROM logs WHERE server_id=? AND tool='cdp_call' AND payload_mode='full' AND context_id>0 ORDER BY context_id DESC", p.id).map(row => Number(row.context_id)),
+      sessions: all("SELECT DISTINCT context_id FROM logs WHERE server_id=? AND tool='cdp_call' AND payload_mode='payload' AND context_id>0 ORDER BY context_id DESC", p.id).map(row => Number(row.context_id)),
       browser: browserFilter, target: targetFilter, context: contextFilter || "", active: activeFilter,
-      tool_calls_total: Number(one("SELECT COUNT(*) n FROM logs WHERE server_id=? AND tool='cdp_call' AND payload_mode='full'", p.id)?.n || 0),
+      tool_calls_total: Number(one("SELECT COUNT(*) n FROM logs WHERE server_id=? AND tool='cdp_call' AND payload_mode='payload'", p.id)?.n || 0),
     };
   };
   const automationAdminProjection = (current = {}) => {
-    const p = serverConfig(), contextFilter = Math.max(0, Number(current.context) || 0), values = [p.id], where = ["server_id=?", "tool='desktop_auto'", "payload_mode='full'"], pageSize = 10;
+    const p = serverConfig(), contextFilter = Math.max(0, Number(current.context) || 0), values = [p.id], where = ["server_id=?", "tool='desktop_auto'", "payload_mode='payload'"], pageSize = 10;
     if (contextFilter) { where.push("context_id=?"); values.push(contextFilter); }
     const sqlWhere = where.join(" AND "), total = Number(one(`SELECT COUNT(*) n FROM logs WHERE ${sqlWhere}`, ...values)?.n || 0),
       pages = Math.max(1, Math.ceil(total / pageSize)), page = Math.min(pages, Math.max(1, Number(current.page) || 1)), offset = (page - 1) * pageSize;
-    const sourceRows = all(`SELECT id,started_at,completed_at,context_id,context_handle,root_name,status,duration_ms,input_json,resolved_json,error
+    const sourceRows = all(`SELECT id,started_at,completed_at,context_id,context_handle,root_name,status,duration_ms,mcp_request_json,mcp_response_json,error
       FROM logs WHERE ${sqlWhere} ORDER BY started_at DESC,id DESC LIMIT ? OFFSET ?`, ...values, pageSize, offset);
-    const contentByLog = adminContentRowsForLogs(sourceRows.map(row => row.id));
     const rows = sourceRows.map(row => {
-      const input = parseJson(row.input_json || "{}", {}), resolved = parseJson(row.resolved_json || "{}", {}), yaml = String(input.yaml || "");
+      const input = mcpToolArgsFromPacket(row.mcp_request_json), resolved = mcpToolStructuredResultFromPacket(row.mcp_response_json), yaml = String(input.yaml || "");
       let scenario = null, scenario_error = "";
       try { scenario = yaml ? parseYaml(yaml) : null; } catch (error) { scenario_error = String(error?.message || error); }
       const actions = Array.isArray(scenario) ? scenario.map((step, index) => {
@@ -9099,15 +8818,15 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         const [action, params] = entries[0] || ["unknown", step];
         return { index: index + 1, action: String(action), params };
       }) : [];
-      const contents = contentByLog.get(Number(row.id)) || [];
+      const contents = [...adminInlineImages(input, "input"), ...adminInlineImages(resolved, "output")];
       return {
         id: Number(row.id), started_at: Number(row.started_at), completed_at: Number(row.completed_at || 0), context_id: Number(row.context_id) || 0,
         root_name: String(row.root_name || ""), status: String(row.status), duration_ms: row.duration_ms, yaml, scenario, scenario_error, actions,
         result: resolved, results_count: Array.isArray(resolved?.results) ? resolved.results.length : 0,
-        images: contents.filter(content => content.data_url), contents, error: String(row.error || ""),
+        images: contents, contents, error: String(row.error || ""),
       };
     });
-    const sessions = all("SELECT DISTINCT context_id FROM logs WHERE server_id=? AND tool='desktop_auto' AND payload_mode='full' AND context_id>0 ORDER BY context_id DESC", p.id).map(row => Number(row.context_id));
+    const sessions = all("SELECT DISTINCT context_id FROM logs WHERE server_id=? AND tool='desktop_auto' AND payload_mode='payload' AND context_id>0 ORDER BY context_id DESC", p.id).map(row => Number(row.context_id));
     return { rows, sessions, context: contextFilter || "", total, page, pages, page_size: pageSize };
   };
 
@@ -9183,15 +8902,15 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 <? } else if(section==="prompts"){ const p=s.prompts||{}; ?><section id=prompts class=page><div class=row><h2 class=grow>🧭 Guided Prompts</h2><button data-action=prompt-help>❓ Template Help</button><button class=primary data-action=new-prompt>➕ Add Prompt</button></div><p class=muted><code>guided_prompts.yaml</code> is authoritative. Entries are exposed through MCP <code>prompts/list</code> and rendered on demand through <code>prompts/get</code>.</p><div class=row><input id=promptQuery class=grow placeholder="Search name, title, description or arguments…" value="<?= p.query||'' ?>"><select id=promptPageSize><? [5,10,25,50].forEach(n=>{ ?><option<?= Number(p.pageSize||5)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-prompts>🔎 Search</button></div><div id=promptList></div></section>
 <? } else if(section==="prompt_help"){ const h=s.promptHelp||{}; ?><section id=prompt_help class=page><div class=row><h2 class=grow>🧭 Guided Prompt Templates</h2><button data-action=prompts-back>← Guided Prompts</button></div><div class=card><h3>YAML shape</h3><p><code>guided_prompts.yaml</code> contains a top-level <code>prompts</code> array. Prompt arguments are MCP string arguments with <code>name</code> plus optional <code>title</code>, <code>description</code> and <code>required</code>; <code>required</code> controls whether the client must supply them.</p><pre><?= h.yaml||'' ?></pre></div><div class=card><h3>Eta</h3><p>The <code>template</code> is rendered with Eta using standard tags and no HTML escaping. Read values with <code>&lt;%= it.args.focus %&gt;</code>, use normal JavaScript in <code>&lt;% ... %&gt;</code>, and branch on any model field. Templates are trusted local configuration and are not sandboxed.</p><pre><?= h.model||'' ?></pre></div><div class=card><h3>Session / Workspace context</h3><p><code>it.session</code> and <code>it.workspace</code> are populated only when the prompt declares a <code>context_handle</code> argument and the client supplies a valid active MrMCP Session handle. <code>it.workspaces</code> is always available and includes the fallback Workspace plus enabled named Workspaces.</p></div></section>
 <? } else if(section==="logs"){ const l=s.logs||{}; ?><section id=logs class=page><div class=row><h2 class=grow>🛠️ Tool Calls</h2><button class=danger data-action=clear-tool-calls<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Click a row for details. Terminate active work from Actions.</p><div class=row><input id=logTool placeholder="Tool / command…" value="<?= l.toolQuery||'' ?>"><input id=logQuery class=grow placeholder="Search input, output, errors…" value="<?= l.query||'' ?>"><select id=logContext><option value="">All sessions</option><? (s.contextValues||[]).forEach(v=>{ ?><option value="<?= v.pk ?>"<?= String(l.context||"")===String(v.pk)?" selected":"" ?>>#<?= v.pk ?></option><? }) ?></select><select id=logStatus class="<?= l.status||'' ?>"><option value="">All states</option><? ['completed','failed','invalid','running'].forEach(v=>{ ?><option class="<?= v ?>" value="<?= v ?>"<?= l.status===v?' selected':'' ?>><?= v ?></option><? }) ?></select><select id=logPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(l.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=clear-log-filters>🧹 Clear Filters</button></div><? if(l.selfTest){ ?><div id=logSelfTest class=card><div class=row><h3 class=grow>🧪 MCP Self-Test</h3><button class=small data-action=copy-detail data-target=logDetail>📋 Copy JSON</button><button class=small data-action=close-self-test>✕ Close</button></div><pre id=logDetail><?= it.pretty(l.selfTest) ?></pre></div><? } ?><div id=logList></div></section>
-<? } else if(section==="browser"){ ?><section id=browser class=page><div class=row><h2 class=grow>🌐 Browser</h2><span class=muted>CDP state · retained traffic · replay</span></div><p class=muted>Diagnostic view over existing CDP browser/profile state, logical targets, subscriptions and retained ring traffic. Recorded request/response inspection and Replay use only Tool Calls retained in Full mode.</p><div id=browserList></div></section>
-<? } else if(section==="automation"){ ?><section id=automation class=page><div class=row><h2 class=grow>🖱️ Automation</h2><span class=muted>AAF scenarios · screenshots · replay</span></div><p class=muted>Diagnostic view over <code>desktop_auto</code> Tool Calls retained in Full mode. Open a scenario/result to inspect its retained payloads, or replay it through the same stateless Auto.js engine.</p><div id=automationList></div></section>
+<? } else if(section==="browser"){ ?><section id=browser class=page><div class=row><h2 class=grow>🌐 Browser</h2><span class=muted>CDP state · retained traffic · replay</span></div><p class=muted>Diagnostic view over existing CDP browser/profile state, logical targets, subscriptions and retained ring traffic. Recorded request/response inspection and Replay use only Tool Calls retained with Payload mode.</p><div id=browserList></div></section>
+<? } else if(section==="automation"){ ?><section id=automation class=page><div class=row><h2 class=grow>🖱️ Automation</h2><span class=muted>AAF scenarios · screenshots · replay</span></div><p class=muted>Diagnostic view over <code>desktop_auto</code> Tool Calls retained with Payload mode. Open a scenario/result to inspect its retained payloads, or replay it through the same stateless Auto.js engine.</p><div id=automationList></div></section>
 <? } else if(section==="published"){ ?><section id=published class=page><div class=row><h2 class=grow>📦 Published</h2><button class=danger data-action=clear-published<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear Matching</button></div><p class=muted>Deduplicated persistent content snapshots created by <code>publish</code>. Path, text and Base64 sources all become ordinary files under <code>.mrmcp/publish</code>; one resource may have references from multiple Sessions and Workspaces.</p><div id=publishedList></div></section>
 <? } else if(section==="trash"){ ?><section id=trash class=page><div class=row><h2 class=grow>🗑️ Trash</h2><span class=muted>Persistent reversible filesystem trash · independent of Tool Call logging</span></div><div id=trashList></div></section>
 <? } else if(section==="memory"){ const m=s.memory||{}; ?><section id=memory class=page><div class=row><h2 class=grow>🧠 Memory</h2><button class=primary data-action=new-memory>➕ New Memory</button></div><p class=muted>Persistent explicit key-value memory. Create it here or through <code>memory_set</code>. Each value is explicitly JSON or plain text; Global memory is server-wide, Session memory belongs to one Session, and Workspace memory is shared by Workspace label. Expired TTL entries are removed automatically.</p><div class=row><input id=memoryQuery class=grow placeholder="Search keys or values…" value="<?= m.query||'' ?>"><select id=memoryScope><option value=""<?= !m.scope?' selected':'' ?>>All scopes</option><option value=global<?= m.scope==='global'?' selected':'' ?>>Global</option><option value=session<?= m.scope==='session'?' selected':'' ?>>Session</option><option value=workspace<?= m.scope==='workspace'?' selected':'' ?>>Workspace</option></select><select id=memoryContext><option value="">All sessions</option><? (m.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(m.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=memoryWorkspace><option value="">All workspaces</option><? (m.workspaces||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= String(m.workspace||'')===String(name)?' selected':'' ?>><?= name ?></option><? }) ?></select><input id=memoryFrom type=date title="Set on or after" value="<?= m.from||'' ?>"><input id=memoryTo type=date title="Set on or before" value="<?= m.to||'' ?>"><button data-action=load-memory>🔎 Search</button><button data-action=clear-memory-filters>🧹 Clear Filters</button></div><div id=memoryList></div></section>
 <? } else if(section==="debug"){ const d=s.debug||{},enabled=!!s.debug?.enabled; ?><section id=debug class=page><div class=row><h2 class=grow>🐞 HTTP Debug Log</h2><button class="debug-toggle <?= enabled?'enabled':'disabled' ?>" data-action=toggle-debug-settings aria-pressed="<?= enabled?'true':'false' ?>"><?= enabled?"🟢 Logging ON · Disable":"🔴 Logging OFF · Enable" ?></button><button class=danger data-action=clear-debug>🗑️ Clear</button></div><p class=muted>Off by default. Secrets are redacted. Disabling stops new records but keeps stored data visible. Click a row for request JSON.</p><div class=row><input id=debugQuery class=grow placeholder="Search URL, headers, body or errors…" value="<?= d.query||'' ?>"><select id=debugMethod><option value="">All methods</option><? ['GET','POST','OPTIONS'].forEach(v=>{ ?><option<?= d.method===v?' selected':'' ?>><?= v ?></option><? }) ?></select><input id=debugStatus type=number placeholder="Status" value="<?= d.status||'' ?>"><button data-action=load-debug>🔎 Search</button></div><div id=debugList></div></section>
 <? } else if(section==="oauth"){ ?><section id=oauth class=page><div class=row><h2 class=grow>🔐 OAuth Clients</h2><button class=danger data-action=clear-clients<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><div id=oauthList></div></section>
 <? } else if(section==="telegram"){ const t=s.telegram||{}; ?><section id=telegram class=page><div class=row><h2 class=grow>✈️ Telegram</h2><button class=primary data-action=save-telegram<?= t.save_disabled?' disabled':'' ?>>💾 Save Telegram</button></div><div class=card><h3>🤖 Telegram Bot</h3><div class=row><label class=grow>Bot token</label><? if(t.field_warning){ ?><span class=field-warning>⚠ <?= t.field_warning ?></span><? } ?></div><input id=telegramBotToken type=password autocomplete=off value="<?= t.telegram_bot_token||'' ?>" placeholder="123456789:AA…"><p class=muted>Used only by <code>telegram_req</code> to authenticate Bot API requests. Chat IDs, channels and application state are intentionally left to the agent/Memory.</p></div></section>
-<? } else if(section==="settings"){ const tab=s.settingsTab||"network"; ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><nav class=settings-tabs aria-label="Settings sections"><? [["network","🌐","Network"],["security","🔒","Security"],["process","🖥️","Process"],["notifications","🔔","Notifications"],["maintenance","🧹","Maintenance"]].forEach(([id,icon,label])=>{ ?><button data-action=settings-tab data-settings-tab="<?= id ?>" class="<?= tab===id?'active':'' ?>"<?= tab===id?' aria-current=page':'' ?>><?= icon ?> <?= label ?></button><? }) ?></nav><div class=settings-layout><div class=settings-main><div class=card<? if(tab!=="network"){ ?> hidden<? } ?>><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card<? if(tab!=="security"){ ?> hidden<? } ?>><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card<? if(tab!=="notifications"){ ?> hidden<? } ?>><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card<? if(tab!=="process"){ ?> hidden<? } ?>><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><label><input id=gitPreserveLineEndings type=checkbox<?= settings.git_preserve_line_endings?" checked":"" ?>> Preserve Git working-tree line endings across platforms</label><p class=muted>When enabled, every managed process gets Git runtime config <code>core.autocrlf=false</code>. Repository <code>.gitattributes</code> and an explicit <code>git -c</code> can still override it.</p><div class=row><label class=grow>Environment variables for all spawned processes · one <code>NAME=value</code> per line</label><? if(settings.field_warnings?.exec_environment){ ?><span class=field-warning>⚠ <?= settings.field_warnings.exec_environment ?></span><? } ?></div><textarea id=execEnvironment rows=8 placeholder="CACHE_DIR=\${MRMCP_DIR}&#10;TOOLS=\${MRMCP_BIN}&#10;PROJECT=\${WORKSPACE}&#10;RUN_FROM=\${CWD}"><?= settings.exec_environment||'' ?></textarea><p class=muted>Available placeholders: <code>\${MRMCP_DIR}</code> = MrMCP data directory, <code>\${MRMCP_BIN}</code> = managed bin directory, <code>\${WORKSPACE}</code> = current Workspace root, <code>\${CWD}</code> = effective exec directory. Precedence: system environment → these settings → per-call <code>env</code>. Off PATH inheritance leaves child <code>PATH</code> as only <code>.mrmcp/bin</code>; PATH remains governed by this toggle rather than the generic environment list.</p></div><div class=card<? if(tab!=="maintenance"){ ?> hidden<? } ?>><h3>🧹 Tool Call History</h3><label>History storage</label><select id=toolCallStorage><option value=disk<?= settings.tool_call_storage==='disk'?' selected':'' ?>>Disk · survives restart</option><option value=memory<?= settings.tool_call_storage==='memory'?' selected':'' ?>>Memory · SQLite TEMP, volatile</option></select><p class=muted>Storage and payload retention are independent. Disk writes Tool Call history to the main SQLite database. Memory uses SQLite TEMP tables in RAM with the same Tool Call ids, GUI and tools_log behavior; rows disappear on restart.</p><label>Payload retention</label><select id=toolCallPayloadMode><option value=full<?= settings.tool_call_payload_mode==='full'?' selected':'' ?>>Full · complete diagnostic payloads and binary content</option><option value=light<?= settings.tool_call_payload_mode==='light'?' selected':'' ?>>Light · bounded JSON/text previews, no binary</option><option value=metadata<?= settings.tool_call_payload_mode==='metadata'?' selected':'' ?>>Metadata · no Tool Call request/response payload copies</option></select><p class=muted>Payload retention affects only diagnostic copies in Tool Call history. Functional state required by tools remains available in its owning subsystem; for example persistent-process command/output state is retained independently so exec_attach and exec_status keep working.</p><div class=row><label class=grow>Disk retention hours · 0 keeps indefinitely</label><? if(settings.field_warnings?.tool_call_retention_hours){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_retention_hours ?></span><? } ?></div><input id=toolCallRetentionHours type=number min=0 step=1 value="<?= settings.tool_call_retention_hours??0 ?>"><div class=row><label class=grow>Memory retention minutes · 0 keeps until restart</label><? if(settings.field_warnings?.tool_call_memory_retention_minutes){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_memory_retention_minutes ?></span><? } ?></div><input id=toolCallMemoryRetentionMinutes type=number min=0 step=1 value="<?= settings.tool_call_memory_retention_minutes??60 ?>"><p class=muted>Retention removes completed history from its own storage tier and keeps origins of still-running persistent processes. Changing the current storage or payload setting affects new Tool Calls only; existing rows retain their own storage and payload capabilities.</p><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, Memory, CDP browser state, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
+<? } else if(section==="settings"){ const tab=s.settingsTab||"network"; ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><nav class=settings-tabs aria-label="Settings sections"><? [["network","🌐","Network"],["security","🔒","Security"],["process","🖥️","Process"],["notifications","🔔","Notifications"],["maintenance","🧹","Maintenance"]].forEach(([id,icon,label])=>{ ?><button data-action=settings-tab data-settings-tab="<?= id ?>" class="<?= tab===id?'active':'' ?>"<?= tab===id?' aria-current=page':'' ?>><?= icon ?> <?= label ?></button><? }) ?></nav><div class=settings-layout><div class=settings-main><div class=card<? if(tab!=="network"){ ?> hidden<? } ?>><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card<? if(tab!=="security"){ ?> hidden<? } ?>><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card<? if(tab!=="notifications"){ ?> hidden<? } ?>><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card<? if(tab!=="process"){ ?> hidden<? } ?>><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><label><input id=gitPreserveLineEndings type=checkbox<?= settings.git_preserve_line_endings?" checked":"" ?>> Preserve Git working-tree line endings across platforms</label><p class=muted>When enabled, every managed process gets Git runtime config <code>core.autocrlf=false</code>. Repository <code>.gitattributes</code> and an explicit <code>git -c</code> can still override it.</p><div class=row><label class=grow>Environment variables for all spawned processes · one <code>NAME=value</code> per line</label><? if(settings.field_warnings?.exec_environment){ ?><span class=field-warning>⚠ <?= settings.field_warnings.exec_environment ?></span><? } ?></div><textarea id=execEnvironment rows=8 placeholder="CACHE_DIR=\${MRMCP_DIR}&#10;TOOLS=\${MRMCP_BIN}&#10;PROJECT=\${WORKSPACE}&#10;RUN_FROM=\${CWD}"><?= settings.exec_environment||'' ?></textarea><p class=muted>Available placeholders: <code>\${MRMCP_DIR}</code> = MrMCP data directory, <code>\${MRMCP_BIN}</code> = managed bin directory, <code>\${WORKSPACE}</code> = current Workspace root, <code>\${CWD}</code> = effective exec directory. Precedence: system environment → these settings → per-call <code>env</code>. Off PATH inheritance leaves child <code>PATH</code> as only <code>.mrmcp/bin</code>; PATH remains governed by this toggle rather than the generic environment list.</p></div><div class=card<? if(tab!=="maintenance"){ ?> hidden<? } ?>><h3>🧹 Tool Call History</h3><label>History storage</label><select id=toolCallStorage><option value=disk<?= settings.tool_call_storage==='disk'?' selected':'' ?>>Disk · survives restart</option><option value=memory<?= settings.tool_call_storage==='memory'?' selected':'' ?>>Memory · SQLite TEMP, volatile</option></select><p class=muted>Storage and payload retention are independent. Disk writes Tool Call history to the main SQLite database. Memory uses SQLite TEMP tables in RAM with the same Tool Call ids, GUI and tools_log behavior; rows disappear on restart.</p><label>Payload retention</label><select id=toolCallPayloadMode><option value=payload<?= settings.tool_call_payload_mode==='payload'?' selected':'' ?>>Payload · complete diagnostic payloads and binary content</option><option value=metadata<?= settings.tool_call_payload_mode==='metadata'?' selected':'' ?>>Metadata · no Tool Call request/response payload copies</option></select><p class=muted>Payload retention affects only diagnostic copies in Tool Call history. Functional state required by tools remains available in its owning subsystem; for example persistent-process command/output state is retained independently so exec_attach and exec_status keep working.</p><div class=row><label class=grow>Disk retention hours · 0 keeps indefinitely</label><? if(settings.field_warnings?.tool_call_retention_hours){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_retention_hours ?></span><? } ?></div><input id=toolCallRetentionHours type=number min=0 step=1 value="<?= settings.tool_call_retention_hours??0 ?>"><div class=row><label class=grow>Memory retention minutes · 0 keeps until restart</label><? if(settings.field_warnings?.tool_call_memory_retention_minutes){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_memory_retention_minutes ?></span><? } ?></div><input id=toolCallMemoryRetentionMinutes type=number min=0 step=1 value="<?= settings.tool_call_memory_retention_minutes??60 ?>"><p class=muted>Retention removes completed history from its own storage tier and keeps origins of still-running persistent processes. Changing the current storage or payload setting affects new Tool Calls only; existing rows retain their own storage and payload capabilities.</p><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, Memory, CDP browser state, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
 <? } else if(section==="help"){ ?><section id=help class=page><h2>❓ Help</h2><div class=card><h3>Connect ChatGPT Web</h3><ol><li>Make sure the Dashboard shows a trusted HTTPS certificate. ChatGPT needs a remote HTTPS MCP endpoint; use <code><?= settings.external_base_url ? settings.external_base_url + "/mcp" : "https://your-host/mcp" ?></code>.</li><li>In ChatGPT Web, enable Developer mode. In managed workspaces the current path is <b>Workspace settings → Permissions &amp; Roles → Connected Data Developer mode / Create custom MCP connectors</b>. Authorized users may also find the toggle under <b>Settings → Apps → Advanced Settings</b>.</li><li>Create a custom app from <b>Workspace settings → Apps → Create</b> or <b>Settings → Apps → Create</b>, enter the MrMCP endpoint, choose the offered authentication method, then select <b>Scan Tools</b>.</li><li>If OAuth is enabled in MrMCP, complete the authorization prompt. After the tool scan completes, create the app and select it from a new ChatGPT conversation.</li></ol></div><div class=card><h3>Authentication</h3><p>For ChatGPT, OAuth is the preferred MrMCP setup because ChatGPT can discover the authorization metadata, complete consent, and keep refresh-token connectivity. MrMCP also supports Basic authentication for MCP clients that offer it. Authentication grants access to the server; the <code>context_handle</code> selects persistent context state after authentication.</p></div><div class=card><h3>Write Access</h3><p>MrMCP does not maintain a separate read/write allowlist: every authenticated client receives every published tool. ChatGPT controls whether write/modify actions are usable through the app's permissions and action controls. As of this build, OpenAI documents full MCP write/modify support for Business, Enterprise and Edu; Pro custom MCP access is limited to read/fetch, and availability may change. Test write tools in Developer mode first. Where available, use <b>Workspace settings → Apps → Configure Actions / Action control</b> to enable the required actions. ChatGPT may still ask for confirmation before a write.</p></div><div class=card><h3>Using MrMCP in a Chat</h3><ol><li>Start a new chat and select the MrMCP app from the tools/apps menu.</li><li>If needed, call <code>list_workspaces</code> to discover the enabled Workspace names, then call <code>open_workspace</code> with the desired <code>name</code>. When continuing an existing Session, also pass its handle as <code>current_context_handle</code>; MrMCP moves that same Session to the Workspace. If the handle is omitted, empty, unknown or expired, a new Session is created.</li><li>The result already includes <code>workspace_name</code>, absolute <code>cwd</code> and <code>agent_guidance_path</code>. Read that file when non-null, then reuse the returned <code>context_handle</code> on later Session-bound calls. The Workspaces page can also move Sessions manually.</li><li>If you change ChatGPT model or thinking level, the MCP context may be recreated even inside the same conversation. Check the Sessions page if continuity matters.</li></ol><p class=muted>ChatGPT UI labels and plan availability can change. Current OpenAI references: <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt" target=_blank rel=noopener>Developer mode and MCP apps in ChatGPT</a> · <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt" target=_blank rel=noopener>Apps in ChatGPT</a>.</p></div></section><? } ?>`,
     dialogs: `<? const dialog=it.data?.state?.dialog; ?><? if(dialog){ ?><div id=dialogOverlay class=dialog-overlay><? if(dialog.kind==="root"){ const r=dialog.data||{}; ?><dialog id=rootDialog open data-managed-dialog=root><form id=rootForm><input id=rid type=hidden value="<?= r.id||'' ?>"><h2>📁 Workspace</h2><div class=row><label class=grow>Workspace name</label><? if(r.name_warning){ ?><span class=field-warning>⚠ <?= r.name_warning ?></span><? } ?></div><input id=rname value="<?= r.name||'' ?>"><div class=row><label class=grow>Directory path</label><? if(r.path_warning){ ?><span class=field-warning>⚠ <?= r.path_warning ?></span><? } else if(!r.path_checked){ ?><span class=muted>Leave the field to validate the directory.</span><? } ?></div><input id=rpath placeholder="C:\\projects\\my-workspace, /srv/my-workspace or ./project" value="<?= r.path||'' ?>"><div class=muted>Relative to the program folder.</div><label><input id=renabled type=checkbox<?= r.enabled!==false?' checked':'' ?>> Enabled</label><? if(r.form_warning){ ?><div class=field-warning>⚠ <?= r.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (r.name_warning||r.path_warning||!r.path_checked||r.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="command"){ const c=dialog.data||{}; ?><dialog id=commandDialog open data-managed-dialog=command><form id=commandForm><input id=coldName type=hidden value="<?= c.registered?c.name:'' ?>"><h2>🧰 Command Catalog Entry</h2><div class=row><label class=grow>Logical name</label><? if(c.name_warning){ ?><span class=field-warning>⚠ <?= c.name_warning ?></span><? } ?></div><input id=cname value="<?= c.name||'' ?>"><div class=row><label class=grow>Path below .mrmcp/bin</label><? if(c.path_warning){ ?><span class="<?= c.path_error?'field-warning':'muted' ?>"><?= c.path_error?'⚠ ':'' ?><?= c.path_warning ?></span><? } else if(!c.path_checked){ ?><span class=muted>Leave the field to validate the path.</span><? } ?></div><input id=cpath placeholder="Optional; defaults to logical name; Windows suffix optional" value="<?= c.path||'' ?>"><label>Description for the agent</label><textarea id=cdescription placeholder="Optional: what it does and when the agent should use it."><?= c.description||'' ?></textarea><div class=row><label class=grow>Download URL</label><? if(c.download_warning){ ?><span class=field-warning>⚠ <?= c.download_warning ?></span><? } ?></div><input id=cdownloadUrl placeholder="https://example.com/tool" value="<?= c.download_url||'' ?>"><div class=row><label class=grow>Documentation URL</label><? if(c.documentation_warning){ ?><span class=field-warning>⚠ <?= c.documentation_warning ?></span><? } ?></div><input id=cdocumentationUrl placeholder="https://example.com/docs" value="<?= c.documentation_url||'' ?>"><? if(c.form_warning){ ?><div class=field-warning>⚠ <?= c.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (c.name_warning||c.path_error||!c.path_checked||c.download_warning||c.documentation_warning||c.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="prompt"){ const p=dialog.data||{}; ?><dialog id=promptDialog open data-managed-dialog=prompt><form id=promptForm><input id=poldName type=hidden value="<?= p.old_name||'' ?>"><h2>🧭 Guided Prompt</h2><div class=row><label class=grow>Name</label><? if(p.name_warning){ ?><span class=field-warning>⚠ <?= p.name_warning ?></span><? } ?></div><input id=pname value="<?= p.name||'' ?>"><label>Title</label><input id=ptitle value="<?= p.title||'' ?>" placeholder="Human-readable title shown by MCP clients"><label>Description</label><textarea id=pdescription placeholder="What this guided prompt does."><?= p.description||'' ?></textarea><div class=row><label class=grow>Arguments · YAML list</label><? if(p.args_warning){ ?><span class=field-warning>⚠ <?= p.args_warning ?></span><? } ?></div><textarea id=parguments rows=8 placeholder="- name: focus&#10;  description: Area to focus on.&#10;  required: false"><?= p.arguments_text||'' ?></textarea><div class=row><label class=grow>Eta template</label><? if(p.template_warning){ ?><span class=field-warning>⚠ <?= p.template_warning ?></span><? } ?></div><textarea id=ptemplate rows=14 placeholder="Review the project. &lt;%= it.args.focus %&gt;"><?= p.template||'' ?></textarea><div class=muted>Standard Eta tags. Model documentation is available from Guided Prompts → Template Help.</div><? if(p.form_warning){ ?><div class=field-warning>⚠ <?= p.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (p.name_warning||p.args_warning||p.template_warning||p.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="memory"){ const m=dialog.data||{},creating=!m.id; ?><dialog id=memoryDialog open data-managed-dialog=memory><form id=memoryForm><input id=mid type=hidden value="<?= m.id||'' ?>"><h2><?= creating?'➕ New Memory':'🧠 Memory' ?></h2><? if(creating){ ?><label>Scope</label><select id=mscope><option value=global<?= m.scope==='global'?' selected':'' ?>>Global</option><option value=session<?= m.scope==='session'?' selected':'' ?><?= !(m.sessions||[]).length?' disabled':'' ?>>Session</option><option value=workspace<?= m.scope==='workspace'?' selected':'' ?><?= !(m.workspaces||[]).length?' disabled':'' ?>>Workspace</option></select><? if(m.scope==='workspace'){ ?><label>Workspace</label><select id=mworkspace><? (m.workspaces||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= String(m.workspace||'')===String(name)?' selected':'' ?>><?= name ?></option><? }) ?></select><? } else if(m.scope==='session'){ ?><label>Session</label><select id=mcontext><? (m.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(m.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><? } else { ?><div class=muted>Shared across all Sessions and Workspaces on this MrMCP server.</div><? } ?><? } else { ?><div class=muted><?= m.scope==='global'?'Global':(m.scope==='workspace'?'Workspace':'Session') ?> · <?= m.owner_name||'' ?></div><? } ?><label>Key</label><input id=mkey value="<?= m.key||'' ?>"><label>Value</label><? if(m.json){ ?><textarea id=mvalue rows=14 hidden><?= m.value_text||'' ?></textarea><div id=memoryJsonEditor class="json-editor-host memory" data-json-source=mvalue data-json-edit=memory data-json-error=memoryJsonError></div><div id=memoryJsonError class=field-warning hidden></div><? } else { ?><textarea id=mvalue rows=14><?= m.value_text||'' ?></textarea><? } ?><label><input id=mjson type=checkbox<?= m.json?' checked':'' ?>> Value is JSON · validate before saving</label><div class=muted>Switching between TEXT and JSON keeps the current draft unchanged.</div><label>TTL seconds · 0 = permanent</label><input id=mttl type=number min=0 max=315360000 value="<?= m.ttl_seconds||0 ?>"><? if(m.form_warning){ ?><div class=field-warning>⚠ <?= m.form_warning ?></div><? } ?><p class=row><button class=primary type=submit>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="confirm"){ ?><dialog id=confirmDialog open data-managed-dialog=confirm><h2>⚠️ <?= dialog.title||"Confirm Action" ?></h2><p><?= dialog.message||"Continue?" ?></p><p class=row><button class="primary danger" data-action=confirm-dialog>✓ Confirm</button><button data-action=close-dialog>✕ Cancel</button></p></dialog><? } ?></div><? } ?>`,
     status: `<? const d=it.data||{},s=d.settings||{},a=d.activity||{},bad=!!s.mcp_listen_error,warn=!!s.listener_fallback,recent=a.recent_sessions||[],inFlight=a.tool_calls_in_flight||0,errors=a.tool_calls_errors||0,invalid=a.tool_calls_invalid||0; ?><span class="status-group <?= d.live!=="connected"?(d.live==="reconnecting"?"pending":"failed"):(bad?"failed":(warn?"pending":"ok")) ?>"><?= d.live!=="connected"?(d.live==="reconnecting"?"🟡 reconnecting":"🔴 offline"):(bad?"🔴 listener error":(warn?"🟡 fallback":"🟢 live")) ?></span><span class="status-group status-link" data-action=header-settings title="HTTP / HTTPS effective listener ports; GUI uses local Tauriless assets">🔌 <span class=status-ports><?= s.mcp_http_active?s.mcp_http_port:"off" ?>/<?= s.mcp_https_active?s.mcp_https_port:"off" ?></span><? if(warn){ ?> <span class=pending>⚠</span><? } ?></span><span class=status-group title="Sessions with a Tool Call in the last <?= a.active_window_minutes||10 ?> minutes">💬 <span class="status-link <?= a.active_sessions?'ok':'muted' ?>" data-action=header-sessions><?= a.active_sessions||0 ?> active</span><? if(recent.length){ ?> · <span class=status-sessions><? recent.forEach((x,i)=>{ ?><?= i?" ":"" ?><span class=status-link data-action=session-tool-calls data-id="<?= x.id ?>">#<?= x.id ?>(<?= x.tool_calls ?>)</span><? }) ?></span><? } ?></span><span class=status-group title="Tool Calls in flight / total recorded / failed / invalid">🛠️ <span class="status-link <?= inFlight?'pending':'muted' ?>" data-action=header-tool-calls data-status=running><?= inFlight ?> in flight</span> · <span class="status-link status-total" data-action=header-tool-calls data-status=""><?= a.tool_calls_total||0 ?> total</span> · <span class="status-link <?= errors?'failed':'muted' ?>" data-action=header-tool-calls data-status=failed><?= errors ?> errors</span> · <span class="status-link <?= invalid?'invalid':'muted' ?>" data-action=header-tool-calls data-status=invalid><?= invalid ?> invalid</span></span>`,
@@ -9207,9 +8926,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     oauth: `<table class=oauth-table><tr><th>Client</th><th>Sessions</th><th>Tokens</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td class=oauth-client><b><?= c.name ?></b><div class=oauth-client-id title="<?= c.client_id ?>"><code><?= c.client_id ?></code></div><div class=oauth-meta><span class=muted>Created</span> <?= it.logdt(c.created_at) ?></div></td><td class=oauth-meta><div class=oauth-count><b><?= c.session_count||0 ?></b> total</div><div><span class=muted>First</span> <?= c.first_session_at ? it.logdt(c.first_session_at) : "—" ?></div><div><span class=muted>Last</span> <?= c.last_session_at ? it.logdt(c.last_session_at) : "—" ?></div></td><td><div class=oauth-tokens><div class=oauth-token><b><?= c.token_count||0 ?></b> <span>Access</span><div class=oauth-meta><span class=muted>Issued</span> <?= c.last_token_at ? it.logdt(c.last_token_at) : "—" ?></div></div><div class=oauth-token><b><?= c.refresh_token_count||0 ?></b> <span>Refresh</span><div class=oauth-meta><span class=muted>Used</span> <?= c.last_refresh_at ? it.logdt(c.last_refresh_at) : "—" ?></div></div></div></td><td class=oauth-actions><button class=small data-action=oauth-sessions data-id="<?= c.client_id ?>">💬 View Sessions</button><button class="small danger" data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> Available Tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,
     processes: `<? const d=it.data||{},rows=d.rows||[]; ?><? if(!rows.length){ ?><div class=card><p class=muted>No active processes.</p></div><? } else { rows.forEach(p=>{ ?><article class=card><div class=row><div class=grow><b><? if(p.persistent){ ?>exec #<?= p.exec_id ?><? } else { ?>foreground exec<? } ?></b><? if(p.pid!=null){ ?> <span class=muted>· PID <?= p.pid ?></span><? } ?><? if(p.attached){ ?> <span class=progress-requested>· attached</span><? } ?></div><span class="<?= p.status ?>"><?= p.status ?></span><button class=small data-action=terminate-process data-id="<?= p.process_id ?>">⏹️ Terminate</button><button class="small danger" data-action=kill-process data-id="<?= p.process_id ?>">⚠️ Kill</button></div><div class=terminal-command><span class=prompt>&gt;</span><span><?= p.command ?></span></div><div class=terminal-cwd>cwd <code><?= p.cwd ?></code><? if(p.context_handle){ ?> · Session <code><?= p.context_handle ?></code><? } ?></div><div class=row><span class=muted>Started <?= it.logdt(Date.parse(p.started_at)) ?></span><span class=muted>· stdin <?= p.stdin_open?"open":"closed" ?></span><? if(p.progress_requested){ ?><span class=progress-requested>· progress requested</span><? } ?></div><div class=terminal-stream-label>Live output tail</div><pre><?= p.output||"(no output yet)" ?></pre></article><? }) } ?>`,
-    logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Click to expand details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=http-session><? if(l.context_id){ ?><div class=idcell>#<?= l.context_id ?></div><? if(l.root_id&&l.root_name){ ?><div class=workspace-label>📁 <?= l.root_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><code><?= l.tool ?></code><? if(l.payload_mode&&l.payload_mode!=='full'){ ?> <span class="descriptor-status <?= l.payload_mode==='metadata'?'outdated':'current' ?>"><?= String(l.payload_mode).toUpperCase() ?></span><? } ?><? if(l.call_preview){ ?><div class=tool-command-preview>↳ <?= l.call_preview ?></div><? } ?><? if(l.progress_requested){ ?><div class=progress-requested>📡 Progress requested</div><? } ?></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Kill</button><? } else { ?>—<? } ?></td></tr><? if(String(d.openRowId||"")===String(l.id)&&d.openDetail){ const x=d.openDetail,terminal=it.terminal(x); ?><tr id="tool-call-detail-<?= l.id ?>" class=detail-row data-detail-kind=tool data-detail-id="<?= l.id ?>"><td colspan=7><div class=detail-panel><div class=row><b class=grow>Tool Call #<?= l.id ?></b><span class="descriptor-status <?= x.payload_mode==='metadata'?'outdated':'current' ?>"><?= String(x.payload_mode||'full').toUpperCase() ?></span><? if(x.progress_requested){ ?><span class=progress-requested>📡 Progress requested</span><? } ?><? if(x.payload_mode==='full'&&x.tool==='desktop_auto'){ ?><button class=small data-action=replay-automation data-id="<?= l.id ?>">▶ Replay</button><? } else if(x.payload_mode==='full'&&x.tool==='cdp_call'){ ?><button class=small data-action=replay-cdp data-id="<?= l.id ?>">▶ Replay batch</button><? } ?><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><div class=tool-detail-grid><div class=tool-detail-main><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><? if((x.contents||[]).length){ ?><section class=tool-content-detail><div class=row><b class=grow>🖼️ Binary / MCP Content</b><span class=muted><?= x.contents.length ?> retained item<?= x.contents.length===1?'':'s' ?></span></div><div class=tool-content-grid><? x.contents.forEach(c=>{ ?><article class=tool-content-card><div class=row><b class=grow><?= c.direction==='input'?'→ Input':'← Output' ?></b><span class=muted><?= it.bytes(c.bytes) ?></span></div><div><code><?= c.mime_type ?></code></div><div class=tool-content-path><?= c.content_type ?> · <?= c.json_path ?></div><? if(c.data_url){ ?><img class=tool-content-preview src="<?= c.data_url ?>" alt="<?= c.direction ?> <?= c.mime_type ?> preview"><? } else { ?><div class=tool-content-placeholder>Binary resource retained · no inline preview for this MIME type</div><? } ?></article><? }) ?></div></section><? } ?><? if(x.payload_mode==='metadata'){ ?><section class=json-detail><b>Payload</b><p class=muted>Request/response JSON, stdout/stderr and binary content were not retained for this Tool Call. Metadata and the historical tool descriptor remain available.</p></section><? } else { ?><section class=json-detail><div class=row><b class=grow>Input JSON</b><button class=small data-action=copy-detail data-target="tool-input-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-input-<?= l.id ?>" class=json-editor-source hidden><?= it.prettyParsed(x.input_json) ?></pre><div class=json-editor-host data-json-source="tool-input-<?= l.id ?>"></div></section><? if(x.resolved_json){ ?><section class=json-detail><div class=row><b class=grow>Tool Return Value JSON</b><button class=small data-action=copy-detail data-target="tool-return-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-return-<?= l.id ?>" class=json-editor-source hidden><?= it.prettyParsed(x.resolved_json) ?></pre><div class=json-editor-host data-json-source="tool-return-<?= l.id ?>"></div></section><? } ?><section class=json-detail><div class=row><b class=grow>MCP Transport Additions</b><button class=small data-action=copy-detail data-target="tool-output-<?= l.id ?>">📋 Copy JSON</button></div><pre id="tool-output-<?= l.id ?>" class=json-editor-source hidden><?= it.prettyParsed(x.result_json||{}) ?></pre><div class=json-editor-host data-json-source="tool-output-<?= l.id ?>"></div></section><? } ?><? if(x.stderr&&!terminal){ ?><section class=json-detail><b>Standard error</b><pre><?= x.stderr ?></pre></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error</b><pre><?= x.error ?></pre></section><? } ?></div><aside class=tool-descriptor><div class=row><b class=grow>Agent Tool Definition</b><? if(x.tool_descriptor){ ?><span class="descriptor-status <?= x.tool_descriptor_matches_current?'current':'outdated' ?>"><?= x.tool_descriptor_matches_current?'CURRENT':'OUTDATED' ?></span><button class=small data-action=copy-detail data-target="tool-descriptor-<?= l.id ?>">📋 Copy JSON</button><? } ?></div><? if(x.tool_descriptor){ ?><pre id="tool-descriptor-<?= l.id ?>" hidden><?= it.pretty(x.tool_descriptor) ?></pre><? if(x.tool_descriptor.title){ ?><div class=muted>Title</div><div><?= x.tool_descriptor.title ?></div><? } ?><div class=muted>Description</div><p><?= x.tool_descriptor.description||"—" ?></p><div class=muted>Input Schema</div><pre id="tool-descriptor-input-<?= l.id ?>" class=json-editor-source hidden><?= it.pretty(x.tool_descriptor.inputSchema||{}) ?></pre><div class="json-editor-host compact" data-json-source="tool-descriptor-input-<?= l.id ?>"></div><div class=muted>Output Schema</div><pre id="tool-descriptor-output-<?= l.id ?>" class=json-editor-source hidden><?= it.pretty(x.tool_descriptor.outputSchema||{}) ?></pre><div class="json-editor-host compact" data-json-source="tool-descriptor-output-<?= l.id ?>"></div><? } else { ?><p class=muted>No descriptor snapshot was recorded for this call.</p><? } ?></aside></div></div></td></tr><? } }) ?></tbody></table>`,
-    browser: `<? const d=it.data||{},ops=d.operations||[],ring=d.ring||[],cards=d.browsers||[],clicks=ops.filter(x=>x.method==='_mrmcp.click').length,finds=ops.filter(x=>x.method==='_mrmcp.find').length; ?><div class=row><select id=browserName><option value="">All browsers</option><? (d.browser_values||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= d.browser===name?' selected':'' ?>><?= name ?></option><? }) ?></select><select id=browserTarget><option value="">All targets</option><? (d.target_values||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= d.target===name?' selected':'' ?>><?= name ?></option><? }) ?></select><select id=browserContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=browserActive><option value="">Any connection state</option><option value=active<?= d.active==='active'?' selected':'' ?>>Active / connected</option><option value=inactive<?= d.active==='inactive'?' selected':'' ?>>Inactive / disconnected</option></select><button data-action=clear-browser-filters>🧹 Clear Filters</button></div><div class=grid><div class=card><div class=muted>Browser profiles</div><strong style="font-size:24px"><?= cards.length ?><?= Number(d.browser_total||0)>cards.length?'/'+d.browser_total:'' ?></strong></div><div class=card><div class=muted>Full-payload cdp_call Tool Calls</div><strong style="font-size:24px"><?= d.tool_calls_total||0 ?></strong></div><div class=card><div class=muted>Visible operations</div><strong style="font-size:24px"><?= ops.length ?><?= Number(d.operation_matches||0)>ops.length?'/'+d.operation_matches:'' ?></strong><div class=muted><?= clicks ?> click · <?= finds ?> find</div></div><div class=card><div class=muted>Retained CDP messages</div><strong style="font-size:24px"><?= ring.length ?></strong><div class=muted>after current filters</div></div></div><? if(!cards.length){ ?><div class=card><p class=muted>No browser profiles match the current filters.</p></div><? } else { ?><div class=grid><? cards.forEach(b=>{ ?><article class=card><div class=row><h3 class=grow style="margin:0"><code><?= b.browser ?></code></h3><b class="<?= b.active?'ok':'muted' ?>"><?= b.active?'🟢 connected':'⚪ disconnected' ?></b></div><div class=grid><div><span class=muted>Port</span><br><b><?= b.port||'—' ?></b></div><div><span class=muted>Logical targets</span><br><b><?= b.logical_target_count ?></b></div><div><span class=muted>Live CDP targets</span><br><b><?= b.live_target_count ?></b></div><div><span class=muted>Subscriptions</span><br><b><?= b.subscription_count ?></b></div><div><span class=muted>Ring</span><br><b><?= b.ring_count ?></b> · <?= it.bytes(b.ring_bytes) ?></div><div><span class=muted>Recorded sequence</span><br><b><?= b.recorded_sequence ?></b></div><div><span class=muted>Retained seq range</span><br><b><?= b.oldest_seq==null?'—':b.oldest_seq+'–'+b.newest_seq ?></b></div><div><span class=muted>Notifications / responses</span><br><b><?= b.notifications ?> / <?= b.responses ?></b></div><div><span class=muted>Stream resets</span><br><b class="<?= b.stream_resets?'pending':'muted' ?>"><?= b.stream_resets ?></b></div><div><span class=muted>Dropped</span><br><b class="<?= b.dropped?'failed':'muted' ?>"><?= b.dropped ?></b></div></div><div class=muted style="margin-top:8px">Profile <code><?= b.user_data_dir ?></code><? if(b.connection_id){ ?> · connection <code><?= b.connection_id ?></code><? } ?><? if(b.pending){ ?> · <?= b.pending ?> pending<? } ?></div><? if((b.session_ids||[]).length){ ?><div class=muted>Recorded origins: <? b.session_ids.forEach((id,i)=>{ ?><?= i?', ':'' ?><span class=idcell>#<?= id ?></span><? }) ?></div><? } ?><? if((b.targets||[]).length){ ?><details><summary>Logical targets (<?= b.targets.length ?>)</summary><table><tr><th>Label</th><th>Target ID</th><th>Updated</th></tr><? b.targets.forEach(t=>{ ?><tr><td><code><?= t.target ?></code></td><td><code><?= t.target_id ?></code></td><td><?= it.logdt(t.updated_at) ?></td></tr><? }) ?></table></details><? } ?><? if((b.live_targets||[]).length){ ?><details><summary>Live CDP targets (<?= b.live_targets.length ?>)</summary><table><tr><th>Label</th><th>Type</th><th>Title / URL</th><th>Target / Session</th></tr><? b.live_targets.forEach(t=>{ ?><tr><td><? if(t.label){ ?><code><?= t.label ?></code><? } else { ?>—<? } ?></td><td><code><?= t.type||'—' ?></code></td><td><? if(t.title){ ?><div><?= t.title ?></div><? } ?><code><?= t.url||'—' ?></code></td><td><code><?= t.target_id||'—' ?></code><? if(t.session_id){ ?><div class=muted>session <code><?= t.session_id ?></code></div><? } ?></td></tr><? }) ?></table></details><? } ?><? if((b.subscriptions||[]).length){ const sid='browser-subs-'+b.browser.replace(/[^A-Za-z0-9_-]/g,'_'); ?><details><summary>Subscriptions (<?= b.subscriptions.length ?>)</summary><pre id="<?= sid ?>" class=json-editor-source hidden><?= it.pretty(b.subscriptions) ?></pre><div class="json-editor-host compact" data-json-source="<?= sid ?>"></div></details><? } ?></article><? }) ?></div><? } ?><div class=row><h3 class=grow>→ Recorded CDP sends</h3><span class=muted>last 500 Full-payload cdp_call Tool Calls · up to 200 matching operations</span></div><? if(!ops.length){ ?><div class=card><p class=muted>No recorded operations match the current filters.</p></div><? } else { ?><table><thead><tr><th>Time</th><th>Session</th><th>Browser / Target</th><th>Operation</th><th>State</th><th></th></tr></thead><tbody><? ops.forEach(o=>{ const jid='browser-call-'+o.log_id+'-'+o.call_index,rid=jid+'-response'; ?><tr><td class=nowrap><?= it.logdt(o.started_at) ?></td><td><? if(o.context_id){ ?><span class=idcell>#<?= o.context_id ?></span><? if(o.root_name){ ?><div class=workspace-label>📁 <?= o.root_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><code><?= o.browser ?></code><div class=muted><?= o.target?('target '+o.target):'browser-level' ?></div></td><td><b><?= o.method||'unknown' ?></b><div class=muted>Tool Call #<?= o.log_id ?> · item <?= o.call_index+1 ?> · wait <?= o.wait?'true':'false' ?><? if(o.duration_ms!=null){ ?> · <?= o.duration_ms ?>ms<? } ?></div><? if((o.images||[]).length){ ?><div class=tool-content-grid><? o.images.forEach(c=>{ ?><img class=tool-content-preview src="<?= c.data_url ?>" alt="CDP screenshot preview"><? }) ?></div><? } ?><details><summary>Request JSON</summary><pre id="<?= jid ?>" class=json-editor-source hidden><?= it.pretty(o.call) ?></pre><div class="json-editor-host compact" data-json-source="<?= jid ?>"></div></details><? if(o.response){ ?><details><summary>Response JSON</summary><pre id="<?= rid ?>" class=json-editor-source hidden><?= it.pretty(o.response) ?></pre><div class="json-editor-host compact" data-json-source="<?= rid ?>"></div></details><? } ?></td><td><? if(o.success===true){ ?><div class=ok>success</div><? } else if(o.success===false){ ?><div class=failed>failed</div><? } else { ?><div class="<?= o.status ?>"><?= o.status ?></div><? } ?><div class=muted>Tool Call <?= o.status ?></div><div class="<?= o.active?'ok':'muted' ?>"><?= o.active?'browser connected':'browser disconnected' ?></div></td><td><button class=small data-action=replay-cdp data-id="<?= o.log_id ?>" data-index="<?= o.call_index ?>">▶ Replay</button></td></tr><? }) ?></tbody></table><? } ?><div class=row><h3 class=grow>← Retained CDP traffic</h3><span class=muted>existing bounded ring only; notifications appear only when retained by a live subscription · Session filter narrows relevant browsers, because ring events themselves are global</span></div><? if(!ring.length){ ?><div class=card><p class=muted>No retained CDP messages match the current browser/target filters.</p></div><? } else { ?><table><thead><tr><th>Seq</th><th>Browser / Target</th><th>Type</th><th>Method</th><th>Bytes</th><th>Payload</th></tr></thead><tbody><? ring.forEach((m,i)=>{ const jid='browser-ring-'+i; ?><tr><td class=idcell>#<?= m.seq ?></td><td><code><?= m.browser ?></code><div class=muted><?= m.target||'browser-level' ?></div></td><td><?= m.type ?></td><td><code><?= m.method||'—' ?></code></td><td><?= it.bytes(m.bytes) ?></td><td><details><summary>JSON</summary><pre id="<?= jid ?>" class=json-editor-source hidden><?= it.pretty(m) ?></pre><div class="json-editor-host compact" data-json-source="<?= jid ?>"></div></details></td></tr><? }) ?></tbody></table><? } ?>`,
-    automation: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class=row><select id=automationContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><button data-action=clear-automation-filters>🧹 Clear Filters</button><span class="muted grow"><?= d.total||0 ?> Full-payload desktop_auto Tool Call<?= Number(d.total||0)===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Automation Pages"><button class=page-button data-action=automation-page data-automation-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=automation-page data-automation-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=automation-page data-automation-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No automation runs match the current Session filter.</p></div><? } else { rows.forEach(r=>{ const scenarioId='automation-scenario-'+r.id,resultId='automation-result-'+r.id; ?><article class=card><div class=row><div class=grow><h3 style="margin:0">🖱️ Automation #<?= r.id ?></h3><div class=muted><?= it.logdt(r.started_at) ?> · <? if(r.context_id){ ?>Session #<?= r.context_id ?><? } else { ?>No Session<? } ?><? if(r.root_name){ ?> · 📁 <?= r.root_name ?><? } ?> · <?= r.duration_ms==null?'in flight':r.duration_ms+'ms' ?></div></div><b class="<?= r.status ?>"><?= r.status ?></b><button class=small data-action=replay-automation data-id="<?= r.id ?>">▶ Replay scenario</button></div><div class=grid><div><span class=muted>Engine results</span><br><b><?= r.results_count ?></b></div><div><span class=muted>Retained images</span><br><b><?= (r.images||[]).length ?></b></div><div><span class=muted>Retained binary items</span><br><b><?= (r.contents||[]).length ?></b></div></div><? if((r.actions||[]).length){ ?><details><summary>Scenario actions (<?= r.actions.length ?>)</summary><table><thead><tr><th>#</th><th>Action</th><th>Parameters</th></tr></thead><tbody><? r.actions.forEach(a=>{ ?><tr><td class=idcell>#<?= a.index ?></td><td><code><?= a.action ?></code></td><td><pre style="margin:0;white-space:pre-wrap"><?= it.pretty(a.params) ?></pre></td></tr><? }) ?></tbody></table></details><? } ?><? if((r.images||[]).length){ ?><div class=tool-content-grid><? r.images.forEach(c=>{ ?><article class=tool-content-card><div class=row><b class=grow><?= c.direction==='input'?'→ Input':'← Output' ?></b><span class=muted><?= it.bytes(c.bytes) ?></span></div><div class=tool-content-path><?= c.json_path ?></div><img class=tool-content-preview src="<?= c.data_url ?>" alt="Automation screenshot"></article><? }) ?></div><? } ?><details><summary>YAML scenario</summary><pre><?= r.yaml||'(empty)' ?></pre></details><? if(r.scenario!==null){ ?><details><summary>Parsed scenario</summary><pre id="<?= scenarioId ?>" class=json-editor-source hidden><?= it.pretty(r.scenario) ?></pre><div class=json-editor-host data-json-source="<?= scenarioId ?>"></div></details><? } else if(r.scenario_error){ ?><div class=failed><?= r.scenario_error ?></div><? } ?><details><summary>Returned state / results</summary><pre id="<?= resultId ?>" class=json-editor-source hidden><?= it.pretty(r.result||{}) ?></pre><div class=json-editor-host data-json-source="<?= resultId ?>"></div></details><? if((r.contents||[]).some(c=>!c.data_url)){ ?><details><summary>Other retained binary content</summary><? r.contents.filter(c=>!c.data_url).forEach(c=>{ ?><div><code><?= c.mime_type ?></code> · <?= it.bytes(c.bytes) ?> · <?= c.direction ?> · <code><?= c.json_path ?></code></div><? }) ?></details><? } ?><? if(r.error){ ?><pre class=failed><?= r.error ?></pre><? } ?></article><? }) } ?>`,
+    logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Open Tool Call details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=http-session><? if(l.context_id){ ?><div class=idcell>#<?= l.context_id ?></div><? if(l.root_id&&l.root_name){ ?><div class=workspace-label>📁 <?= l.root_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><code><?= l.tool ?></code><? if(l.payload_mode&&l.payload_mode!=='payload'){ ?> <span class="descriptor-status <?= l.payload_mode==='metadata'?'outdated':'current' ?>"><?= String(l.payload_mode).toUpperCase() ?></span><? } ?><? if(l.call_preview){ ?><div class=tool-command-preview>↳ <?= l.call_preview ?></div><? } ?><? if(l.progress_requested){ ?><div class=progress-requested>📡 Progress requested</div><? } ?></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Kill</button><? } else { ?>—<? } ?></td></tr><? }) ?></tbody></table><? if(d.openDetail&&d.openRowId){ const x=d.openDetail,l=rows.find(row=>String(row.id)===String(d.openRowId))||{id:d.openRowId},terminal=it.terminal(x); ?><div id="tool-call-detail-<?= l.id ?>" class=tool-detail-overlay data-detail-kind=tool data-detail-id="<?= l.id ?>"><div class="detail-panel tool-detail-screen"><div class="row tool-detail-screen-head"><b class=grow>Tool Call #<?= l.id ?></b><span class="descriptor-status <?= x.payload_mode==='metadata'?'outdated':'current' ?>"><?= String(x.payload_mode||'payload').toUpperCase() ?></span><? if(x.progress_requested){ ?><span class=progress-requested>📡 Progress requested</span><? } ?><? if(x.payload_mode==='payload'&&x.tool==='desktop_auto'){ ?><button class=small data-action=replay-automation data-id="<?= l.id ?>">▶ Replay</button><? } else if(x.payload_mode==='payload'&&x.tool==='cdp_call'){ ?><button class=small data-action=replay-cdp data-id="<?= l.id ?>">▶ Replay batch</button><? } ?><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><div class=tool-detail-grid><div class=tool-detail-main><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><? if(x.payload_mode==='metadata'){ ?><section class=json-detail><b>Payload</b><p class=muted>MCP request/response packets were not retained for this Tool Call. Metadata and the historical tool descriptor remain available.</p></section><? } else { ?><section class="json-detail debug-packet"><div class=row><b class=grow>→ MCP Request</b><span class=muted>canonical stored packet · decoded only for this view</span><button class=small data-action=copy-detail data-target="tool-request-<?= l.id ?>">📋 Copy Raw JSON</button></div><pre id="tool-request-<?= l.id ?>" hidden><?= x.mcp_request_json||'' ?></pre><?~ it.debugPayload(x.mcp_request_json) ?></section><section class="json-detail debug-packet"><div class=row><b class=grow>← MCP Response</b><span class=muted>canonical stored packet · decoded only for this view</span><button class=small data-action=copy-detail data-target="tool-response-<?= l.id ?>">📋 Copy Raw JSON</button></div><pre id="tool-response-<?= l.id ?>" hidden><?= x.mcp_response_json||'' ?></pre><?~ it.debugPayload(x.mcp_response_json) ?></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error metadata</b><pre><?= x.error ?></pre></section><? } ?></div><aside class=tool-descriptor><div class=row><b class=grow>Agent Tool Definition</b><? if(x.tool_descriptor){ ?><span class="descriptor-status <?= x.tool_descriptor_matches_current?'current':'outdated' ?>"><?= x.tool_descriptor_matches_current?'CURRENT':'OUTDATED' ?></span><button class=small data-action=copy-detail data-target="tool-descriptor-<?= l.id ?>">📋 Copy JSON</button><? } ?></div><? if(x.tool_descriptor){ ?><pre id="tool-descriptor-<?= l.id ?>" hidden><?= it.pretty(x.tool_descriptor) ?></pre><? if(x.tool_descriptor.title){ ?><div class=muted>Title</div><div><?= x.tool_descriptor.title ?></div><? } ?><div class=muted>Description</div><p><?= x.tool_descriptor.description||"—" ?></p><div class=muted>Input Schema</div><pre id="tool-descriptor-input-<?= l.id ?>" class=json-editor-source hidden><?= it.pretty(x.tool_descriptor.inputSchema||{}) ?></pre><div class="json-editor-host compact" data-json-source="tool-descriptor-input-<?= l.id ?>"></div><div class=muted>Output Schema</div><pre id="tool-descriptor-output-<?= l.id ?>" class=json-editor-source hidden><?= it.pretty(x.tool_descriptor.outputSchema||{}) ?></pre><div class="json-editor-host compact" data-json-source="tool-descriptor-output-<?= l.id ?>"></div><? } else { ?><p class=muted>No descriptor snapshot was recorded for this call.</p><? } ?></aside></div></div></div><? } ?>`,
+    browser: `<? const d=it.data||{},ops=d.operations||[],ring=d.ring||[],cards=d.browsers||[],clicks=ops.filter(x=>x.method==='_mrmcp.click').length,finds=ops.filter(x=>x.method==='_mrmcp.find').length; ?><div class=row><select id=browserName><option value="">All browsers</option><? (d.browser_values||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= d.browser===name?' selected':'' ?>><?= name ?></option><? }) ?></select><select id=browserTarget><option value="">All targets</option><? (d.target_values||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= d.target===name?' selected':'' ?>><?= name ?></option><? }) ?></select><select id=browserContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=browserActive><option value="">Any connection state</option><option value=active<?= d.active==='active'?' selected':'' ?>>Active / connected</option><option value=inactive<?= d.active==='inactive'?' selected':'' ?>>Inactive / disconnected</option></select><button data-action=clear-browser-filters>🧹 Clear Filters</button></div><div class=grid><div class=card><div class=muted>Browser profiles</div><strong style="font-size:24px"><?= cards.length ?><?= Number(d.browser_total||0)>cards.length?'/'+d.browser_total:'' ?></strong></div><div class=card><div class=muted>Payload-retained cdp_call Tool Calls</div><strong style="font-size:24px"><?= d.tool_calls_total||0 ?></strong></div><div class=card><div class=muted>Visible operations</div><strong style="font-size:24px"><?= ops.length ?><?= d.operation_has_more?'+':'' ?></strong><div class=muted><?= clicks ?> click · <?= finds ?> find</div></div><div class=card><div class=muted>Retained CDP messages</div><strong style="font-size:24px"><?= ring.length ?></strong><div class=muted>after current filters</div></div></div><? if(!cards.length){ ?><div class=card><p class=muted>No browser profiles match the current filters.</p></div><? } else { ?><div class=grid><? cards.forEach(b=>{ ?><article class=card><div class=row><h3 class=grow style="margin:0"><code><?= b.browser ?></code></h3><b class="<?= b.active?'ok':'muted' ?>"><?= b.active?'🟢 connected':'⚪ disconnected' ?></b></div><div class=grid><div><span class=muted>Port</span><br><b><?= b.port||'—' ?></b></div><div><span class=muted>Logical targets</span><br><b><?= b.logical_target_count ?></b></div><div><span class=muted>Live CDP targets</span><br><b><?= b.live_target_count ?></b></div><div><span class=muted>Subscriptions</span><br><b><?= b.subscription_count ?></b></div><div><span class=muted>Ring</span><br><b><?= b.ring_count ?></b> · <?= it.bytes(b.ring_bytes) ?></div><div><span class=muted>Recorded sequence</span><br><b><?= b.recorded_sequence ?></b></div><div><span class=muted>Retained seq range</span><br><b><?= b.oldest_seq==null?'—':b.oldest_seq+'–'+b.newest_seq ?></b></div><div><span class=muted>Notifications / responses</span><br><b><?= b.notifications ?> / <?= b.responses ?></b></div><div><span class=muted>Stream resets</span><br><b class="<?= b.stream_resets?'pending':'muted' ?>"><?= b.stream_resets ?></b></div><div><span class=muted>Dropped</span><br><b class="<?= b.dropped?'failed':'muted' ?>"><?= b.dropped ?></b></div></div><div class=muted style="margin-top:8px">Profile <code><?= b.user_data_dir ?></code><? if(b.connection_id){ ?> · connection <code><?= b.connection_id ?></code><? } ?><? if(b.pending){ ?> · <?= b.pending ?> pending<? } ?></div><? if((b.session_ids||[]).length){ ?><div class=muted>Recorded origins: <? b.session_ids.forEach((id,i)=>{ ?><?= i?', ':'' ?><span class=idcell>#<?= id ?></span><? }) ?></div><? } ?><? if((b.targets||[]).length){ ?><details><summary>Logical targets (<?= b.targets.length ?>)</summary><table><tr><th>Label</th><th>Target ID</th><th>Updated</th></tr><? b.targets.forEach(t=>{ ?><tr><td><code><?= t.target ?></code></td><td><code><?= t.target_id ?></code></td><td><?= it.logdt(t.updated_at) ?></td></tr><? }) ?></table></details><? } ?><? if((b.live_targets||[]).length){ ?><details><summary>Live CDP targets (<?= b.live_targets.length ?>)</summary><table><tr><th>Label</th><th>Type</th><th>Title / URL</th><th>Target / Session</th></tr><? b.live_targets.forEach(t=>{ ?><tr><td><? if(t.label){ ?><code><?= t.label ?></code><? } else { ?>—<? } ?></td><td><code><?= t.type||'—' ?></code></td><td><? if(t.title){ ?><div><?= t.title ?></div><? } ?><code><?= t.url||'—' ?></code></td><td><code><?= t.target_id||'—' ?></code><? if(t.session_id){ ?><div class=muted>session <code><?= t.session_id ?></code></div><? } ?></td></tr><? }) ?></table></details><? } ?><? if((b.subscriptions||[]).length){ const sid='browser-subs-'+b.browser.replace(/[^A-Za-z0-9_-]/g,'_'); ?><details><summary>Subscriptions (<?= b.subscriptions.length ?>)</summary><pre id="<?= sid ?>" class=json-editor-source hidden><?= it.pretty(b.subscriptions) ?></pre><div class="json-editor-host compact" data-json-source="<?= sid ?>"></div></details><? } ?></article><? }) ?></div><? } ?><div class=row><h3 class=grow>→ Recorded CDP sends</h3><span class=muted>scanned <?= d.operation_scan_calls||0 ?> of up to <?= d.operation_scan_limit||500 ?> recent Payload-retained cdp_call Tool Calls · stops after 200 matching operations</span></div><? if(!ops.length){ ?><div class=card><p class=muted>No recorded operations match the current filters.</p></div><? } else { ?><table><thead><tr><th>Time</th><th>Session</th><th>Browser / Target</th><th>Operation</th><th>State</th><th></th></tr></thead><tbody><? ops.forEach(o=>{ const jid='browser-call-'+o.log_id+'-'+o.call_index,rid=jid+'-response'; ?><tr><td class=nowrap><?= it.logdt(o.started_at) ?></td><td><? if(o.context_id){ ?><span class=idcell>#<?= o.context_id ?></span><? if(o.root_name){ ?><div class=workspace-label>📁 <?= o.root_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><code><?= o.browser ?></code><div class=muted><?= o.target?('target '+o.target):'browser-level' ?></div></td><td><b><?= o.method||'unknown' ?></b><div class=muted>Tool Call #<?= o.log_id ?> · item <?= o.call_index+1 ?> · wait <?= o.wait?'true':'false' ?><? if(o.duration_ms!=null){ ?> · <?= o.duration_ms ?>ms<? } ?></div><? if((o.images||[]).length){ ?><div class=tool-content-grid><? o.images.forEach(c=>{ ?><img class=tool-content-preview src="<?= c.data_url ?>" alt="CDP screenshot preview"><? }) ?></div><? } ?><details><summary>Request JSON</summary><pre id="<?= jid ?>" class=json-editor-source hidden><?= it.pretty(o.call) ?></pre><div class="json-editor-host compact" data-json-source="<?= jid ?>"></div></details><? if(o.response){ ?><details><summary>Response JSON</summary><pre id="<?= rid ?>" class=json-editor-source hidden><?= it.pretty(o.response) ?></pre><div class="json-editor-host compact" data-json-source="<?= rid ?>"></div></details><? } ?></td><td><? if(o.success===true){ ?><div class=ok>success</div><? } else if(o.success===false){ ?><div class=failed>failed</div><? } else { ?><div class="<?= o.status ?>"><?= o.status ?></div><? } ?><div class=muted>Tool Call <?= o.status ?></div><div class="<?= o.active?'ok':'muted' ?>"><?= o.active?'browser connected':'browser disconnected' ?></div></td><td><button class=small data-action=replay-cdp data-id="<?= o.log_id ?>" data-index="<?= o.call_index ?>">▶ Replay</button></td></tr><? }) ?></tbody></table><? } ?><div class=row><h3 class=grow>← Retained CDP traffic</h3><span class=muted>existing bounded ring only; notifications appear only when retained by a live subscription · Session filter narrows relevant browsers, because ring events themselves are global</span></div><? if(!ring.length){ ?><div class=card><p class=muted>No retained CDP messages match the current browser/target filters.</p></div><? } else { ?><table><thead><tr><th>Seq</th><th>Browser / Target</th><th>Type</th><th>Method</th><th>Bytes</th><th>Payload</th></tr></thead><tbody><? ring.forEach((m,i)=>{ const jid='browser-ring-'+i; ?><tr><td class=idcell>#<?= m.seq ?></td><td><code><?= m.browser ?></code><div class=muted><?= m.target||'browser-level' ?></div></td><td><?= m.type ?></td><td><code><?= m.method||'—' ?></code></td><td><?= it.bytes(m.bytes) ?></td><td><details><summary>JSON</summary><pre id="<?= jid ?>" class=json-editor-source hidden><?= it.pretty(m) ?></pre><div class="json-editor-host compact" data-json-source="<?= jid ?>"></div></details></td></tr><? }) ?></tbody></table><? } ?>`,
+    automation: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class=row><select id=automationContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><button data-action=clear-automation-filters>🧹 Clear Filters</button><span class="muted grow"><?= d.total||0 ?> Payload-retained desktop_auto Tool Call<?= Number(d.total||0)===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Automation Pages"><button class=page-button data-action=automation-page data-automation-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=automation-page data-automation-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=automation-page data-automation-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No automation runs match the current Session filter.</p></div><? } else { rows.forEach(r=>{ const scenarioId='automation-scenario-'+r.id,resultId='automation-result-'+r.id; ?><article class=card><div class=row><div class=grow><h3 style="margin:0">🖱️ Automation #<?= r.id ?></h3><div class=muted><?= it.logdt(r.started_at) ?> · <? if(r.context_id){ ?>Session #<?= r.context_id ?><? } else { ?>No Session<? } ?><? if(r.root_name){ ?> · 📁 <?= r.root_name ?><? } ?> · <?= r.duration_ms==null?'in flight':r.duration_ms+'ms' ?></div></div><b class="<?= r.status ?>"><?= r.status ?></b><button class=small data-action=replay-automation data-id="<?= r.id ?>">▶ Replay scenario</button></div><div class=grid><div><span class=muted>Engine results</span><br><b><?= r.results_count ?></b></div><div><span class=muted>Retained images</span><br><b><?= (r.images||[]).length ?></b></div><div><span class=muted>Retained binary items</span><br><b><?= (r.contents||[]).length ?></b></div></div><? if((r.actions||[]).length){ ?><details><summary>Scenario actions (<?= r.actions.length ?>)</summary><table><thead><tr><th>#</th><th>Action</th><th>Parameters</th></tr></thead><tbody><? r.actions.forEach(a=>{ ?><tr><td class=idcell>#<?= a.index ?></td><td><code><?= a.action ?></code></td><td><pre style="margin:0;white-space:pre-wrap"><?= it.pretty(a.params) ?></pre></td></tr><? }) ?></tbody></table></details><? } ?><? if((r.images||[]).length){ ?><div class=tool-content-grid><? r.images.forEach(c=>{ ?><article class=tool-content-card><div class=row><b class=grow><?= c.direction==='input'?'→ Input':'← Output' ?></b><span class=muted><?= it.bytes(c.bytes) ?></span></div><div class=tool-content-path><?= c.json_path ?></div><img class=tool-content-preview src="<?= c.data_url ?>" alt="Automation screenshot"></article><? }) ?></div><? } ?><details><summary>YAML scenario</summary><pre><?= r.yaml||'(empty)' ?></pre></details><? if(r.scenario!==null){ ?><details><summary>Parsed scenario</summary><pre id="<?= scenarioId ?>" class=json-editor-source hidden><?= it.pretty(r.scenario) ?></pre><div class=json-editor-host data-json-source="<?= scenarioId ?>"></div></details><? } else if(r.scenario_error){ ?><div class=failed><?= r.scenario_error ?></div><? } ?><details><summary>Returned state / results</summary><pre id="<?= resultId ?>" class=json-editor-source hidden><?= it.pretty(r.result||{}) ?></pre><div class=json-editor-host data-json-source="<?= resultId ?>"></div></details><? if((r.contents||[]).some(c=>!c.data_url)){ ?><details><summary>Other retained binary content</summary><? r.contents.filter(c=>!c.data_url).forEach(c=>{ ?><div><code><?= c.mime_type ?></code> · <?= it.bytes(c.bytes) ?> · <?= c.direction ?> · <code><?= c.json_path ?></code></div><? }) ?></details><? } ?><? if(r.error){ ?><pre class=failed><?= r.error ?></pre><? } ?></article><? }) } ?>`,
     published: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class=row><select id=publishedContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=publishedSize><option value="">All sizes</option><option value=small<?= d.size==='small'?' selected':'' ?>>&lt; 1 MB</option><option value=medium<?= d.size==='medium'?' selected':'' ?>>1–10 MB</option><option value=large<?= d.size==='large'?' selected':'' ?>>10–100 MB</option><option value=huge<?= d.size==='huge'?' selected':'' ?>>≥ 100 MB</option></select><button data-action=clear-published-filters>🧹 Clear Filters</button></div><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> publication<?= d.total===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Published Pages"><button class=page-button data-action=published-page data-published-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=published-page data-published-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=published-page data-published-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No published items match the current filters.</p></div><? } else { ?><table class=published-table><thead><tr><th>Created</th><th>Resource</th><th>Published By</th><th>Published File</th><th>Activity</th><th>Source</th><th></th></tr></thead><tbody><? rows.forEach(r=>{ ?><tr><td class=nowrap><?= it.logdt(r.created_at) ?></td><td class=published-id><div class=nowrap>📦 <?= r.mime_type||'content' ?></div><code title="<?= r.id ?>"><?= r.id ?></code><? if(r.content_key){ ?><div class=published-file-meta title="<?= r.content_key ?>">key <?= r.content_key ?></div><? } ?></td><td class=http-session><? const refs=r.references||[]; if(refs.length){ refs.forEach(u=>{ ?><div class=published-reference><span class=idcell>#<?= u.context_id ?></span><? if(u.root_name){ ?> <span class=workspace-label title="<?= u.root_name ?>">📁 <?= u.root_name ?></span><? } ?></div><? }); } else { ?>—<? } ?></td><td><button class=published-open data-action=open-published data-id="<?= r.id ?>" title="<?= r.published_name ?> · Open public URL in browser"><code><?= r.published_name ?></code></button><? if(r.title){ ?><div class=published-file-meta><?= r.title ?></div><? } ?><? if(r.filename&&r.filename!==r.source_filename){ ?><div class=published-file-meta>Presented as: <?= r.filename ?></div><? } ?><? if(r.presentation&&r.presentation!=='auto'){ ?><div class=published-file-meta><?= r.presentation ?></div><? } ?></td><td class=published-activity><b><?= r.request_count||0 ?> req</b><div class=published-file-meta><?= it.bytes(r.size) ?></div><? if(r.last_request_at){ ?><div class=published-file-meta>last <?= it.logdt(r.last_request_at) ?></div><? } ?></td><td class=published-source><? const latest=(r.references||[])[0]; if(latest?.source_path){ ?><code title="<?= latest.source_path ?>"><?= latest.source_path ?></code><? } else if(r.source_path){ ?><code title="<?= r.source_path ?>"><?= r.source_path ?></code><? } else { ?><span class=muted>Direct content</span><? } ?><? if((r.reference_count||0)>1){ ?><div class=published-file-meta><?= r.reference_count ?> references</div><? } ?></td><td class=nowrap><button class="small danger" data-action=delete-published data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></tbody></table><? } ?>`,
     memory: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> memor<?= d.total===1?'y':'ies' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Memory Pages"><button class=page-button data-action=memory-page data-memory-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=memory-page data-memory-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=memory-page data-memory-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No memories match the current filters.</p></div><? } else { ?><table><thead><tr><th>Set</th><th>Scope</th><th>Key</th><th>Value</th><th>TTL</th><th></th></tr></thead><tbody><? rows.forEach(r=>{ ?><tr><td class=nowrap><?= it.logdt(r.set_at) ?></td><td><? if(r.scope==='global'){ ?><span class=workspace-label>🌐 Global</span><? } else if(r.scope==='session'){ ?><span class=idcell>💬 #<?= r.owner_id ?></span><? } else { ?><span class=workspace-label>📁 <?= r.owner_name ?></span><? } ?></td><td><code><?= r.key ?></code></td><td><span class="descriptor-status <?= Number(r.is_json)?'current':'outdated' ?>"><?= Number(r.is_json)?'JSON':'TEXT' ?></span> <code title="Open View / Edit to inspect the complete value"><?= r.value_preview ?><?= String(r.value_json||'').length>320?'…':'' ?></code></td><td class=nowrap><? if(r.expires_at){ ?><?= r.ttl_seconds ?>s<div class=muted>until <?= it.logdt(r.expires_at) ?></div><? } else { ?><span class=muted>permanent</span><? } ?></td><td class=nowrap><button class=small data-action=edit-memory data-id="<?= r.id ?>">✏️ View / Edit</button> <button class="small danger" data-action=delete-memory data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></tbody></table><? } ?>`,
     debug: `<? const d=it.data||{},rows=d.rows||[]; ?><p class="<?= d.enabled?'ok':'failed' ?>"><b><?= d.enabled?'● Recording enabled':'● Recording disabled' ?></b><? if(!d.enabled){ ?> · showing stored requests<? } ?></p><? if(!rows.length){ ?><p class=muted>No stored HTTP debug requests match the current filters.</p><? } else { ?><table><tr><th>ID</th><th>Time</th><th>Session</th><th>Client</th><th>Method</th><th>Path</th><th>Status</th><th>Duration</th><th>IP</th><th>Error</th></tr><? rows.forEach(r => { ?><tr data-action=select-debug data-id="<?= r.id ?>" title="Click to expand"><td class=idcell>#<?= r.id ?></td><td class=nowrap><?= it.logdt(r.ts) ?></td><td class=http-session><? if(r.context_id){ ?><div class=idcell>#<?= r.context_id ?></div><? if(r.workspace_name){ ?><div class=workspace-label>📁 <?= r.workspace_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><? if(r.client_id){ ?><code><?= r.client_id ?></code><? } else { ?>—<? } ?></td><td><b><?= r.method ?></b></td><td><code><?= r.path ?></code></td><td class="<?= !r.status?'pending':(r.status>=400?'failed':'ok') ?>"><?= r.status||"…" ?></td><td><?= r.status ? r.duration_ms+"ms" : "in flight" ?></td><td class=nowrap><?= r.remote_addr||"—" ?><? if(r.remote_addr){ ?> (<?= r.remote_count||1 ?>)<? } ?></td><td><?= r.error_preview ?></td></tr><? if(String(d.openRowId||"")===String(r.id)&&d.openDetail){ const x=d.openDetail; ?><tr class=detail-row data-detail-kind=http data-detail-id="<?= r.id ?>"><td colspan=10><div class="detail-panel http-detail-panel"><div class="row http-detail-head"><div class=grow><b>HTTP Request #<?= r.id ?></b><div class=http-detail-meta><span><?= it.logdt(x.ts) ?></span><span><? if(x.context_id){ ?>Session #<?= x.context_id ?><? } else { ?>No Session<? } ?></span><? if(x.workspace_name){ ?><span>📁 <?= x.workspace_name ?></span><? } ?><span><? if(x.client_id){ ?>Client <code><?= x.client_id ?></code><? } else { ?>No client id<? } ?></span><span><?= x.remote_addr||"unknown IP" ?><? if(x.remote_addr){ ?> · <?= x.remote_count||1 ?> total request<?= Number(x.remote_count||1)===1?'':'s' ?><? } ?></span><span><?= x.status ? x.duration_ms+"ms" : "in flight" ?></span></div></div><button class=small data-action=copy-detail data-target="http-json-<?= r.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=http>✕ Close</button></div><div class=http-detail-grid><section class=http-detail-block><div class=row><h4 class=grow>→ Request</h4><b><?= x.method ?></b> <code><?= x.path ?></code></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.request_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.request_body||{}) ?></pre></section><section class=http-detail-block><div class=row><h4 class=grow>← Response</h4><b class="<?= !x.status?'pending':(x.status>=400?'failed':'ok') ?>"><?= x.status||"in flight" ?></b></div><div class=muted>Headers</div><pre><?= it.prettyParsed(x.response_headers||{}) ?></pre><div class=muted>Body</div><pre><?= it.prettyParsed(x.response_body||{}) ?></pre></section></div><? if(x.error){ ?><section class="http-detail-block http-detail-error"><h4 class=failed>Error</h4><pre><?= x.error ?></pre></section><? } ?><details class=http-detail-raw><summary>Raw record</summary><pre id="http-json-<?= r.id ?>"><?= it.pretty(x) ?></pre></details></div></td></tr><? } }) ?></table><? } ?>`,
@@ -9267,8 +8986,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   const fragmentTerminalOutput = normalizeTerminalOutput;
   const fragmentTerminal = log => {
     if (!log) return null;
-    const input = typeof log.input_json === "string" ? parseJson(log.input_json, {}) : (log.input_json || {});
-    const resolved = typeof log.resolved_json === "string" ? parseJson(log.resolved_json, {}) : (log.resolved_json || {});
+    const input = mcpToolArgsFromPacket(log.mcp_request_json);
+    const resolved = mcpToolStructuredResultFromPacket(log.mcp_response_json);
     const live = log.process && typeof log.process === "object" ? log.process : null;
     const source = live || resolved || {};
     const processLike = !!live || (source?.command != null && (
@@ -9289,13 +9008,72 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       cwd: String(source.cwd || input.cwd || ""),
       stdin,
       stdin_encoding: String(input.stdin_encoding || "text"),
-      output: fragmentTerminalOutput(live?.output ?? resolved.output ?? log.stdout ?? ""),
+      output: fragmentTerminalOutput(live?.output ?? resolved.output ?? ""),
       status: String(source.status || log.status || ""),
       exit_code: source.exit_code ?? null,
       signal: String(source.signal || ""),
       requested_signal: String(source.requested_signal || ""),
       termination_source: String(source.termination_source || ""),
     };
+  };
+  const fragmentDebugPayload = source => {
+    const root = mcpPacketObject(source) ?? source;
+    const render = (value, depth = 0, key = "", parent = null, allowBase64 = true) => {
+      if (value === null) return '<span class="debug-null">null</span>';
+      if (typeof value === "boolean" || typeof value === "number") return `<span class="debug-scalar">${htmlEscape(String(value))}</span>`;
+      if (typeof value === "string") {
+        const text = value, trimmed = text.trim();
+        const dataUrl = text.startsWith("data:") ? text.match(/^data:([^;,\s]+)(?:;[^,]*)?;base64,([A-Za-z0-9+/=\s]+)$/i) : null;
+        const hintedMime = key === "data" && parent?.type === "image" ? String(parent.mimeType || parent.mime_type || "image/png") : "";
+        const renderBase64 = (mime, base64) => {
+          const bytes = decodeLogBase64(base64);
+          if (!bytes?.length) return "";
+          mime = String(mime || sniffLogBinaryMime(bytes) || "").split(";")[0].trim().toLowerCase();
+          if (mime.startsWith("image/")) return `<figure class="debug-image"><img src="data:${htmlEscape(mime)};base64,${Buffer.from(bytes).toString("base64")}" alt="decoded ${htmlEscape(mime)}"><figcaption>${htmlEscape(mime)} · ${fragmentBytes(bytes.length)}</figcaption></figure>`;
+          try {
+            const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+            if (decoded && !/[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(decoded))
+              return `<details class="debug-decoded" open><summary>Base64 text · ${fragmentBytes(bytes.length)}</summary>${render(decoded, depth + 1, key, parent, false)}</details>`;
+          } catch {}
+          return "";
+        };
+        if (dataUrl) {
+          const decoded = renderBase64(dataUrl[1], dataUrl[2]);
+          if (decoded) return decoded;
+        }
+        if (allowBase64) {
+          if (hintedMime) {
+            const decoded = renderBase64(hintedMime, text);
+            if (decoded) return decoded;
+          } else if (text.length >= 16 && (/[=]\s*$/.test(text) || text.replace(/\s+/g, "").length >= 64 || /base64|blob|data/i.test(key))) {
+            const decoded = renderBase64(sniffLogBase64ValueMime(text), text);
+            if (decoded) return decoded;
+          }
+        }
+        if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+          const parsed = parseJson(trimmed, null);
+          if (parsed && typeof parsed === "object")
+            return `<details class="debug-decoded" open><summary>JSON string</summary>${render(parsed, depth + 1)}</details>`;
+        }
+        if (text.includes("\n") && (/^\s*-\s+\S/m.test(text) || /^\s*[A-Za-z0-9_.-]+\s*:\s*/m.test(text))) {
+          try {
+            const parsed = parseYaml(text);
+            if (parsed && typeof parsed === "object")
+              return `<details class="debug-decoded" open><summary>YAML string</summary>${render(parsed, depth + 1)}</details>`;
+          } catch {}
+        }
+        return text.includes("\n") ? `<pre class="debug-multiline">${htmlEscape(text)}</pre>` : `<span class="debug-string">${htmlEscape(text)}</span>`;
+      }
+      if (Array.isArray(value)) {
+        return `<details class="debug-node"${depth < 2 ? " open" : ""}><summary>Array · ${value.length}</summary><div class="debug-children">${value.map((item, index) => `<div class="debug-entry"><span class="debug-key">${index}</span>${render(item, depth + 1, String(index), value)}</div>`).join("")}</div></details>`;
+      }
+      if (value && typeof value === "object") {
+        const entries = Object.entries(value);
+        return `<details class="debug-node"${depth < 2 ? " open" : ""}><summary>Object · ${entries.length}</summary><div class="debug-children">${entries.map(([childKey, child]) => `<div class="debug-entry"><span class="debug-key">${htmlEscape(childKey)}</span>${render(child, depth + 1, childKey, value)}</div>`).join("")}</div></details>`;
+      }
+      return `<span class="debug-scalar">${htmlEscape(String(value))}</span>`;
+    };
+    return `<div class="debug-payload-tree">${render(root)}</div>`;
   };
   const endpointRows = p => [
     ["MCP sslip.io", p.sslip_https_mcp_url], ["MCP direct IP", p.direct_ip_https_mcp_url],
@@ -9317,6 +9095,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     requireCurrentUiRender(generation);
     const context = {
       data, dt: fragmentDate, logdt: fragmentLogDate, bytes: fragmentBytes, pages: fragmentPageItems, endpointRows, terminal: fragmentTerminal,
+      debugPayload: fragmentDebugPayload,
       pretty: value => JSON.stringify(value ?? null, null, 2),
       prettyParsed: value => {
         const parsed = typeof value === "string" ? parseJson(value, value) : value;
@@ -9373,8 +9152,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       warnings.tool_call_retention_hours = "Tool Call retention must be a whole number of hours; 0 keeps logs indefinitely.";
     const storage = String(settings.tool_call_storage || "disk").toLowerCase();
     if (!TOOL_CALL_STORAGES.has(storage)) warnings.tool_call_storage = "Tool Call storage must be Disk or Memory.";
-    const payloadMode = String(settings.tool_call_payload_mode || "full").toLowerCase();
-    if (!TOOL_CALL_PAYLOAD_MODES.has(payloadMode)) warnings.tool_call_payload_mode = "Tool Call payload mode must be Full, Light or Metadata.";
+    const payloadMode = String(settings.tool_call_payload_mode || "payload").toLowerCase();
+    if (!TOOL_CALL_PAYLOAD_MODES.has(payloadMode)) warnings.tool_call_payload_mode = "Tool Call payload mode must be Payload or Metadata.";
     const memoryRetentionText = String(settings.tool_call_memory_retention_minutes ?? "60").trim(), memoryRetentionMinutes = Number(memoryRetentionText);
     if (!/^\d+$/.test(memoryRetentionText) || !Number.isSafeInteger(memoryRetentionMinutes) || memoryRetentionMinutes < 0)
       warnings.tool_call_memory_retention_minutes = "Memory Tool Call retention must be whole minutes; 0 keeps rows until restart.";
@@ -9403,15 +9182,26 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     requireCurrentUiRender(generation);
     const section = UI_SECTIONS.has(uiState.currentSection) ? uiState.currentSection : "dashboard";
     const projection = state(section);
-    const viewState = structuredClone(uiState);
-    viewState.currentSection = section;
-    viewState.settings = uiSettingsProjection(projection.settings);
-    viewState.telegram = uiTelegramProjection(projection.settings);
-    viewState.maintenance = projection.maintenance;
-    viewState.trashCount = Number(projection.trash_summary?.items || 0);
-    viewState.processCount = Number(projection.process_summary?.active || 0);
-    viewState.contextValues = projection.context_values || [];
-    viewState.debug.enabled = !!projection.settings.debug_http_log;
+    const viewState = {
+      currentSection: section,
+      settings: uiSettingsProjection(projection.settings),
+      maintenance: projection.maintenance,
+      trashCount: Number(projection.trash_summary?.items || 0),
+      processCount: Number(projection.process_summary?.active || 0),
+      contextValues: projection.context_values || [],
+      dialog: uiState.dialog,
+      settingsTab: uiState.settingsTab,
+    };
+    if (section === "sessions") viewState.sessions = { ...uiState.sessions };
+    else if (section === "commands") viewState.commands = { ...uiState.commands };
+    else if (section === "prompts") viewState.prompts = { ...uiState.prompts };
+    else if (section === "logs") viewState.logs = { ...uiState.logs };
+    else if (section === "browser") viewState.browser = { ...uiState.browser };
+    else if (section === "automation") viewState.automation = { ...uiState.automation };
+    else if (section === "published") viewState.published = { ...uiState.published };
+    else if (section === "memory") viewState.memory = { ...uiState.memory };
+    else if (section === "debug") viewState.debug = { ...uiState.debug, enabled: !!projection.settings.debug_http_log };
+    else if (section === "telegram") viewState.telegram = uiTelegramProjection(projection.settings);
     const model = { section, projection, viewState, commandData: null, promptData: null, processData: null, logData: null, browserData: null, automationData: null, publishedData: null, trashData: null, memoryData: null, debugData: null };
     if (section === "prompt_help") viewState.promptHelp = { yaml: GUIDED_PROMPTS_HELP_YAML, model: GUIDED_PROMPTS_HELP_MODEL };
     if (section === "roots") {
@@ -9740,10 +9530,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     }
   }
   async function replayAdminAction(logId, expectedTool, callIndex = null) {
-    const row = one("SELECT id,tool,input_json,payload_mode FROM logs WHERE id=?", Math.max(0, Number(logId) || 0));
+    const row = one("SELECT id,tool,mcp_request_json,payload_mode FROM logs WHERE id=?", Math.max(0, Number(logId) || 0));
     if (!row || row.tool !== expectedTool) throw new Error(`Recorded ${expectedTool} Tool Call not found`);
-    if (row.payload_mode !== "full") throw new Error("Replay requires a Tool Call recorded with Full payload retention");
-    const args = parseJson(row.input_json || "{}", {});
+    if (row.payload_mode !== "payload") throw new Error("Replay requires a Tool Call recorded with Payload retention");
+    const args = mcpToolArgsFromPacket(row.mcp_request_json);
     if (expectedTool === "desktop_auto") {
       await runDesktopScenario(args.yaml);
       uiNotice("Automation scenario replayed.", "ok");
@@ -9752,7 +9542,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const calls = Array.isArray(args.calls) ? args.calls : [];
     const replayCalls = callIndex == null ? calls : [calls[Math.max(0, Number(callIndex) || 0)]].filter(Boolean);
     if (!replayCalls.length) throw new Error("Recorded CDP operation not found");
-    const result = await runCdpBatch({ calls: structuredClone(replayCalls), wait: args.wait !== false });
+    const result = await runCdpBatch({ calls: replayCalls, wait: args.wait !== false });
     if (result.results.some(item => item?.success === false)) {
       const failed = result.results.find(item => item?.success === false);
       throw new Error(String(failed?.error || "CDP replay failed"));
@@ -9810,7 +9600,6 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         uiState.logs.openRowId = String(id);
         uiState.logs.selfTest = null;
         uiState.scrollBySection.logs = [0, 0];
-        uiState.scrollTarget = `tool-call-row-${id}`;
         uiState.focus = null;
         break;
       }
@@ -10132,7 +9921,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           git_preserve_line_endings: !!values.gitPreserveLineEndings,
           exec_environment: String(values.execEnvironment || ""),
           tool_call_storage: String(values.toolCallStorage || "disk"),
-          tool_call_payload_mode: String(values.toolCallPayloadMode || "full"),
+          tool_call_payload_mode: String(values.toolCallPayloadMode || "payload"),
           tool_call_retention_hours: String(values.toolCallRetentionHours ?? "0"),
           tool_call_memory_retention_minutes: String(values.toolCallMemoryRetentionMinutes ?? "60"),
         };
@@ -10839,41 +10628,41 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       const pageSize = Math.max(10, Math.min(Number(u.searchParams.get("page_size")) || 25, 100));
       const offset = (page - 1) * pageSize;
       let rows, total;
-      if (q && fts && !toolQuery) {
+      const toolLike = `%${toolQuery}%`, toolFilter = `(?='' OR l.tool LIKE ? COLLATE NOCASE OR (
+        l.tool LIKE 'exec%' AND EXISTS (
+          SELECT 1 FROM process_runs pr
+          WHERE l.tool IN ('exec','exec_start') AND pr.log_id=l.id
+            AND (COALESCE(json_extract(CASE WHEN json_valid(pr.command_json) THEN pr.command_json ELSE '{}' END,'$.catalog_name'),'') LIKE ? COLLATE NOCASE
+              OR COALESCE(json_extract(CASE WHEN json_valid(pr.command_json) THEN pr.command_json ELSE '{}' END,'$.program'),'') LIKE ? COLLATE NOCASE)
+        )
+      ))`;
+      if (q && fts) {
         try {
           const hits = `WITH hits(log_id) AS (
-            SELECT CAST(log_id AS INTEGER) FROM main.logs_fts WHERE logs_fts MATCH ?
+            SELECT rowid FROM main.logs_fts WHERE logs_fts MATCH ?
             UNION ALL
-            SELECT CAST(log_id AS INTEGER) FROM logs_fts_memory WHERE logs_fts_memory MATCH ?
+            SELECT rowid FROM logs_fts_memory WHERE logs_fts_memory MATCH ?
           )`;
           total = one(`${hits} SELECT COUNT(*) n FROM hits h JOIN logs l ON l.id=h.log_id
-            WHERE (?=0 OR l.context_id=?) AND (?='' OR l.status=?)`,
-            q, q, contextId, contextId, status, status)?.n || 0;
-          rows = all(`${hits} SELECT l.id,l.started_at,l.completed_at,l.context_id,l.root_id,l.root_name,l.tool,l.status,l.duration_ms,l.input_json,l.progress_requested,l.payload_mode,l.storage
+            WHERE (?=0 OR l.context_id=?) AND (?='' OR l.status=?) AND ${toolFilter}`,
+            q, q, contextId, contextId, status, status, toolQuery, toolLike, toolLike, toolLike)?.n || 0;
+          rows = all(`${hits} SELECT l.id,l.started_at,l.completed_at,l.context_id,l.root_id,l.root_name,l.tool,l.status,l.duration_ms,l.mcp_request_json,l.progress_requested,l.payload_mode,l.storage
             FROM hits h JOIN logs l ON l.id=h.log_id
-            WHERE (?=0 OR l.context_id=?) AND (?='' OR l.status=?)
+            WHERE (?=0 OR l.context_id=?) AND (?='' OR l.status=?) AND ${toolFilter}
             ORDER BY l.started_at DESC,l.id DESC LIMIT ? OFFSET ?`,
-            q, q, contextId, contextId, status, status, pageSize, offset);
+            q, q, contextId, contextId, status, status, toolQuery, toolLike, toolLike, toolLike, pageSize, offset);
         } catch {}
       }
       if (!rows) {
-        const like = `%${q}%`, toolLike = `%${toolQuery}%`;
-        const toolFilter = `(?='' OR l.tool LIKE ? COLLATE NOCASE OR (
-          l.tool LIKE 'exec%' AND EXISTS (
-            SELECT 1 FROM process_runs pr
-            WHERE l.tool IN ('exec','exec_start') AND pr.log_id=l.id
-              AND (COALESCE(json_extract(CASE WHEN json_valid(pr.command_json) THEN pr.command_json ELSE '{}' END,'$.catalog_name'),'') LIKE ? COLLATE NOCASE
-                OR COALESCE(json_extract(CASE WHEN json_valid(pr.command_json) THEN pr.command_json ELSE '{}' END,'$.program'),'') LIKE ? COLLATE NOCASE)
-          )
-        ))`;
+        const like = `%${q}%`;
         total = one(`SELECT COUNT(*) n FROM logs l WHERE (?=0 OR l.context_id=?) AND (?='' OR l.status=?)
           AND ${toolFilter}
-          AND (?='' OR COALESCE(CAST(l.context_id AS TEXT),'')||COALESCE(l.context_handle,'')||COALESCE(l.tool,'')||COALESCE(l.payload_mode,'')||COALESCE(l.input_json,'')||COALESCE(l.result_json,'')||COALESCE(l.resolved_json,'')||COALESCE(l.stdout,'')||COALESCE(l.stderr,'')||COALESCE(l.error,'') LIKE ?)`,
+          AND (?='' OR COALESCE(CAST(l.context_id AS TEXT),'')||COALESCE(l.context_handle,'')||COALESCE(l.tool,'')||COALESCE(l.payload_mode,'')||COALESCE(l.mcp_request_json,'')||COALESCE(l.mcp_response_json,'')||COALESCE(l.error,'') LIKE ?)`,
           contextId, contextId, status, status, toolQuery, toolLike, toolLike, toolLike, q, like)?.n || 0;
-        rows = all(`SELECT l.id,l.started_at,l.completed_at,l.context_id,l.root_id,l.root_name,l.tool,l.status,l.duration_ms,l.input_json,l.progress_requested,l.payload_mode,l.storage FROM logs l
+        rows = all(`SELECT l.id,l.started_at,l.completed_at,l.context_id,l.root_id,l.root_name,l.tool,l.status,l.duration_ms,l.mcp_request_json,l.progress_requested,l.payload_mode,l.storage FROM logs l
           WHERE (?=0 OR l.context_id=?) AND (?='' OR l.status=?)
           AND ${toolFilter}
-          AND (?='' OR COALESCE(CAST(l.context_id AS TEXT),'')||COALESCE(l.context_handle,'')||COALESCE(l.tool,'')||COALESCE(l.payload_mode,'')||COALESCE(l.input_json,'')||COALESCE(l.result_json,'')||COALESCE(l.resolved_json,'')||COALESCE(l.stdout,'')||COALESCE(l.stderr,'')||COALESCE(l.error,'') LIKE ?)
+          AND (?='' OR COALESCE(CAST(l.context_id AS TEXT),'')||COALESCE(l.context_handle,'')||COALESCE(l.tool,'')||COALESCE(l.payload_mode,'')||COALESCE(l.mcp_request_json,'')||COALESCE(l.mcp_response_json,'')||COALESCE(l.error,'') LIKE ?)
           ORDER BY l.started_at DESC,l.id DESC LIMIT ? OFFSET ?`,
           contextId, contextId, status, status, toolQuery, toolLike, toolLike, toolLike, q, like, pageSize, offset);
       }
@@ -10882,8 +10671,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         .map(record => [record.log_id, record]));
       rows = rows.map(row => {
         const process = processByLog.get(row.id), control = activeCallControls.get(row.id);
-        const input = parseJson(row.input_json || "{}", {}), call_preview = toolCallModeKeepsJson(String(row.payload_mode || "full")) ? compactToolCallPreview(p, row.tool, input) : "";
-        const { input_json: _inputJson, ...summary } = row;
+        const input = mcpToolArgsFromPacket(row.mcp_request_json), call_preview = toolCallModeKeepsJson(String(row.payload_mode || "payload")) ? compactToolCallPreview(p, row.tool, input) : "";
+        const { mcp_request_json: _mcpRequestJson, ...summary } = row;
         return { ...summary, call_preview, progress_requested: !!row.progress_requested,
           killable: !!process || !!control?.cancel, process_id: process?.id || control?.process_id || "" };
       });
@@ -10905,15 +10694,15 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const lm = u.pathname.match(/^\/api\/logs\/(\d+)$/);
     if (lm && req.method === "GET") {
       const logId = Number(lm[1]);
-      const detail = one(`SELECT id,started_at,completed_at,server_id,server_name,tool,status,input_json,resolved_json,
-        stdout,stderr,error,result_json,duration_ms,context_id,context_handle,progress_requested,payload_mode,storage FROM logs WHERE id=?`, logId);
+      const detail = one(`SELECT id,started_at,completed_at,server_id,server_name,tool,status,mcp_request_json,mcp_response_json,
+        error,duration_ms,context_id,context_handle,progress_requested,payload_mode,storage FROM logs WHERE id=?`, logId);
       if (!detail) return json({ error: "Not found" });
       const descriptor = one("SELECT descriptor_json FROM tool_call_descriptor_records WHERE log_id=?", logId);
       if (descriptor?.descriptor_json) {
         detail.tool_descriptor = parseJson(descriptor.descriptor_json, null);
-        const currentDescriptor = serverTools(serverConfig(), true).find(tool => tool.name === detail.tool) || null;
+        const currentDescriptor = serverToolDescriptor(serverConfig(), detail.tool);
         detail.tool_descriptor_current_available = !!currentDescriptor;
-        detail.tool_descriptor_matches_current = !!currentDescriptor && JSON.stringify(currentDescriptor) === JSON.stringify(detail.tool_descriptor);
+        detail.tool_descriptor_matches_current = !!currentDescriptor && descriptorJson(currentDescriptor) === descriptor.descriptor_json;
       }
       let process = [...processes.values()].find(record => record.log_id === logId);
       if (!process && ["exec", "exec_start"].includes(detail.tool)) {
@@ -10921,11 +10710,6 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         if (historicalProcess) process = processHistoryAdminView(historicalProcess);
       }
       detail.progress_requested = !!detail.progress_requested;
-      detail.contents = detail.payload_mode === "full" ? all("SELECT id,direction,json_path,content_type,mime_type,bytes,data FROM tool_call_content_all WHERE log_id=? ORDER BY direction,id", logId).map(row => ({
-        id: Number(row.id), direction: row.direction, json_path: row.json_path, content_type: row.content_type,
-        mime_type: row.mime_type, bytes: Number(row.bytes || 0),
-        data_url: String(row.mime_type || "").startsWith("image/") ? `data:${row.mime_type};base64,${Buffer.from(row.data).toString("base64")}` : "",
-      })) : [];
       if (process) detail.process = process.output_readers ? processAdminView(process) : process;
       return json(detail);
     }
@@ -10976,7 +10760,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 <meta http-equiv="Content-Security-Policy" content="${UI_CSP}">
 <meta name=viewport content="width=device-width,initial-scale=1"><link rel=icon href="${GUI_LOGO_DATA_URL}"><title>MrMCP</title><style>${GUI_JSONEDITOR_CSS}
 
-:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}#app>aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}#app>aside button{display:flex;align-items:center;gap:4px;width:100%;text-align:left;white-space:nowrap;margin:3px 0;padding-left:6px;padding-right:6px;background:transparent;border:0}#app>aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.notice-balloon{position:fixed;top:64px;right:16px;z-index:1900;max-width:min(520px,calc(100vw - 32px));padding:10px 12px;border:1px solid #7d3f47;border-radius:9px;background:#25191b;color:#ffb7bf;box-shadow:0 8px 28px #0008}.notice-balloon.info{border-color:#365a7d;background:#16202b;color:#a9d5ff}.notice-balloon.ok{border-color:#356849;background:#16241b;color:#9ce8b1}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.debug-toggle{font-weight:750;min-width:190px}.debug-toggle.enabled{background:#173f24;border-color:#347a49;color:#9ce8b1}.debug-toggle.disabled{background:#421d21;border-color:#7d3f47;color:#ffb7bf}.debug-toggle.enabled:hover{background:#20512f}.debug-toggle.disabled:hover{background:#53262b}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.settings-tabs{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 14px;padding-bottom:10px;border-bottom:1px solid #292c33}.settings-tabs button{background:#1b1e24;border-color:#30343d}.settings-tabs button.active{background:#2459a8;border-color:#3984e8;color:#fff;font-weight:650}.settings-layout{display:block}.settings-main,.settings-side{min-width:0}.settings-side{position:static}.settings-layout .card{max-width:980px}.settings-layout .card h3{margin-top:0}.settings-main input:not([type=checkbox]){width:100%}.settings-main textarea{min-height:96px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.detail-row td{padding:0 18px 14px 28px;background:#111318}.detail-panel{border:1px solid #343944;border-left:3px solid #3984e8;border-radius:8px;background:#0d0f12;padding:14px 16px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.tool-detail-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:14px;align-items:start}.tool-detail-main{min-width:0}.tool-descriptor{min-width:0;position:sticky;top:10px;border:1px solid #343944;border-radius:8px;background:#111318;padding:12px}.tool-descriptor>.muted{margin-top:10px}.tool-descriptor p{margin:5px 0 10px;line-height:1.45}.tool-descriptor pre{margin:5px 0 10px;max-height:28vh}.descriptor-status{font-size:11px;font-weight:800;letter-spacing:.04em;padding:3px 6px;border-radius:5px}.descriptor-status.current{color:#75d58b;background:#16341f}.descriptor-status.outdated{color:#ffd166;background:#3a2f13}.http-detail-head{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #292d34}.http-detail-meta{display:flex;gap:7px 16px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:#89909b}.http-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.http-detail-block{min-width:0;border:1px solid #292d34;border-radius:8px;background:#0a0c0f;padding:10px}.http-detail-block h4{margin:0}.http-detail-block pre{max-height:30vh}.http-detail-error{margin-top:12px;border-color:#68353a;background:#1d1012}.http-detail-raw{margin-top:12px}.http-detail-raw summary{cursor:pointer;color:#89909b}@media(max-width:1100px){.tool-detail-grid,.http-detail-grid{grid-template-columns:1fr}.tool-descriptor{position:static}}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.tool-command-preview{margin-top:3px;max-width:440px;color:#c5cad3;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.tool-content-detail{margin-top:12px;padding:12px;border:1px solid #343944;border-radius:8px;background:#0a0c0f}.tool-content-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:9px;margin-top:9px}.tool-content-card{position:relative;min-width:0;padding:9px;border:1px solid #292d34;border-radius:7px;background:#111318}.tool-content-path{margin-top:4px;color:#89909b;font:11px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.tool-content-preview{display:block;max-width:180px;max-height:120px;margin-top:8px;border-radius:5px;object-fit:contain;background:#07080a;transition:transform .12s ease;transform-origin:left top;position:relative;z-index:1}.tool-content-preview:hover{transform:scale(1.75);z-index:20;box-shadow:0 8px 30px #000c}.tool-content-placeholder{margin-top:8px;padding:10px;border-radius:5px;background:#090a0c;color:#89909b;font-size:12px}.json-editor-host{height:320px;min-height:180px;margin-top:8px;border-radius:8px;overflow:hidden}.json-editor-host.compact{height:240px;min-height:150px;margin:5px 0 10px}.json-editor-host.memory{height:min(58vh,620px);min-height:320px}.json-editor-host .jsoneditor{border-color:#343944;background:#090a0c}.json-editor-host div.jsoneditor-tree{background:#090a0c;color:#e8e8e8}.json-editor-host div.jsoneditor-field,.json-editor-host div.jsoneditor-value{color:#e8e8e8}.json-editor-host div.jsoneditor-readonly{color:#89909b}.json-editor-host div.jsoneditor-value.jsoneditor-string{color:#9ce8b1}.json-editor-host div.jsoneditor-value.jsoneditor-number{color:#ffd166}.json-editor-host div.jsoneditor-value.jsoneditor-boolean{color:#c7a0ff}.json-editor-host div.jsoneditor-value.jsoneditor-null{color:#8fd3ff}.json-editor-host .jsoneditor-navigation-bar{background:#111318;color:#89909b;border-color:#292d34}.json-editor-host .jsoneditor-frame{background:#111318;border-color:#343944}.json-editor-host .jsoneditor-search input{color:#eee;background:#22252b}.json-editor-host tr.jsoneditor-highlight,.json-editor-host tr.jsoneditor-selected{background:#252a33}.json-editor-host .jsoneditor-menu{background:#2459a8;border-color:#2459a8}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.http-session{white-space:nowrap}.workspace-label{margin-top:3px;color:#89909b;font-size:12px;font-weight:600}.menu-icon{display:inline-block;width:22px;text-align:center}.menu-label{flex:1;min-width:0}.menu-badge{min-width:20px;padding:1px 6px;border-radius:999px;background:#343944;color:#d6e6ff;font-size:11px;font-weight:750;text-align:center}.trash-table td:first-child{max-width:640px;overflow-wrap:anywhere}.trash-table td:first-child code{white-space:normal}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-call-card{padding:0;overflow:hidden;min-height:210px}.dashboard-call-table{margin:0;background:transparent}.dashboard-call-table thead{position:sticky;top:0;z-index:1;background:#181a1f}.dashboard-call-table tr{height:35px}.dashboard-call-table th,.dashboard-call-table td{padding:7px 9px}.dashboard-call-table tr[data-action=dashboard-tool-call]{cursor:pointer}.dashboard-call-table tr[data-action=dashboard-tool-call]:hover{background:#20242a}.dashboard-call-summary{max-width:720px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dashboard-call-recent{animation:dashboardCallFade var(--dashboard-call-ttl,5s) linear forwards}@keyframes dashboardCallFade{from{opacity:1}to{opacity:.18}}.progress-requested{color:#8fd3ff;white-space:nowrap}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}#publishedList{overflow-x:auto}.published-table{table-layout:fixed;min-width:850px}.published-table th:nth-child(1){width:130px}.published-table th:nth-child(2){width:165px}.published-table th:nth-child(3){width:135px}.published-table th:nth-child(4){width:185px}.published-table th:nth-child(5){width:105px}.published-table th:nth-child(7){width:80px}.published-id{min-width:0}.published-id code,.published-id .published-file-meta{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-reference{display:inline-flex;align-items:center;gap:4px;max-width:100%;margin:0 6px 4px 0}.published-reference .workspace-label{max-width:105px;margin-top:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-open{display:block;width:100%;max-width:100%;padding:0;border:0;background:transparent;text-align:left;color:#9ecbff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-open code{white-space:nowrap}.published-open:hover{background:transparent;text-decoration:underline}.published-file-meta{margin-top:3px;color:#89909b;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-activity{white-space:nowrap}.published-source{min-width:0}.published-source code{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout,.settings-layout{grid-template-columns:1fr}.default-root-card,.settings-side{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){#app>aside{width:130px}main{margin-left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
+:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}#app>aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}#app>aside button{display:flex;align-items:center;gap:4px;width:100%;text-align:left;white-space:nowrap;margin:3px 0;padding-left:6px;padding-right:6px;background:transparent;border:0}#app>aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.notice-balloon{position:fixed;top:64px;right:16px;z-index:1900;max-width:min(520px,calc(100vw - 32px));padding:10px 12px;border:1px solid #7d3f47;border-radius:9px;background:#25191b;color:#ffb7bf;box-shadow:0 8px 28px #0008}.notice-balloon.info{border-color:#365a7d;background:#16202b;color:#a9d5ff}.notice-balloon.ok{border-color:#356849;background:#16241b;color:#9ce8b1}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.debug-toggle{font-weight:750;min-width:190px}.debug-toggle.enabled{background:#173f24;border-color:#347a49;color:#9ce8b1}.debug-toggle.disabled{background:#421d21;border-color:#7d3f47;color:#ffb7bf}.debug-toggle.enabled:hover{background:#20512f}.debug-toggle.disabled:hover{background:#53262b}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.settings-tabs{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 14px;padding-bottom:10px;border-bottom:1px solid #292c33}.settings-tabs button{background:#1b1e24;border-color:#30343d}.settings-tabs button.active{background:#2459a8;border-color:#3984e8;color:#fff;font-weight:650}.settings-layout{display:block}.settings-main,.settings-side{min-width:0}.settings-side{position:static}.settings-layout .card{max-width:980px}.settings-layout .card h3{margin-top:0}.settings-main input:not([type=checkbox]){width:100%}.settings-main textarea{min-height:96px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.tool-detail-overlay{position:fixed;top:54px;left:170px;right:0;bottom:0;z-index:1750;overflow:auto;overscroll-behavior:contain;padding:16px;background:#101114}.tool-detail-overlay .tool-detail-screen{min-height:calc(100vh - 86px)}.tool-detail-screen-head{position:sticky;top:-14px;z-index:10;margin:-14px -16px 12px;padding:12px 16px;background:#0d0f12;border-bottom:1px solid #292d34}.detail-row td{padding:0 18px 14px 28px;background:#111318}.detail-panel{border:1px solid #343944;border-left:3px solid #3984e8;border-radius:8px;background:#0d0f12;padding:14px 16px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.tool-detail-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:14px;align-items:start}.tool-detail-main{min-width:0}.tool-descriptor{min-width:0;position:sticky;top:10px;border:1px solid #343944;border-radius:8px;background:#111318;padding:12px}.tool-descriptor>.muted{margin-top:10px}.tool-descriptor p{margin:5px 0 10px;line-height:1.45}.tool-descriptor pre{margin:5px 0 10px;max-height:28vh}.descriptor-status{font-size:11px;font-weight:800;letter-spacing:.04em;padding:3px 6px;border-radius:5px}.descriptor-status.current{color:#75d58b;background:#16341f}.descriptor-status.outdated{color:#ffd166;background:#3a2f13}.http-detail-head{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #292d34}.http-detail-meta{display:flex;gap:7px 16px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:#89909b}.http-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.http-detail-block{min-width:0;border:1px solid #292d34;border-radius:8px;background:#0a0c0f;padding:10px}.http-detail-block h4{margin:0}.http-detail-block pre{max-height:30vh}.http-detail-error{margin-top:12px;border-color:#68353a;background:#1d1012}.http-detail-raw{margin-top:12px}.http-detail-raw summary{cursor:pointer;color:#89909b}@media(max-width:1100px){.tool-detail-grid,.http-detail-grid{grid-template-columns:1fr}.tool-descriptor{position:static}}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.tool-command-preview{margin-top:3px;max-width:440px;color:#c5cad3;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.debug-packet{min-width:0}.debug-payload-tree{margin-top:9px;padding:10px;border:1px solid #292d34;border-radius:8px;background:#080a0d;font:12px ui-monospace,SFMono-Regular,Consolas,monospace}.debug-node{margin:3px 0}.debug-node>summary,.debug-decoded>summary{cursor:pointer;color:#9ecbff}.debug-children{margin:5px 0 5px 12px;padding-left:10px;border-left:1px solid #292d34}.debug-entry{display:grid;grid-template-columns:minmax(80px,180px) minmax(0,1fr);gap:9px;align-items:start;padding:3px 0}.debug-key{color:#ffd166;overflow-wrap:anywhere}.debug-string{color:#9ce8b1;white-space:pre-wrap;overflow-wrap:anywhere}.debug-scalar{color:#c7a0ff}.debug-null{color:#8fd3ff}.debug-multiline{margin:0;max-height:40vh;white-space:pre-wrap}.debug-decoded{margin:3px 0;padding:5px 7px;border:1px solid #26303b;border-radius:6px;background:#0b0e12}.debug-image{margin:4px 0}.debug-image img{display:block;max-width:min(100%,720px);max-height:60vh;object-fit:contain;border-radius:6px;background:#050607}.debug-image figcaption{margin-top:4px;color:#89909b}.tool-content-detail{margin-top:12px;padding:12px;border:1px solid #343944;border-radius:8px;background:#0a0c0f}.tool-content-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:9px;margin-top:9px}.tool-content-card{position:relative;min-width:0;padding:9px;border:1px solid #292d34;border-radius:7px;background:#111318}.tool-content-path{margin-top:4px;color:#89909b;font:11px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.tool-content-preview{display:block;max-width:180px;max-height:120px;margin-top:8px;border-radius:5px;object-fit:contain;background:#07080a;transition:transform .12s ease;transform-origin:left top;position:relative;z-index:1}.tool-content-preview:hover{transform:scale(1.75);z-index:20;box-shadow:0 8px 30px #000c}.tool-content-placeholder{margin-top:8px;padding:10px;border-radius:5px;background:#090a0c;color:#89909b;font-size:12px}.json-editor-host{height:320px;min-height:180px;margin-top:8px;border-radius:8px;overflow:hidden}.json-editor-host.compact{height:240px;min-height:150px;margin:5px 0 10px}.json-editor-host.memory{height:min(58vh,620px);min-height:320px}.json-editor-host .jsoneditor{border-color:#343944;background:#090a0c}.json-editor-host div.jsoneditor-tree{background:#090a0c;color:#e8e8e8}.json-editor-host div.jsoneditor-field,.json-editor-host div.jsoneditor-value{color:#e8e8e8}.json-editor-host div.jsoneditor-readonly{color:#89909b}.json-editor-host div.jsoneditor-value.jsoneditor-string{color:#9ce8b1}.json-editor-host div.jsoneditor-value.jsoneditor-number{color:#ffd166}.json-editor-host div.jsoneditor-value.jsoneditor-boolean{color:#c7a0ff}.json-editor-host div.jsoneditor-value.jsoneditor-null{color:#8fd3ff}.json-editor-host .jsoneditor-navigation-bar{background:#111318;color:#89909b;border-color:#292d34}.json-editor-host .jsoneditor-frame{background:#111318;border-color:#343944}.json-editor-host .jsoneditor-search input{color:#eee;background:#22252b}.json-editor-host tr.jsoneditor-highlight,.json-editor-host tr.jsoneditor-selected{background:#252a33}.json-editor-host .jsoneditor-menu{background:#2459a8;border-color:#2459a8}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.http-session{white-space:nowrap}.workspace-label{margin-top:3px;color:#89909b;font-size:12px;font-weight:600}.menu-icon{display:inline-block;width:22px;text-align:center}.menu-label{flex:1;min-width:0}.menu-badge{min-width:20px;padding:1px 6px;border-radius:999px;background:#343944;color:#d6e6ff;font-size:11px;font-weight:750;text-align:center}.trash-table td:first-child{max-width:640px;overflow-wrap:anywhere}.trash-table td:first-child code{white-space:normal}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.dashboard-call-card{padding:0;overflow:hidden;min-height:210px}.dashboard-call-table{margin:0;background:transparent}.dashboard-call-table thead{position:sticky;top:0;z-index:1;background:#181a1f}.dashboard-call-table tr{height:35px}.dashboard-call-table th,.dashboard-call-table td{padding:7px 9px}.dashboard-call-table tr[data-action=dashboard-tool-call]{cursor:pointer}.dashboard-call-table tr[data-action=dashboard-tool-call]:hover{background:#20242a}.dashboard-call-summary{max-width:720px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.dashboard-call-recent{animation:dashboardCallFade var(--dashboard-call-ttl,5s) linear forwards}@keyframes dashboardCallFade{from{opacity:1}to{opacity:.18}}.progress-requested{color:#8fd3ff;white-space:nowrap}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}#publishedList{overflow-x:auto}.published-table{table-layout:fixed;min-width:850px}.published-table th:nth-child(1){width:130px}.published-table th:nth-child(2){width:165px}.published-table th:nth-child(3){width:135px}.published-table th:nth-child(4){width:185px}.published-table th:nth-child(5){width:105px}.published-table th:nth-child(7){width:80px}.published-id{min-width:0}.published-id code,.published-id .published-file-meta{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-reference{display:inline-flex;align-items:center;gap:4px;max-width:100%;margin:0 6px 4px 0}.published-reference .workspace-label{max-width:105px;margin-top:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-open{display:block;width:100%;max-width:100%;padding:0;border:0;background:transparent;text-align:left;color:#9ecbff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-open code{white-space:nowrap}.published-open:hover{background:transparent;text-decoration:underline}.published-file-meta{margin-top:3px;color:#89909b;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-activity{white-space:nowrap}.published-source{min-width:0}.published-source code{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout,.settings-layout{grid-template-columns:1fr}.default-root-card,.settings-side{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){#app>aside{width:130px}main{margin-left:130px}.tool-detail-overlay{left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
 </style></head><body>
 <div id=app data-section=dashboard><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div><div class=status><span class=pending>starting…</span></div></header><main style="margin-left:0"><div class=card>Starting the local MrMCP UI…</div></main></div>
 <script nonce="${UI_SCRIPT_NONCE}">__MRMCP_BROWSER_JS__</script></body></html>` : "";
