@@ -1326,21 +1326,32 @@ async function backend({ addWorkspace = null } = {}) {
     if (!exact.length && !starts.length || exact.includes("*") || starts.includes("*")) return true;
     return exact.includes(method) || starts.some(prefix => method.startsWith(prefix));
   };
-  const cdpSubscriptionMatches = (subscription, message) => {
+  const cdpSubscriptionMatches = (subscription, message, regexText = null) => {
     if (!message || subscription.browser !== message.browser) return false;
     if (!cdpMethodMatches(message.method || "", subscription.methods, subscription.method_prefixes)) return false;
     if (subscription.regex) {
       subscription.regex.lastIndex = 0;
-      if (!subscription.regex.test(JSON.stringify(message.cdp ?? null))) return false;
+      if (!subscription.regex.test(regexText ? regexText() : JSON.stringify(message.cdp ?? null))) return false;
     }
     if (!message.target_id) return !!subscription.include_browser;
     if (!subscription.targets?.length || subscription.targets.includes("*")) return true;
     return !!message.target && subscription.targets.includes(message.target);
   };
+  const cdpRingLength = record => Math.max(0, record.ring.length - Number(record.ring_head || 0));
+  const cdpRingOldest = record => cdpRingLength(record) ? record.ring[Number(record.ring_head || 0)] : null;
+  const cdpRingNewest = record => cdpRingLength(record) ? record.ring.at(-1) : null;
+  function cdpCompactRing(record) {
+    const head = Number(record.ring_head || 0);
+    if (head < 1024 || head * 2 < record.ring.length) return;
+    record.ring = record.ring.slice(head);
+    record.ring_head = 0;
+  }
   function cdpMarkDropped(record, message) {
     record.dropped += 1;
+    let serialized;
+    const regexText = () => serialized ??= JSON.stringify(message.cdp ?? null);
     for (const subscription of cdpSubscriptions.values()) {
-      if (subscription.cursor < message.seq && cdpSubscriptionMatches(subscription, message)) subscription.dropped += 1;
+      if (subscription.cursor < message.seq && cdpSubscriptionMatches(subscription, message, regexText)) subscription.dropped += 1;
     }
   }
   function cdpRecordMessage(record, message) {
@@ -1352,11 +1363,12 @@ async function backend({ addWorkspace = null } = {}) {
       cdpMarkDropped(record, stored);
       return null;
     }
-    while (record.ring.length && (record.ring.length >= CDP_RING_MAX_MESSAGES || record.ring_bytes + stored._bytes > CDP_RING_MAX_BYTES)) {
-      const removed = record.ring.shift();
-      record.ring_bytes = Math.max(0, record.ring_bytes - Number(removed._bytes || 0));
-      cdpMarkDropped(record, removed);
+    while (cdpRingLength(record) && (cdpRingLength(record) >= CDP_RING_MAX_MESSAGES || record.ring_bytes + stored._bytes > CDP_RING_MAX_BYTES)) {
+      const removed = record.ring[record.ring_head++];
+      record.ring_bytes = Math.max(0, record.ring_bytes - Number(removed?._bytes || 0));
+      if (removed) cdpMarkDropped(record, removed);
     }
+    cdpCompactRing(record);
     record.ring.push(stored);
     record.ring_bytes += stored._bytes;
     queueCdpUiRender();
@@ -1536,7 +1548,13 @@ async function backend({ addWorkspace = null } = {}) {
       browser: record.browser, type: "notification", id: null, method: message.method,
       ...targetMeta, cdp: message,
     };
-    if ([...cdpSubscriptions.values()].some(subscription => cdpSubscriptionMatches(subscription, envelope))) cdpRecordMessage(record, envelope);
+    let serialized;
+    const regexText = () => serialized ??= JSON.stringify(envelope.cdp ?? null);
+    for (const subscription of cdpSubscriptions.values()) {
+      if (!cdpSubscriptionMatches(subscription, envelope, regexText)) continue;
+      cdpRecordMessage(record, envelope);
+      break;
+    }
   }
   function cdpDisconnect(record, reason = "CDP connection closed") {
     if (!record.open) return;
@@ -1559,7 +1577,7 @@ async function backend({ addWorkspace = null } = {}) {
       next_id: Math.floor(Math.random() * 0x3fffffff) + 1, pending: new Map(),
       target_to_session: new Map(), session_to_target: new Map(), target_labels: new Map(), label_targets: new Map(), live_targets: new Map(),
       attach_waiters: new Map(), session_init_promises: new Map(), session_setup_errors: new Map(), target_promises: new Map(),
-      ring: [], ring_bytes: 0, dropped: 0, message_chain: Promise.resolve(),
+      ring: [], ring_head: 0, ring_bytes: 0, dropped: 0, message_chain: Promise.resolve(),
     };
     for (const row of all("SELECT target,target_id FROM cdp_targets WHERE browser=?", browserRecord.browser)) {
       record.target_labels.set(String(row.target_id), String(row.target));
@@ -1802,9 +1820,11 @@ async function backend({ addWorkspace = null } = {}) {
       method_prefixes: (args.method_prefixes || []).map(value => String(value).trim()).filter(Boolean),
     };
     let messages = [];
+    const ringHead = Number(record.ring_head || 0);
     if (subscription) {
       let scannedTo = subscription.cursor;
-      for (const message of record.ring) {
+      for (let index = ringHead; index < record.ring.length; index++) {
+        const message = record.ring[index];
         if (message.seq <= subscription.cursor) continue;
         scannedTo = message.seq;
         if (!cdpSubscriptionMatches(subscription, message) || !cdpPollMatches(message, filters)) continue;
@@ -1813,15 +1833,18 @@ async function backend({ addWorkspace = null } = {}) {
       }
       if (args.advance !== false) subscription.cursor = scannedTo || (cdpBrowserSequences.get(record.browser) || subscription.cursor);
     } else {
-      const matched = record.ring.filter(message => cdpPollMatches(message, filters));
-      messages = matched.slice(Math.max(0, matched.length - limit)).map(cdpPublicMessage);
+      for (let index = record.ring.length - 1; index >= ringHead && messages.length < limit; index--) {
+        const message = record.ring[index];
+        if (cdpPollMatches(message, filters)) messages.push(cdpPublicMessage(message));
+      }
+      messages.reverse();
     }
     return {
       browser: record.browser, subscription: subscription?.id || null, messages,
       cursor: subscription?.cursor ?? null, dropped: subscription?.dropped ?? record.dropped,
       stream_resets: subscription?.stream_resets ?? 0,
-      oldest_seq: record.ring.length ? record.ring[0].seq : null,
-      newest_seq: record.ring.length ? record.ring[record.ring.length - 1].seq : null,
+      oldest_seq: cdpRingOldest(record)?.seq ?? null,
+      newest_seq: cdpRingNewest(record)?.seq ?? null,
     };
   }
 
@@ -3305,8 +3328,8 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   }
 
   // File tools can access every entry inside the selected Workspace.
-  async function safePath(root, path = ".") {
-    const rootReal = await Deno.realPath(root);
+  async function safePath(root, path = ".", knownRootReal = "") {
+    const rootReal = knownRootReal || await Deno.realPath(root);
     const target = resolve(rootReal, String(path || "."));
     if (!within(rootReal, target)) throw new Error("Path outside selected Workspace");
     let current = target;
@@ -3344,11 +3367,20 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     throw new Error(`Unsupported text encoding: ${value}`);
   }
   function lineEndingKind(value) {
-    const crlf = (value.match(/\r\n/g) || []).length;
-    const lf = (value.match(/(?<!\r)\n/g) || []).length;
-    const cr = (value.match(/\r(?!\n)/g) || []).length;
-    const kinds = [["crlf", crlf], ["lf", lf], ["cr", cr]].filter(([, count]) => count > 0);
-    return kinds.length === 0 ? "none" : kinds.length === 1 ? kinds[0][0] : "mixed";
+    value = String(value || "");
+    let kind = "none";
+    const seen = current => {
+      if (kind === "none") { kind = current; return false; }
+      return kind !== current;
+    };
+    for (let index = 0; index < value.length; index++) {
+      const code = value.charCodeAt(index);
+      if (code === 13) {
+        if (value.charCodeAt(index + 1) === 10) { if (seen("crlf")) return "mixed"; index++; }
+        else if (seen("cr")) return "mixed";
+      } else if (code === 10 && seen("lf")) return "mixed";
+    }
+    return kind;
   }
   function normalizeLineEndings(value, mode, source = null) {
     mode = String(mode || "preserve").toLowerCase();
@@ -3614,7 +3646,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     return rules;
   }
   async function fsWalk(root, start = ".", options = {}) {
-    const rootReal = await Deno.realPath(root), base = await safePath(rootReal, start);
+    const rootReal = options.root_real || await Deno.realPath(root), base = await safePath(rootReal, start, rootReal);
     const stat = await Deno.lstat(base), include = compileGlobs(options.include), exclude = compileGlobs(options.exclude, []);
     const includePrefixes = includeTraversalPrefixes(options.include);
     const hidden = options.hidden === true, useGitignore = options.gitignore !== false, metadata = options.metadata !== false;
@@ -3729,8 +3761,8 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     try { return await Deno.lstat(path); }
     catch (error) { if (error instanceof Deno.errors.NotFound) return null; throw error; }
   };
-  async function trashItemMetadata(path) {
-    const stat = await Deno.lstat(path);
+  async function trashItemMetadata(path, knownStat = null) {
+    const stat = knownStat || await Deno.lstat(path);
     const item_type = stat.isFile ? "file" : stat.isDirectory ? "directory" : stat.isSymlink ? "symlink" : "other";
     const size_bytes = stat.isDirectory ? -1 : Number(stat.size || 0);
     return { item_type, size_bytes };
@@ -3943,8 +3975,8 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const context = getContextRecord(p, String(args.context_handle || ""));
     return { context, root: selectedContextRoot(p, context) };
   }
-  async function resolveWorkspacePath(selection, path = ".") {
-    const absolute = await safePath(selection.root.path, path);
+  async function resolveWorkspacePath(selection, path = ".", knownRootReal = "") {
+    const absolute = await safePath(selection.root.path, path, knownRootReal);
     return {
       ...selection,
       path: absolute,
@@ -3953,8 +3985,9 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   }
   async function workspaceInfo(selection, options = {}) {
     let agentGuidancePath = null;
+    const rootReal = await Deno.realPath(selection.root.path);
     for (const name of ["AGENTS.md", "agents.md", "CLAUDE.md", "Claude.md", "claude.md"]) {
-      const candidate = await resolveWorkspacePath(selection, name).catch(() => null);
+      const candidate = await resolveWorkspacePath(selection, name, rootReal).catch(() => null);
       const stat = candidate ? await Deno.stat(candidate.path).catch(() => null) : null;
       if (stat?.isFile) {
         agentGuidancePath = candidate.path;
@@ -6479,7 +6512,9 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       }));
       return { results: result?.results || [], state, images: imageMetadata, [TOOL_RESULT_CONTENT]: content };
     }
-    const resolvePath = path => resolveWorkspacePath(selection, path);
+    let workspaceRootRealPromise = null;
+    const workspaceRootReal = () => workspaceRootRealPromise ||= Deno.realPath(selection.root.path);
+    const resolvePath = async path => resolveWorkspacePath(selection, path, await workspaceRootReal());
     const pathKey = path => Deno.build.os === "windows" ? resolve(path).toLowerCase() : resolve(path);
     const exists = async path => {
       try { return await Deno.lstat(path); }
@@ -6488,10 +6523,18 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const errorStatus = error => error instanceof Deno.errors.NotFound ? "not_found"
       : error instanceof Deno.errors.PermissionDenied ? "permission_denied" : "failed";
     const textLines = document => {
-      const normalized = normalizeLineEndings(document.text, "lf");
-      if (!normalized) return [];
-      const lines = normalized.split("\n");
-      if (normalized.endsWith("\n")) lines.pop();
+      const text = String(document.text || "");
+      if (!text) return [];
+      const lines = [];
+      let start = 0;
+      for (let index = 0; index < text.length; index++) {
+        const code = text.charCodeAt(index);
+        if (code !== 10 && code !== 13) continue;
+        lines.push(text.slice(start, index));
+        if (code === 13 && text.charCodeAt(index + 1) === 10) index++;
+        start = index + 1;
+      }
+      if (start < text.length) lines.push(text.slice(start));
       return lines;
     };
     const searchRegex = (pattern, regex, caseSensitive) => new RegExp(
@@ -6548,7 +6591,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     }
     if (name === "fs_glob") {
       const limit = Math.min(Number(args.limit || 1000), 10000), metadata = args.metadata === true;
-      const walked = await fsWalk(selection.root.path, args.path || ".", { ...args, metadata, after_path: args.after_path, hard_limit: limit + 1 });
+      const walked = await fsWalk(selection.root.path, args.path || ".", { ...args, root_real: await workspaceRootReal(), metadata, after_path: args.after_path, hard_limit: limit + 1 });
       const page = walked.entries.slice(0, limit), truncated = walked.entries.length > limit || walked.limited;
       return {
         metadata, returned: page.length, limit,
@@ -6564,7 +6607,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       const before = Math.min(Number(args.context_lines_before || 0), 100), afterContext = Math.min(Number(args.context_lines_after || 0), 100);
       const mode = String(args.mode || "matches"), limit = Math.min(Number(args.limit || 300), 2000);
       const maxFileBytes = Math.min(Number(args.max_file_bytes || 5 * 1024 * 1024), 50 * 1024 * 1024);
-      const cursor = args.resume_after || null, walked = await fsWalk(selection.root.path, args.path || ".", { ...args, from_path: cursor?.path, metadata: false });
+      const cursor = args.resume_after || null, walked = await fsWalk(selection.root.path, args.path || ".", { ...args, root_real: await workspaceRootReal(), from_path: cursor?.path, metadata: false });
       const files = []; let scannedFiles = 0, matchedFiles = 0, returned = 0;
       let truncated = false, truncationReason = null, nextAfter = null, lastWalkedPath = null;
       let lastReturned = cursor ? { ...cursor } : null;
@@ -6575,7 +6618,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         if (cursor && entry.path.localeCompare(String(cursor.path)) < 0) continue;
         if (cursor && entry.path === cursor.path && cursor.line == null) continue;
         try {
-          const path = await safePath(selection.root.path, entry.path);
+          const path = await safePath(selection.root.path, entry.path, await workspaceRootReal());
           scannedFiles++;
           const stat = await Deno.stat(path);
           if (stat.size > maxFileBytes) continue;
@@ -7023,7 +7066,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       return { succeeded, failed: entries.length - succeeded, entries };
     }
     if (name === "fs_trash" || name === "fs_untrash") {
-      const rootReal = await Deno.realPath(selection.root.path), metadataRoot = resolve(DATA), trashRoot = resolve(TRASH_ROOT);
+      const rootReal = await workspaceRootReal(), metadataRoot = resolve(DATA), trashRoot = resolve(TRASH_ROOT);
       const slash = path => slashPath(relative(rootReal, path)) || ".";
       if (name === "fs_trash") {
         const candidates = [], entries = [];
@@ -7031,19 +7074,20 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           let target;
           try {
             target = await resolvePath(raw);
-            if (!await exists(target.path)) { entries.push({ path: target.display, status: "not_found" }); return; }
+            const stat = await exists(target.path);
+            if (!stat) { entries.push({ path: target.display, status: "not_found" }); return; }
             if (resolve(target.path) === resolve(rootReal)) { entries.push({ path: target.display, status: "invalid_target", error: "Cannot trash the current Workspace" }); return; }
             if (resolve(target.path) === metadataRoot || within(metadataRoot, target.path)) {
               entries.push({ path: target.display, status: "invalid_target", error: "Cannot trash MrMCP metadata" }); return;
             }
-            candidates.push(target);
+            candidates.push({ ...target, stat });
           } catch (error) {
             entries.push({ path: target?.display || String(raw), status: errorStatus(error), error: String(error?.message || error) });
           }
         };
         for (const raw of args.paths || []) await addCandidate(raw);
         if (args.selection) {
-          const walked = await fsWalk(selection.root.path, args.selection.path || ".", { ...args.selection, hard_limit: 10001, metadata: false });
+          const walked = await fsWalk(selection.root.path, args.selection.path || ".", { ...args.selection, root_real: rootReal, hard_limit: 10001, metadata: false });
           if (walked.limited || walked.entries.length > 10000) throw new Error("fs_trash selection matched more than 10000 paths");
           for (const entry of walked.entries) await addCandidate(entry.path);
         }
@@ -7068,7 +7112,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         const trashDir = join(trashRoot, trashId), planned = [];
         for (const [index, target] of selected.entries()) {
           try {
-            const metadata = await trashItemMetadata(target.path);
+            const metadata = await trashItemMetadata(target.path, target.stat);
             planned.push({ target, original_path: resolve(target.path), payload: index + "-" + basename(target.path), ...metadata });
           } catch (error) {
             entries.push({ path: target.display, status: errorStatus(error), error: String(error?.message || error) });
@@ -8340,14 +8384,15 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   };
 
   const contextProjection = (serverId, roots = rootsProjection(serverId), oauthClientId = "") => {
-    const oauthFilter = String(oauthClientId || ""), toolCounts = sessionToolCountProjection(serverId);
+    const oauthFilter = String(oauthClientId || ""), toolCounts = sessionToolCountProjection(serverId),
+      rootsById = new Map(roots.filter(root => root.enabled).map(root => [Number(root.id), root]));
     const rows = all(`SELECT c.id,c.handle,c.label,c.root_id,c.created_at,c.updated_at,c.last_active_at,c.protocol_version,c.auth_kind,c.oauth_client_id,c.client_name,c.user_agent
       FROM contexts c WHERE c.server_id=? AND c.handle LIKE 'ctx_%' ${oauthFilter ? "AND c.oauth_client_id=?" : ""}
       ORDER BY c.last_active_at DESC,c.created_at DESC LIMIT 500`,
       ...(oauthFilter ? [serverId, oauthFilter] : [serverId]));
     return rows.map(context => {
       const selected = Number(context.root_id || 0);
-      const root = selected ? roots.find(item => item.id === selected && item.enabled) : null;
+      const root = selected ? rootsById.get(selected) || null : null;
       return {
         ...context,
         tool_calls: toolCounts.get(Number(context.id)) || 0,
@@ -8662,11 +8707,23 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   const browserAdminProjection = (current = {}) => {
     const p = serverConfig(), browserFilter = String(current.browser || ""), targetFilter = String(current.target || ""),
       contextFilter = Math.max(0, Number(current.context) || 0), activeFilter = ["active", "inactive"].includes(String(current.active || "")) ? String(current.active) : "";
-    const persistent = all("SELECT browser,port,created_at,updated_at FROM cdp_browsers ORDER BY browser COLLATE NOCASE");
+    const persistent = all("SELECT browser,port,created_at,updated_at FROM cdp_browsers ORDER BY browser COLLATE NOCASE"),
+      persistentByBrowser = new Map(persistent.map(row => [String(row.browser), row])),
+      targetRows = all("SELECT browser,target,target_id,created_at,updated_at FROM cdp_targets ORDER BY browser COLLATE NOCASE,target COLLATE NOCASE"),
+      targetsByBrowser = new Map(), targetSet = new Set();
+    for (const row of targetRows) {
+      const browser = String(row.browser), group = targetsByBrowser.get(browser) || [];
+      group.push(row); targetsByBrowser.set(browser, group); targetSet.add(String(row.target));
+    }
+    const subscriptionsByBrowser = new Map();
+    for (const subscription of cdpSubscriptions.values()) {
+      const browser = String(subscription.browser), group = subscriptionsByBrowser.get(browser) || [];
+      group.push(subscription); subscriptionsByBrowser.set(browser, group);
+    }
     const browserSet = new Set(persistent.map(row => String(row.browser)));
     for (const name of cdpBrowsers.keys()) browserSet.add(String(name));
-    const targetSet = new Set(all("SELECT DISTINCT target FROM cdp_targets ORDER BY target COLLATE NOCASE").map(row => String(row.target)));
-    const scannedOperations = [], operations = [], scanBatchSize = 50, scanLimit = 500, operationLimit = 200;
+    const operations = [], originBrowserMatches = new Set(), operationSessionsByBrowser = new Map(),
+      scanBatchSize = 50, scanLimit = 500, operationLimit = 200;
     let scannedToolCalls = 0, beforeId = Number.MAX_SAFE_INTEGER, scanExhausted = false;
     const operationMatchesFilters = operation =>
       (!browserFilter || operation.browser === browserFilter) && (!targetFilter || operation.target === targetFilter) &&
@@ -8685,17 +8742,21 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           const spec = calls[index], browser = String(spec?.browser ?? "main").trim() || "main", target = spec?.target == null ? "" : String(spec.target),
             call = spec?.call && typeof spec.call === "object" ? spec.call : {}, live = cdpBrowsers.get(browser),
             active = !!(live?.open && live.ws?.readyState === WebSocket.OPEN),
-            operationResult = Array.isArray(resolved?.results) ? resolved.results[index] : null;
+            operationResult = Array.isArray(resolved?.results) ? resolved.results[index] : null, contextId = Number(row.context_id) || 0;
           browserSet.add(browser); if (target) targetSet.add(target);
+          if (contextId) {
+            const sessions = operationSessionsByBrowser.get(browser) || new Set();
+            sessions.add(contextId); operationSessionsByBrowser.set(browser, sessions);
+          }
+          if ((!contextFilter || contextId === contextFilter) && (!targetFilter || target === targetFilter)) originBrowserMatches.add(browser);
           const operation = {
             log_id: Number(row.id), call_index: index, batch_size: calls.length, started_at: Number(row.started_at), completed_at: Number(row.completed_at || 0),
-            context_id: Number(row.context_id) || 0, root_name: String(row.root_name || ""), status: String(row.status), duration_ms: row.duration_ms,
+            context_id: contextId, root_name: String(row.root_name || ""), status: String(row.status), duration_ms: row.duration_ms,
             browser, target, active, method: call._mrmcp ? `_mrmcp.${call._mrmcp}` : String(call.method || ""),
             wait: input.wait !== false, call: spec, response: operationResult ? cdpAdminMessage(operationResult) : null,
             success: operationResult ? operationResult.success !== false && !operationResult.error : null,
             images: operationResult ? adminInlineImages(operationResult, "output") : [],
           };
-          scannedOperations.push(operation);
           if (operationMatchesFilters(operation)) operations.push(operation);
           if (operations.length >= operationLimit) break;
         }
@@ -8703,17 +8764,27 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       }
       if (logRows.length < batchLimit) { scanExhausted = true; break; }
     }
-    const originBrowserMatches = new Set(scannedOperations.filter(operation =>
-      (!contextFilter || operation.context_id === contextFilter) && (!targetFilter || operation.target === targetFilter)
-    ).map(operation => operation.browser));
     const operationHasMore = !scanExhausted && (operations.length >= operationLimit || scannedToolCalls >= scanLimit);
+    const ringStatsByBrowser = new Map(), ringGroups = [];
+    for (const [browser, record] of cdpBrowsers) {
+      const active = !!(record?.open && record.ws?.readyState === WebSocket.OPEN), group = [];
+      let notifications = 0, responses = 0;
+      const includeRing = (!browserFilter || browser === browserFilter) && (!activeFilter || (activeFilter === "active") === active) &&
+        (!contextFilter || originBrowserMatches.has(browser));
+      for (let index = record.ring.length - 1, head = Number(record.ring_head || 0); index >= head; index--) {
+        const message = record.ring[index];
+        if (message.type === "notification") notifications++;
+        else if (message.type === "response") responses++;
+        if (includeRing && group.length < 150 && (!targetFilter || String(message.target || "") === targetFilter))
+          group.push({ browser, bytes: Number(message._bytes || 0), ...cdpAdminMessage(message) });
+      }
+      ringStatsByBrowser.set(browser, { notifications, responses });
+      if (includeRing) ringGroups.push(group);
+    }
     const browserRows = [...browserSet].sort((a, b) => a.localeCompare(b)).map(browser => {
-      const saved = persistent.find(row => String(row.browser) === browser) || {}, live = cdpBrowsers.get(browser);
-      const active = !!(live?.open && live.ws?.readyState === WebSocket.OPEN);
-      const targets = all("SELECT target,target_id,created_at,updated_at FROM cdp_targets WHERE browser=? ORDER BY target COLLATE NOCASE", browser);
-      const subscriptions = [...cdpSubscriptions.values()].filter(subscription => subscription.browser === browser);
-      const notifications = live?.ring?.filter(message => message.type === "notification").length || 0;
-      const responses = live?.ring?.filter(message => message.type === "response").length || 0;
+      const saved = persistentByBrowser.get(browser) || {}, live = cdpBrowsers.get(browser), active = !!(live?.open && live.ws?.readyState === WebSocket.OPEN),
+        targets = targetsByBrowser.get(browser) || [], subscriptions = subscriptionsByBrowser.get(browser) || [],
+        ringStats = ringStatsByBrowser.get(browser) || { notifications: 0, responses: 0 };
       const liveTargets = live ? [...live.live_targets.values()].map(info => {
         const targetId = String(info?.targetId || "");
         return {
@@ -8725,14 +8796,12 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       return {
         browser, port: Number(saved.port || live?.port || 0), user_data_dir: live?.user_data_dir || join(CDP_DIR, browser), active,
         connection_id: live?.connection_id || "", pending: live?.pending?.size || 0,
-        ring_count: live?.ring?.length || 0, ring_bytes: live?.ring_bytes || 0, dropped: live?.dropped || 0,
-        recorded_sequence: cdpBrowserSequences.get(browser) || 0, notifications, responses,
-        oldest_seq: live?.ring?.length ? Number(live.ring[0].seq) : null,
-        newest_seq: live?.ring?.length ? Number(live.ring[live.ring.length - 1].seq) : null,
+        ring_count: live ? cdpRingLength(live) : 0, ring_bytes: live?.ring_bytes || 0, dropped: live?.dropped || 0,
+        recorded_sequence: cdpBrowserSequences.get(browser) || 0, notifications: ringStats.notifications, responses: ringStats.responses,
+        oldest_seq: live ? cdpRingOldest(live)?.seq ?? null : null, newest_seq: live ? cdpRingNewest(live)?.seq ?? null : null,
         stream_resets: subscriptions.reduce((sum, subscription) => sum + Number(subscription.stream_resets || 0), 0),
-        live_target_count: liveTargets.length, logical_target_count: targets.length, live_targets: liveTargets,
-        subscription_count: subscriptions.length,
-        session_ids: [...new Set(scannedOperations.filter(operation => operation.browser === browser && operation.context_id).map(operation => operation.context_id))].sort((a, b) => b - a),
+        live_target_count: liveTargets.length, logical_target_count: targets.length, live_targets: liveTargets, subscription_count: subscriptions.length,
+        session_ids: [...(operationSessionsByBrowser.get(browser) || [])].sort((a, b) => b - a),
         targets, subscriptions: subscriptions.map(subscription => ({
           id: subscription.id, targets: subscription.targets, methods: subscription.methods, method_prefixes: subscription.method_prefixes,
           include_browser: subscription.include_browser, regex: subscription.regex_source || "", regex_flags: subscription.regex_flags || "",
@@ -8744,14 +8813,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       (!contextFilter || originBrowserMatches.has(row.browser)) &&
       (!targetFilter || row.targets.some(target => String(target.target) === targetFilter) || originBrowserMatches.has(row.browser))
     );
-    const ring = [], ringGroups = [];
-    for (const [browser, record] of cdpBrowsers) {
-      const active = !!(record?.open && record.ws?.readyState === WebSocket.OPEN);
-      if (browserFilter && browser !== browserFilter || activeFilter && ((activeFilter === "active") !== active) ||
-          contextFilter && !originBrowserMatches.has(browser)) continue;
-      ringGroups.push([...record.ring].reverse().filter(message => !targetFilter || String(message.target || "") === targetFilter)
-        .map(message => ({ browser, bytes: Number(message._bytes || 0), ...cdpAdminMessage(message) })));
-    }
+    const ring = [];
     for (let index = 0; ring.length < 150; index++) {
       let added = false;
       for (const group of ringGroups) {

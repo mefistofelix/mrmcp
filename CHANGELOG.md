@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Reduced data-independent hot-path overhead: CDP retained traffic now uses amortized O(1) head-index eviction, `cdp_poll` reads only the needed retained tail, Browser batches CDP targets and avoids whole-ring copies/repeated operation/subscription scans, regex subscriptions share one serialized payload per message, filesystem tools reuse one canonical Workspace root per call, Trash reuses candidate stat metadata, Session projections use indexed root lookup, and text tools avoid redundant full-document line-ending passes/copies.
 - Moved the live/recent Active Tool Calls panel out of Dashboard into Processes, alongside active foreground/persistent process controls; its projection, refresh timer and row action are now Processes-owned while Dashboard retains only aggregate Tool Call metrics.
 
 ## 0.10.128
