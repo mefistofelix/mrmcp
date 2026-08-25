@@ -339,9 +339,9 @@ Arguments:
 - at least one of `paths` or `selection` is required.
 - `context_handle`.
 
-Nested selected targets collapse under their selected parent. A transaction manifest is written before payload moves. Successful entries are stored under one `trash_id`; failures do not roll successful entries back. If no payload remains in the trash after the call, the result has `trash_id: null` and no empty transaction is kept. A `failed_partial` payload keeps the `trash_id` so the reported partial state remains inspectable.
+Nested selected targets collapse under their selected parent. Before payload moves, MrMCP records one SQLite transaction row plus per-item original path, type and cached byte size for non-directory payloads; directory size remains unknown rather than recursively pre-scanning the tree. Successful payloads are stored under one `trash_id`; failures do not roll successful entries back. A failed move with no retained payload removes that item metadata, while `failed_partial` keeps its row so the partial payload remains inspectable. If no tracked item remains, the result has `trash_id: null` and no empty transaction is kept.
 
-Returns `trash_id`, physical trash/manifest paths, `succeeded`, `failed` and per-path statuses.
+Returns `trash_id`, the physical trash directory path, `succeeded`, `failed` and per-path statuses.
 
 Rationale: removal is intentionally reversible; there is no permanent filesystem-delete tool.
 
@@ -354,9 +354,9 @@ Arguments:
 - `trash_id` — identifier returned by `fs_trash`.
 - `context_handle`.
 
-Each payload is restored independently. Occupied destinations, missing parents, wrong-Workspace paths and unavailable payloads are reported per entry. Successful restores remain restored; failed payloads remain available for retry. The trash transaction is deleted only when no payload remains.
+Each payload is restored independently. Occupied destinations, missing parents, wrong-Workspace paths and unavailable payloads are reported per entry. Successful restores remain restored and delete their item metadata; failed or physically missing tracked items remain visible for retry/cleanup. The trash transaction is deleted only when no tracked item metadata remains.
 
-The desktop **Trash** section is an operator view over the same authoritative manifest/payload store, not over Tool Call history. Its sidebar badge counts payload items actually present. It lists transactions and original paths/type/size, restores one item or a whole transaction without overwriting an occupied destination, supports confirmed permanent deletion of one item/transaction, and exposes confirmed Empty Trash. Orphan payload directories without a valid manifest remain visible as deletable but non-restorable state.
+The desktop **Trash** section is an operator view over authoritative SQLite Trash metadata plus live payload presence, not over Tool Call history. Its sidebar badge counts tracked DB items without scanning the filesystem. Each item shows cached original path/type/size together with a live Present/Missing disk state; externally missing payloads remain visible in metadata until explicitly removed. Restore acts only on present payloads and never overwrites an occupied destination; permanent delete removes a present payload when available and always removes its DB metadata. Empty Trash clears both the global payload store and Trash metadata.
 
 ---
 
@@ -520,10 +520,10 @@ Tool Call history has two independent operator settings and every row exposes th
 
 - **Storage: Disk** — history lives in the main SQLite database and survives restart.
 - **Storage: Memory** — history lives in SQLite TEMP tables/FTS on the active connection and disappears on restart. It has a separate retention in minutes.
-- **Payload: Full** — complete request/raw-return JSON and actual text output, plus detectable binary input/output content in the Tool Call content store.
-- **Payload: Metadata** — no Tool Call request/response JSON, stdout/stderr or binary copies; identity, Session/Workspace snapshot, status/timing, progress flag and bounded errors remain.
+- **Payload: Payload** — stores exactly the canonical MCP JSON-RPC request packet and canonical MCP JSON-RPC response packet once. Nested JSON/YAML/Base64/images are interpreted only while the fullscreen debugger renders the row.
+- **Payload: Metadata** — stores neither MCP packet; identity, Session/Workspace snapshot, status/timing, progress flag and bounded errors remain.
 
-Storage and payload are orthogonal: `Memory + Full`, `Disk + Metadata`, etc. are all valid. The payload policy is diagnostic only and cannot remove state required by another feature. In particular persistent-process command/transcript state remains owned by the process subsystem so `exec_attach` / `exec_status` keep working; Browser ring, explicit Memory, Published and CDP state likewise keep their own authoritative storage. Expanded Tool Calls render only fields/capabilities actually present on that row, and Browser/Automation replay is limited to Full rows. No third-party JSON viewer is loaded.
+Storage and payload are orthogonal: `Memory + Payload`, `Disk + Metadata`, etc. are all valid. The payload policy is diagnostic only and cannot remove state required by another feature. Persistent-process runtime/history is owned by the process subsystem in the main database and remains independent of Tool Call storage, retention and clear operations, so `exec_attach` / `exec_status` keep working. Browser ring, explicit Memory, Published, Trash and CDP state likewise keep their own authoritative storage. Fullscreen Tool Call details render only capabilities actually present on that row, and Browser/Automation replay is limited to Payload rows.
 
 ---
 

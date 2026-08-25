@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.127 — Optimize Tool Call processing, persistence and filesystem paging.
+MrMCP 0.10.128 — Simplify Tool Call persistence, process state and Trash metadata.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -97,8 +97,8 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.127";
-const DB_SCHEMA_VERSION = 2;
+const VERSION = "0.10.128";
+const DB_SCHEMA_VERSION = 3;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, DASHBOARD_TOOL_CALL_TTL_MS = 5000;
@@ -871,6 +871,20 @@ async function backend({ addWorkspace = null } = {}) {
     );
     CREATE INDEX IF NOT EXISTS published_uses_publication ON published_uses(published_id,published_at DESC);
     CREATE INDEX IF NOT EXISTS published_uses_context ON published_uses(context_id,published_at DESC);
+    CREATE TABLE IF NOT EXISTS trash_transactions(
+      trash_id TEXT PRIMARY KEY,
+      created_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS trash_transactions_time ON trash_transactions(created_at DESC);
+    CREATE TABLE IF NOT EXISTS trash_items(
+      trash_id TEXT NOT NULL,
+      payload TEXT NOT NULL,
+      original_path TEXT NOT NULL,
+      item_type TEXT NOT NULL CHECK(item_type IN ('file','directory','symlink','other')),
+      size_bytes INTEGER NOT NULL DEFAULT -1,
+      PRIMARY KEY(trash_id,payload),
+      FOREIGN KEY(trash_id) REFERENCES trash_transactions(trash_id) ON DELETE CASCADE
+    );
     CREATE TABLE IF NOT EXISTS metrics(
       name TEXT PRIMARY KEY,
       value INTEGER NOT NULL DEFAULT 0
@@ -1065,30 +1079,6 @@ async function backend({ addWorkspace = null } = {}) {
     CREATE INDEX logs_memory_tool ON logs_memory(tool,started_at DESC);
     CREATE INDEX logs_memory_context ON logs_memory(context_handle,started_at DESC);
     CREATE INDEX logs_memory_context_id ON logs_memory(context_id,started_at DESC);
-    CREATE TEMP TABLE process_runs_memory(
-      id TEXT PRIMARY KEY,
-      log_id INTEGER NOT NULL DEFAULT 0,
-      pid INTEGER,
-      server_id INTEGER NOT NULL,
-      server_name TEXT NOT NULL,
-      context_id INTEGER NOT NULL DEFAULT 0,
-      context_handle TEXT NOT NULL DEFAULT '',
-      root_id INTEGER NOT NULL DEFAULT 0,
-      root_name TEXT NOT NULL DEFAULT '',
-      root_path TEXT NOT NULL DEFAULT '',
-      command_json TEXT NOT NULL,
-      cwd TEXT NOT NULL,
-      status TEXT NOT NULL,
-      started_at INTEGER NOT NULL,
-      completed_at INTEGER,
-      exit_code INTEGER,
-      signal TEXT NOT NULL DEFAULT '',
-      timeout_ms INTEGER NOT NULL DEFAULT 0,
-      stdout_tail TEXT NOT NULL DEFAULT '',
-      stderr_tail TEXT NOT NULL DEFAULT '',
-      error TEXT NOT NULL DEFAULT ''
-    );
-    CREATE INDEX process_runs_memory_time ON process_runs_memory(started_at DESC);
     CREATE TEMP TABLE tool_call_descriptors_memory(
       log_id INTEGER PRIMARY KEY,
       descriptor_json TEXT NOT NULL
@@ -1101,14 +1091,6 @@ async function backend({ addWorkspace = null } = {}) {
       SELECT id,started_at,completed_at,server_id,server_name,tool,status,mcp_request_json,mcp_response_json,error,
         duration_ms,context_id,context_handle,root_id,root_name,root_path,progress_requested,payload_mode,'memory' storage
       FROM logs_memory;
-    CREATE TEMP VIEW process_runs AS
-      SELECT id,log_id,pid,server_id,server_name,context_id,context_handle,root_id,root_name,root_path,command_json,cwd,status,started_at,
-        completed_at,exit_code,signal,timeout_ms,stdout_tail,stderr_tail,error,'disk' storage
-      FROM main.process_runs
-      UNION ALL
-      SELECT id,log_id,pid,server_id,server_name,context_id,context_handle,root_id,root_name,root_path,command_json,cwd,status,started_at,
-        completed_at,exit_code,signal,timeout_ms,stdout_tail,stderr_tail,error,'memory' storage
-      FROM process_runs_memory;
     CREATE TEMP VIEW tool_call_descriptor_records AS
       SELECT calls.log_id,descriptors.descriptor_json,'disk' storage
       FROM main.tool_call_descriptors calls JOIN main.tool_descriptors descriptors ON descriptors.id=calls.descriptor_id
@@ -2145,17 +2127,12 @@ async function backend({ addWorkspace = null } = {}) {
     }
   }
   function deleteToolCallRecords() {
-    const cleared = {
-      tool_calls: one("SELECT COUNT(*) n FROM logs")?.n || 0,
-      process_runs: one("SELECT COUNT(*) n FROM process_runs")?.n || 0,
-    };
+    const cleared = { tool_calls: one("SELECT COUNT(*) n FROM logs")?.n || 0 };
     statement("DELETE FROM tool_call_descriptors_memory").run();
-    statement("DELETE FROM process_runs_memory").run();
     statement("DELETE FROM logs_memory").run();
     statement("DELETE FROM main.tool_call_descriptors").run();
     statement("DELETE FROM main.tool_descriptors").run();
     if (fts) { statement("DELETE FROM main.logs_fts").run(); statement("DELETE FROM logs_fts_memory").run(); }
-    statement("DELETE FROM main.process_runs").run();
     statement("DELETE FROM main.logs").run();
     descriptorIdCache.clear();
     return cleared;
@@ -2166,11 +2143,9 @@ async function backend({ addWorkspace = null } = {}) {
     if (row.storage === "memory") {
       if (fts) statement("DELETE FROM logs_fts_memory WHERE rowid=?").run(logId);
       statement("DELETE FROM tool_call_descriptors_memory WHERE log_id=?").run(logId);
-      statement("DELETE FROM process_runs_memory WHERE log_id=?").run(logId);
       statement("DELETE FROM logs_memory WHERE id=?").run(logId);
     } else {
       if (fts) statement("DELETE FROM main.logs_fts WHERE rowid=?").run(logId);
-      statement("DELETE FROM main.process_runs WHERE log_id=?").run(logId);
       statement("DELETE FROM main.logs WHERE id=?").run(logId);
       statement("DELETE FROM main.tool_descriptors WHERE NOT EXISTS (SELECT 1 FROM main.tool_call_descriptors calls WHERE calls.descriptor_id=main.tool_descriptors.id)").run();
     }
@@ -2258,7 +2233,7 @@ async function backend({ addWorkspace = null } = {}) {
     return await withToolCallsDrained("database", async () => {
       const cleared = {
         tool_calls: one("SELECT COUNT(*) n FROM logs")?.n || 0,
-        process_runs: one("SELECT COUNT(*) n FROM process_runs")?.n || 0,
+        process_runs: one("SELECT COUNT(*) n FROM main.process_runs WHERE status NOT IN ('starting','running')")?.n || 0,
         http_logs: one("SELECT COUNT(*) n FROM debug_logs")?.n || 0,
         published: one("SELECT COUNT(*) n FROM published")?.n || 0,
         requests: requestMetricValue,
@@ -2266,6 +2241,7 @@ async function backend({ addWorkspace = null } = {}) {
       db.exec("BEGIN IMMEDIATE");
       try {
         deleteToolCallRecords();
+        db.prepare("DELETE FROM main.process_runs WHERE status NOT IN ('starting','running')").run();
         deleteDebugLogRecords();
         db.prepare("DELETE FROM published").run();
         db.prepare("UPDATE metrics SET value=0").run();
@@ -3749,16 +3725,29 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     id: 0, server_id: p.id, name: "Program folder", path: APP_DIR, enabled: 1, fallback: true,
   });
   const configuredRootPath = configuredWorkspacePath;
+  const lstatIfExists = async path => {
+    try { return await Deno.lstat(path); }
+    catch (error) { if (error instanceof Deno.errors.NotFound) return null; throw error; }
+  };
+  async function trashItemMetadata(path) {
+    const stat = await Deno.lstat(path);
+    const item_type = stat.isFile ? "file" : stat.isDirectory ? "directory" : stat.isSymlink ? "symlink" : "other";
+    const size_bytes = stat.isDirectory ? -1 : Number(stat.size || 0);
+    return { item_type, size_bytes };
+  }
   async function emptyManagedTrash() {
     return await withToolCallsDrained("trash", async () => {
-      const result = { trash_roots: 0, entries_removed: 0, failures: [] };
+      const result = {
+        trash_roots: 0, entries_removed: 0,
+        metadata_items: Number(one("SELECT COUNT(*) n FROM trash_items")?.n || 0), failures: [],
+      };
       let stat;
       try { stat = await Deno.stat(TRASH_ROOT); }
       catch (error) {
-        if (!(error instanceof Deno.errors.NotFound)) result.failures.push(`${TRASH_ROOT}: ${String(error?.message || error)}`);
+        if (!(error instanceof Deno.errors.NotFound)) result.failures.push(TRASH_ROOT + ": " + String(error?.message || error));
       }
       if (stat) {
-        if (!stat.isDirectory) result.failures.push(`${TRASH_ROOT}: not a directory`);
+        if (!stat.isDirectory) result.failures.push(TRASH_ROOT + ": not a directory");
         else {
           result.trash_roots = 1;
           try {
@@ -3766,10 +3755,11 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
               await Deno.remove(join(TRASH_ROOT, entry.name), { recursive: true });
               result.entries_removed++;
             }
-          } catch (error) { result.failures.push(`${TRASH_ROOT}: ${String(error?.message || error)}`); }
+          } catch (error) { result.failures.push(TRASH_ROOT + ": " + String(error?.message || error)); }
         }
       }
-      emitUiChange(["state", "trash"], "trash-empty");
+      if (!result.failures.length) run("DELETE FROM trash_transactions");
+      changed({ ui: ["state", "trash"] }, "trash-empty");
       return { ok: result.failures.length === 0, ...result };
     });
   }
@@ -4658,7 +4648,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         } },
       ],
       fs_untrash: [
-        "Restore paths still present under one trash_id. Entries are independent: successful restores remain restored, failed entries stay in the trash for inspection or retry, and the trash transaction is removed only when no payload remains.",
+        "Restore paths still present under one trash_id. Entries are independent: successful restores remain restored, failed or missing tracked items stay visible for inspection or retry, and the trash transaction is removed only when no tracked item metadata remains.",
         { properties: { trash_id: { type: "string", description: "Trash transaction identifier returned by fs_trash." }, ...contextInput }, required: ["trash_id"] },
       ],
       desktop_auto: [
@@ -5069,7 +5059,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       fs_mkdir: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsMkdirEntry) }),
       fs_copy: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsCopyEntry) }),
       fs_move: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsMoveEntry) }),
-      fs_trash: strictOutputSchema({ trash_id: nullableString, trash_path: nullableString, manifest_path: nullableString, succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsTrashEntry) }),
+      fs_trash: strictOutputSchema({ trash_id: nullableString, trash_path: nullableString, succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsTrashEntry) }),
       fs_untrash: strictOutputSchema({ trash_id: { type: "string" }, succeeded: { type: "integer" }, failed: { type: "integer" }, entries: fsArray(fsUntrashEntry) }),
       workspace_dev_preferences_write: strictOutputSchema({
         path: { type: "string", enum: ["DEV_PREF.md"] },
@@ -5478,7 +5468,6 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   }
   const toolCallModeKeepsJson = mode => mode === "payload";
   const logTableForStorage = storage => storage === "memory" ? "logs_memory" : "main.logs";
-  const processTableForStorage = storage => storage === "memory" ? "process_runs_memory" : "main.process_runs";
   function toolCallJsonForMode(mode, value) {
     if (mode !== "payload") return "";
     return JSON.stringify(value, (_key, item) => typeof item === "string" ? redactPublishedText(item) : item);
@@ -5592,13 +5581,10 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const hours = toolCallRetentionHours();
     if (!hours) return 0;
     const cutoff = now - hours * 60 * 60 * 1000;
-    const eligible = `completed_at IS NOT NULL AND completed_at<? AND NOT EXISTS(
-      SELECT 1 FROM main.process_runs pr WHERE pr.log_id=main.logs.id AND pr.status IN ('starting','running')
-    )`;
+    const eligible = `completed_at IS NOT NULL AND completed_at<?`;
     db.exec("BEGIN IMMEDIATE");
     try {
       if (fts) statement(`DELETE FROM main.logs_fts WHERE rowid IN (SELECT id FROM main.logs WHERE ${eligible})`).run(cutoff);
-      statement(`DELETE FROM main.process_runs WHERE log_id IN (SELECT id FROM main.logs WHERE ${eligible})`).run(cutoff);
       const result = statement(`DELETE FROM main.logs WHERE ${eligible}`).run(cutoff);
       statement("DELETE FROM main.tool_descriptors WHERE NOT EXISTS (SELECT 1 FROM main.tool_call_descriptors calls WHERE calls.descriptor_id=main.tool_descriptors.id)").run();
       db.exec("COMMIT");
@@ -5615,16 +5601,13 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const minutes = toolCallMemoryRetentionMinutes();
     if (!minutes) return 0;
     const cutoff = now - minutes * 60 * 1000;
-    const ids = all(`SELECT id FROM logs_memory l WHERE l.completed_at IS NOT NULL AND l.completed_at<? AND NOT EXISTS(
-      SELECT 1 FROM process_runs_memory pr WHERE pr.log_id=l.id AND pr.status IN ('starting','running')
-    )`, cutoff).map(row => Number(row.id));
+    const ids = all(`SELECT id FROM logs_memory WHERE completed_at IS NOT NULL AND completed_at<?`, cutoff).map(row => Number(row.id));
     if (!ids.length) return 0;
     const placeholders = ids.map(() => "?").join(",");
     db.exec("BEGIN");
     try {
       if (fts) statement(`DELETE FROM logs_fts_memory WHERE rowid IN (${placeholders})`).run(...ids);
       statement(`DELETE FROM tool_call_descriptors_memory WHERE log_id IN (${placeholders})`).run(...ids);
-      statement(`DELETE FROM process_runs_memory WHERE log_id IN (${placeholders})`).run(...ids);
       const result = statement(`DELETE FROM logs_memory WHERE id IN (${placeholders})`).run(...ids);
       db.exec("COMMIT");
       const removed = Number(result.changes || 0);
@@ -6087,7 +6070,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const defaultTimeout = persistent ? 0 : 120000;
     const spec = commandSpec(args), timeout = Math.max(0, Math.min(
       Number(args.timeout_ms ?? defaultTimeout), 604800000,
-    )), storage = String(execution.logStorage || "disk");
+    ));
     if (!spec.shell) {
       const mapped = await catalogProgram(spec.program);
       if (mapped) {
@@ -6132,7 +6115,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         program: spec.program, args: spec.argv, shell: spec.shell,
         catalog_name: spec.catalog_name || null, system_path_inherited: includeSystemPath,
         ...(persistent ? { exec_id: Number(execution.logId || 0) } : {}), persistent: !!persistent,
-      }), storage,
+      }),
       cwd: target.path, cwd_display: target.display, status: "running", started_at: Date.now(), completed_at: null,
       exit_code: null, signal: "", requested_signal: "", termination_source: "", timed_out: false, error: "",
       output: "", stdout: "", stderr: "", output_base: 0, stdout_base: 0, stderr_base: 0, output_bytes: 0, updated_at: Date.now(),
@@ -6147,7 +6130,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       execution.setCancel?.((signal, source = "user") => terminateProcess(rec, signal, source), { process_id: rec.id, kind: "process" });
       execution.onDisconnect?.(() => terminateProcess(rec, "SIGTERM", "client"));
     }
-    run(`INSERT INTO ${processTableForStorage(storage)}(id,log_id,pid,server_id,server_name,context_id,context_handle,root_id,root_name,root_path,
+    run(`INSERT INTO main.process_runs(id,log_id,pid,server_id,server_name,context_id,context_handle,root_id,root_name,root_path,
       command_json,cwd,status,started_at,timeout_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       rec.id, rec.log_id, rec.pid, p.id, "mcp", rec.context_id, rec.context_handle, rec.root_id, rec.root_name, rec.root_path,
       rec.command_json, rec.cwd_display, rec.status, rec.started_at, timeout);
@@ -6175,14 +6158,14 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       if (rec.timeout_timer) clearTimeout(rec.timeout_timer);
       try { await rec.stdin_writer?.close(); } catch {}
       rec.stdin_writer = null;
-      run(`UPDATE ${processTableForStorage(storage)} SET status=?,completed_at=?,exit_code=?,signal=?,stdout_tail=?,stderr_tail=?,error=? WHERE id=?`,
+      run(`UPDATE main.process_runs SET status=?,completed_at=?,exit_code=?,signal=?,stdout_tail=?,stderr_tail=?,error=? WHERE id=?`,
         rec.status, rec.completed_at, rec.exit_code, rec.signal, processTail(rec.output), processTail(rec.stderr), rec.error, rec.id);
       notifyProcessActivity(rec);
       emitUiChange(["state", "processes", "logs"], "process-exit");
       return rec;
     }).catch(error => {
       rec.completed_at = Date.now(); rec.status = "failed"; rec.error = String(error?.stack || error);
-      run(`UPDATE ${processTableForStorage(storage)} SET status='failed',completed_at=?,error=? WHERE id=?`,
+      run(`UPDATE main.process_runs SET status='failed',completed_at=?,error=? WHERE id=?`,
         rec.completed_at, rec.error, rec.id);
       notifyProcessActivity(rec);
       emitUiChange(["state", "processes", "logs"], "process-exit");
@@ -7073,57 +7056,70 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           if (selected.some(parent => resolve(parent.path) !== resolve(target.path) && within(parent.path, target.path))) continue;
           selected.push(target);
         }
-        if (!selected.length) return { trash_id: null, trash_path: null, manifest_path: null, succeeded: 0, failed: entries.length, entries };
+        if (!selected.length) return { trash_id: null, trash_path: null, succeeded: 0, failed: entries.length, entries };
         const date = new Date(), pad = value => String(value).padStart(2, "0");
-        const baseId = `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+        const baseId = date.getFullYear() + pad(date.getMonth() + 1) + pad(date.getDate()) + "-" + pad(date.getHours()) + pad(date.getMinutes()) + pad(date.getSeconds());
         let trashId = baseId, increment = 1;
         for (;;) {
-          const trashDir = join(trashRoot, trashId), manifestPath = join(trashRoot, `${trashId}.json`);
-          if (!await exists(trashDir) && !await exists(manifestPath)) break;
-          trashId = `${baseId}-${++increment}`;
+          const trashDir = join(trashRoot, trashId);
+          if (!await exists(trashDir) && !one("SELECT 1 FROM trash_transactions WHERE trash_id=?", trashId)) break;
+          trashId = baseId + "-" + (++increment);
         }
-        const trashDir = join(trashRoot, trashId), manifestPath = join(trashRoot, `${trashId}.json`);
-        const items = selected.map((target, index) => ({
-          original: resolve(target.path), payload: `${index}-${basename(target.path)}`,
-        }));
-        await Deno.mkdir(trashDir, { recursive: true });
-        await Deno.writeTextFile(manifestPath, JSON.stringify({ trash_id: trashId, created_at: new Date().toISOString(), items }, null, 2) + "\n");
-        let succeeded = 0;
+        const trashDir = join(trashRoot, trashId), planned = [];
         for (const [index, target] of selected.entries()) {
-          const destination = join(trashDir, items[index].payload);
           try {
-            await moveRecursive(target.path, destination);
-            entries.push({ path: target.display, status: "trashed" });
+            const metadata = await trashItemMetadata(target.path);
+            planned.push({ target, original_path: resolve(target.path), payload: index + "-" + basename(target.path), ...metadata });
+          } catch (error) {
+            entries.push({ path: target.display, status: errorStatus(error), error: String(error?.message || error) });
+          }
+        }
+        if (!planned.length) return { trash_id: null, trash_path: null, succeeded: 0, failed: entries.length, entries };
+        db.exec("BEGIN IMMEDIATE");
+        try {
+          run("INSERT INTO trash_transactions(trash_id,created_at) VALUES(?,?)", trashId, Date.now());
+          for (const item of planned) run(
+            "INSERT INTO trash_items(trash_id,payload,original_path,item_type,size_bytes) VALUES(?,?,?,?,?)",
+            trashId, item.payload, item.original_path, item.item_type, item.size_bytes,
+          );
+          db.exec("COMMIT");
+        } catch (error) {
+          db.exec("ROLLBACK");
+          throw error;
+        }
+        try { await Deno.mkdir(trashDir, { recursive: true }); }
+        catch (error) { run("DELETE FROM trash_transactions WHERE trash_id=?", trashId); throw error; }
+        let succeeded = 0;
+        for (const item of planned) {
+          const destination = join(trashDir, item.payload);
+          try {
+            await moveRecursive(item.target.path, destination);
+            entries.push({ path: item.target.display, status: "trashed" });
             succeeded++;
           } catch (error) {
             const partial = !!await exists(destination).catch(() => false);
-            entries.push({ path: target.display, status: partial ? "failed_partial" : errorStatus(error), error: String(error?.message || error) });
+            if (!partial) run("DELETE FROM trash_items WHERE trash_id=? AND payload=?", trashId, item.payload);
+            entries.push({ path: item.target.display, status: partial ? "failed_partial" : errorStatus(error), error: String(error?.message || error) });
           }
         }
-        let retainedPayload = false;
-        for (const item of items) {
-          if (await exists(join(trashDir, item.payload))) { retainedPayload = true; break; }
+        if (!one("SELECT 1 FROM trash_items WHERE trash_id=? LIMIT 1", trashId)) {
+          await Deno.remove(trashDir, { recursive: true }).catch(error => { if (!(error instanceof Deno.errors.NotFound)) throw error; });
+          run("DELETE FROM trash_transactions WHERE trash_id=?", trashId);
+          return { trash_id: null, trash_path: null, succeeded: 0, failed: entries.length, entries };
         }
-        if (!retainedPayload) {
-          await Deno.remove(trashDir, { recursive: true }).catch(() => {});
-          await Deno.remove(manifestPath).catch(() => {});
-          return { trash_id: null, trash_path: null, manifest_path: null, succeeded: 0, failed: entries.length, entries };
-        }
-        emitUiChange(["state", "trash"], "fs-trash");
-        return {
-          trash_id: trashId, trash_path: trashDir, manifest_path: manifestPath,
-          succeeded, failed: entries.length - succeeded, entries,
-        };
+        changed({ ui: ["state", "trash"] }, "fs-trash");
+        return { trash_id: trashId, trash_path: trashDir, succeeded, failed: entries.length - succeeded, entries };
       }
       const trashId = String(args.trash_id || "").trim();
       if (!/^\d{8}-\d{6}(?:-\d+)?$/.test(trashId)) throw new Error("Invalid trash_id");
-      const trashDir = join(trashRoot, trashId), manifestPath = join(trashRoot, `${trashId}.json`);
-      const manifest = JSON.parse(await Deno.readTextFile(manifestPath));
-      const items = Array.isArray(manifest.items) ? manifest.items : [];
+      if (!one("SELECT 1 FROM trash_transactions WHERE trash_id=?", trashId)) throw new Error("Trash transaction not found");
+      const trashDir = join(trashRoot, trashId), items = all(
+        "SELECT payload,original_path,item_type,size_bytes FROM trash_items WHERE trash_id=? ORDER BY payload", trashId,
+      );
       if (!items.length) throw new Error("Trash transaction contains no items");
       const entries = []; let succeeded = 0;
       for (const item of items) {
-        const target = resolve(String(item.original || "")), source = resolve(trashDir, String(item.payload || ""));
+        const target = resolve(String(item.original_path || "")), source = resolve(trashDir, String(item.payload || ""));
         if (!within(rootReal, target)) { entries.push({ path: slash(target), status: "wrong_workspace" }); continue; }
         if (!within(trashDir, source)) { entries.push({ path: slash(target), status: "invalid_payload" }); continue; }
         if (!await exists(source)) { entries.push({ path: slash(target), status: "not_in_trash" }); continue; }
@@ -7131,6 +7127,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         if (!await exists(dirname(target))) { entries.push({ path: slash(target), status: "parent_missing" }); continue; }
         try {
           await moveRecursive(source, target);
+          run("DELETE FROM trash_items WHERE trash_id=? AND payload=?", trashId, item.payload);
           entries.push({ path: slash(target), status: "restored" });
           succeeded++;
         } catch (error) {
@@ -7138,16 +7135,8 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           entries.push({ path: slash(target), status: partial ? "failed_partial" : errorStatus(error), error: String(error?.message || error) });
         }
       }
-      let remaining = false;
-      for (const item of items) {
-        const source = resolve(trashDir, String(item.payload || ""));
-        if (within(trashDir, source) && await exists(source)) { remaining = true; break; }
-      }
-      if (!remaining) {
-        await Deno.remove(trashDir, { recursive: true }).catch(() => {});
-        await Deno.remove(manifestPath).catch(() => {});
-      }
-      emitUiChange(["state", "trash"], "fs-untrash");
+      await cleanupTrashTransactionIfEmpty(trashId, trashDir);
+      changed({ ui: ["state", "trash"] }, "fs-untrash");
       return { trash_id: trashId, succeeded, failed: entries.length - succeeded, entries };
     }
     if (name === "publish") {
@@ -7350,7 +7339,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     activeCallControls.set(id, control);
     emitToolCallActivity();
     const executionState = {
-      ...callInfo, logId: id, payloadMode, logStorage: policy.storage,
+      ...callInfo, logId: id, payloadMode,
       progress: callInfo.requestStream?.progress || null,
       onDisconnect(callback) { callInfo.requestStream?.onDisconnect(callback); },
       setCancel(cancel, metadata = {}) {
@@ -8389,101 +8378,76 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 
   const validTrashId = value => /^\d{8}-\d{6}(?:-\d+)?$/.test(String(value || ""));
   function trashSummaryProjection() {
-    let transactions = 0, items = 0;
-    try {
-      for (const entry of Deno.readDirSync(TRASH_ROOT)) {
-        if (!entry.isDirectory || !validTrashId(entry.name)) continue;
-        transactions++;
-        try { for (const _ of Deno.readDirSync(join(TRASH_ROOT, entry.name))) items++; } catch {}
-      }
-    } catch {}
-    return { transactions, items };
-  }
-  function trashAdminProjection() {
-    const byId = new Map(), manifests = new Set();
-    try {
-      for (const entry of Deno.readDirSync(TRASH_ROOT)) {
-        if (!entry.isFile || !entry.name.endsWith(".json")) continue;
-        const trashId = entry.name.slice(0, -5);
-        if (!validTrashId(trashId)) continue;
-        manifests.add(trashId);
-        const manifestPath = join(TRASH_ROOT, entry.name), trashPath = join(TRASH_ROOT, trashId);
-        let manifest = null, error = "";
-        try { manifest = JSON.parse(Deno.readTextFileSync(manifestPath)); }
-        catch (cause) { error = `Invalid manifest: ${String(cause?.message || cause)}`; }
-        const rows = [];
-        for (const item of Array.isArray(manifest?.items) ? manifest.items : []) {
-          const payload = String(item?.payload || ""), original = String(item?.original || ""), source = resolve(trashPath, payload);
-          if (!payload || !within(trashPath, source)) continue;
-          let stat = null;
-          try { stat = Deno.lstatSync(source); } catch {}
-          if (!stat) continue;
-          rows.push({
-            payload, original, type: stat.isDirectory ? "directory" : stat.isSymlink ? "symlink" : "file",
-            size: stat.isFile ? Number(stat.size || 0) : null,
-          });
-        }
-        byId.set(trashId, {
-          trash_id: trashId, created_at: Date.parse(String(manifest?.created_at || "")) || 0,
-          manifest_path: manifestPath, trash_path: trashPath, items: rows, error, restorable: !error,
-        });
-      }
-      for (const entry of Deno.readDirSync(TRASH_ROOT)) {
-        if (!entry.isDirectory || !validTrashId(entry.name) || manifests.has(entry.name)) continue;
-        const trashPath = join(TRASH_ROOT, entry.name), rows = [];
-        try {
-          for (const payloadEntry of Deno.readDirSync(trashPath)) {
-            const source = join(trashPath, payloadEntry.name); let stat = null;
-            try { stat = Deno.lstatSync(source); } catch {}
-            rows.push({ payload: payloadEntry.name, original: "", type: stat?.isDirectory ? "directory" : stat?.isSymlink ? "symlink" : "file", size: stat?.isFile ? Number(stat.size || 0) : null });
-          }
-        } catch {}
-        byId.set(entry.name, { trash_id: entry.name, created_at: 0, manifest_path: "", trash_path: trashPath, items: rows, error: "Manifest missing; payload can only be deleted.", restorable: false });
-      }
-    } catch {}
-    const transactions = [...byId.values()].filter(row => row.items.length || row.error)
-      .sort((a, b) => b.created_at - a.created_at || b.trash_id.localeCompare(a.trash_id));
+    const row = one(`SELECT
+      (SELECT COUNT(*) FROM trash_transactions) transactions,
+      (SELECT COUNT(*) FROM trash_items) items,
+      COALESCE((SELECT SUM(CASE WHEN size_bytes>=0 THEN size_bytes ELSE 0 END) FROM trash_items),0) cached_bytes,
+      COALESCE((SELECT SUM(CASE WHEN size_bytes<0 THEN 1 ELSE 0 END) FROM trash_items),0) unknown_sizes`) || {};
     return {
-      transactions,
-      transaction_count: transactions.length,
-      item_count: transactions.reduce((sum, row) => sum + row.items.length, 0),
+      transactions: Number(row.transactions || 0), items: Number(row.items || 0),
+      cached_bytes: Number(row.cached_bytes || 0), unknown_sizes: Number(row.unknown_sizes || 0),
     };
   }
-  async function cleanupTrashTransactionIfEmpty(trashId, trashDir, manifestPath) {
-    let remaining = false;
-    try { for await (const _ of Deno.readDir(trashDir)) { remaining = true; break; } } catch {}
-    if (!remaining) {
-      await Deno.remove(trashDir, { recursive: true }).catch(() => {});
-      await Deno.remove(manifestPath).catch(() => {});
+  function trashAdminProjection() {
+    const transactions = all("SELECT trash_id,created_at FROM trash_transactions ORDER BY created_at DESC,trash_id DESC");
+    const byId = new Map(transactions.map(row => [String(row.trash_id), {
+      trash_id: String(row.trash_id), created_at: Number(row.created_at || 0), items: [], cached_bytes: 0, missing_count: 0, unknown_sizes: 0,
+    }]));
+    let itemCount = 0, cachedBytes = 0, unknownSizes = 0;
+    for (const item of all("SELECT trash_id,payload,original_path,item_type,size_bytes FROM trash_items ORDER BY trash_id DESC,payload")) {
+      itemCount++;
+      const parent = byId.get(String(item.trash_id));
+      if (!parent) continue;
+      const trashPath = join(TRASH_ROOT, parent.trash_id), source = resolve(trashPath, String(item.payload || ""));
+      let stat = null;
+      if (within(trashPath, source)) try { stat = Deno.lstatSync(source); } catch {}
+      const disk_type = stat ? (stat.isDirectory ? "directory" : stat.isSymlink ? "symlink" : stat.isFile ? "file" : "other") : "";
+      const size = Number(item.size_bytes);
+      if (size >= 0) { parent.cached_bytes += size; cachedBytes += size; }
+      else { parent.unknown_sizes++; unknownSizes++; }
+      if (!stat) parent.missing_count++;
+      parent.items.push({
+        payload: String(item.payload || ""), original: String(item.original_path || ""), type: String(item.item_type || "other"),
+        size_cached: size >= 0 ? size : null, disk_present: !!stat, disk_type,
+      });
     }
-    return !remaining;
+    for (const row of byId.values()) row.restorable = row.items.some(item => item.disk_present && item.original);
+    return {
+      transactions: [...byId.values()], transaction_count: transactions.length,
+      item_count: itemCount, cached_bytes: cachedBytes, unknown_sizes: unknownSizes,
+    };
+  }
+  async function cleanupTrashTransactionIfEmpty(trashId, trashDir = join(TRASH_ROOT, trashId)) {
+    if (one("SELECT 1 FROM trash_items WHERE trash_id=? LIMIT 1", trashId)) return false;
+    await Deno.remove(trashDir, { recursive: true }).catch(error => { if (!(error instanceof Deno.errors.NotFound)) throw error; });
+    run("DELETE FROM trash_transactions WHERE trash_id=?", trashId);
+    return true;
   }
   async function restoreManagedTrash(trashId, payload = "") {
     trashId = String(trashId || "").trim(); payload = String(payload || "");
     if (!validTrashId(trashId)) throw new Error("Invalid trash_id");
     return await withToolCallsDrained("trash", async () => {
-      const trashDir = join(TRASH_ROOT, trashId), manifestPath = join(TRASH_ROOT, `${trashId}.json`);
-      const manifest = JSON.parse(await Deno.readTextFile(manifestPath));
-      const items = Array.isArray(manifest.items) ? manifest.items : [], selected = [];
-      for (const item of items) {
-        const name = String(item?.payload || ""), source = resolve(trashDir, name);
-        if (payload ? name === payload : (name && within(trashDir, source) && await exists(source))) selected.push(item);
-      }
-      if (!selected.length) throw new Error(payload ? "Trash item not found" : "Trash transaction contains no remaining items");
+      if (!one("SELECT 1 FROM trash_transactions WHERE trash_id=?", trashId)) throw new Error("Trash transaction not found");
+      const trashDir = join(TRASH_ROOT, trashId), selected = payload
+        ? all("SELECT payload,original_path FROM trash_items WHERE trash_id=? AND payload=?", trashId, payload)
+        : all("SELECT payload,original_path FROM trash_items WHERE trash_id=? ORDER BY payload", trashId);
+      if (!selected.length) throw new Error(payload ? "Trash item not found" : "Trash transaction contains no items");
       const entries = []; let succeeded = 0;
       for (const item of selected) {
-        const name = String(item?.payload || ""), source = resolve(trashDir, name), target = resolve(String(item?.original || ""));
-        if (!name || !within(trashDir, source)) { entries.push({ payload: name, original: String(item?.original || ""), status: "invalid_payload" }); continue; }
-        if (!await exists(source)) { entries.push({ payload: name, original: target, status: "not_in_trash" }); continue; }
-        if (await exists(target)) { entries.push({ payload: name, original: target, status: "destination_exists" }); continue; }
-        if (!await exists(dirname(target))) { entries.push({ payload: name, original: target, status: "parent_missing" }); continue; }
+        const name = String(item.payload || ""), source = resolve(trashDir, name), target = resolve(String(item.original_path || ""));
+        if (!name || !within(trashDir, source)) { entries.push({ payload: name, original: String(item.original_path || ""), status: "invalid_payload" }); continue; }
+        if (!await lstatIfExists(source)) { entries.push({ payload: name, original: target, status: "not_in_trash" }); continue; }
+        if (await lstatIfExists(target)) { entries.push({ payload: name, original: target, status: "destination_exists" }); continue; }
+        if (!await lstatIfExists(dirname(target))) { entries.push({ payload: name, original: target, status: "parent_missing" }); continue; }
         try {
-          await moveRecursive(source, target); succeeded++;
+          await moveRecursive(source, target);
+          run("DELETE FROM trash_items WHERE trash_id=? AND payload=?", trashId, name);
+          succeeded++;
           entries.push({ payload: name, original: target, status: "restored" });
         } catch (error) { entries.push({ payload: name, original: target, status: "failed", error: String(error?.message || error) }); }
       }
-      await cleanupTrashTransactionIfEmpty(trashId, trashDir, manifestPath);
-      emitUiChange(["state", "trash"], "trash-restore");
+      await cleanupTrashTransactionIfEmpty(trashId, trashDir);
+      changed({ ui: ["state", "trash"] }, "trash-restore");
       return { ok: succeeded === entries.length, trash_id: trashId, succeeded, failed: entries.length - succeeded, entries };
     });
   }
@@ -8491,28 +8455,22 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     trashId = String(trashId || "").trim(); payload = String(payload || "");
     if (!validTrashId(trashId)) throw new Error("Invalid trash_id");
     return await withToolCallsDrained("trash", async () => {
-      const trashDir = join(TRASH_ROOT, trashId), manifestPath = join(TRASH_ROOT, `${trashId}.json`);
+      if (!one("SELECT 1 FROM trash_transactions WHERE trash_id=?", trashId)) throw new Error("Trash transaction not found");
+      const trashDir = join(TRASH_ROOT, trashId);
       if (!payload) {
-        const existed = await exists(trashDir) || await exists(manifestPath);
         await Deno.remove(trashDir, { recursive: true }).catch(error => { if (!(error instanceof Deno.errors.NotFound)) throw error; });
-        await Deno.remove(manifestPath).catch(error => { if (!(error instanceof Deno.errors.NotFound)) throw error; });
-        if (!existed) throw new Error("Trash transaction not found");
-        emitUiChange(["state", "trash"], "trash-delete");
+        run("DELETE FROM trash_transactions WHERE trash_id=?", trashId);
+        changed({ ui: ["state", "trash"] }, "trash-delete");
         return { ok: true, trash_id: trashId, deleted: "transaction" };
       }
-      let allowed = false;
-      try {
-        const manifest = JSON.parse(await Deno.readTextFile(manifestPath));
-        allowed = Array.isArray(manifest.items) && manifest.items.some(item => String(item?.payload || "") === payload);
-      } catch {
-        try { allowed = [...Deno.readDirSync(trashDir)].some(entry => entry.name === payload); } catch {}
-      }
-      if (!allowed) throw new Error("Trash item not found");
+      const item = one("SELECT payload FROM trash_items WHERE trash_id=? AND payload=?", trashId, payload);
+      if (!item) throw new Error("Trash item not found");
       const source = resolve(trashDir, payload);
       if (!within(trashDir, source)) throw new Error("Invalid trash payload");
-      await Deno.remove(source, { recursive: true });
-      await cleanupTrashTransactionIfEmpty(trashId, trashDir, manifestPath);
-      emitUiChange(["state", "trash"], "trash-delete");
+      await Deno.remove(source, { recursive: true }).catch(error => { if (!(error instanceof Deno.errors.NotFound)) throw error; });
+      run("DELETE FROM trash_items WHERE trash_id=? AND payload=?", trashId, payload);
+      await cleanupTrashTransactionIfEmpty(trashId, trashDir);
+      changed({ ui: ["state", "trash"] }, "trash-delete");
       return { ok: true, trash_id: trashId, payload, deleted: "item" };
     });
   }
@@ -8915,18 +8873,18 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 <? } else if(section==="browser"){ ?><section id=browser class=page><div class=row><h2 class=grow>🌐 Browser</h2><span class=muted>CDP state · retained traffic · replay</span></div><p class=muted>Diagnostic view over existing CDP browser/profile state, logical targets, subscriptions and retained ring traffic. Recorded request/response inspection and Replay use only Tool Calls retained with Payload mode.</p><div id=browserList></div></section>
 <? } else if(section==="automation"){ ?><section id=automation class=page><div class=row><h2 class=grow>🖱️ Automation</h2><span class=muted>AAF scenarios · screenshots · replay</span></div><p class=muted>Diagnostic view over <code>desktop_auto</code> Tool Calls retained with Payload mode. Open a scenario/result to inspect its retained payloads, or replay it through the same stateless Auto.js engine.</p><div id=automationList></div></section>
 <? } else if(section==="published"){ ?><section id=published class=page><div class=row><h2 class=grow>📦 Published</h2><button class=danger data-action=clear-published<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear Matching</button></div><p class=muted>Deduplicated persistent content snapshots created by <code>publish</code>. Path, text and Base64 sources all become ordinary files under <code>.mrmcp/publish</code>; one resource may have references from multiple Sessions and Workspaces.</p><div id=publishedList></div></section>
-<? } else if(section==="trash"){ ?><section id=trash class=page><div class=row><h2 class=grow>🗑️ Trash</h2><span class=muted>Persistent reversible filesystem trash · independent of Tool Call logging</span></div><div id=trashList></div></section>
+<? } else if(section==="trash"){ ?><section id=trash class=page><div class=row><h2 class=grow>🗑️ Trash</h2><span class=muted>SQLite metadata · live payload presence · independent of Tool Call logging</span></div><p class=muted>Original path and type are cached when an item enters Trash; byte size is cached for non-directory payloads. Disk presence is checked live; missing payloads remain visible until their metadata is explicitly deleted.</p><div id=trashList></div></section>
 <? } else if(section==="memory"){ const m=s.memory||{}; ?><section id=memory class=page><div class=row><h2 class=grow>🧠 Memory</h2><button class=primary data-action=new-memory>➕ New Memory</button></div><p class=muted>Persistent explicit key-value memory. Create it here or through <code>memory_set</code>. Each value is explicitly JSON or plain text; Global memory is server-wide, Session memory belongs to one Session, and Workspace memory is shared by Workspace label. Expired TTL entries are removed automatically.</p><div class=row><input id=memoryQuery class=grow placeholder="Search keys or values…" value="<?= m.query||'' ?>"><select id=memoryScope><option value=""<?= !m.scope?' selected':'' ?>>All scopes</option><option value=global<?= m.scope==='global'?' selected':'' ?>>Global</option><option value=session<?= m.scope==='session'?' selected':'' ?>>Session</option><option value=workspace<?= m.scope==='workspace'?' selected':'' ?>>Workspace</option></select><select id=memoryContext><option value="">All sessions</option><? (m.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(m.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=memoryWorkspace><option value="">All workspaces</option><? (m.workspaces||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= String(m.workspace||'')===String(name)?' selected':'' ?>><?= name ?></option><? }) ?></select><input id=memoryFrom type=date title="Set on or after" value="<?= m.from||'' ?>"><input id=memoryTo type=date title="Set on or before" value="<?= m.to||'' ?>"><button data-action=load-memory>🔎 Search</button><button data-action=clear-memory-filters>🧹 Clear Filters</button></div><div id=memoryList></div></section>
 <? } else if(section==="debug"){ const d=s.debug||{},enabled=!!s.debug?.enabled; ?><section id=debug class=page><div class=row><h2 class=grow>🐞 HTTP Debug Log</h2><button class="debug-toggle <?= enabled?'enabled':'disabled' ?>" data-action=toggle-debug-settings aria-pressed="<?= enabled?'true':'false' ?>"><?= enabled?"🟢 Logging ON · Disable":"🔴 Logging OFF · Enable" ?></button><button class=danger data-action=clear-debug>🗑️ Clear</button></div><p class=muted>Off by default. Secrets are redacted. Disabling stops new records but keeps stored data visible. Click a row for request JSON.</p><div class=row><input id=debugQuery class=grow placeholder="Search URL, headers, body or errors…" value="<?= d.query||'' ?>"><select id=debugMethod><option value="">All methods</option><? ['GET','POST','OPTIONS'].forEach(v=>{ ?><option<?= d.method===v?' selected':'' ?>><?= v ?></option><? }) ?></select><input id=debugStatus type=number placeholder="Status" value="<?= d.status||'' ?>"><button data-action=load-debug>🔎 Search</button></div><div id=debugList></div></section>
 <? } else if(section==="oauth"){ ?><section id=oauth class=page><div class=row><h2 class=grow>🔐 OAuth Clients</h2><button class=danger data-action=clear-clients<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><div id=oauthList></div></section>
 <? } else if(section==="telegram"){ const t=s.telegram||{}; ?><section id=telegram class=page><div class=row><h2 class=grow>✈️ Telegram</h2><button class=primary data-action=save-telegram<?= t.save_disabled?' disabled':'' ?>>💾 Save Telegram</button></div><div class=card><h3>🤖 Telegram Bot</h3><div class=row><label class=grow>Bot token</label><? if(t.field_warning){ ?><span class=field-warning>⚠ <?= t.field_warning ?></span><? } ?></div><input id=telegramBotToken type=password autocomplete=off value="<?= t.telegram_bot_token||'' ?>" placeholder="123456789:AA…"><p class=muted>Used only by <code>telegram_req</code> to authenticate Bot API requests. Chat IDs, channels and application state are intentionally left to the agent/Memory.</p></div></section>
-<? } else if(section==="settings"){ const tab=s.settingsTab||"network"; ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><nav class=settings-tabs aria-label="Settings sections"><? [["network","🌐","Network"],["security","🔒","Security"],["process","🖥️","Process"],["notifications","🔔","Notifications"],["maintenance","🧹","Maintenance"]].forEach(([id,icon,label])=>{ ?><button data-action=settings-tab data-settings-tab="<?= id ?>" class="<?= tab===id?'active':'' ?>"<?= tab===id?' aria-current=page':'' ?>><?= icon ?> <?= label ?></button><? }) ?></nav><div class=settings-layout><div class=settings-main><div class=card<? if(tab!=="network"){ ?> hidden<? } ?>><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card<? if(tab!=="security"){ ?> hidden<? } ?>><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card<? if(tab!=="notifications"){ ?> hidden<? } ?>><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card<? if(tab!=="process"){ ?> hidden<? } ?>><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><label><input id=gitPreserveLineEndings type=checkbox<?= settings.git_preserve_line_endings?" checked":"" ?>> Preserve Git working-tree line endings across platforms</label><p class=muted>When enabled, every managed process gets Git runtime config <code>core.autocrlf=false</code>. Repository <code>.gitattributes</code> and an explicit <code>git -c</code> can still override it.</p><div class=row><label class=grow>Environment variables for all spawned processes · one <code>NAME=value</code> per line</label><? if(settings.field_warnings?.exec_environment){ ?><span class=field-warning>⚠ <?= settings.field_warnings.exec_environment ?></span><? } ?></div><textarea id=execEnvironment rows=8 placeholder="CACHE_DIR=\${MRMCP_DIR}&#10;TOOLS=\${MRMCP_BIN}&#10;PROJECT=\${WORKSPACE}&#10;RUN_FROM=\${CWD}"><?= settings.exec_environment||'' ?></textarea><p class=muted>Available placeholders: <code>\${MRMCP_DIR}</code> = MrMCP data directory, <code>\${MRMCP_BIN}</code> = managed bin directory, <code>\${WORKSPACE}</code> = current Workspace root, <code>\${CWD}</code> = effective exec directory. Precedence: system environment → these settings → per-call <code>env</code>. Off PATH inheritance leaves child <code>PATH</code> as only <code>.mrmcp/bin</code>; PATH remains governed by this toggle rather than the generic environment list.</p></div><div class=card<? if(tab!=="maintenance"){ ?> hidden<? } ?>><h3>🧹 Tool Call History</h3><label>History storage</label><select id=toolCallStorage><option value=disk<?= settings.tool_call_storage==='disk'?' selected':'' ?>>Disk · survives restart</option><option value=memory<?= settings.tool_call_storage==='memory'?' selected':'' ?>>Memory · SQLite TEMP, volatile</option></select><p class=muted>Storage and payload retention are independent. Disk writes Tool Call history to the main SQLite database. Memory uses SQLite TEMP tables in RAM with the same Tool Call ids, GUI and tools_log behavior; rows disappear on restart.</p><label>Payload retention</label><select id=toolCallPayloadMode><option value=payload<?= settings.tool_call_payload_mode==='payload'?' selected':'' ?>>Payload · complete diagnostic payloads and binary content</option><option value=metadata<?= settings.tool_call_payload_mode==='metadata'?' selected':'' ?>>Metadata · no Tool Call request/response payload copies</option></select><p class=muted>Payload retention affects only diagnostic copies in Tool Call history. Functional state required by tools remains available in its owning subsystem; for example persistent-process command/output state is retained independently so exec_attach and exec_status keep working.</p><div class=row><label class=grow>Disk retention hours · 0 keeps indefinitely</label><? if(settings.field_warnings?.tool_call_retention_hours){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_retention_hours ?></span><? } ?></div><input id=toolCallRetentionHours type=number min=0 step=1 value="<?= settings.tool_call_retention_hours??0 ?>"><div class=row><label class=grow>Memory retention minutes · 0 keeps until restart</label><? if(settings.field_warnings?.tool_call_memory_retention_minutes){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_memory_retention_minutes ?></span><? } ?></div><input id=toolCallMemoryRetentionMinutes type=number min=0 step=1 value="<?= settings.tool_call_memory_retention_minutes??60 ?>"><p class=muted>Retention removes completed history from its own storage tier and keeps origins of still-running persistent processes. Changing the current storage or payload setting affects new Tool Calls only; existing rows retain their own storage and payload capabilities.</p><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, Memory, CDP browser state, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
+<? } else if(section==="settings"){ const tab=s.settingsTab||"network"; ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><nav class=settings-tabs aria-label="Settings sections"><? [["network","🌐","Network"],["security","🔒","Security"],["process","🖥️","Process"],["notifications","🔔","Notifications"],["maintenance","🧹","Maintenance"]].forEach(([id,icon,label])=>{ ?><button data-action=settings-tab data-settings-tab="<?= id ?>" class="<?= tab===id?'active':'' ?>"<?= tab===id?' aria-current=page':'' ?>><?= icon ?> <?= label ?></button><? }) ?></nav><div class=settings-layout><div class=settings-main><div class=card<? if(tab!=="network"){ ?> hidden<? } ?>><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card<? if(tab!=="security"){ ?> hidden<? } ?>><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card<? if(tab!=="notifications"){ ?> hidden<? } ?>><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card<? if(tab!=="process"){ ?> hidden<? } ?>><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><label><input id=gitPreserveLineEndings type=checkbox<?= settings.git_preserve_line_endings?" checked":"" ?>> Preserve Git working-tree line endings across platforms</label><p class=muted>When enabled, every managed process gets Git runtime config <code>core.autocrlf=false</code>. Repository <code>.gitattributes</code> and an explicit <code>git -c</code> can still override it.</p><div class=row><label class=grow>Environment variables for all spawned processes · one <code>NAME=value</code> per line</label><? if(settings.field_warnings?.exec_environment){ ?><span class=field-warning>⚠ <?= settings.field_warnings.exec_environment ?></span><? } ?></div><textarea id=execEnvironment rows=8 placeholder="CACHE_DIR=\${MRMCP_DIR}&#10;TOOLS=\${MRMCP_BIN}&#10;PROJECT=\${WORKSPACE}&#10;RUN_FROM=\${CWD}"><?= settings.exec_environment||'' ?></textarea><p class=muted>Available placeholders: <code>\${MRMCP_DIR}</code> = MrMCP data directory, <code>\${MRMCP_BIN}</code> = managed bin directory, <code>\${WORKSPACE}</code> = current Workspace root, <code>\${CWD}</code> = effective exec directory. Precedence: system environment → these settings → per-call <code>env</code>. Off PATH inheritance leaves child <code>PATH</code> as only <code>.mrmcp/bin</code>; PATH remains governed by this toggle rather than the generic environment list.</p></div><div class=card<? if(tab!=="maintenance"){ ?> hidden<? } ?>><h3>🧹 Tool Call History</h3><label>History storage</label><select id=toolCallStorage><option value=disk<?= settings.tool_call_storage==='disk'?' selected':'' ?>>Disk · survives restart</option><option value=memory<?= settings.tool_call_storage==='memory'?' selected':'' ?>>Memory · SQLite TEMP, volatile</option></select><p class=muted>Storage and payload retention are independent. Disk writes Tool Call history to the main SQLite database. Memory uses SQLite TEMP tables in RAM with the same Tool Call ids, GUI and tools_log behavior; rows disappear on restart.</p><label>Payload retention</label><select id=toolCallPayloadMode><option value=payload<?= settings.tool_call_payload_mode==='payload'?' selected':'' ?>>Payload · canonical MCP request and response packets</option><option value=metadata<?= settings.tool_call_payload_mode==='metadata'?' selected':'' ?>>Metadata · no Tool Call request/response payload copies</option></select><p class=muted>Payload retention affects only diagnostic copies in Tool Call history. Functional state required by tools remains available in its owning subsystem; for example persistent-process command/output state is retained independently so exec_attach and exec_status keep working.</p><div class=row><label class=grow>Disk retention hours · 0 keeps indefinitely</label><? if(settings.field_warnings?.tool_call_retention_hours){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_retention_hours ?></span><? } ?></div><input id=toolCallRetentionHours type=number min=0 step=1 value="<?= settings.tool_call_retention_hours??0 ?>"><div class=row><label class=grow>Memory retention minutes · 0 keeps until restart</label><? if(settings.field_warnings?.tool_call_memory_retention_minutes){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_memory_retention_minutes ?></span><? } ?></div><input id=toolCallMemoryRetentionMinutes type=number min=0 step=1 value="<?= settings.tool_call_memory_retention_minutes??60 ?>"><p class=muted>Retention removes completed Tool Call history from its own storage tier. Process, CDP and other functional state are unaffected. Changing the current storage or payload setting affects new Tool Calls only; existing rows retain their own storage and payload capabilities.</p><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, Memory, CDP browser state, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
 <? } else if(section==="help"){ ?><section id=help class=page><h2>❓ Help</h2><div class=card><h3>Connect ChatGPT Web</h3><ol><li>Make sure the Dashboard shows a trusted HTTPS certificate. ChatGPT needs a remote HTTPS MCP endpoint; use <code><?= settings.external_base_url ? settings.external_base_url + "/mcp" : "https://your-host/mcp" ?></code>.</li><li>In ChatGPT Web, enable Developer mode. In managed workspaces the current path is <b>Workspace settings → Permissions &amp; Roles → Connected Data Developer mode / Create custom MCP connectors</b>. Authorized users may also find the toggle under <b>Settings → Apps → Advanced Settings</b>.</li><li>Create a custom app from <b>Workspace settings → Apps → Create</b> or <b>Settings → Apps → Create</b>, enter the MrMCP endpoint, choose the offered authentication method, then select <b>Scan Tools</b>.</li><li>If OAuth is enabled in MrMCP, complete the authorization prompt. After the tool scan completes, create the app and select it from a new ChatGPT conversation.</li></ol></div><div class=card><h3>Authentication</h3><p>For ChatGPT, OAuth is the preferred MrMCP setup because ChatGPT can discover the authorization metadata, complete consent, and keep refresh-token connectivity. MrMCP also supports Basic authentication for MCP clients that offer it. Authentication grants access to the server; the <code>context_handle</code> selects persistent context state after authentication.</p></div><div class=card><h3>Write Access</h3><p>MrMCP does not maintain a separate read/write allowlist: every authenticated client receives every published tool. ChatGPT controls whether write/modify actions are usable through the app's permissions and action controls. As of this build, OpenAI documents full MCP write/modify support for Business, Enterprise and Edu; Pro custom MCP access is limited to read/fetch, and availability may change. Test write tools in Developer mode first. Where available, use <b>Workspace settings → Apps → Configure Actions / Action control</b> to enable the required actions. ChatGPT may still ask for confirmation before a write.</p></div><div class=card><h3>Using MrMCP in a Chat</h3><ol><li>Start a new chat and select the MrMCP app from the tools/apps menu.</li><li>If needed, call <code>list_workspaces</code> to discover the enabled Workspace names, then call <code>open_workspace</code> with the desired <code>name</code>. When continuing an existing Session, also pass its handle as <code>current_context_handle</code>; MrMCP moves that same Session to the Workspace. If the handle is omitted, empty, unknown or expired, a new Session is created.</li><li>The result already includes <code>workspace_name</code>, absolute <code>cwd</code> and <code>agent_guidance_path</code>. Read that file when non-null, then reuse the returned <code>context_handle</code> on later Session-bound calls. The Workspaces page can also move Sessions manually.</li><li>If you change ChatGPT model or thinking level, the MCP context may be recreated even inside the same conversation. Check the Sessions page if continuity matters.</li></ol><p class=muted>ChatGPT UI labels and plan availability can change. Current OpenAI references: <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt" target=_blank rel=noopener>Developer mode and MCP apps in ChatGPT</a> · <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt" target=_blank rel=noopener>Apps in ChatGPT</a>.</p></div></section><? } ?>`,
     dialogs: `<? const dialog=it.data?.state?.dialog; ?><? if(dialog){ ?><div id=dialogOverlay class=dialog-overlay><? if(dialog.kind==="root"){ const r=dialog.data||{}; ?><dialog id=rootDialog open data-managed-dialog=root><form id=rootForm><input id=rid type=hidden value="<?= r.id||'' ?>"><h2>📁 Workspace</h2><div class=row><label class=grow>Workspace name</label><? if(r.name_warning){ ?><span class=field-warning>⚠ <?= r.name_warning ?></span><? } ?></div><input id=rname value="<?= r.name||'' ?>"><div class=row><label class=grow>Directory path</label><? if(r.path_warning){ ?><span class=field-warning>⚠ <?= r.path_warning ?></span><? } else if(!r.path_checked){ ?><span class=muted>Leave the field to validate the directory.</span><? } ?></div><input id=rpath placeholder="C:\\projects\\my-workspace, /srv/my-workspace or ./project" value="<?= r.path||'' ?>"><div class=muted>Relative to the program folder.</div><label><input id=renabled type=checkbox<?= r.enabled!==false?' checked':'' ?>> Enabled</label><? if(r.form_warning){ ?><div class=field-warning>⚠ <?= r.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (r.name_warning||r.path_warning||!r.path_checked||r.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="command"){ const c=dialog.data||{}; ?><dialog id=commandDialog open data-managed-dialog=command><form id=commandForm><input id=coldName type=hidden value="<?= c.registered?c.name:'' ?>"><h2>🧰 Command Catalog Entry</h2><div class=row><label class=grow>Logical name</label><? if(c.name_warning){ ?><span class=field-warning>⚠ <?= c.name_warning ?></span><? } ?></div><input id=cname value="<?= c.name||'' ?>"><div class=row><label class=grow>Path below .mrmcp/bin</label><? if(c.path_warning){ ?><span class="<?= c.path_error?'field-warning':'muted' ?>"><?= c.path_error?'⚠ ':'' ?><?= c.path_warning ?></span><? } else if(!c.path_checked){ ?><span class=muted>Leave the field to validate the path.</span><? } ?></div><input id=cpath placeholder="Optional; defaults to logical name; Windows suffix optional" value="<?= c.path||'' ?>"><label>Description for the agent</label><textarea id=cdescription placeholder="Optional: what it does and when the agent should use it."><?= c.description||'' ?></textarea><div class=row><label class=grow>Download URL</label><? if(c.download_warning){ ?><span class=field-warning>⚠ <?= c.download_warning ?></span><? } ?></div><input id=cdownloadUrl placeholder="https://example.com/tool" value="<?= c.download_url||'' ?>"><div class=row><label class=grow>Documentation URL</label><? if(c.documentation_warning){ ?><span class=field-warning>⚠ <?= c.documentation_warning ?></span><? } ?></div><input id=cdocumentationUrl placeholder="https://example.com/docs" value="<?= c.documentation_url||'' ?>"><? if(c.form_warning){ ?><div class=field-warning>⚠ <?= c.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (c.name_warning||c.path_error||!c.path_checked||c.download_warning||c.documentation_warning||c.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="prompt"){ const p=dialog.data||{}; ?><dialog id=promptDialog open data-managed-dialog=prompt><form id=promptForm><input id=poldName type=hidden value="<?= p.old_name||'' ?>"><h2>🧭 Guided Prompt</h2><div class=row><label class=grow>Name</label><? if(p.name_warning){ ?><span class=field-warning>⚠ <?= p.name_warning ?></span><? } ?></div><input id=pname value="<?= p.name||'' ?>"><label>Title</label><input id=ptitle value="<?= p.title||'' ?>" placeholder="Human-readable title shown by MCP clients"><label>Description</label><textarea id=pdescription placeholder="What this guided prompt does."><?= p.description||'' ?></textarea><div class=row><label class=grow>Arguments · YAML list</label><? if(p.args_warning){ ?><span class=field-warning>⚠ <?= p.args_warning ?></span><? } ?></div><textarea id=parguments rows=8 placeholder="- name: focus&#10;  description: Area to focus on.&#10;  required: false"><?= p.arguments_text||'' ?></textarea><div class=row><label class=grow>Eta template</label><? if(p.template_warning){ ?><span class=field-warning>⚠ <?= p.template_warning ?></span><? } ?></div><textarea id=ptemplate rows=14 placeholder="Review the project. &lt;%= it.args.focus %&gt;"><?= p.template||'' ?></textarea><div class=muted>Standard Eta tags. Model documentation is available from Guided Prompts → Template Help.</div><? if(p.form_warning){ ?><div class=field-warning>⚠ <?= p.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (p.name_warning||p.args_warning||p.template_warning||p.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="memory"){ const m=dialog.data||{},creating=!m.id; ?><dialog id=memoryDialog open data-managed-dialog=memory><form id=memoryForm><input id=mid type=hidden value="<?= m.id||'' ?>"><h2><?= creating?'➕ New Memory':'🧠 Memory' ?></h2><? if(creating){ ?><label>Scope</label><select id=mscope><option value=global<?= m.scope==='global'?' selected':'' ?>>Global</option><option value=session<?= m.scope==='session'?' selected':'' ?><?= !(m.sessions||[]).length?' disabled':'' ?>>Session</option><option value=workspace<?= m.scope==='workspace'?' selected':'' ?><?= !(m.workspaces||[]).length?' disabled':'' ?>>Workspace</option></select><? if(m.scope==='workspace'){ ?><label>Workspace</label><select id=mworkspace><? (m.workspaces||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= String(m.workspace||'')===String(name)?' selected':'' ?>><?= name ?></option><? }) ?></select><? } else if(m.scope==='session'){ ?><label>Session</label><select id=mcontext><? (m.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(m.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><? } else { ?><div class=muted>Shared across all Sessions and Workspaces on this MrMCP server.</div><? } ?><? } else { ?><div class=muted><?= m.scope==='global'?'Global':(m.scope==='workspace'?'Workspace':'Session') ?> · <?= m.owner_name||'' ?></div><? } ?><label>Key</label><input id=mkey value="<?= m.key||'' ?>"><label>Value</label><? if(m.json){ ?><textarea id=mvalue rows=14 hidden><?= m.value_text||'' ?></textarea><div id=memoryJsonEditor class="json-editor-host memory" data-json-source=mvalue data-json-edit=memory data-json-error=memoryJsonError></div><div id=memoryJsonError class=field-warning hidden></div><? } else { ?><textarea id=mvalue rows=14><?= m.value_text||'' ?></textarea><? } ?><label><input id=mjson type=checkbox<?= m.json?' checked':'' ?>> Value is JSON · validate before saving</label><div class=muted>Switching between TEXT and JSON keeps the current draft unchanged.</div><label>TTL seconds · 0 = permanent</label><input id=mttl type=number min=0 max=315360000 value="<?= m.ttl_seconds||0 ?>"><? if(m.form_warning){ ?><div class=field-warning>⚠ <?= m.form_warning ?></div><? } ?><p class=row><button class=primary type=submit>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="confirm"){ ?><dialog id=confirmDialog open data-managed-dialog=confirm><h2>⚠️ <?= dialog.title||"Confirm Action" ?></h2><p><?= dialog.message||"Continue?" ?></p><p class=row><button class="primary danger" data-action=confirm-dialog>✓ Confirm</button><button data-action=close-dialog>✕ Cancel</button></p></dialog><? } ?></div><? } ?>`,
     status: `<? const d=it.data||{},s=d.settings||{},a=d.activity||{},bad=!!s.mcp_listen_error,warn=!!s.listener_fallback,recent=a.recent_sessions||[],inFlight=a.tool_calls_in_flight||0,errors=a.tool_calls_errors||0,invalid=a.tool_calls_invalid||0; ?><span class="status-group <?= d.live!=="connected"?(d.live==="reconnecting"?"pending":"failed"):(bad?"failed":(warn?"pending":"ok")) ?>"><?= d.live!=="connected"?(d.live==="reconnecting"?"🟡 reconnecting":"🔴 offline"):(bad?"🔴 listener error":(warn?"🟡 fallback":"🟢 live")) ?></span><span class="status-group status-link" data-action=header-settings title="HTTP / HTTPS effective listener ports; GUI uses local Tauriless assets">🔌 <span class=status-ports><?= s.mcp_http_active?s.mcp_http_port:"off" ?>/<?= s.mcp_https_active?s.mcp_https_port:"off" ?></span><? if(warn){ ?> <span class=pending>⚠</span><? } ?></span><span class=status-group title="Sessions with a Tool Call in the last <?= a.active_window_minutes||10 ?> minutes">💬 <span class="status-link <?= a.active_sessions?'ok':'muted' ?>" data-action=header-sessions><?= a.active_sessions||0 ?> active</span><? if(recent.length){ ?> · <span class=status-sessions><? recent.forEach((x,i)=>{ ?><?= i?" ":"" ?><span class=status-link data-action=session-tool-calls data-id="<?= x.id ?>">#<?= x.id ?>(<?= x.tool_calls ?>)</span><? }) ?></span><? } ?></span><span class=status-group title="Tool Calls in flight / total recorded / failed / invalid">🛠️ <span class="status-link <?= inFlight?'pending':'muted' ?>" data-action=header-tool-calls data-status=running><?= inFlight ?> in flight</span> · <span class="status-link status-total" data-action=header-tool-calls data-status=""><?= a.tool_calls_total||0 ?> total</span> · <span class="status-link <?= errors?'failed':'muted' ?>" data-action=header-tool-calls data-status=failed><?= errors ?> errors</span> · <span class="status-link <?= invalid?'invalid':'muted' ?>" data-action=header-tool-calls data-status=invalid><?= invalid ?> invalid</span></span>`,
     cards: `<? const meta={sessions:["💬","Sessions"],roots:["📁","Workspaces"],tool_calls:["🛠️","Tool Calls"],tool_calls_in_flight:["🛠️","Tool Calls In Flight"],failed_calls:["⚠️","Failed Calls"],http_requests:["🌐","HTTP Requests"]}; Object.entries(it.data || {}).forEach(([key,value]) => { const item=meta[key]||["•",key]; ?><div class=card><div class=muted><?= item[0] ?> <?= item[1] ?></div><strong style="font-size:24px"><?= value ?></strong></div><? }) ?>`,
     active_tool_calls: `<? const rows=it.data||[],icons={completed:"✅",failed:"❌",invalid:"◆",killed:"❌",timed_out:"❌",running:"⏳",received:"⏳"}; ?><div class="card dashboard-call-card"><table class=dashboard-call-table><thead><tr><th>State</th><th>Tool Call</th><th>Session</th><th>Time</th></tr></thead><tbody><? if(!rows.length){ ?><tr><td colspan=4 class=muted>No active Tool Calls.</td></tr><? } else { rows.forEach(l=>{ const ms=Number(l.elapsed_ms||0),elapsed=ms<1000?ms+"ms":(ms/1000).toFixed(ms<10000?1:0)+"s"; ?><tr data-action=dashboard-tool-call title="Open Tool Call #<?= l.id ?>" data-id="<?= l.id ?>" class="<?= l.active?'':'dashboard-call-recent' ?>"<? if(!l.active){ ?> style="--dashboard-call-ttl:<?= Math.max(50,Number(l.ttl_ms||0)) ?>ms"<? } ?>><td class="<?= l.active?'pending':l.status ?> nowrap"><?= icons[l.status]||"•" ?> <?= l.active?"running":l.status ?></td><td class=dashboard-call-summary><?= l.call_summary ?><? if(l.storage==='memory'){ ?> <span class=muted>· MEMORY</span><? } ?><? if(l.progress_requested){ ?> <span class=progress-requested>📡 progress</span><? } ?></td><td class=idcell><?= l.context_id?"#"+l.context_id:"—" ?></td><td class=nowrap><?= elapsed ?><? if(!l.active){ ?> <span class=muted>· done</span><? } ?></td></tr><? }) } ?></tbody></table></div>`,
-    trash: `<? const d=it.data||{},rows=d.transactions||[],m=d.maintenance||{}; ?><div class=row><div class=grow><b><?= d.item_count||0 ?></b> item<?= Number(d.item_count||0)===1?'':'s' ?> in <b><?= d.transaction_count||0 ?></b> transaction<?= Number(d.transaction_count||0)===1?'':'s' ?></div><button class="danger" data-action=empty-trash<?= m.active?' disabled':'' ?>>🗑️ Empty Trash</button></div><? if(!rows.length){ ?><div class=card><p class=muted>Trash is empty.</p></div><? } else { rows.forEach(t=>{ ?><article class="card trash-transaction"><div class=row><div class=grow><h3 style="margin:0"><code><?= t.trash_id ?></code></h3><div class=muted><?= t.created_at?it.logdt(t.created_at):'Unknown creation time' ?> · <?= (t.items||[]).length ?> item<?= (t.items||[]).length===1?'':'s' ?></div></div><? if(t.restorable&&(t.items||[]).length){ ?><button class=small data-action=restore-trash data-id="<?= t.trash_id ?>">↩️ Restore all</button><? } ?><button class="small danger" data-action=delete-trash data-id="<?= t.trash_id ?>">🗑️ Delete transaction</button></div><? if(t.error){ ?><p class=field-warning><?= t.error ?></p><? } ?><table class=trash-table><thead><tr><th>Original path</th><th>Type / size</th><th>Stored payload</th><th></th></tr></thead><tbody><? (t.items||[]).forEach(x=>{ ?><tr><td><? if(x.original){ ?><code><?= x.original ?></code><? } else { ?><span class=muted>Original path unavailable</span><? } ?></td><td class=nowrap><?= x.type ?><? if(x.size!==null){ ?> · <?= it.bytes(x.size) ?><? } ?></td><td><code><?= x.payload ?></code></td><td class=nowrap><? if(t.restorable&&x.original){ ?><button class=small data-action=restore-trash-item data-id="<?= t.trash_id ?>" data-payload="<?= x.payload ?>">↩️ Restore</button> <? } ?><button class="small danger" data-action=delete-trash-item data-id="<?= t.trash_id ?>" data-payload="<?= x.payload ?>">🗑️ Delete</button></td></tr><? }) ?></tbody></table></article><? }) } ?>`,
+    trash: `<? const d=it.data||{},rows=d.transactions||[],m=d.maintenance||{}; ?><div class=row><div class=grow><b><?= d.item_count||0 ?></b> tracked item<?= Number(d.item_count||0)===1?'':'s' ?> in <b><?= d.transaction_count||0 ?></b> transaction<?= Number(d.transaction_count||0)===1?'':'s' ?> · <b><?= it.bytes(d.cached_bytes||0) ?></b> cached<? if(d.unknown_sizes){ ?> · <span class=pending><?= d.unknown_sizes ?> unknown size<?= Number(d.unknown_sizes)===1?'':'s' ?></span><? } ?></div><button class="danger" data-action=empty-trash<?= m.active?' disabled':'' ?>>🗑️ Empty Trash</button></div><? if(!rows.length){ ?><div class=card><p class=muted>Trash metadata is empty.</p></div><? } else { rows.forEach(t=>{ ?><article class="card trash-transaction"><div class=row><div class=grow><h3 style="margin:0"><code><?= t.trash_id ?></code></h3><div class=muted><?= t.created_at?it.logdt(t.created_at):'Unknown creation time' ?> · <?= (t.items||[]).length ?> item<?= (t.items||[]).length===1?'':'s' ?> · <?= it.bytes(t.cached_bytes||0) ?> cached<? if(t.unknown_sizes){ ?> · <?= t.unknown_sizes ?> unknown<? } ?><? if(t.missing_count){ ?> · <span class=failed><?= t.missing_count ?> missing on disk</span><? } ?></div></div><? if(t.restorable){ ?><button class=small data-action=restore-trash data-id="<?= t.trash_id ?>">↩️ Restore available</button><? } ?><button class="small danger" data-action=delete-trash data-id="<?= t.trash_id ?>">🗑️ Delete transaction</button></div><table class=trash-table><thead><tr><th>Original path</th><th>Cached metadata</th><th>Disk payload</th><th>Stored payload</th><th></th></tr></thead><tbody><? (t.items||[]).forEach(x=>{ ?><tr><td><? if(x.original){ ?><code><?= x.original ?></code><? } else { ?><span class=muted>Original path unavailable</span><? } ?></td><td class=nowrap><b><?= x.type ?></b><? if(x.size_cached!==null){ ?> · <?= it.bytes(x.size_cached) ?><? } else { ?> · <span class=pending>size unknown</span><? } ?></td><td class=nowrap><? if(x.disk_present){ ?><span class=ok>✅ Present</span><? if(x.disk_type&&x.disk_type!==x.type){ ?> <span class=pending>· now <?= x.disk_type ?></span><? } ?><? } else { ?><span class=failed>❌ Missing</span><? } ?></td><td><code><?= x.payload ?></code></td><td class=nowrap><? if(x.disk_present&&x.original){ ?><button class=small data-action=restore-trash-item data-id="<?= t.trash_id ?>" data-payload="<?= x.payload ?>">↩️ Restore</button> <? } ?><button class="small danger" data-action=delete-trash-item data-id="<?= t.trash_id ?>" data-payload="<?= x.payload ?>"><?= x.disk_present?'🗑️ Delete':'🧹 Remove metadata' ?></button></td></tr><? }) ?></tbody></table></article><? }) } ?>`,
     tls: `<? const t=it.data||{}, problem=!t.tls_active_trusted||!!t.tls_last_error||!!t.mcp_listen_error; ?><div class="card <?= problem ? "tls-alert" : "tls-good" ?>"><div class=row><h3 class=grow>🔒 TLS / Let's Encrypt</h3><b class="<?= t.tls_active_trusted ? "ok" : "failed" ?>"><?= t.tls_active_trusted ? "trusted" : (t.tls_active ? "fallback active" : "offline") ?></b></div><div class=grid><div><span class=muted>HTTPS Listener</span><br><b><?= t.mcp_https_active ? "0.0.0.0:"+t.mcp_https_port+" active" : "not listening" ?></b></div><div><span class=muted>Active Certificate</span><br><b><?= t.tls_active_kind || "none" ?> · <?= t.tls_active_valid ? "valid" : "invalid" ?></b></div><div><span class=muted>Expires</span><br><b><?= it.dt(t.tls_active_expires) || "unknown" ?></b></div><div><span class=muted>Last ACME Request</span><br><b><?= it.dt(t.tls_last_request_at) || "never recorded" ?></b></div><div><span class=muted>Last ACME Result</span><br><b class="<?= t.tls_last_request_valid ? "ok" : (t.tls_last_request_status === "error" ? "failed" : "pending") ?>"><? if (t.tls_last_request_status) { ?><?= t.tls_last_request_status ?> · certificate <?= t.tls_last_request_valid ? "valid" : "not valid" ?><? } else { ?>not recorded<? } ?></b></div><div><span class=muted>Last Valid Certificate</span><br><b><?= it.dt(t.tls_last_issued_at) || "not recorded" ?></b></div><div><span class=muted>Renewal Due</span><br><b><?= it.dt(t.tls_renewal_due_at) || "as soon as allowed" ?></b></div><div><span class=muted>Rate-Limit Reset</span><br><b><?= it.dt(t.tls_rate_limit_reset_at) || "none" ?></b></div><div><span class=muted>Next ACME Attempt</span><br><b><?= it.dt(t.tls_next_attempt_at) || "not scheduled" ?></b></div></div><? if (t.tls_last_error || t.mcp_listen_error) { ?><pre class=tls-error><?= t.tls_last_error || t.mcp_listen_error ?></pre><? } ?><? if (!t.tls_active_trusted) { ?><p class=failed><b>Public clients such as ChatGPT will reject the self-signed fallback until Let's Encrypt succeeds.</b></p><? } ?></div>`,
     urls: `<? (it.data || []).forEach(x => { if (!x?.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?><? if (x.note) { ?> <span class=muted><?= x.note ?></span><? } ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?>`,
     roots: `<? const d=it.data||{},rows=d.roots||[],defaults=d.default_sessions||[]; ?><div class=roots-layout><div class=roots-named><h3>📁 Workspaces</h3><? if(!rows.length){ ?><div class=card><p class=muted>No Workspaces registered.</p></div><? } ?><? rows.forEach(r => { ?><div class="card root-card<?= r.enabled?'':' root-disabled' ?>"<? if(r.enabled){ ?> data-root-drop="<?= r.id ?>"<? } ?>><div class=root-card-header><div class=grow><h3>📁 <?= r.name ?></h3><code class="<?= r.path_warning?'failed':'' ?>"<? if(r.path_warning){ ?> title="<?= r.path_warning ?>"<? } ?>><?= r.path ?></code></div><div class=command-actions><button class=small data-action=edit-root data-id="<?= r.id ?>">✏️ Edit</button><button class="small danger" data-action=delete-root data-id="<?= r.id ?>">🗑️ Delete</button></div></div><div class="<?= r.enabled?'ok':'muted' ?>"><?= r.enabled ? "enabled" : "disabled" ?></div><div class=root-session-list><? if(!r.enabled){ ?><div class=muted>Enable this Workspace to assign Sessions.</div><? } else if(!(r.sessions||[]).length){ ?><div class=root-drop-empty>Drop a Session here</div><? } ?><? (r.sessions||[]).forEach(v=>{ ?><div class=session-chip draggable=true data-session-drag data-session-id="<?= v.pk ?>" title="Drag Session #<?= v.pk ?>"><div class=session-chip-main><span>💬</span><b>#<?= v.pk ?></b><span class=grow><?= v.client_name ?></span></div><div class=session-chip-meta><span><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></span><span><span class=muted>Last Activity</span> <?= it.logdt(v.last_active_at) ?></span><span><span class=muted>Status</span> <span class="<?= v.expired?'failed':'ok' ?>"><?= v.expired?'expired':'active' ?></span></span><span><span class=muted>Tool Calls:</span> <?= v.tool_calls||0 ?></span></div></div><? }) ?></div></div><? }) ?></div><div class=roots-default><div class=row><h3 class=grow>💬 Sessions</h3><span class=muted>No Workspace assigned</span></div><div class="card default-root-card" data-root-drop="0"><p class=muted>Uses the program folder until assigned to a Workspace.</p><div class=root-session-list><? if(!defaults.length){ ?><div class=root-drop-empty>Drop a Session here to remove its Workspace association.</div><? } ?><? defaults.forEach(v=>{ ?><div class=session-chip draggable=true data-session-drag data-session-id="<?= v.pk ?>" title="Drag Session #<?= v.pk ?>"><div class=session-chip-main><span>💬</span><b>#<?= v.pk ?></b><span class=grow><?= v.client_name ?></span></div><div class=session-chip-meta><span><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></span><span><span class=muted>Last Activity</span> <?= it.logdt(v.last_active_at) ?></span><span><span class=muted>Status</span> <span class="<?= v.expired?'failed':'ok' ?>"><?= v.expired?'expired':'active' ?></span></span><span><span class=muted>Tool Calls:</span> <?= v.tool_calls||0 ?></span></div></div><? }) ?></div></div></div></div>`,
@@ -9885,7 +9843,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         uiConfirm("Clear HTTP Debug Log", "Delete all HTTP debug log rows?", "clear-debug");
         return;
       case "clear-tool-calls":
-        uiConfirm("Clear Tool Calls", "Delete all Tool Call records, search rows, descriptor/transport metadata and persisted process history? Running persistent processes are left running. Tool Call IDs are never reset or reused.", "clear-tool-calls");
+        uiConfirm("Clear Tool Calls", "Delete all Tool Call records, search rows and historical tool descriptors? Process state/history is independent and is not deleted. Tool Call IDs are never reset or reused.", "clear-tool-calls");
         return;
       case "clear-sessions":
         uiConfirm("Clear Sessions", "Delete all Sessions? Running persistent processes belonging to those Sessions will be terminated. Tool Call history is preserved with its recorded Session and Workspace snapshots.", "clear-sessions");
