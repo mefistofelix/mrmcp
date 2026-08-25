@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Moved the live/recent Active Tool Calls panel out of Dashboard into Processes, alongside active foreground/persistent process controls; its projection, refresh timer and row action are now Processes-owned while Dashboard retains only aggregate Tool Call metrics.
+
 ## 0.10.128
 
 - Decoupled managed-process state/history from Tool Call history storage: `process_runs` now always belongs to the main process subsystem, Tool Call retention/delete/clear never removes process state, and Clear Operational Data removes only non-running process history while preserving active process rows/runtime.
