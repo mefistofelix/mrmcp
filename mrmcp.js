@@ -5772,10 +5772,99 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   }
   // Foreground exec is request-scoped and streamed live. Persistent processes are explicitly
   // started with exec_start, whose Tool Call id becomes exec_id for attach/status/write/kill.
-  // Keep the complete normalized process transcript for the retained process lifetime: foreground exec
-  // returns the whole transcript once, while repeated exec_attach calls consume it through attach_cursor.
-  const processTail = value => value.length > 65536 ? value.slice(-65536) : value;
-  function appendProcessBuffer(rec, key, value) { rec[key] += value; }
+  // Retain one ordered normalized chunk ledger. Combined/stdout/stderr strings are materialized only
+  // for the response that asks for them, so process lifetime storage never duplicates transcript text.
+  const processTextLength = (rec, key = "output") => key === "output"
+    ? Number(rec.output_chars || 0) : Number(rec[`${key}_chars`] || 0);
+  function processOutputChunkIndex(rec, position) {
+    const chunks = rec.output_chunks || [];
+    let low = 0, high = chunks.length;
+    while (low < high) {
+      const middle = (low + high) >> 1, chunk = chunks[middle];
+      if (Number(chunk.output_start || 0) + chunk.text.length <= position) low = middle + 1;
+      else high = middle;
+    }
+    return low;
+  }
+  function processOutputRangeEach(rec, start, end, visit) {
+    const total = processTextLength(rec), chunks = rec.output_chunks || [];
+    start = Math.max(0, Math.min(Number(start || 0), total));
+    end = Math.max(start, Math.min(Number(end ?? total), total));
+    for (let index = processOutputChunkIndex(rec, start); index < chunks.length; index++) {
+      const chunk = chunks[index], chunkStart = Number(chunk.output_start || 0), chunkEnd = chunkStart + chunk.text.length;
+      if (chunkStart >= end) break;
+      if (chunkEnd <= start) continue;
+      const text = chunk.text.slice(Math.max(0, start - chunkStart), Math.min(chunk.text.length, end - chunkStart));
+      if (text) visit(text, chunk);
+    }
+  }
+  function processTextRange(rec, key = "output", start = 0, end = processTextLength(rec, key)) {
+    const total = processTextLength(rec, key), parts = [];
+    start = Math.max(0, Math.min(Number(start || 0), total));
+    end = Math.max(start, Math.min(Number(end ?? total), total));
+    if (key === "output") {
+      processOutputRangeEach(rec, start, end, text => parts.push(text));
+      return parts.join("");
+    }
+    for (const chunk of rec.output_chunks || []) {
+      if (chunk.stream !== key) continue;
+      const chunkStart = Number(chunk.stream_start || 0), chunkEnd = chunkStart + chunk.text.length;
+      if (chunkStart >= end) break;
+      if (chunkEnd <= start) continue;
+      parts.push(chunk.text.slice(Math.max(0, start - chunkStart), Math.min(chunk.text.length, end - chunkStart)));
+    }
+    return parts.join("");
+  }
+  const processTextTail = (rec, key = "output", maxChars = 65536) => {
+    const total = processTextLength(rec, key), size = Math.max(0, Number(maxChars || 0));
+    return processTextRange(rec, key, Math.max(0, total - size), total);
+  };
+  function processTailLinesFromChunks(rec, key, limit) {
+    const wanted = Math.max(1, Number(limit || 200)), parts = [];
+    let newlines = 0;
+    for (let index = (rec.output_chunks || []).length - 1; index >= 0; index--) {
+      const chunk = rec.output_chunks[index];
+      if (key !== "output" && chunk.stream !== key) continue;
+      parts.push(chunk.text);
+      for (let offset = chunk.text.length - 1; offset >= 0; offset--)
+        if (chunk.text.charCodeAt(offset) === 10) newlines++;
+      if (newlines > wanted) break;
+    }
+    return processTailLines(parts.reverse().join(""), wanted);
+  }
+  function processOutputPrefix(rec, start, maxBytes) {
+    const total = processTextLength(rec), parts = [];
+    start = Math.max(0, Math.min(Number(start || 0), total));
+    maxBytes = Math.max(1, Number(maxBytes || 1));
+    let bytes = 0, chars = 0;
+    for (let index = processOutputChunkIndex(rec, start); index < (rec.output_chunks || []).length; index++) {
+      const chunk = rec.output_chunks[index], chunkStart = Number(chunk.output_start || 0);
+      let text = chunk.text.slice(Math.max(0, start - chunkStart));
+      if (!text) continue;
+      const whole = text.length === chunk.text.length, textBytes = whole ? Number(chunk.bytes || 0) : enc.encode(text).byteLength;
+      if (bytes + textBytes <= maxBytes) {
+        parts.push(text); bytes += textBytes; chars += text.length; continue;
+      }
+      const remaining = maxBytes - bytes;
+      if (remaining <= 0) break;
+      text = textPrefixByBytes(text, remaining);
+      if (text) { parts.push(text); bytes += enc.encode(text).byteLength; chars += text.length; }
+      break;
+    }
+    return { text: parts.join(""), bytes, end: start + chars };
+  }
+  function appendProcessChunk(rec, stream, text) {
+    const bytes = enc.encode(text).byteLength;
+    rec.output_chunks.push({
+      stream, text, bytes,
+      output_start: rec.output_chars,
+      stream_start: rec[`${stream}_chars`],
+    });
+    rec.output_chars += text.length;
+    rec[`${stream}_chars`] += text.length;
+    rec.output_bytes += bytes;
+    return bytes;
+  }
   function notifyProcessActivity(rec) {
     for (const wake of [...rec.output_waiters]) { rec.output_waiters.delete(wake); wake(); }
   }
@@ -5862,9 +5951,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   function appendProcessOutput(rec, stream, value, final = false) {
     const normalized = normalizeTerminalChunk(rec.output_normalizers[stream], value, final);
     if (!normalized) return;
-    appendProcessBuffer(rec, stream, normalized);
-    appendProcessBuffer(rec, "output", normalized);
-    rec.output_bytes += enc.encode(normalized).byteLength;
+    appendProcessChunk(rec, stream, normalized);
     rec.updated_at = Date.now();
     rec.foreground_progress?.push(normalized);
     const attachment = rec.attachment;
@@ -5921,16 +6008,6 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     };
   }
   function processView(rec, options = {}) {
-    const read = (key, requested) => {
-      const base = rec[`${key}_base`], start = Math.max(Number(requested || 0), base);
-      return {
-        value: rec[key].slice(start - base),
-        from: start,
-        next: base + rec[key].length,
-        truncated_before: Number(requested || 0) < base ? base : null,
-      };
-    };
-    const combined = read("output", options.output_offset);
     const view = {
       ...(rec.persistent ? { exec_id: rec.log_id } : {}),
       status: rec.status, command: rec.display,
@@ -5939,14 +6016,15 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       completed_at: rec.completed_at ? new Date(rec.completed_at).toISOString() : null,
       exit_code: rec.exit_code, signal: rec.signal || null, requested_signal: rec.requested_signal || null,
       termination_source: rec.termination_source || null, timed_out: !!rec.timed_out,
-      output: combined.value,
       stdin_open: !!rec.stdin_writer, error: rec.error || "",
       success: rec.status === "running" || rec.status === "completed",
     };
-    if (options.separate_streams === true) {
-      const out = read("stdout", options.stdout_offset), err = read("stderr", options.stderr_offset);
-      Object.assign(view, { stdout: out.value, stderr: err.value });
-    }
+    if (options.include_output !== false)
+      view.output = processTextRange(rec, "output", Number(options.output_offset || 0));
+    if (options.separate_streams === true) Object.assign(view, {
+      stdout: processTextRange(rec, "stdout", Number(options.stdout_offset || 0)),
+      stderr: processTextRange(rec, "stderr", Number(options.stderr_offset || 0)),
+    });
     return view;
   }
   function processStartView(rec) {
@@ -5975,15 +6053,16 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   }
   function processStatusView(rec, args = {}) {
     const mode = String(args.output || "none"), includeStreams = mode !== "none" && args.separate_streams === true;
-    const view = processView(rec, { separate_streams: includeStreams });
+    const view = processView(rec, {
+      include_output: mode === "all",
+      separate_streams: mode === "all" && includeStreams,
+    });
     view.output_mode = mode; view.attached = !!rec.attachment; delete view.success;
-    if (mode === "none") {
-      delete view.output; delete view.stdout; delete view.stderr;
-    } else if (mode === "tail") {
-      view.output = processTailLines(view.output, args.tail_lines);
+    if (mode === "tail") {
+      view.output = processTailLinesFromChunks(rec, "output", args.tail_lines);
       if (includeStreams) {
-        view.stdout = processTailLines(view.stdout, args.tail_lines);
-        view.stderr = processTailLines(view.stderr, args.tail_lines);
+        view.stdout = processTailLinesFromChunks(rec, "stdout", args.tail_lines);
+        view.stderr = processTailLinesFromChunks(rec, "stderr", args.tail_lines);
       }
     }
     return view;
@@ -6011,14 +6090,12 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     };
   }
   function processSummary(rec, tail = 8192, separateStreams = false) {
-    const outputTotal = rec.output_base + rec.output.length;
-    const stdoutTotal = rec.stdout_base + rec.stdout.length;
-    const stderrTotal = rec.stderr_base + rec.stderr.length;
+    const outputTotal = processTextLength(rec), stdoutTotal = processTextLength(rec, "stdout"), stderrTotal = processTextLength(rec, "stderr");
     return processView(rec, {
-      output_offset: Math.max(rec.output_base, outputTotal - tail),
+      output_offset: Math.max(0, outputTotal - tail),
       separate_streams: separateStreams,
-      stdout_offset: Math.max(rec.stdout_base, stdoutTotal - tail),
-      stderr_offset: Math.max(rec.stderr_base, stderrTotal - tail),
+      stdout_offset: Math.max(0, stdoutTotal - tail),
+      stderr_offset: Math.max(0, stderrTotal - tail),
     });
   }
   async function terminateProcess(rec, signal = "SIGTERM", source = "user") {
@@ -6151,7 +6228,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       }),
       cwd: target.path, cwd_display: target.display, status: "running", started_at: Date.now(), completed_at: null,
       exit_code: null, signal: "", requested_signal: "", termination_source: "", timed_out: false, error: "",
-      output: "", stdout: "", stderr: "", output_base: 0, stdout_base: 0, stderr_base: 0, output_bytes: 0, updated_at: Date.now(),
+      output_chunks: [], output_chars: 0, stdout_chars: 0, stderr_chars: 0, output_bytes: 0, updated_at: Date.now(),
       output_readers: new Set(), output_waiters: new Set(), output_normalizers: { stdout: terminalNormalizer(), stderr: terminalNormalizer() }, output_cancelled: false,
       foreground_progress: persistent ? null : execution.progress || null,
       attachment: null, attach_cursor: 0, attach_cursor_bytes: 0, stdin_history: [],
@@ -6192,7 +6269,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       try { await rec.stdin_writer?.close(); } catch {}
       rec.stdin_writer = null;
       run(`UPDATE main.process_runs SET status=?,completed_at=?,exit_code=?,signal=?,stdout_tail=?,stderr_tail=?,error=? WHERE id=?`,
-        rec.status, rec.completed_at, rec.exit_code, rec.signal, processTail(rec.output), processTail(rec.stderr), rec.error, rec.id);
+        rec.status, rec.completed_at, rec.exit_code, rec.signal, processTextTail(rec), processTextTail(rec, "stderr"), rec.error, rec.id);
       notifyProcessActivity(rec);
       emitUiChange(["state", "processes", "logs"], "process-exit");
       return rec;
@@ -6229,11 +6306,11 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     return rec;
   }
   const processIsRunning = rec => ["starting", "running"].includes(rec.status);
-  const processOutputEnd = rec => rec.output_base + rec.output.length;
+  const processOutputEnd = rec => processTextLength(rec);
   function attachProcessView(rec, start, end, args, remainingBytes) {
-    const view = processView(rec, { separate_streams: args.separate_streams === true });
-    const from = Math.max(start, rec.output_base), to = Math.max(from, Math.min(end, processOutputEnd(rec)));
-    view.output = rec.output.slice(from - rec.output_base, to - rec.output_base);
+    const view = processView(rec, { include_output: false, separate_streams: args.separate_streams === true });
+    const from = Math.max(0, Number(start || 0)), to = Math.max(from, Math.min(Number(end ?? processOutputEnd(rec)), processOutputEnd(rec)));
+    view.output = processTextRange(rec, "output", from, to);
     view.remaining_bytes = Math.max(0, Number(remainingBytes || 0));
     return view;
   }
@@ -6262,7 +6339,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     if (!rec.persistent) throw new Error("exec_attach can attach only to a persistent process created by exec_start");
     if (rec.attachment) throw new Error(`Persistent exec_id ${rec.log_id} already has an active exec_attach`);
     const progressMode = !!execution.progressRequested, progress = progressMode ? execution.progress : null;
-    const start = Math.max(rec.attach_cursor, rec.output_base), startBytes = rec.attach_cursor_bytes;
+    const start = Math.max(0, rec.attach_cursor), startBytes = rec.attach_cursor_bytes;
     let sentCursor = start, sentBytes = startBytes, detached = false, detach;
     const attachment = { progress, progress_requested: progressMode };
     const disconnected = new Promise(resolve => { detach = resolve; });
@@ -6280,8 +6357,10 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     });
     try {
       if (progressMode) {
-        const backlog = rec.output.slice(start - rec.output_base);
-        if (progress) { progress.push(backlog); progress.flush(); }
+        if (progress) {
+          processOutputRangeEach(rec, start, processOutputEnd(rec), text => progress.push(text));
+          progress.flush();
+        }
         if (processIsRunning(rec)) await Promise.race([rec.done, disconnected]);
         if (detached) return attachProcessView(
           rec, start, sentCursor, args, Math.max(0, rec.output_bytes - sentBytes),
@@ -6296,10 +6375,9 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       if (reason === "disconnected" || detached) return attachProcessView(
         rec, start, start, args, Math.max(0, rec.output_bytes - startBytes),
       );
-      const available = rec.output.slice(start - rec.output_base);
-      const chunk = textPrefixByBytes(available, MCP_ATTACH_RESPONSE_BYTES);
-      const chunkBytes = enc.encode(chunk).byteLength, end = start + chunk.length;
-      rec.attach_cursor = end; rec.attach_cursor_bytes = startBytes + chunkBytes;
+      const chunk = processOutputPrefix(rec, start, MCP_ATTACH_RESPONSE_BYTES);
+      const end = chunk.end;
+      rec.attach_cursor = end; rec.attach_cursor_bytes = startBytes + chunk.bytes;
       return attachProcessView(
         rec, start, end, args, Math.max(0, rec.output_bytes - rec.attach_cursor_bytes),
       );
