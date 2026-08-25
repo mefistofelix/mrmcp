@@ -616,6 +616,7 @@ async function backend({ addWorkspace = null } = {}) {
   db.exec(`
     PRAGMA journal_mode=WAL;
     PRAGMA foreign_keys=ON;
+    PRAGMA busy_timeout=5000;
     CREATE TABLE IF NOT EXISTS config(
       key TEXT PRIMARY KEY, value TEXT NOT NULL
     );
@@ -919,7 +920,8 @@ async function backend({ addWorkspace = null } = {}) {
     if (scopes.length) emitUiChange(scopes, "database");
     return result;
   };
-  const getCfg = (key, fallback) => one("SELECT value FROM config WHERE key=?", key)?.value ?? fallback;
+  const configCache = new Map(all("SELECT key,value FROM config").map(row => [String(row.key), String(row.value)]));
+  const getCfg = (key, fallback) => configCache.has(String(key)) ? configCache.get(String(key)) : fallback;
   const desktopNotificationEnabled = type => getCfg(`desktop_notifications_${type}`, getCfg("desktop_notifications", "1")) === "1";
   const postOsNotification = (type, title, body) => {
     if (IS_BACKEND_WORKER && desktopNotificationEnabled(type)) self.postMessage({ type: "os-notification", title, body });
@@ -1024,10 +1026,15 @@ async function backend({ addWorkspace = null } = {}) {
       error && `• ⚠️ ${compactNotificationError(error)}`,
     ].filter(Boolean).join("\n");
   };
-  const setCfg = (key, value) => run(
-    "INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-    key, String(value),
-  );
+  const setCfg = (key, value) => {
+    const text = String(value);
+    const result = run(
+      "INSERT INTO config(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+      key, text,
+    );
+    configCache.set(String(key), text);
+    return result;
+  };
   const requiredSchema = {
     server_config: ["oauth", "basic_enabled", "basic_username", "basic_secret_enc"],
     roots: ["server_id", "name", "path", "enabled"],
@@ -1095,8 +1102,9 @@ async function backend({ addWorkspace = null } = {}) {
     ["tls_next_attempt_at", "0"], ["tls_rate_limit_reset_at", "0"], ["tls_renewal_due_at", "0"],
     ["tls_self_signed_created_at", "0"], ["debug_http_log", "0"],
     ["inherit_system_path", "1"], ["git_preserve_line_endings", "1"], ["exec_environment", ""],
+    ["tool_call_retention_hours", "0"],
     ["command_discovery_enabled", "1"], ["telegram_bot_token", ""],
-  ]) if (!one("SELECT 1 FROM config WHERE key=?", k)) setCfg(k, v);
+  ]) if (!configCache.has(k)) setCfg(k, v);
   setCfg("tls_cert_path", CERT_PATH);
   setCfg("tls_key_path", KEY_PATH);
   setCfg("tls_staging", "0");
@@ -3451,6 +3459,26 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     (Array.isArray(patterns) && patterns.length ? patterns : fallback).map(pattern => globRegex(pattern));
   const matchesGlobs = (path, globs) => globs.some(regex => regex.test(path));
   const excludedByGlobs = (path, globs) => matchesGlobs(path, globs) || matchesGlobs(`${path}/x`, globs);
+  function fixedGlobPrefix(pattern) {
+    const source = slashPath(pattern);
+    if (!source || source.startsWith("/")) return "";
+    const parts = source.split("/"), fixed = [];
+    for (const part of parts) {
+      if (!part || /[*?]/.test(part)) break;
+      fixed.push(part);
+    }
+    return fixed.join("/");
+  }
+  function includeTraversalPrefixes(patterns) {
+    const values = Array.isArray(patterns) && patterns.length ? patterns : ["**/*"];
+    const prefixes = values.map(fixedGlobPrefix);
+    return prefixes.some(prefix => !prefix) ? null : [...new Set(prefixes)];
+  }
+  function includeMayMatchBelow(directory, prefixes) {
+    if (!prefixes) return true;
+    const local = slashPath(directory).replace(/\/$/, "");
+    return prefixes.some(prefix => local === prefix || prefix.startsWith(`${local}/`) || local.startsWith(`${prefix}/`));
+  }
   const fingerprintBytes = async bytes => `fp_${await sha256(bytes)}`;
   const fileFingerprint = async path => await fingerprintBytes(await Deno.readFile(path));
 
@@ -3509,6 +3537,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   async function fsWalk(root, start = ".", options = {}) {
     const rootReal = await Deno.realPath(root), base = await safePath(rootReal, start);
     const stat = await Deno.lstat(base), include = compileGlobs(options.include), exclude = compileGlobs(options.exclude, []);
+    const includePrefixes = includeTraversalPrefixes(options.include);
     const hidden = options.hidden === true, useGitignore = options.gitignore !== false;
     const result = [], hardLimit = Math.min(Math.max(Number(options.hard_limit || 100000), 1), 200000);
     const afterPath = slashPath(options.after_path || ""), fromPath = slashPath(options.from_path || "");
@@ -3557,7 +3586,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
             ...(entry.isSymlink ? { link_target: await Deno.readLink(absolute) } : {}),
           });
         }
-        if (entry.isDirectory && !ignored && !excluded) await visit(absolute, rules);
+        if (entry.isDirectory && !ignored && !excluded && includeMayMatchBelow(local, includePrefixes)) await visit(absolute, rules);
       }
     }
     await visit(base, initialRules, false);
@@ -5342,22 +5371,74 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     if (!keys.length) return;
     run(`UPDATE logs SET ${keys.map(k => `${k}=?`).join(",")} WHERE id=?`, ...keys.map(k => fields[k]), id);
   }
+  const deferredLogIndexes = new Set();
+  let deferredLogMaintenanceTimer = null, nextToolCallRetentionSweepAt = 0;
+  let logIndexSelectStatement = null, logFtsDeleteStatement = null, logFtsInsertStatement = null;
   function indexLog(id) {
     if (!fts) return;
     try {
-      const l = one("SELECT * FROM logs WHERE id=?", id);
-      run("DELETE FROM logs_fts WHERE log_id=?", id);
-      run("INSERT INTO logs_fts(log_id,server,tool,input,output,stderr,error) VALUES(?,?,?,?,?,?,?)",
-        id, l.server_name, l.tool, l.input_json, l.result_json || l.resolved_json || l.stdout || '', l.stderr, l.error);
+      logIndexSelectStatement ||= db.prepare("SELECT server_name,tool,input_json,result_json,resolved_json,stdout,stderr,error FROM logs WHERE id=?");
+      logFtsDeleteStatement ||= db.prepare("DELETE FROM logs_fts WHERE log_id=?");
+      logFtsInsertStatement ||= db.prepare("INSERT INTO logs_fts(log_id,server,tool,input,output,stderr,error) VALUES(?,?,?,?,?,?,?)");
+      const l = logIndexSelectStatement.get(id);
+      if (!l) return;
+      logFtsDeleteStatement.run(id);
+      logFtsInsertStatement.run(
+        id, l.server_name, l.tool, l.input_json, l.resolved_json || l.stdout || l.result_json || "", l.stderr, l.error,
+      );
     } catch {}
   }
+  function toolCallRetentionHours() {
+    const hours = Number(getCfg("tool_call_retention_hours", "0"));
+    return Number.isFinite(hours) && hours > 0 ? hours : 0;
+  }
+  function pruneToolCallRetention(now = Date.now()) {
+    nextToolCallRetentionSweepAt = now + 60 * 60 * 1000;
+    const hours = toolCallRetentionHours();
+    if (!hours) return 0;
+    const cutoff = now - hours * 60 * 60 * 1000;
+    const eligible = `completed_at IS NOT NULL AND completed_at<? AND NOT EXISTS(
+      SELECT 1 FROM process_runs pr WHERE pr.log_id=logs.id AND pr.status IN ('starting','running')
+    )`;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      if (fts) db.prepare(`DELETE FROM logs_fts WHERE CAST(log_id AS INTEGER) IN (SELECT id FROM logs WHERE ${eligible})`).run(cutoff);
+      db.prepare(`DELETE FROM process_runs WHERE log_id IN (SELECT id FROM logs WHERE ${eligible})`).run(cutoff);
+      const result = db.prepare(`DELETE FROM logs WHERE ${eligible}`).run(cutoff);
+      db.exec("COMMIT");
+      const removed = Number(result.changes || 0);
+      if (removed) emitUiChange(["dashboard", "logs", "sessions", "roots", "settings"], "tool-call-retention");
+      return removed;
+    } catch (error) {
+      db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+  function flushDeferredLogMaintenance() {
+    deferredLogMaintenanceTimer = null;
+    const ids = [...deferredLogIndexes];
+    deferredLogIndexes.clear();
+    for (const id of ids) indexLog(id);
+    if (Date.now() >= nextToolCallRetentionSweepAt) {
+      try { pruneToolCallRetention(); } catch (error) { console.error("Tool Call retention cleanup failed:", error); }
+    }
+  }
+  function scheduleLogIndex(id) {
+    deferredLogIndexes.add(Number(id));
+    if (!deferredLogMaintenanceTimer) deferredLogMaintenanceTimer = setTimeout(flushDeferredLogMaintenance, 0);
+  }
+  function requestToolCallRetentionSweep() {
+    nextToolCallRetentionSweepAt = 0;
+    if (!deferredLogMaintenanceTimer) deferredLogMaintenanceTimer = setTimeout(flushDeferredLogMaintenance, 0);
+  }
+  if (toolCallRetentionHours()) requestToolCallRetentionSweep();
   function rejectToolCall(p, tool, args, message, contextHandle = "", status = "failed", result = { error: message }, descriptor = null, progressRequested = false) {
     const id = beginLog(p, tool, args, contextHandle, null, descriptor, false, progressRequested), completed = Date.now();
     updateLog(id, {
       completed_at: completed, duration_ms: 0, status,
       error: message, result_json: JSON.stringify(result),
     });
-    indexLog(id);
+    scheduleLogIndex(id);
     postOsNotification(
       "tool_call",
       status === "invalid" ? `⚠️ Invalid Tool Call #${id}` : `❌ Tool Call Rejected #${id}`,
@@ -6241,17 +6322,22 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         if (cursor && entry.path.localeCompare(String(cursor.path)) < 0) continue;
         if (cursor && entry.path === cursor.path && cursor.line == null) continue;
         try {
-          const path = await safePath(selection.root.path, entry.path), stat = await Deno.stat(path);
+          const path = await safePath(selection.root.path, entry.path);
           scannedFiles++;
-          if (stat.size > maxFileBytes) continue;
-          const document = await readTextDocument(path, args.encoding || "auto"), lines = textLines(document), indexes = [];
+          if (entry.size > maxFileBytes) continue;
+          const document = await readTextDocument(path, args.encoding || "auto");
+          if (args.regex !== true) {
+            regex.lastIndex = 0;
+            if (!regex.test(document.text)) continue;
+          }
+          const lines = textLines(document), indexes = [];
           for (let index = 0; index < lines.length; index++) {
             regex.lastIndex = 0;
             if (regex.test(lines[index])) indexes.push(index);
           }
           if (!indexes.length) continue;
           const fingerprint = await fingerprintBytes(document.bytes);
-          const metadata = { size: stat.size, encoding: document.encoding, bom: document.bom, line_endings: document.line_endings };
+          const metadata = { size: entry.size, encoding: document.encoding, bom: document.bom, line_endings: document.line_endings };
           if (mode === "matches") {
             const eligible = indexes.filter(index => !cursor || entry.path !== cursor.path || index + 1 > Number(cursor.line));
             if (!eligible.length) continue;
@@ -6840,7 +6926,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         workspace_name: row.root_name, workspace_path: row.root_path,
         input: parseJson(row.input_json, row.input_json),
         result: parseJson(row.resolved_json, row.resolved_json || null),
-        output: row.stdout || "",
+        output: row.stdout || row.resolved_json || "",
         ...(row.stderr ? { stderr: row.stderr } : {}),
         ...(row.error ? { error: row.error } : {}),
       })) };
@@ -6961,7 +7047,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       resolved_json: JSON.stringify(structuredContent), stdout: error,
       result_json: JSON.stringify(toolResultForLog(toolResult)), error,
     });
-    indexLog(id);
+    scheduleLogIndex(id);
     postOsNotification("tool_call", `⚠️ Invalid Tool Call #${id}`, toolCallNotificationBody(p, name, args, handle, null, error, progressRequested));
     return toolResult;
   }
@@ -6995,7 +7081,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       const publicLogResult = redactPublishedCapabilityUrls(structuredResult);
       const stdout = typeof publicLogResult.output === "string" ? publicLogResult.output
         : typeof publicLogResult.stdout === "string" ? publicLogResult.stdout
-        : JSON.stringify(publicLogResult, null, 2);
+        : "";
       const stderr = typeof publicLogResult.stderr === "string" ? publicLogResult.stderr : "";
       const status = structuredResult.success === false ? "failed" : "completed";
       const includeContext = !["list_workspaces", "tools_schema"].includes(name);
@@ -7017,7 +7103,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         resolved_json: JSON.stringify(publicLogResult), stdout, stderr,
         result_json: JSON.stringify(toolResultForLog(toolResult)),
       });
-      indexLog(id);
+      scheduleLogIndex(id);
       if (status === "failed") {
         const failure = publicLogResult.error || publicLogResult.stderr ||
           (publicLogResult.exit_code != null ? `Exit code ${publicLogResult.exit_code}${publicLogResult.signal ? ` · ${publicLogResult.signal}` : ""}` : "Tool returned an error");
@@ -7041,7 +7127,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         completed_at: Date.now(), duration_ms: Date.now() - started, status: "failed",
         error: message, result_json: JSON.stringify(toolResultForLog(toolResult)),
       });
-      indexLog(id);
+      scheduleLogIndex(id);
       postOsNotification("tool_call", `❌ Tool Call Failed #${id}`,
         toolCallNotificationBody(p, name, args, callInfo.contextHandle, callInfo.selection?.root, error?.message || error, !!callInfo.progressRequested));
       return toolResult;
@@ -7908,6 +7994,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       inherit_system_path: getCfg("inherit_system_path", "1") === "1",
       git_preserve_line_endings: getCfg("git_preserve_line_endings", "1") === "1",
       exec_environment: getCfg("exec_environment", ""),
+      tool_call_retention_hours: Number(getCfg("tool_call_retention_hours", "0")) || 0,
       telegram_bot_token: getCfg("telegram_bot_token", ""),
       external_url: getCfg("external_url", ""), gui_transport: "Tauriless local asset protocol",
       listener_fallback: listenerFallbacks().length > 0, listener_fallbacks: listenerFallbacks(),
@@ -8411,7 +8498,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 <? } else if(section==="debug"){ const d=s.debug||{},enabled=!!s.debug?.enabled; ?><section id=debug class=page><div class=row><h2 class=grow>🐞 HTTP Debug Log</h2><button class="debug-toggle <?= enabled?'enabled':'disabled' ?>" data-action=toggle-debug-settings aria-pressed="<?= enabled?'true':'false' ?>"><?= enabled?"🟢 Logging ON · Disable":"🔴 Logging OFF · Enable" ?></button><button class=danger data-action=clear-debug>🗑️ Clear</button></div><p class=muted>Off by default. Secrets are redacted. Disabling stops new records but keeps stored data visible. Click a row for request JSON.</p><div class=row><input id=debugQuery class=grow placeholder="Search URL, headers, body or errors…" value="<?= d.query||'' ?>"><select id=debugMethod><option value="">All methods</option><? ['GET','POST','OPTIONS'].forEach(v=>{ ?><option<?= d.method===v?' selected':'' ?>><?= v ?></option><? }) ?></select><input id=debugStatus type=number placeholder="Status" value="<?= d.status||'' ?>"><button data-action=load-debug>🔎 Search</button></div><div id=debugList></div></section>
 <? } else if(section==="oauth"){ ?><section id=oauth class=page><div class=row><h2 class=grow>🔐 OAuth Clients</h2><button class=danger data-action=clear-clients<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><div id=oauthList></div></section>
 <? } else if(section==="telegram"){ const t=s.telegram||{}; ?><section id=telegram class=page><div class=row><h2 class=grow>✈️ Telegram</h2><button class=primary data-action=save-telegram<?= t.save_disabled?' disabled':'' ?>>💾 Save Telegram</button></div><div class=card><h3>🤖 Telegram Bot</h3><div class=row><label class=grow>Bot token</label><? if(t.field_warning){ ?><span class=field-warning>⚠ <?= t.field_warning ?></span><? } ?></div><input id=telegramBotToken type=password autocomplete=off value="<?= t.telegram_bot_token||'' ?>" placeholder="123456789:AA…"><p class=muted>Used only by <code>telegram_req</code> to authenticate Bot API requests. Chat IDs, channels and application state are intentionally left to the agent/Memory.</p></div></section>
-<? } else if(section==="settings"){ const tab=s.settingsTab||"network"; ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><nav class=settings-tabs aria-label="Settings sections"><? [["network","🌐","Network"],["security","🔒","Security"],["process","🖥️","Process"],["notifications","🔔","Notifications"],["maintenance","🧹","Maintenance"]].forEach(([id,icon,label])=>{ ?><button data-action=settings-tab data-settings-tab="<?= id ?>" class="<?= tab===id?'active':'' ?>"<?= tab===id?' aria-current=page':'' ?>><?= icon ?> <?= label ?></button><? }) ?></nav><div class=settings-layout><div class=settings-main><div class=card<? if(tab!=="network"){ ?> hidden<? } ?>><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card<? if(tab!=="security"){ ?> hidden<? } ?>><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card<? if(tab!=="notifications"){ ?> hidden<? } ?>><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card<? if(tab!=="process"){ ?> hidden<? } ?>><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><label><input id=gitPreserveLineEndings type=checkbox<?= settings.git_preserve_line_endings?" checked":"" ?>> Preserve Git working-tree line endings across platforms</label><p class=muted>When enabled, every managed process gets Git runtime config <code>core.autocrlf=false</code>. Repository <code>.gitattributes</code> and an explicit <code>git -c</code> can still override it.</p><div class=row><label class=grow>Environment variables for all spawned processes · one <code>NAME=value</code> per line</label><? if(settings.field_warnings?.exec_environment){ ?><span class=field-warning>⚠ <?= settings.field_warnings.exec_environment ?></span><? } ?></div><textarea id=execEnvironment rows=8 placeholder="CACHE_DIR=\${MRMCP_DIR}&#10;TOOLS=\${MRMCP_BIN}&#10;PROJECT=\${WORKSPACE}&#10;RUN_FROM=\${CWD}"><?= settings.exec_environment||'' ?></textarea><p class=muted>Available placeholders: <code>\${MRMCP_DIR}</code> = MrMCP data directory, <code>\${MRMCP_BIN}</code> = managed bin directory, <code>\${WORKSPACE}</code> = current Workspace root, <code>\${CWD}</code> = effective exec directory. Precedence: system environment → these settings → per-call <code>env</code>. Off PATH inheritance leaves child <code>PATH</code> as only <code>.mrmcp/bin</code>; PATH remains governed by this toggle rather than the generic environment list.</p></div><div class=card<? if(tab!=="maintenance"){ ?> hidden<? } ?>><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, Memory, CDP browser state, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
+<? } else if(section==="settings"){ const tab=s.settingsTab||"network"; ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><nav class=settings-tabs aria-label="Settings sections"><? [["network","🌐","Network"],["security","🔒","Security"],["process","🖥️","Process"],["notifications","🔔","Notifications"],["maintenance","🧹","Maintenance"]].forEach(([id,icon,label])=>{ ?><button data-action=settings-tab data-settings-tab="<?= id ?>" class="<?= tab===id?'active':'' ?>"<?= tab===id?' aria-current=page':'' ?>><?= icon ?> <?= label ?></button><? }) ?></nav><div class=settings-layout><div class=settings-main><div class=card<? if(tab!=="network"){ ?> hidden<? } ?>><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card<? if(tab!=="security"){ ?> hidden<? } ?>><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card<? if(tab!=="notifications"){ ?> hidden<? } ?>><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card<? if(tab!=="process"){ ?> hidden<? } ?>><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><label><input id=gitPreserveLineEndings type=checkbox<?= settings.git_preserve_line_endings?" checked":"" ?>> Preserve Git working-tree line endings across platforms</label><p class=muted>When enabled, every managed process gets Git runtime config <code>core.autocrlf=false</code>. Repository <code>.gitattributes</code> and an explicit <code>git -c</code> can still override it.</p><div class=row><label class=grow>Environment variables for all spawned processes · one <code>NAME=value</code> per line</label><? if(settings.field_warnings?.exec_environment){ ?><span class=field-warning>⚠ <?= settings.field_warnings.exec_environment ?></span><? } ?></div><textarea id=execEnvironment rows=8 placeholder="CACHE_DIR=\${MRMCP_DIR}&#10;TOOLS=\${MRMCP_BIN}&#10;PROJECT=\${WORKSPACE}&#10;RUN_FROM=\${CWD}"><?= settings.exec_environment||'' ?></textarea><p class=muted>Available placeholders: <code>\${MRMCP_DIR}</code> = MrMCP data directory, <code>\${MRMCP_BIN}</code> = managed bin directory, <code>\${WORKSPACE}</code> = current Workspace root, <code>\${CWD}</code> = effective exec directory. Precedence: system environment → these settings → per-call <code>env</code>. Off PATH inheritance leaves child <code>PATH</code> as only <code>.mrmcp/bin</code>; PATH remains governed by this toggle rather than the generic environment list.</p></div><div class=card<? if(tab!=="maintenance"){ ?> hidden<? } ?>><h3>🧹 Tool Call History</h3><div class=row><label class=grow>Retention hours · 0 keeps indefinitely</label><? if(settings.field_warnings?.tool_call_retention_hours){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_retention_hours ?></span><? } ?></div><input id=toolCallRetentionHours type=number min=0 step=1 value="<?= settings.tool_call_retention_hours??0 ?>"><p class=muted>Cleanup removes expired completed Tool Call history and linked search/process history. Active persistent executions are retained. Stored tool output is not size-capped, and Tool Call IDs are never reset.</p><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, Memory, CDP browser state, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
 <? } else if(section==="help"){ ?><section id=help class=page><h2>❓ Help</h2><div class=card><h3>Connect ChatGPT Web</h3><ol><li>Make sure the Dashboard shows a trusted HTTPS certificate. ChatGPT needs a remote HTTPS MCP endpoint; use <code><?= settings.external_base_url ? settings.external_base_url + "/mcp" : "https://your-host/mcp" ?></code>.</li><li>In ChatGPT Web, enable Developer mode. In managed workspaces the current path is <b>Workspace settings → Permissions &amp; Roles → Connected Data Developer mode / Create custom MCP connectors</b>. Authorized users may also find the toggle under <b>Settings → Apps → Advanced Settings</b>.</li><li>Create a custom app from <b>Workspace settings → Apps → Create</b> or <b>Settings → Apps → Create</b>, enter the MrMCP endpoint, choose the offered authentication method, then select <b>Scan Tools</b>.</li><li>If OAuth is enabled in MrMCP, complete the authorization prompt. After the tool scan completes, create the app and select it from a new ChatGPT conversation.</li></ol></div><div class=card><h3>Authentication</h3><p>For ChatGPT, OAuth is the preferred MrMCP setup because ChatGPT can discover the authorization metadata, complete consent, and keep refresh-token connectivity. MrMCP also supports Basic authentication for MCP clients that offer it. Authentication grants access to the server; the <code>context_handle</code> selects persistent context state after authentication.</p></div><div class=card><h3>Write Access</h3><p>MrMCP does not maintain a separate read/write allowlist: every authenticated client receives every published tool. ChatGPT controls whether write/modify actions are usable through the app's permissions and action controls. As of this build, OpenAI documents full MCP write/modify support for Business, Enterprise and Edu; Pro custom MCP access is limited to read/fetch, and availability may change. Test write tools in Developer mode first. Where available, use <b>Workspace settings → Apps → Configure Actions / Action control</b> to enable the required actions. ChatGPT may still ask for confirmation before a write.</p></div><div class=card><h3>Using MrMCP in a Chat</h3><ol><li>Start a new chat and select the MrMCP app from the tools/apps menu.</li><li>If needed, call <code>list_workspaces</code> to discover the enabled Workspace names, then call <code>open_workspace</code> with the desired <code>name</code>. When continuing an existing Session, also pass its handle as <code>current_context_handle</code>; MrMCP moves that same Session to the Workspace. If the handle is omitted, empty, unknown or expired, a new Session is created.</li><li>The result already includes <code>workspace_name</code>, absolute <code>cwd</code> and <code>agent_guidance_path</code>. Read that file when non-null, then reuse the returned <code>context_handle</code> on later Session-bound calls. The Workspaces page can also move Sessions manually.</li><li>If you change ChatGPT model or thinking level, the MCP context may be recreated even inside the same conversation. Check the Sessions page if continuity matters.</li></ol><p class=muted>ChatGPT UI labels and plan availability can change. Current OpenAI references: <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt" target=_blank rel=noopener>Developer mode and MCP apps in ChatGPT</a> · <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt" target=_blank rel=noopener>Apps in ChatGPT</a>.</p></div></section><? } ?>`,
     dialogs: `<? const dialog=it.data?.state?.dialog; ?><? if(dialog){ ?><div id=dialogOverlay class=dialog-overlay><? if(dialog.kind==="root"){ const r=dialog.data||{}; ?><dialog id=rootDialog open data-managed-dialog=root><form id=rootForm><input id=rid type=hidden value="<?= r.id||'' ?>"><h2>📁 Workspace</h2><div class=row><label class=grow>Workspace name</label><? if(r.name_warning){ ?><span class=field-warning>⚠ <?= r.name_warning ?></span><? } ?></div><input id=rname value="<?= r.name||'' ?>"><div class=row><label class=grow>Directory path</label><? if(r.path_warning){ ?><span class=field-warning>⚠ <?= r.path_warning ?></span><? } else if(!r.path_checked){ ?><span class=muted>Leave the field to validate the directory.</span><? } ?></div><input id=rpath placeholder="C:\\projects\\my-workspace, /srv/my-workspace or ./project" value="<?= r.path||'' ?>"><div class=muted>Relative to the program folder.</div><label><input id=renabled type=checkbox<?= r.enabled!==false?' checked':'' ?>> Enabled</label><? if(r.form_warning){ ?><div class=field-warning>⚠ <?= r.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (r.name_warning||r.path_warning||!r.path_checked||r.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="command"){ const c=dialog.data||{}; ?><dialog id=commandDialog open data-managed-dialog=command><form id=commandForm><input id=coldName type=hidden value="<?= c.registered?c.name:'' ?>"><h2>🧰 Command Catalog Entry</h2><div class=row><label class=grow>Logical name</label><? if(c.name_warning){ ?><span class=field-warning>⚠ <?= c.name_warning ?></span><? } ?></div><input id=cname value="<?= c.name||'' ?>"><div class=row><label class=grow>Path below .mrmcp/bin</label><? if(c.path_warning){ ?><span class="<?= c.path_error?'field-warning':'muted' ?>"><?= c.path_error?'⚠ ':'' ?><?= c.path_warning ?></span><? } else if(!c.path_checked){ ?><span class=muted>Leave the field to validate the path.</span><? } ?></div><input id=cpath placeholder="Optional; defaults to logical name; Windows suffix optional" value="<?= c.path||'' ?>"><label>Description for the agent</label><textarea id=cdescription placeholder="Optional: what it does and when the agent should use it."><?= c.description||'' ?></textarea><div class=row><label class=grow>Download URL</label><? if(c.download_warning){ ?><span class=field-warning>⚠ <?= c.download_warning ?></span><? } ?></div><input id=cdownloadUrl placeholder="https://example.com/tool" value="<?= c.download_url||'' ?>"><div class=row><label class=grow>Documentation URL</label><? if(c.documentation_warning){ ?><span class=field-warning>⚠ <?= c.documentation_warning ?></span><? } ?></div><input id=cdocumentationUrl placeholder="https://example.com/docs" value="<?= c.documentation_url||'' ?>"><? if(c.form_warning){ ?><div class=field-warning>⚠ <?= c.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (c.name_warning||c.path_error||!c.path_checked||c.download_warning||c.documentation_warning||c.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="prompt"){ const p=dialog.data||{}; ?><dialog id=promptDialog open data-managed-dialog=prompt><form id=promptForm><input id=poldName type=hidden value="<?= p.old_name||'' ?>"><h2>🧭 Guided Prompt</h2><div class=row><label class=grow>Name</label><? if(p.name_warning){ ?><span class=field-warning>⚠ <?= p.name_warning ?></span><? } ?></div><input id=pname value="<?= p.name||'' ?>"><label>Title</label><input id=ptitle value="<?= p.title||'' ?>" placeholder="Human-readable title shown by MCP clients"><label>Description</label><textarea id=pdescription placeholder="What this guided prompt does."><?= p.description||'' ?></textarea><div class=row><label class=grow>Arguments · YAML list</label><? if(p.args_warning){ ?><span class=field-warning>⚠ <?= p.args_warning ?></span><? } ?></div><textarea id=parguments rows=8 placeholder="- name: focus&#10;  description: Area to focus on.&#10;  required: false"><?= p.arguments_text||'' ?></textarea><div class=row><label class=grow>Eta template</label><? if(p.template_warning){ ?><span class=field-warning>⚠ <?= p.template_warning ?></span><? } ?></div><textarea id=ptemplate rows=14 placeholder="Review the project. &lt;%= it.args.focus %&gt;"><?= p.template||'' ?></textarea><div class=muted>Standard Eta tags. Model documentation is available from Guided Prompts → Template Help.</div><? if(p.form_warning){ ?><div class=field-warning>⚠ <?= p.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (p.name_warning||p.args_warning||p.template_warning||p.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="memory"){ const m=dialog.data||{},creating=!m.id; ?><dialog id=memoryDialog open data-managed-dialog=memory><form id=memoryForm><input id=mid type=hidden value="<?= m.id||'' ?>"><h2><?= creating?'➕ New Memory':'🧠 Memory' ?></h2><? if(creating){ ?><label>Scope</label><select id=mscope><option value=global<?= m.scope==='global'?' selected':'' ?>>Global</option><option value=session<?= m.scope==='session'?' selected':'' ?><?= !(m.sessions||[]).length?' disabled':'' ?>>Session</option><option value=workspace<?= m.scope==='workspace'?' selected':'' ?><?= !(m.workspaces||[]).length?' disabled':'' ?>>Workspace</option></select><? if(m.scope==='workspace'){ ?><label>Workspace</label><select id=mworkspace><? (m.workspaces||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= String(m.workspace||'')===String(name)?' selected':'' ?>><?= name ?></option><? }) ?></select><? } else if(m.scope==='session'){ ?><label>Session</label><select id=mcontext><? (m.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(m.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><? } else { ?><div class=muted>Shared across all Sessions and Workspaces on this MrMCP server.</div><? } ?><? } else { ?><div class=muted><?= m.scope==='global'?'Global':(m.scope==='workspace'?'Workspace':'Session') ?> · <?= m.owner_name||'' ?></div><? } ?><label>Key</label><input id=mkey value="<?= m.key||'' ?>"><label>Value</label><? if(m.json){ ?><textarea id=mvalue rows=14 hidden><?= m.value_text||'' ?></textarea><div id=memoryJsonEditor class="json-editor-host memory" data-json-source=mvalue data-json-edit=memory data-json-error=memoryJsonError></div><div id=memoryJsonError class=field-warning hidden></div><? } else { ?><textarea id=mvalue rows=14><?= m.value_text||'' ?></textarea><? } ?><label><input id=mjson type=checkbox<?= m.json?' checked':'' ?>> Value is JSON · validate before saving</label><div class=muted>Switching between TEXT and JSON keeps the current draft unchanged.</div><label>TTL seconds · 0 = permanent</label><input id=mttl type=number min=0 max=315360000 value="<?= m.ttl_seconds||0 ?>"><? if(m.form_warning){ ?><div class=field-warning>⚠ <?= m.form_warning ?></div><? } ?><p class=row><button class=primary type=submit>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="confirm"){ ?><dialog id=confirmDialog open data-managed-dialog=confirm><h2>⚠️ <?= dialog.title||"Confirm Action" ?></h2><p><?= dialog.message||"Continue?" ?></p><p class=row><button class="primary danger" data-action=confirm-dialog>✓ Confirm</button><button data-action=close-dialog>✕ Cancel</button></p></dialog><? } ?></div><? } ?>`,
     status: `<? const d=it.data||{},s=d.settings||{},a=d.activity||{},bad=!!s.mcp_listen_error,warn=!!s.listener_fallback,recent=a.recent_sessions||[],inFlight=a.tool_calls_in_flight||0,errors=a.tool_calls_errors||0,invalid=a.tool_calls_invalid||0; ?><span class="status-group <?= d.live!=="connected"?(d.live==="reconnecting"?"pending":"failed"):(bad?"failed":(warn?"pending":"ok")) ?>"><?= d.live!=="connected"?(d.live==="reconnecting"?"🟡 reconnecting":"🔴 offline"):(bad?"🔴 listener error":(warn?"🟡 fallback":"🟢 live")) ?></span><span class="status-group status-link" data-action=header-settings title="HTTP / HTTPS effective listener ports; GUI uses local Tauriless assets">🔌 <span class=status-ports><?= s.mcp_http_active?s.mcp_http_port:"off" ?>/<?= s.mcp_https_active?s.mcp_https_port:"off" ?></span><? if(warn){ ?> <span class=pending>⚠</span><? } ?></span><span class=status-group title="Sessions with a Tool Call in the last <?= a.active_window_minutes||10 ?> minutes">💬 <span class="status-link <?= a.active_sessions?'ok':'muted' ?>" data-action=header-sessions><?= a.active_sessions||0 ?> active</span><? if(recent.length){ ?> · <span class=status-sessions><? recent.forEach((x,i)=>{ ?><?= i?" ":"" ?><span class=status-link data-action=session-tool-calls data-id="<?= x.id ?>">#<?= x.id ?>(<?= x.tool_calls ?>)</span><? }) ?></span><? } ?></span><span class=status-group title="Tool Calls in flight / total recorded / failed / invalid">🛠️ <span class="status-link <?= inFlight?'pending':'muted' ?>" data-action=header-tool-calls data-status=running><?= inFlight ?> in flight</span> · <span class="status-link status-total" data-action=header-tool-calls data-status=""><?= a.tool_calls_total||0 ?> total</span> · <span class="status-link <?= errors?'failed':'muted' ?>" data-action=header-tool-calls data-status=failed><?= errors ?> errors</span> · <span class="status-link <?= invalid?'invalid':'muted' ?>" data-action=header-tool-calls data-status=invalid><?= invalid ?> invalid</span></span>`,
@@ -8586,6 +8673,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) warnings.tls_email = "Let's Encrypt email is not valid.";
     try { configuredExecEnvironment(settings.exec_environment || ""); }
     catch (error) { warnings.exec_environment = String(error?.message || error); }
+    const retentionText = String(settings.tool_call_retention_hours ?? "0").trim();
+    const retentionHours = Number(retentionText);
+    if (!/^\d+$/.test(retentionText) || !Number.isSafeInteger(retentionHours) || retentionHours < 0)
+      warnings.tool_call_retention_hours = "Tool Call retention must be a whole number of hours; 0 keeps logs indefinitely.";
     return warnings;
   }
   function telegramTokenWarning(value) {
@@ -8837,6 +8928,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       notifySession: "desktop_notifications_session", notifyWorkspace: "desktop_notifications_workspace",
       notifyToolCall: "desktop_notifications_tool_call", inheritSystemPath: "inherit_system_path",
       gitPreserveLineEndings: "git_preserve_line_endings", execEnvironment: "exec_environment",
+      toolCallRetentionHours: "tool_call_retention_hours",
     };
     if (settingsMap[id]) {
       uiState.settingsDraft ||= {};
@@ -9298,6 +9390,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           inherit_system_path: !!values.inheritSystemPath,
           git_preserve_line_endings: !!values.gitPreserveLineEndings,
           exec_environment: String(values.execEnvironment || ""),
+          tool_call_retention_hours: String(values.toolCallRetentionHours ?? "0"),
         };
         const warnings = settingsFieldWarnings(body);
         if (Object.values(warnings).some(Boolean)) {
@@ -9433,7 +9526,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
               if (id === "ptemplate") d.template_warning = String(item.value || "").trim() ? "" : "Template is required.";
               renderDraft = true;
             }
-            if (["externalUrl", "tlsEmail", "publicIpUrls", "sslipSuffix", "acmeDirectoryUrl"].includes(id)) renderDraft = true;
+            if (["externalUrl", "tlsEmail", "publicIpUrls", "sslipSuffix", "acmeDirectoryUrl", "toolCallRetentionHours"].includes(id)) renderDraft = true;
             if (["logTool", "logQuery"].includes(id)) { uiState.logs.page = 1; filterLogs = true; }
           }
           if (renderDraft) queueUiRender("input:draft", 40);
@@ -9677,6 +9770,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         if (x[key] != null) setCfg(key, x[key] ? "1" : "0");
       if (x.inherit_system_path != null) setCfg("inherit_system_path", x.inherit_system_path ? "1" : "0");
       if (x.git_preserve_line_endings != null) setCfg("git_preserve_line_endings", x.git_preserve_line_endings ? "1" : "0");
+      if (x.tool_call_retention_hours != null) {
+        setCfg("tool_call_retention_hours", String(Number(x.tool_call_retention_hours)));
+        requestToolCallRetentionSweep();
+      }
       if (x.exec_environment != null) {
         try { configuredExecEnvironment(x.exec_environment); }
         catch (error) { return json({ error: String(error?.message || error) }, 400); }

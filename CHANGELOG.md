@@ -2,6 +2,9 @@
 
 ## 0.10.126
 
+- Reduced Tool Call persistence overhead by caching configuration reads, using a 5-second SQLite busy timeout, deferring FTS indexing until after the Tool Call response path, indexing the smaller raw return representation first, and avoiding a third structured-result copy in `stdout` while preserving separate raw-return and final MCP-result records.
+- Added configurable Tool Call history retention in whole hours under Settings → Maintenance; `0` keeps history indefinitely, positive values lazily remove expired completed history without resetting Tool Call ids or deleting the origin of a still-running persistent execution.
+- Optimized filesystem discovery/search without implicit dependency exclusions: include patterns with provable literal directory prefixes prune impossible traversal branches, global/ambiguous globs fail open to the previous traversal, and `fs_grep` reuses walker file size metadata instead of restating every candidate before reading it.
 - Added `fs_text_convert_encoding_eol` for explicit lossless conversion of named existing text files across character encoding, line-ending convention and BOM without changing logical text content.
 - The tool uses authoritative automatic source detection with optional per-file `input_encoding`, supports optimistic fingerprints and source-change checks, preserves mixed/none EOL when requested, and reports `before`/`after` representation metadata.
 - Already-conforming byte streams return `unchanged` without a rewrite; non-regular files and unrepresentable target encodings fail per entry, and an all-`preserve` request is rejected so the tool cannot be used as a passive detection API or proactive repository normalizer.

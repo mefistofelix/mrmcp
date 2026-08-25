@@ -20,7 +20,7 @@ MrMCP is a stateless Model Context Protocol server implemented in Deno. It expos
 - User-managed MCP guided prompts through `guided_prompts.yaml`, with Eta templates, two editable starter examples (one argument-free and one parameterized), and a built-in template/model help view.
 - OAuth and Basic authentication.
 - Automatic TLS/certificate handling.
-- Tool Call and optional HTTP diagnostic logs, with confirmed page-level Clear actions for Tool Calls, Sessions, Workspaces, OAuth Clients and HTTP history.
+- Tool Call and optional HTTP diagnostic logs, with configurable Tool Call history retention in whole hours (`0` keeps indefinitely) plus confirmed page-level Clear actions for Tool Calls, Sessions, Workspaces, OAuth Clients and HTTP history.
 - Local desktop UI with system tray and native notifications.
 - One MIME-aware `publish` MCP App helper for Workspace paths, direct text and Base64 bytes, with persistent deduplicated `.mrmcp/publish/` files, inline/download presentation hints, multi-Workspace publication references and a local Published manager for filtering, native opening and deletion.
 
@@ -148,6 +148,7 @@ The macOS app is currently ad-hoc signed; warning-free first launch of an Intern
 - `README.md` — current user/operator overview.
 - `CHANGELOG.md` — release history.
 - `AGENTS.md` — implementation invariants and release checks.
+- `WEBGUI_PREF.md` — portable server-authoritative Web GUI, Morphlex, state and front/back channel rules.
 - `.github/workflows/` — release and native macOS GUI test workflows.
 - `assets/` — Morphlex, branding, icons and screenshots.
 
