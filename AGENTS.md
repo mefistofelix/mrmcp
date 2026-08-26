@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.128 consists of eight root project files, one GitHub Actions workflow and one versioned asset directory:
+MrMCP 0.10.129 consists of eight root project files, one GitHub Actions workflow and one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, local Tauriless UI and desktop launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.

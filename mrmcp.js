@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.128 — Simplify Tool Call persistence, process state and Trash metadata.
+MrMCP 0.10.129 — Optimize CDP, filesystem and managed-process hot paths.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -97,7 +97,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.128";
+const VERSION = "0.10.129";
 const DB_SCHEMA_VERSION = 3;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
