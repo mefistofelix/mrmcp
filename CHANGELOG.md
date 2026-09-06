@@ -1,6 +1,23 @@
 # Changelog
 
-## Unreleased
+## 0.10.130
+
+- Replaced generic completion text for filesystem and common retrieval tools with concise metadata-only summaries of counts, per-entry failures and continuations, keeping full results solely in `structuredContent`. `fs_grep` now echoes `max_file_bytes` and reports page-local `skipped_large_files`, with incomplete-coverage summaries for skipped files or read/decode errors. Clarified tool selection, optional context and batched reads while retaining the existing Cymbal catalog route for symbol/caller exploration.
+
+- Added startup recovery for incompatible database schemas: desktop confirmation shows current and backup paths, Start Fresh renames the entire `.mrmcp` directory to a unique dated sibling before creating fresh data, and Quit leaves the existing data in place. Recovery preserves SQLite WAL files, handles backup-name collisions and startup failures, and continues in the same desktop window; headless/one-shot modes require terminal confirmation and unattended runs never reset automatically. Settings now displays the absolute active Data Directory in every tab.
+
+- Fixed `fs_read` ranges extending past EOF: clamp the requested end to actual lines so responses and continuation cursors never invent trailing rows. Fixed Commands, Guided Prompts and Tool Calls GUI pages remaining outside their available page range after filtering or deletion; Tool Calls applies the clamp in both FTS and fallback searches. Command lookup and Download All now use the complete catalog rather than a 100-row administration page.
+- Made `fs_grep` consume shared filesystem traversal progressively, stopping once its result page is full and using at most one path of lookahead when needed to distinguish EOF. Added stable-id cursor indexes for Session Tool Call history in both Disk/Memory storage and scoped Memory searches, avoiding unnecessary per-page sorts.
+
+- Fixed filesystem pagination skipping siblings such as `a.txt` beside `a/`: traversal and cursors now share one depth-first component order, including an exact tie-breaker for locale-equivalent names. Continuations skip completed subtrees and no longer sort a bounded page in a different order.
+- Settings saves now persist only changed values and restart listeners/check certificate renewal only for changed network/TLS settings. Saving unchanged settings or changing file/process/history/notification preferences no longer unnecessarily drains the MCP listeners.
+- Preserved inherited Git runtime configuration with differently-cased Windows environment names instead of overwriting its first pair. Clarified that forcing `core.autocrlf=false` can show existing CRLF checkouts as modified without changing their bytes. Reused each edit's split result for occurrence validation and replacement, avoiding a second full-text split.
+
+- Added Settings → Files with persisted Initial 16 KiB / Complete file encoding detection for `fs_read`, `fs_grep` and `fs_navigate`. Sample mode is the default, uses a zero-copy prefix with the same pinned `chardet`, decodes the entire buffer strictly, and retries full detection once when sample confidence is below 80 or the sample fails. Mutations retain complete-source detection, and explicit encodings bypass detection.
+
+- Fixed nested Tool Call JSON rendering: object/array keys now share their branch heading instead of consuming a separate column at every level, keeping decoded JSON/YAML, multiline text and images inside the detail panel. Isolated embedded JSONEditor tables from administration row styles and improved dark-theme control contrast across schema, Browser, Automation and Memory views.
+
+- Added `WEBGUI_PREF.md` as the portable administration-GUI architecture reference, with the backend/frontend state boundary, render/input channels and public Morphlex contract separated from MrMCP's desktop implementation details.
 
 ## 0.10.129
 

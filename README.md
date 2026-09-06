@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.129
+# MrMCP 0.10.130
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated `/mcp` endpoint, Workspace-scoped Sessions, filesystem and process tools, OAuth/Basic authentication, TLS automation, and a local Tauriless administration UI.
 
@@ -52,6 +52,10 @@ deno run -A mrmcp.js --add-workspace "Workspace name" "/path/to/workspace"
 
 The desktop UI is local-only and opens no GUI TCP listener. Public MCP/OAuth traffic uses HTTP/HTTPS listeners; occupied base ports fall back in `+50` steps without rewriting configuration.
 
+Settings shows the absolute **Data Directory** path in every tab. Portable builds keep `.mrmcp` beside the executable; source mode keeps it beside `mrmcp.js`; the macOS app uses `~/Library/Application Support/MrMCP/.mrmcp`.
+
+If the database schema is incompatible at startup, the desktop asks whether to **Start Fresh** or **Quit**, showing both the current folder and proposed backup path. Start Fresh renames the entire `.mrmcp` folder to a sibling `.mrmcp.backup-YYYYMMDD-HHmmss` folder (with a suffix when necessary), then creates new settings, credentials and data. Existing backups are never replaced, and Quit preserves the current data. Headless and one-shot modes require terminal confirmation; unattended runs stop with recovery instructions.
+
 ## Workspaces and Sessions
 
 MrMCP keeps transport state stateless. Persistent application state is selected explicitly with a `context_handle`.
@@ -93,6 +97,12 @@ Filesystem:
 - `publish` — publish exactly one Workspace path, text string or Base64 payload with a required MIME type, optional filename/title/description and an `auto|inline|download` presentation hint.
 
 The `fs_*` surface is multi-file where appropriate, stateless for navigation/pagination, uses opaque file fingerprints for optimistic concurrency, and reports independent per-entry outcomes instead of cross-entry rollback. `fs_glob` defaults to lightweight path/type pages and adds size/timestamps/link targets only with `metadata=true`; `fs_grep` pages by explicit result count with stateless `resume_after`, while `fs_read` keeps its per-file text ceiling and per-file `next_start_line` continuation without an aggregate batch byte budget. See `TOOLS.md` for the complete tool contracts and rationale.
+
+Filesystem and retrieval tools provide compact text summaries of result counts, errors and continuations alongside the complete structured result. `fs_grep` reports the effective `max_file_bytes` and page-local `skipped_large_files`, making incomplete search coverage visible even when no matches are returned. Use the available Cymbal catalog command for symbol/caller exploration and the filesystem tools for textual search and file operations.
+
+Settings → **Files** controls automatic encoding detection for reading and searching: **Initial 16 KiB** (default, faster) or **Complete file** (more thorough). Sample mode retries full detection when confidence is low or its charset cannot decode the entire file, but can still miss later charset clues. File edits and conversions always use complete detection; an explicit encoding skips detection.
+
+Settings → **Process** can disable Git's automatic CRLF conversion by injecting `core.autocrlf=false` (enabled by default). Existing CRLF checkouts created with `autocrlf=true` may appear modified under this policy without any file edit; switch the option off to use the repository/machine policy. `.gitattributes` and explicit `git -c` options still apply. Saving unrelated settings leaves the MCP listeners running.
 
 Commands and execution:
 

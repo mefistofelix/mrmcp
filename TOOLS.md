@@ -12,6 +12,12 @@ Most tools require `context_handle`, the opaque `ctx_...` capability returned by
 
 Filesystem paths are relative to the Session's current Workspace unless the specific tool says otherwise. MrMCP resolves and confines them to that Workspace.
 
+### Result summaries and tool choice
+
+`structuredContent` remains the complete structured result. Filesystem tools, `tools_log`, `memory_find`, Workspace discovery, command discovery and `tools_schema` also return a short text summary of counts, failures and applicable continuation fields. Summaries are derived only from current result metadata; they never duplicate file contents, match snippets, fingerprints, nested payloads or complete JSON. Batch mutation summaries report both succeeded and failed entries, including all-failed batches; the per-entry statuses remain authoritative and the existing call-level completion semantics are unchanged.
+
+Choose `fs_glob` for paths, `fs_grep` for textual occurrences (including comments, strings and configuration), `fs_navigate` for next/previous matches in known files, and `fs_read` for known ranges. Batch independent reads. Request a few context lines when nearby source can avoid another read; the default remains zero. For symbol/caller/impact exploration, prefer a suitable available command from `discover_commands`, following its catalog description; the versioned catalog already includes Cymbal.
+
 ### Stateless filesystem navigation
 
 Filesystem discovery, search and navigation keep no server-side cursor state.
@@ -20,6 +26,8 @@ Filesystem discovery, search and navigation keep no server-side cursor state.
 - `fs_grep` continues with `resume_after` / `next_resume_after`.
 - `fs_navigate` receives an explicit `from_line` and direction for every file on every call.
 - `fs_read` continues a truncated range with `next_start_line`.
+
+These cursors describe positions in the current data, not a frozen snapshot. Reuse the same selection and search arguments on continuation. Changes to files or line positions between calls can change subsequent results; returned fingerprints identify the content version read. Each text read/search still decodes complete files and computes whole-file metadata where required, even when the returned page is small.
 
 The continuation value is ordinary call data. Losing a previous response loses no hidden server state.
 
@@ -43,7 +51,7 @@ Design rationale: agents are good at expressing the intended logical text but sh
 
 Character-set rules:
 
-- `encoding:"auto"` passes the complete original `Uint8Array` from `Deno.readFile()` to pinned `chardet` and uses only the charset it reports. BOM, UTF-8 validity, NUL patterns and other local heuristics never override or supplement that decision. If `chardet` returns no usable charset, auto decoding fails. An explicit input encoding bypasses `chardet` entirely and is decoded as requested.
+- `encoding:"auto"` uses only the charset reported by pinned `chardet`. For `fs_read`, `fs_grep` and `fs_navigate`, Settings → Files selects **Initial 16 KiB** (default, persisted as `text_encoding_detection=sample`) or **Complete file** (`full`). The sample is a zero-copy prefix of the original byte buffer; files at or below 16 KiB are detected in full. The selected decoder still reads the entire file strictly. Sample mode uses the first candidate from the public `chardet.analyse` API only when its confidence score is at least 80. If the candidate is absent, has a lower confidence score, yields no charset or decoding fails, `chardet.detect` and strict decoding retry once with the complete original buffer. A sample may miss later charset clues even when decoding succeeds; Complete file inspects all bytes. Mutations (`fs_write`, `fs_edit`, `fs_text_convert_encoding_eol`) always detect the complete source when automatic decoding is needed, regardless of this read/search setting. BOM, UTF-8 validity, NUL patterns and other local heuristics never select or override a charset. If full detection/decoding fails, the tool reports the error. An explicit input encoding bypasses `chardet` entirely in both modes.
 - Physical BOM inspection is independent metadata only. A recognized UTF-8/UTF-16/UTF-32 prefix produces `bom:true`; it never selects the charset. The selected decoder may consume a matching BOM according to that charset's normal decoding semantics (including the custom UTF-32 decoder), which is distinct from using BOM as a detector.
 - Native `TextDecoder` charsets decode with `fatal:true`; malformed data is not retried through a permissive decoder. A charset unavailable to `TextDecoder` may use `iconv-lite`, but only when decode/re-encode reproduces the original bytes exactly.
 - `output_encoding:"preserve"` reuses the detected source charset. On a new file, where there is nothing to preserve, it means UTF-8. A `chardet` result of ASCII remains strict ASCII; it is not silently promoted to UTF-8 or interpreted through the WHATWG Windows-1252 `ascii` alias. Encoding intent is not stored separately from file bytes: a newly written UTF-8 file containing only ASCII-compatible bytes may later be reported as `ascii` by `auto` if that is what `chardet` detects, because those bytes do not physically distinguish the two encodings. Encoding is checked by decoding the final bytes through MrMCP's own read path and comparing the exact text, so unsupported characters are rejected instead of becoming `?` or replacement characters. Auto-detected legacy encodings can therefore be preserved only when both decoding and encoding are lossless.
@@ -124,12 +132,12 @@ Arguments:
 - shared path selection: `path`, `include[]`, `exclude[]`, `gitignore`, `hidden`.
 - `metadata` — default `false`. The normal page contains only `path` + `type`; set true only when size, modification/creation timestamps or stored symlink targets are needed.
 - `limit` — maximum entries returned, default 1000, maximum 10000.
-- `after_path` — stateless continuation path returned by the previous page as `next_after_path`. Only lexically later entries are returned.
+- `after_path` — stateless continuation path returned by the previous page as `next_after_path`. Only later entries in depth-first path-component order are returned: a directory and its descendants precede its next sibling. Sibling names use locale comparison with an exact string tie-breaker.
 - `context_handle`.
 
 Results are deterministically ordered and echo `metadata`, `returned` and the effective `limit`. Every entry always reports `path` and `type` (`file`, `directory` or `symlink`). With `metadata=true`, entries additionally report size and modification/creation timestamps, and symlinks report their stored `link_target` without dereferencing it. When `truncated=true`, pass `next_after_path` unchanged as the next `after_path` with the same selection arguments.
 
-Traversal never applies magic dependency/build/cache exclusions. It may skip a subtree only when the active include patterns prove that no descendant could match; ambiguous/global patterns fail open to ordinary traversal. User exclusions belong in `.gitignore` or explicit `exclude[]`.
+Traversal never applies magic dependency/build/cache exclusions. Include-based pruning requires proof that no descendant could match; ambiguous/global patterns fail open to ordinary traversal. Continuations also skip subtrees entirely before the cursor in path-component order. User exclusions belong in `.gitignore` or explicit `exclude[]`.
 
 Rationale: lightweight path/type pages cover common repository navigation without doing per-entry metadata I/O; metadata remains explicit when an agent actually needs it.
 
@@ -155,7 +163,13 @@ Arguments:
 
 Matched files include a whole-file `fingerprint`, size and text metadata. Match rows contain `line`, `column`, `text`, optional `context_before[]` and `context_after[]`. The page also reports `returned`, the effective `limit` and nullable `truncation_reason` (`limit` or `walk_limit`).
 
+Every result echoes the effective `max_file_bytes` and includes `skipped_large_files`, the number of candidates omitted on this page because their observed source size exceeds that threshold. Files exactly at the threshold are searched. Filtered/ignored paths and unvisited candidates are not counted, and no extra traversal is performed to count future skips. The existing `scanned_files` counts candidates examined after path resolution, including oversized files and later read/decode failures; it is not a successful-decoding count. All counters are page-local, not whole-search totals. A continued file can be examined on several pages.
+
+Per-file errors remain in `files[]`; oversized files are represented by the counter rather than additional rows. The text summary flags incomplete coverage when either occurs, even if `returned=0` and `truncated=false`. No continuation means the current traversal ended, not that every selected file was successfully searched.
+
 When `truncated=true`, `next_resume_after` is directly reusable as the next `resume_after`. Search remains stateless; MrMCP does not retain hidden grep cursors.
+
+Traversal is consumed progressively and stops when the result page is full, using at most one additional path to check for a continuation when there are no more matches in the current file. A continuation can still find no further matches: remaining paths may not match the search. This avoids enumerating the entire remaining tree merely to return an early page.
 
 Rationale: repository-wide search belongs in one tool. Paging is governed by the explicit result-count limit and stateless cursor rather than an additional arbitrary response-byte target.
 
@@ -173,7 +187,7 @@ Arguments:
 - `max_output_bytes_per_file` — per-file UTF-8 ceiling, default 1 MiB, maximum 5 MiB. A single complete line may exceed it so line content is never split.
 - `context_handle`.
 
-Successful per-file results include normalized `content`, actual returned range, `total_lines`, source size, fingerprint, text metadata, `truncated` and nullable `next_start_line`. A truncated requested range provides `next_start_line`; each requested file is bounded independently by `max_output_bytes_per_file`.
+Successful per-file results include normalized `content`, actual returned range, `total_lines`, source size, fingerprint, text metadata, `truncated` and nullable `next_start_line`. An `end_line` beyond EOF is clamped to the last actual line; a `start_line` beyond EOF is out of bounds. A truncated requested range provides `next_start_line`; each requested file is bounded independently by `max_output_bytes_per_file`.
 
 Under each file's budget, requested lines take priority over optional context: `fs_read` fills the requested range first and only then uses remaining space for `context_lines_before` / `context_lines_after`. Context omission alone does not create a continuation cursor, and every truncated requested range advances `next_start_line` beyond the requested start. A single indivisible line may exceed the per-file ceiling; this is intentional so text is never split and continuation always progresses.
 
@@ -602,7 +616,7 @@ Additional fields:
 
 - `args[]` — verbatim ordered argv for `program`; default empty.
 - `cwd` — Workspace-relative directory; default `.`.
-- `env` — per-call string environment overrides. Before those overrides, every managed child receives the global Settings → Process Environment `NAME=value` entries. Their values may use `${MRMCP_DIR}` (MrMCP data directory), `${MRMCP_BIN}` (managed bin directory), `${WORKSPACE}` (current Workspace root) and `${CWD}` (effective exec directory); placeholders are expanded when the process starts so Workspace/CWD remain dynamic. Precedence is system environment → global configured environment → per-call `env`. The Process Environment Git line-ending option is enabled by default and appends runtime `core.autocrlf=false` to every managed child, so direct and nested Git invocations ignore machine/platform `core.autocrlf` conversion without changing the user's Git config. Disabling the option stops that injection. Repository `.gitattributes` remains authoritative, and explicit `git -c core.autocrlf=...` can override the runtime default.
+- `env` — per-call string environment overrides. Before those overrides, every managed child receives the global Settings → Process Environment `NAME=value` entries. Their values may use `${MRMCP_DIR}` (MrMCP data directory), `${MRMCP_BIN}` (managed bin directory), `${WORKSPACE}` (current Workspace root) and `${CWD}` (effective exec directory); placeholders are expanded when the process starts so Workspace/CWD remain dynamic. Precedence is system environment → global configured environment → per-call `env`. The Process Environment Git line-ending option is enabled by default and appends runtime `core.autocrlf=false` to every managed child, so direct and nested Git invocations ignore machine/platform `core.autocrlf` conversion without changing the user's Git config. Disabling the option stops that injection. An existing CRLF checkout created with `core.autocrlf=true` can appear modified under the forced `false` policy even though no file bytes changed; disable the option to use the repository/machine policy for that checkout. This setting governs Git conversion, independently of `fs_write` / `fs_edit` representation handling. Repository `.gitattributes` remains authoritative, and explicit `git -c core.autocrlf=...` can override the runtime default.
 - `stdin` — initial stdin data.
 - `stdin_encoding` — `text|base64`; default `text`.
 - `timeout_ms` — tool-specific timeout.

@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.129 — Optimize CDP, filesystem and managed-process hot paths.
+MrMCP 0.10.130 — Improve search, tool summaries, JSON views and startup recovery.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -39,6 +39,7 @@ const macosAppDataDir = () => {
   return join(home, "Library", "Application Support", "MrMCP");
 };
 const APP_DIR = MACOS_APP_BUNDLE ? macosAppDataDir() : Deno.build.standalone ? STANDALONE_DIR : MODULE_DIR;
+const DATA_DIR = join(APP_DIR, ".mrmcp"), DATABASE_PATH = join(DATA_DIR, "mrmcp.sqlite");
 const configuredWorkspacePath = value => resolve(APP_DIR, String(value || "."));
 const nativeHomeDir = () => {
   const home = String(userInfo().homedir || "").trim();
@@ -97,7 +98,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.129";
+const VERSION = "0.10.130";
 const DB_SCHEMA_VERSION = 3;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -411,6 +412,116 @@ self.onmessage = async event => {
 */}
 const JS_KERNEL_SOURCE = jsKernelWorkerSource.toString().match(/\/\*([\s\S]*)\*\//)[1];
 
+function databaseSchemaIssue(db) {
+  if (!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1").get()) return null;
+  const schemaTable = db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'").get();
+  let storedVersion = NaN;
+  if (schemaTable) {
+    try { storedVersion = Number(db.prepare("SELECT version FROM schema_meta WHERE id=1").get()?.version); }
+    catch { /* An invalid schema_meta shape is also incompatible. */ }
+  }
+  return storedVersion === DB_SCHEMA_VERSION ? null : {
+    found: Number.isFinite(storedVersion) ? String(storedVersion) : "unversioned",
+    expected: DB_SCHEMA_VERSION,
+  };
+}
+function inspectStartupDatabase() {
+  try { Deno.lstatSync(DATABASE_PATH); }
+  catch (error) { if (error instanceof Deno.errors.NotFound) return null; throw error; }
+  const db = new DatabaseSync(DATABASE_PATH, { readOnly: true });
+  try { return databaseSchemaIssue(db); } finally { db.close(); }
+}
+async function recoveryBackupPath() {
+  const date = new Date(), pad = value => String(value).padStart(2, "0");
+  const stamp = `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+  const prefix = `${DATA_DIR}.backup-${stamp}`;
+  for (let suffix = 0;; suffix++) {
+    const path = suffix ? `${prefix}-${suffix + 1}` : prefix;
+    try { await Deno.lstat(path); }
+    catch (error) { if (error instanceof Deno.errors.NotFound) return path; throw error; }
+  }
+}
+async function archiveIncompatibleData(backupPath) {
+  const source = resolve(DATA_DIR), destination = resolve(backupPath), parent = resolve(APP_DIR);
+  if (dirname(source) !== parent || basename(source) !== ".mrmcp" || dirname(destination) !== parent ||
+      !basename(destination).startsWith(".mrmcp.backup-") || source === destination)
+    throw new Error("Invalid data recovery paths");
+  try { await Deno.lstat(destination); throw new Error("The backup destination already exists. Choose Start Fresh again to use a new backup name."); }
+  catch (error) { if (!(error instanceof Deno.errors.NotFound)) throw error; }
+  await Deno.rename(source, destination);
+  return destination;
+}
+async function confirmStartupRecovery(issue) {
+  const state = { ...issue, data: DATA_DIR, backup: await recoveryBackupPath(), busy: false, failed: false, error: "" };
+  if (!GUI_RUNTIME) {
+    const message = `Database schema version mismatch (found ${issue.found}, expected ${issue.expected}).\nData directory: ${DATA_DIR}\nBackup directory: ${state.backup}`;
+    if (!Deno.stdin.isTerminal()) throw new Error(`${message}\nStart MrMCP in desktop mode to confirm archiving the old data and starting fresh.`);
+    if (!confirm(`${message}\nRename the entire data directory and start with new settings and data?`)) return null;
+    const backup = await archiveIncompatibleData(state.backup);
+    console.log(`Previous data preserved in ${backup}`);
+    return { backup };
+  }
+  const renderer = new Eta({ tags: ["<?", "?>"], autoEscape: true });
+  const template = `<div id="app"><main><div class=brand>MrMCP</div><h1>Start With New Data?</h1>
+<p>This database uses schema <b><?= it.found ?></b>; this version requires <b><?= it.expected ?></b>.</p>
+<p>Start Fresh renames the entire current data folder to the backup below, then starts MrMCP with new settings, credentials and history.</p>
+<label>Current Data Directory</label><code><?= it.data ?></code><label>Backup Directory</label><code><?= it.backup ?></code>
+<? if(it.error){ ?><p class=error role=alert><?= it.error ?></p><? } ?>
+<? if(it.busy){ ?><p role=status>Preserving old data and starting MrMCP…</p><? } ?>
+<div class=actions><button data-action=startup-cancel<?= it.busy?' disabled':'' ?>>Quit</button>
+<? if(!it.failed){ ?><button class=primary data-action=startup-reset<?= it.busy?' disabled':'' ?>>Start Fresh</button><? } ?></div></main></div>`;
+  const render = () => renderer.renderString(template, state);
+  const morphlex = await Deno.readTextFile(join(ASSETS_DIR, "morphlex.js"));
+  const script = `${morphlex}\nconst app=document.getElementById("app"),internals=window.__TAURI_INTERNALS__;
+const invoke=(command,payload={})=>internals.invoke(command,payload);
+const listen=(event,handler,target={kind:"Any"})=>invoke("plugin:event|listen",{event,target,handler:internals.transformCallback(handler)});
+const send=event=>invoke("plugin:event|emit",{event:${JSON.stringify(UI_INPUT_EVENT)},payload:{event}});
+void listen("tauri://close-requested",()=>{},{kind:"Window",label:"main"}).catch(console.error);
+document.addEventListener("click",event=>{const button=event.target.closest("[data-action]");if(button&&!button.disabled)void send({type:"action",action:button.dataset.action}).catch(console.error);});
+Promise.all([listen(${JSON.stringify(UI_RENDER_EVENT)},event=>morphInner(app,event.payload.html,{preserveChanges:true})),listen("mrmcp://startup-ready",()=>location.replace(location.pathname+"?ready="+Date.now()))]).then(()=>send({type:"bootstrap"})).catch(console.error);`;
+  const nonce = randomToken();
+  const html = `<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none';base-uri 'none';style-src 'unsafe-inline';script-src 'nonce-${nonce}';connect-src 'self' ipc: http://ipc.localhost">
+<title>MrMCP · Data Recovery</title><style>:root{font:15px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}body{margin:0}main{max-width:780px;margin:9vh auto;padding:28px;background:#191c22;border:1px solid #343a44;border-radius:12px}.brand{font-weight:700;color:#9ecbff}h1{font-size:26px}p{line-height:1.55}label{display:block;font-weight:600;margin:18px 0 8px}code{display:block;white-space:pre-wrap;overflow-wrap:anywhere;background:#111419;padding:12px;border-radius:6px}.actions{display:flex;justify-content:flex-end;gap:12px;margin-top:26px}button{font:inherit;color:#eee;background:#262b34;border:1px solid #465062;border-radius:6px;padding:9px 18px;cursor:pointer}button:disabled{opacity:.55;cursor:default}.primary{background:#2459a8}.error{color:#ffb7bf}@media(max-width:820px){main{margin:24px 16px}}</style></head><body>${render()}<script type=module nonce="${nonce}">${script}</script></body></html>`;
+  let revision = 0, resolveDecision, visible = false;
+  const decision = new Promise(resolve => { resolveDecision = resolve; });
+  const update = () => {
+    if (visible) self.postMessage({ type: "ui-render", payload: { revision: ++revision, html: render(), section: "startup" } });
+  };
+  const failed = error => {
+    state.busy = false; state.failed = true;
+    state.error = `The old data is preserved in ${state.backup}. Startup failed: ${String(error?.message || error)}. Quit and restart MrMCP to try again.`;
+    update();
+  };
+  self.onmessage = event => {
+    if (event.data?.type === "shutdown") { self.postMessage({ type: "stopped" }); self.close(); return; }
+    if (event.data?.type === "ui-visibility") { visible = !!event.data.visible; if (visible) update(); return; }
+    const input = event.data?.type === "ui-input" ? event.data.payload?.event : null;
+    if (input?.type === "bootstrap") { update(); return; }
+    if (input?.type !== "action" || state.busy) return;
+    if (input.action === "startup-cancel") { state.busy = true; self.postMessage({ type: "startup-cancelled" }); resolveDecision(null); return; }
+    if (input.action !== "startup-reset" || state.failed) return;
+    state.busy = true; state.error = ""; update();
+    (async () => {
+      try { const backup = await archiveIncompatibleData(state.backup); resolveDecision({ backup, failed }); }
+      catch (error) {
+        state.busy = false; state.error = String(error?.message || error);
+        try { state.backup = await recoveryBackupPath(); } catch {}
+        update();
+      }
+    })();
+  };
+  self.postMessage({ type: "ready", gui: "index.html", gui_html: html, startup_recovery: true });
+  return await decision;
+}
+async function runBackend(options = {}) {
+  const issue = inspectStartupDatabase();
+  const recovery = issue ? await confirmStartupRecovery(issue) : undefined;
+  if (recovery === null) return;
+  try { await backend(options); }
+  catch (error) { if (recovery?.failed) recovery.failed(error); else throw error; }
+}
+
 // Backend lifecycle, persistence and network services.
 async function backend({ addWorkspace = null } = {}) {
   if (Deno.build.standalone && !addWorkspace) {
@@ -425,7 +536,7 @@ async function backend({ addWorkspace = null } = {}) {
       }
     }
   }
-  const DATA = join(APP_DIR, ".mrmcp");
+  const DATA = DATA_DIR;
   const TRASH_ROOT = join(DATA, "trash");
   const TLS_DATA = DATA;
   const DB_PATH = join(DATA, "mrmcp.sqlite");
@@ -449,6 +560,11 @@ async function backend({ addWorkspace = null } = {}) {
   const PUBLISH_DIR = join(DATA, "publish");
   const CDP_DIR = join(DATA, "cdp");
   Deno.mkdirSync(DATA, { recursive: true });
+  const db = new DatabaseSync(DB_PATH), schemaIssue = databaseSchemaIssue(db);
+  if (schemaIssue) {
+    db.close();
+    throw new Error(`Database schema version mismatch (found ${schemaIssue.found}, expected ${schemaIssue.expected}). Restart MrMCP to confirm archiving the old data directory and starting fresh.`);
+  }
   if (!addWorkspace) {
     Deno.mkdirSync(BIN_DIR, { recursive: true });
     await Deno.remove(TEMP_DIR, { recursive: true }).catch(error => {
@@ -457,16 +573,6 @@ async function backend({ addWorkspace = null } = {}) {
     Deno.mkdirSync(TEMP_DIR, { recursive: true });
     Deno.mkdirSync(PUBLISH_DIR, { recursive: true });
     Deno.mkdirSync(CDP_DIR, { recursive: true });
-  }
-  const db = new DatabaseSync(DB_PATH);
-  const existingUserTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' LIMIT 1").get();
-  if (existingUserTable) {
-    const schemaTable = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_meta'").get();
-    const storedVersion = schemaTable ? Number(db.prepare("SELECT version FROM schema_meta WHERE id=1").get()?.version) : NaN;
-    if (storedVersion !== DB_SCHEMA_VERSION) {
-      db.close();
-      throw new Error(`Database schema version mismatch (found ${Number.isFinite(storedVersion) ? storedVersion : "unversioned"}, expected ${DB_SCHEMA_VERSION}). Delete .mrmcp/mrmcp.sqlite and restart.`);
-    }
   }
   let uiRevision = 0, uiRenderConnected = false, uiRenderVisible = false, uiRenderVisibilityEpoch = 0;
   const deliverUiRender = payload => {
@@ -660,6 +766,7 @@ async function backend({ addWorkspace = null } = {}) {
     CREATE INDEX IF NOT EXISTS logs_server ON logs(server_name,started_at DESC);
     CREATE INDEX IF NOT EXISTS logs_tool ON logs(tool,started_at DESC);
     CREATE INDEX IF NOT EXISTS logs_context ON logs(context_handle,started_at DESC);
+    CREATE INDEX IF NOT EXISTS logs_context_cursor ON logs(context_handle,id DESC);
     CREATE INDEX IF NOT EXISTS logs_context_id ON logs(context_id,started_at DESC);
     CREATE TABLE IF NOT EXISTS tool_descriptors(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -814,6 +921,7 @@ async function backend({ addWorkspace = null } = {}) {
       UNIQUE(scope,owner_id,key)
     );
     CREATE INDEX IF NOT EXISTS memories_owner_time ON memories(scope,owner_id,set_at DESC,id DESC);
+    CREATE INDEX IF NOT EXISTS memories_owner_cursor ON memories(scope,owner_id,id DESC);
     CREATE INDEX IF NOT EXISTS memories_expiry ON memories(expires_at) WHERE expires_at>0;
     CREATE TRIGGER IF NOT EXISTS memories_context_delete AFTER DELETE ON contexts BEGIN
       DELETE FROM memories WHERE scope='session' AND owner_id=OLD.id;
@@ -1078,6 +1186,7 @@ async function backend({ addWorkspace = null } = {}) {
     CREATE INDEX logs_memory_server ON logs_memory(server_name,started_at DESC);
     CREATE INDEX logs_memory_tool ON logs_memory(tool,started_at DESC);
     CREATE INDEX logs_memory_context ON logs_memory(context_handle,started_at DESC);
+    CREATE INDEX logs_memory_context_cursor ON logs_memory(context_handle,id DESC);
     CREATE INDEX logs_memory_context_id ON logs_memory(context_id,started_at DESC);
     CREATE TEMP TABLE tool_call_descriptors_memory(
       log_id INTEGER PRIMARY KEY,
@@ -1151,6 +1260,7 @@ async function backend({ addWorkspace = null } = {}) {
     ["tls_next_attempt_at", "0"], ["tls_rate_limit_reset_at", "0"], ["tls_renewal_due_at", "0"],
     ["tls_self_signed_created_at", "0"], ["debug_http_log", "0"],
     ["inherit_system_path", "1"], ["git_preserve_line_endings", "1"], ["exec_environment", ""],
+    ["text_encoding_detection", "sample"],
     ["tool_call_storage", "disk"], ["tool_call_payload_mode", "payload"],
     ["tool_call_retention_hours", "0"], ["tool_call_memory_retention_minutes", "60"],
     ["command_discovery_enabled", "1"], ["telegram_bot_token", ""],
@@ -3348,6 +3458,8 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     return target;
   }
   const TEXT_ENCODINGS = new Set(["utf-8", "utf-16le", "utf-16be", "windows-1252", "latin1"]);
+  const TEXT_ENCODING_SAMPLE_BYTES = 16 * 1024;
+  const textEncodingDetection = () => getCfg("text_encoding_detection", "sample") === "full" ? "full" : "sample";
   const CP1252_SPECIAL = new Map([
     [0x20ac,0x80],[0x201a,0x82],[0x0192,0x83],[0x201e,0x84],[0x2026,0x85],[0x2020,0x86],[0x2021,0x87],
     [0x02c6,0x88],[0x2030,0x89],[0x0160,0x8a],[0x2039,0x8b],[0x0152,0x8c],[0x017d,0x8e],[0x2018,0x91],
@@ -3509,16 +3621,37 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     if (iconv.encodingExists(encoding)) return new Uint8Array(iconv.encode(String(value), encoding));
     throw new Error(`Unsupported output encoding: ${encoding}`);
   }
-  function decodeTextDocument(bytes, requested = "auto") {
+  function decodeTextDocument(bytes, requested = "auto", detection = "full") {
     requested = textEncoding(requested, "auto");
     const bom = textBom(bytes);
-    const encoding = requested === "auto" ? normalizeDetectedEncoding(chardet.detect(bytes)) : requested;
-    if (!encoding) throw new Error("Unable to detect text encoding");
-    const text = decodeTextBytes(bytes, encoding);
+    const detect = input => {
+      const encoding = normalizeDetectedEncoding(chardet.detect(input));
+      if (!encoding) throw new Error("Unable to detect text encoding");
+      return encoding;
+    };
+    let encoding = requested, text;
+    if (requested !== "auto") text = decodeTextBytes(bytes, encoding);
+    else if (detection === "sample" && bytes.length > TEXT_ENCODING_SAMPLE_BYTES) {
+      try {
+        const candidate = chardet.analyse(bytes.subarray(0, TEXT_ENCODING_SAMPLE_BYTES))[0];
+        if (!(candidate?.confidence >= 80)) throw new Error("Sample encoding confidence is too low");
+        encoding = normalizeDetectedEncoding(candidate.name);
+        if (!encoding) throw new Error("Unable to detect text encoding");
+        text = decodeTextBytes(bytes, encoding);
+      } catch {
+        // A prefix may miss later non-ASCII bytes or end inside a character.
+        // Retry charset detection over the complete buffer, keeping decoding strict.
+        encoding = detect(bytes);
+        text = decodeTextBytes(bytes, encoding);
+      }
+    } else {
+      encoding = detect(bytes);
+      text = decodeTextBytes(bytes, encoding);
+    }
     return { text, encoding, bom, line_endings: lineEndingKind(text), bytes };
   }
-  async function readTextDocument(path, requested = "auto") {
-    return decodeTextDocument(await Deno.readFile(path), requested);
+  async function readTextDocument(path, requested = "auto", detection = "full") {
+    return decodeTextDocument(await Deno.readFile(path), requested, detection);
   }
   function encodeTextDocument(value, source = null, options = {}) {
     const requested = textEncoding(options.output_encoding || "preserve", "preserve", true);
@@ -3645,14 +3778,28 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     }
     return rules;
   }
-  async function fsWalk(root, start = ".", options = {}) {
+  function compareFsPaths(left, right) {
+    // Cursor order must match traversal before its hard limit, including siblings
+    // such as a.txt beside a/; sorting only the collected page can skip files.
+    if (left === right) return 0;
+    const a = left.split("/"), b = right.split("/");
+    for (let index = 0; index < Math.min(a.length, b.length); index++) {
+      const order = a[index].localeCompare(b[index]) || (a[index] < b[index] ? -1 : a[index] > b[index] ? 1 : 0);
+      if (order) return order;
+    }
+    return a.length - b.length;
+  }
+  const fsWalkLimit = options => Math.min(Math.max(Number(options.hard_limit || 100000), 1), 200000);
+  async function* fsWalkEntries(root, start = ".", options = {}) {
     const rootReal = options.root_real || await Deno.realPath(root), base = await safePath(rootReal, start, rootReal);
     const stat = await Deno.lstat(base), include = compileGlobs(options.include), exclude = compileGlobs(options.exclude, []);
     const includePrefixes = includeTraversalPrefixes(options.include);
     const hidden = options.hidden === true, useGitignore = options.gitignore !== false, metadata = options.metadata !== false;
-    const result = [], hardLimit = Math.min(Math.max(Number(options.hard_limit || 100000), 1), 200000);
+    const hardLimit = fsWalkLimit(options);
+    let yielded = 0;
     const afterPath = slashPath(options.after_path || ""), fromPath = slashPath(options.from_path || "");
-    const inPage = path => (!afterPath || path.localeCompare(afterPath) > 0) && (!fromPath || path.localeCompare(fromPath) >= 0);
+    const inPage = path => (!afterPath || compareFsPaths(path, afterPath) > 0) && (!fromPath || compareFsPaths(path, fromPath) >= 0);
+    const pageStart = compareFsPaths(afterPath, fromPath) >= 0 ? afterPath : fromPath;
     const baseDirectory = stat.isDirectory ? base : dirname(base);
     const initialRules = useGitignore ? await inheritedGitignoreRules(rootReal, baseDirectory) : [];
     const localPath = absolute => {
@@ -3664,27 +3811,28 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       const local = basename(base), display = displayPath(base);
       if (inPage(display) && (hidden || !basename(base).startsWith(".")) && matchesGlobs(local, include) && !excludedByGlobs(local, exclude)
         && (!useGitignore || !gitignored(display, false, initialRules)))
-        result.push(metadata ? {
+        yield metadata ? {
           path: display,
           type: stat.isSymlink ? "symlink" : "file",
           size: stat.size,
           modified_at: stat.mtime?.toISOString() || null,
           created_at: stat.birthtime?.toISOString() || null,
           ...(stat.isSymlink ? { link_target: await Deno.readLink(base) } : {}),
-        } : { path: display, type: stat.isSymlink ? "symlink" : "file" });
-      return { entries: result, limited: false };
+        } : { path: display, type: stat.isSymlink ? "symlink" : "file" };
+      return;
     }
-    async function visit(directory, inheritedRules, loadRules = true) {
-      if (result.length >= hardLimit) return;
+    async function* visit(directory, inheritedRules, loadRules = true) {
+      if (yielded >= hardLimit) return;
       const rules = useGitignore && loadRules ? await gitignoreRules(rootReal, directory, inheritedRules) : inheritedRules;
       const entries = [];
       for await (const entry of Deno.readDir(directory)) entries.push(entry);
-      entries.sort((a, b) => a.name.localeCompare(b.name));
+      entries.sort((a, b) => compareFsPaths(a.name, b.name));
       for (let offset = 0; offset < entries.length; offset += 16) {
-        if (result.length >= hardLimit) return;
+        if (yielded >= hardLimit) return;
         const batch = await Promise.all(entries.slice(offset, offset + 16).map(async entry => {
           if (!hidden && entry.name.startsWith(".")) return null;
           const absolute = join(directory, entry.name), display = displayPath(absolute), local = localPath(absolute);
+          if (pageStart && compareFsPaths(display, pageStart) < 0 && !pageStart.startsWith(display + "/")) return null;
           const ignored = useGitignore && gitignored(display, entry.isDirectory, rules);
           const excluded = excludedByGlobs(local, exclude);
           let resultEntry = null;
@@ -3704,17 +3852,20 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           return { entry, absolute, local, ignored, excluded, resultEntry };
         }));
         for (const item of batch) {
-          if (result.length >= hardLimit) return;
+          if (yielded >= hardLimit) return;
           if (!item) continue;
-          if (item.resultEntry) result.push(item.resultEntry);
+          if (item.resultEntry) { yielded++; yield item.resultEntry; }
           if (item.entry.isDirectory && !item.ignored && !item.excluded && includeMayMatchBelow(item.local, includePrefixes))
-            await visit(item.absolute, rules);
+            yield* visit(item.absolute, rules);
         }
       }
     }
-    await visit(base, initialRules, false);
-    result.sort((a, b) => a.path.localeCompare(b.path) || a.type.localeCompare(b.type));
-    return { entries: result, limited: result.length >= hardLimit };
+    yield* visit(base, initialRules, false);
+  }
+  async function fsWalk(root, start = ".", options = {}) {
+    const entries = [];
+    for await (const entry of fsWalkEntries(root, start, options)) entries.push(entry);
+    return { entries, limited: entries.length >= fsWalkLimit(options) };
   }
   async function copyRecursive(from, to) {
     const st = await Deno.lstat(from);
@@ -4277,12 +4428,13 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     let rows = await readGuidedPromptConfig();
     const needle = String(query).trim().toLowerCase();
     rows = rows.filter(row => !needle || `${row.name}\n${row.title}\n${row.description}\n${row.arguments.map(x => `${x.name} ${x.description}`).join("\n")}`.toLowerCase().includes(needle));
-    page = Math.max(1, Number(page) || 1);
     page_size = Math.max(1, Math.min(Number(page_size) || 5, 100));
-    const total = rows.length, start = (page - 1) * page_size;
+    const total = rows.length, pages = Math.max(1, Math.ceil(total / page_size));
+    page = Math.min(pages, Math.max(1, Math.floor(Number(page) || 1)));
+    const start = (page - 1) * page_size;
     return {
       query: String(query), page, page_size, total,
-      pages: Math.max(1, Math.ceil(total / page_size)),
+      pages,
       has_more: start + page_size < total,
       config_file: GUIDED_PROMPTS_PATH,
       prompts: rows.slice(start, start + page_size),
@@ -4392,12 +4544,13 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     else if (filter === "unavailable") rows = rows.filter(row => !row.present || !row.executable);
     else if (filter === "yaml") rows = rows.filter(row => row.registered);
     else if (filter === "disk") rows = rows.filter(row => !row.registered);
-    page = Math.max(1, Number(page) || 1);
     page_size = Math.max(1, Math.min(Number(page_size) || 5, 100));
-    const total = rows.length, start = (page - 1) * page_size;
+    const total = rows.length, pages = Math.max(1, Math.ceil(total / page_size));
+    page = Math.min(pages, Math.max(1, Math.floor(Number(page) || 1)));
+    const start = (page - 1) * page_size;
     return {
       query: String(query), filter, page, page_size, total,
-      pages: Math.max(1, Math.ceil(total / page_size)),
+      pages,
       has_more: start + page_size < total,
       bin_directory: BIN_DIR,
       config_file: COMMANDS_PATH,
@@ -4460,7 +4613,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       type: "string",
       enum: ["auto", "utf-8", "utf-16le", "utf-16be", "windows-1252", "latin1"],
       default: "auto",
-      description: "Text decoding mode. auto passes the complete original byte buffer to chardet and uses only its detected charset; an explicit encoding bypasses chardet. Physical BOM presence is checked independently and returned only as bom metadata; it never influences charset detection.",
+      description: "Text decoding mode. auto uses chardet: reading/searching follows the server setting (initial 16 KiB sample or complete file), with full-file detection retried if sample confidence is below 80 or the sample charset cannot decode the complete content. Mutations always detect the complete file. Samples may miss later charset clues; an explicit known encoding bypasses detection. Physical BOM presence is independent metadata and never selects the charset.",
     };
     const outputText = {
       output_encoding: {
@@ -4545,23 +4698,23 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         { properties: { ...contextInput } },
       ],
       fs_glob: [
-        "Discover files, directories and symlinks with globstar include/exclude patterns. This is also the filesystem tree navigator. The default result is intentionally lightweight (path + type); set metadata=true only when size/timestamps/link targets are needed. Results are deterministically ordered and statelessly paginated: when truncated=true, pass next_after_path back as after_path with the same selection arguments. .gitignore handling follows applicable parent rules and nested .gitignore files recursively.",
+        "Discover files, directories and symlinks by path with globstar include/exclude patterns; use fs_grep when selecting files by their text content. This is also the filesystem tree navigator. The default result is intentionally lightweight (path + type); set metadata=true only when size/timestamps/link targets are needed. Results are deterministically ordered and statelessly paginated: when truncated=true, pass next_after_path back as after_path with the same selection arguments. .gitignore handling follows applicable parent rules and nested .gitignore files recursively.",
         { properties: {
           ...pathSelection,
           metadata: { type: "boolean", default: false, description: "Include size, modification/creation timestamps and stored symlink target. Leave false for faster/lighter repository navigation." },
           limit: { type: "integer", minimum: 1, maximum: 10000, default: 1000, description: "Maximum entries returned on this page. The result echoes the effective limit and a stateless next_after_path when more entries remain." },
-          after_path: { type: "string", description: "Workspace-relative final path returned as next_after_path by the previous page. Only lexically later entries are returned." },
+          after_path: { type: "string", description: "Workspace-relative final path returned as next_after_path by the previous page. Only later entries in depth-first path-component order are returned; a directory and its descendants precede its next sibling." },
           ...contextInput,
         } },
       ],
       fs_grep: [
-        "Search text across selected files. With regex=false (the default), pattern is one literal substring exactly as supplied: spaces and punctuation are part of the same search string and are never tokenized. mode=count follows grep -c semantics and counts matching lines per file, not total substring occurrences. Returns whole-file fingerprints for matched files so a later fs_edit/fs_write can detect intervening changes. Pagination is explicit and stateless through resume_after.",
+        "Search textual occurrences across files, including comments, strings and configuration. For symbol/caller exploration, prefer a suitable discover_commands entry. Narrow path/include when scope is known. Use mode=files for paths only, matches for source lines, count for per-file matching-line counts (grep -c, not substring occurrences). With regex=false, pattern is one literal substring including spaces and punctuation. Request a few context lines, e.g. 2 before/after, when nearby code can avoid another read; default 0. Matched files include edit fingerprints. Counters are page-local; skipped_large_files and per-file errors indicate incomplete coverage. When truncated=true, pass next_resume_after as resume_after with unchanged search arguments; remaining paths may yield no matches.",
         { properties: {
           pattern: { type: "string", minLength: 1, description: "Literal substring when regex=false, including any spaces exactly as supplied; regular expression source only when regex=true." }, ...pathSelection,
           regex: { type: "boolean", default: false }, case_sensitive: { type: "boolean", default: false },
           encoding: inputEncoding, ...lineContext,
           mode: { type: "string", enum: ["matches", "files", "count"], default: "matches", description: "matches returns matching lines, files returns matching file metadata only, and count returns the number of matching lines in each file (not the number of substring occurrences)." },
-          max_file_bytes: { type: "integer", minimum: 1, maximum: 52428800, default: 5242880 },
+          max_file_bytes: { type: "integer", minimum: 1, maximum: 52428800, default: 5242880, description: "Skip source files larger than this byte size. The result echoes this limit and counts omitted candidates in skipped_large_files; those files have not been searched." },
           limit: { type: "integer", minimum: 1, maximum: 2000, default: 300, description: "Maximum matching lines in mode=matches or matched files in mode=files/count." },
           resume_after: {
             type: "object", additionalProperties: false,
@@ -4572,7 +4725,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         }, required: ["pattern"] },
       ],
       fs_read: [
-        "Read one or many text files with line ranges and optional context. Every successful file result includes an opaque whole-file fingerprint plus encoding/BOM/line-ending metadata. Output text uses LF line separators; preservation/conversion is handled by mutation tools.",
+        "Read known text files, batching independent files/ranges in one call. Prefer targeted ranges when their locations are known; use fs_grep to locate textual occurrences or fs_navigate to move between matches in known files. Optional context can include nearby code in the same read. Every successful file result includes an opaque whole-file fingerprint plus encoding/BOM/line-ending metadata. For a truncated file range, pass its next_start_line as start_line while retaining the requested end_line. Output text uses LF line separators; preservation/conversion is handled by mutation tools.",
         { properties: {
           files: { type: "array", minItems: 1, maxItems: 100, items: {
             type: "object", additionalProperties: false,
@@ -5082,7 +5235,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         memory_summary: { type: "object", additionalProperties: false, properties: { global: memorySummaryOutput, workspace: memorySummaryOutput, session: memorySummaryOutput }, required: ["global", "workspace", "session"] },
       }),
       fs_glob: strictOutputSchema({ metadata: { type: "boolean" }, returned: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1 }, entries: fsArray(fsGlobEntry), next_after_path: nullableString, truncated: { type: "boolean" } }),
-      fs_grep: strictOutputSchema({ mode: { type: "string", enum: ["matches", "files", "count"] }, scanned_files: { type: "integer" }, matched_files: { type: "integer" }, returned: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1 }, truncation_reason: { anyOf: [{ type: "string", enum: ["limit", "walk_limit"] }, { type: "null" }] }, files: fsArray(fsGrepEntry), next_resume_after: { anyOf: [fsResumePoint, { type: "null" }] }, truncated: { type: "boolean" } }),
+      fs_grep: strictOutputSchema({ mode: { type: "string", enum: ["matches", "files", "count"] }, scanned_files: { type: "integer", minimum: 0, description: "Candidate files examined on this page after path resolution, including oversized files and later read/decode failures. Not a count of successfully searched files." }, matched_files: { type: "integer", minimum: 0 }, skipped_large_files: { type: "integer", minimum: 0, description: "Candidates omitted on this page because their observed source size exceeds max_file_bytes. Excludes filtered paths and candidates not yet visited." }, max_file_bytes: { type: "integer", minimum: 1, maximum: 52428800 }, returned: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1 }, truncation_reason: { anyOf: [{ type: "string", enum: ["limit", "walk_limit"] }, { type: "null" }] }, files: fsArray(fsGrepEntry), next_resume_after: { anyOf: [fsResumePoint, { type: "null" }] }, truncated: { type: "boolean" } }),
       fs_read: strictOutputSchema({ files: fsArray(fsReadEntry) }),
       fs_navigate: strictOutputSchema({ files: fsArray(fsNavigateEntry) }),
       fs_stat: strictOutputSchema({ entries: fsArray(fsStatEntry) }),
@@ -5279,7 +5432,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         cdp_poll: ["browser", "subscription", "messages", "cursor", "dropped", "stream_resets", "oldest_seq", "newest_seq"],
         memory_find: ["memories", "next_before_id"], memory_set: ["memory", "deleted"], telegram_req: ["method", "response", "migrated_chat_id"],
         fs_glob: ["metadata", "returned", "limit", "entries", "next_after_path", "truncated"],
-        fs_grep: ["scanned_files", "matched_files", "returned", "limit", "truncation_reason", "files", "next_resume_after", "truncated"],
+        fs_grep: ["scanned_files", "matched_files", "skipped_large_files", "max_file_bytes", "returned", "limit", "truncation_reason", "files", "next_resume_after", "truncated"],
         fs_read: ["files"], fs_navigate: ["files"], fs_stat: ["entries"],
         fs_write: ["succeeded", "failed", "files"], fs_edit: ["succeeded", "failed", "total_replacements", "files"],
         fs_text_convert_encoding_eol: ["succeeded", "failed", "files"],
@@ -6196,17 +6349,21 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const suppliedEnv = Object.fromEntries(Object.entries(args.env || {}).map(([key, value]) => [key, String(value)]));
     const pathKey = Deno.build.os === "windows" ? "Path" : "PATH";
     const includeSystemPath = getCfg("inherit_system_path", "1") === "1";
-    const processEnv = mergeProcessEnvironment(inheritedEnv, configuredEnv, suppliedEnv);
+    let processEnv = mergeProcessEnvironment(inheritedEnv, configuredEnv, suppliedEnv);
     const effectivePathKey = Object.keys(processEnv).find(key => key.toLowerCase() === "path");
     const inheritedPath = effectivePathKey ? processEnv[effectivePathKey] : "";
     for (const key of Object.keys(processEnv)) if (key.toLowerCase() === "path") delete processEnv[key];
     if (getCfg("git_preserve_line_endings", "1") === "1") {
-      const inheritedGitConfigCount = Number.parseInt(processEnv.GIT_CONFIG_COUNT || "0", 10);
+      const countKey = Object.keys(processEnv).find(key =>
+        (Deno.build.os === "windows" ? key.toUpperCase() : key) === "GIT_CONFIG_COUNT");
+      const inheritedGitConfigCount = Number.parseInt(processEnv[countKey] || "0", 10);
       const gitConfigIndex = Number.isInteger(inheritedGitConfigCount) && inheritedGitConfigCount >= 0
         ? inheritedGitConfigCount : 0;
-      processEnv[`GIT_CONFIG_KEY_${gitConfigIndex}`] = "core.autocrlf";
-      processEnv[`GIT_CONFIG_VALUE_${gitConfigIndex}`] = "false";
-      processEnv.GIT_CONFIG_COUNT = String(gitConfigIndex + 1);
+      processEnv = mergeProcessEnvironment(processEnv, {
+        [`GIT_CONFIG_KEY_${gitConfigIndex}`]: "core.autocrlf",
+        [`GIT_CONFIG_VALUE_${gitConfigIndex}`]: "false",
+        GIT_CONFIG_COUNT: String(gitConfigIndex + 1),
+      });
     }
     processEnv[pathKey] = includeSystemPath && inheritedPath
       ? BIN_DIR + (Deno.build.os === "windows" ? ";" : ":") + inheritedPath
@@ -6685,22 +6842,25 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       const before = Math.min(Number(args.context_lines_before || 0), 100), afterContext = Math.min(Number(args.context_lines_after || 0), 100);
       const mode = String(args.mode || "matches"), limit = Math.min(Number(args.limit || 300), 2000);
       const maxFileBytes = Math.min(Number(args.max_file_bytes || 5 * 1024 * 1024), 50 * 1024 * 1024);
-      const cursor = args.resume_after || null, walked = await fsWalk(selection.root.path, args.path || ".", { ...args, root_real: await workspaceRootReal(), from_path: cursor?.path, metadata: false });
-      const files = []; let scannedFiles = 0, matchedFiles = 0, returned = 0;
+      const cursor = args.resume_after || null;
+      const walkOptions = { ...args, root_real: await workspaceRootReal(), from_path: cursor?.path, metadata: false };
+      const walkLimit = fsWalkLimit(walkOptions), walk = fsWalkEntries(selection.root.path, args.path || ".", walkOptions);
+      const files = []; let scannedFiles = 0, matchedFiles = 0, skippedLargeFiles = 0, returned = 0;
       let truncated = false, truncationReason = null, nextAfter = null, lastWalkedPath = null;
       let lastReturned = cursor ? { ...cursor } : null;
-      for (let entryIndex = 0; entryIndex < walked.entries.length; entryIndex++) {
-        const entry = walked.entries[entryIndex];
+      let walkedCount = 0;
+      for await (const entry of walk) {
+        walkedCount++;
         lastWalkedPath = entry.path;
         if (entry.type !== "file") continue;
-        if (cursor && entry.path.localeCompare(String(cursor.path)) < 0) continue;
+        if (cursor && compareFsPaths(entry.path, String(cursor.path)) < 0) continue;
         if (cursor && entry.path === cursor.path && cursor.line == null) continue;
         try {
           const path = await safePath(selection.root.path, entry.path, await workspaceRootReal());
           scannedFiles++;
           const stat = await Deno.stat(path);
-          if (stat.size > maxFileBytes) continue;
-          const document = await readTextDocument(path, args.encoding || "auto");
+          if (stat.size > maxFileBytes) { skippedLargeFiles++; continue; }
+          const document = await readTextDocument(path, args.encoding || "auto", textEncodingDetection());
           if (args.regex !== true) {
             regex.lastIndex = 0;
             if (!regex.test(document.text)) continue;
@@ -6721,43 +6881,36 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
             }
             matchedFiles++;
             const matches = [];
-            for (let eligibleIndex = 0; eligibleIndex < eligible.length; eligibleIndex++) {
-              if (returned >= limit) { truncated = true; truncationReason = "limit"; break; }
+            for (let eligibleIndex = 0; eligibleIndex < eligible.length && returned < limit; eligibleIndex++) {
               const lineIndex = eligible[eligibleIndex], match = contextMatches(lines, [lineIndex], before, afterContext, regex)[0];
               matches.push(match); returned++;
               const moreInFile = eligibleIndex < eligible.length - 1;
               lastReturned = moreInFile ? { path: entry.path, line: lineIndex + 1 } : { path: entry.path };
-              const more = moreInFile || entryIndex < walked.entries.length - 1 || walked.limited;
-              if (more && returned >= limit) {
-                truncated = true;
-                truncationReason = "limit";
-                break;
-              }
             }
             if (matches.length) files.push({ path: entry.path, status: "ok", fingerprint, ...metadata, matches, count: eligible.length });
-            if (!truncated && matches.length) lastReturned = { path: entry.path };
-            if (truncated) { nextAfter = lastReturned; break; }
           } else {
             matchedFiles++;
             const result = { path: entry.path, status: "ok", fingerprint, ...metadata, ...(mode === "count" ? { count: indexes.length } : {}) };
             files.push(result); returned++; lastReturned = { path: entry.path };
-            const more = entryIndex < walked.entries.length - 1 || walked.limited;
-            if (more && returned >= limit) {
-              truncated = true;
-              truncationReason = "limit";
-              nextAfter = lastReturned;
-              break;
-            }
           }
         } catch (error) {
           files.push({ path: entry.path, status: errorStatus(error), error: String(error?.message || error) });
         }
+        if (returned >= limit) {
+          // One path of lookahead distinguishes EOF from a continuation without
+          // enumerating the remaining tree. Traversal failures stay outside the file error handler.
+          if (lastReturned?.line != null || walkedCount >= walkLimit || !(await walk.next()).done) {
+            truncated = true; truncationReason = "limit"; nextAfter = lastReturned;
+          }
+          break;
+        }
       }
-      if (!truncated && walked.limited && lastWalkedPath) {
+      if (!truncated && walkedCount >= walkLimit && lastWalkedPath) {
         truncated = true; truncationReason = "walk_limit"; nextAfter = { path: lastWalkedPath };
       }
       return {
-        mode, scanned_files: scannedFiles, matched_files: matchedFiles, returned, limit, truncation_reason: truncationReason,
+        mode, scanned_files: scannedFiles, matched_files: matchedFiles, skipped_large_files: skippedLargeFiles, max_file_bytes: maxFileBytes,
+        returned, limit, truncation_reason: truncationReason,
         files, next_resume_after: nextAfter, truncated,
       };
     }
@@ -6770,8 +6923,8 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         try {
           const target = await resolvePath(file.path), stat = await Deno.stat(target.path);
           if (!stat.isFile) { files.push({ path: target.display, status: "not_file", size: stat.size }); continue; }
-          const document = await readTextDocument(target.path, file.encoding || "auto"), lines = textLines(document), total = lines.length;
-          const requestedStart = Number(file.start_line || 1), requestedEnd = Number(file.end_line || total);
+          const document = await readTextDocument(target.path, file.encoding || "auto", textEncodingDetection()), lines = textLines(document), total = lines.length;
+          const requestedStart = Number(file.start_line || 1), requestedEnd = Math.min(total, Number(file.end_line || total));
           if (total === 0 && file.start_line == null && file.end_line == null) {
             files.push({
               path: target.display, status: "ok", content: "", start_line: 1, end_line: 0, total_lines: 0,
@@ -6832,7 +6985,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       const before = Math.min(Number(args.context_lines_before || 0), 100), afterContext = Math.min(Number(args.context_lines_after || 0), 100), files = [];
       for (const file of args.files || []) {
         try {
-          const target = await resolvePath(file.path), document = await readTextDocument(target.path, file.encoding || "auto"), lines = textLines(document);
+          const target = await resolvePath(file.path), document = await readTextDocument(target.path, file.encoding || "auto", textEncodingDetection()), lines = textLines(document);
           const limit = Math.min(Number(file.max_matches || 1), 100), indexes = [], fromLine = Math.max(Number(file.from_line), 0);
           if (file.direction === "backward") {
             for (let index = Math.min(fromLine - 2, lines.length - 1); index >= 0 && indexes.length < limit; index--) {
@@ -7029,10 +7182,11 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           for (let index = 0; index < (file.edits || []).length; index++) {
             const edit = file.edits[index], oldText = normalizeLineEndings(String(edit.old_text), "lf");
             const newText = normalizeLineEndings(String(edit.new_text), "lf"), expected = Number(edit.expected_occurrences ?? 1);
-            const occurrences = oldText ? current.split(oldText).length - 1 : 0;
+            const parts = oldText ? current.split(oldText) : null;
+            const occurrences = parts ? parts.length - 1 : 0;
             editResults.push({ index: index + 1, expected_occurrences: expected, occurrences });
             if (!oldText || occurrences !== expected) { failed = { index: index + 1, expected, occurrences }; break; }
-            current = current.split(oldText).join(newText);
+            current = parts.join(newText);
             replacements += occurrences;
           }
           if (failed) {
@@ -7450,6 +7604,50 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     return toolResult;
   }
 
+  function toolResultSummary(name, result, status) {
+    // Summaries inspect only result metadata, never source text, transcripts or nested payloads.
+    const continuation = field => `; continuation available via ${field}`;
+    switch (name) {
+      case "fs_glob":
+        return `${result.returned} entries returned on this page${result.truncated ? continuation("next_after_path") : ""}`;
+      case "fs_grep": {
+        const failures = result.files.reduce((count, file) => count + (file.status !== "ok" ? 1 : 0), 0);
+        const matches = result.mode === "matches" ? `${result.returned} matching lines in ${result.matched_files} files`
+          : `${result.returned} matched files${result.mode === "count" ? " with per-file matching-line counts" : ""}`;
+        return `${matches} on this page; ${failures} files failed` +
+          (result.skipped_large_files ? `; ${result.skipped_large_files} files skipped above max_file_bytes=${result.max_file_bytes}` : "") +
+          (failures || result.skipped_large_files ? "; search coverage incomplete" : "") +
+          (result.truncated ? `${continuation("next_resume_after")} (${result.truncation_reason}); remaining paths may have no matches` : "");
+      }
+      case "fs_read": case "fs_navigate": case "fs_stat": {
+        let succeeded = 0, failed = 0, truncated = 0, matches = 0;
+        for (const entry of result.files || result.entries) {
+          if (entry.status !== "ok") { failed++; continue; }
+          succeeded++;
+          if (entry.truncated) truncated++;
+          matches += entry.matches?.length || 0;
+        }
+        const activity = name === "fs_read" ? "files read" : name === "fs_navigate" ? "files searched" : "paths inspected";
+        return `${succeeded} ${activity}; ${failed} failed` +
+          (name === "fs_navigate" ? `; ${matches} matching lines returned` : "") +
+          (truncated ? `; ${truncated} ranges truncated, continue each via next_start_line` : "");
+      }
+      case "fs_write": case "fs_edit": case "fs_text_convert_encoding_eol": case "fs_mkdir":
+      case "fs_copy": case "fs_move": case "fs_trash": case "fs_untrash":
+        return `${result.succeeded} entries succeeded; ${result.failed} failed` +
+          (name === "fs_edit" ? `; ${result.total_replacements} replacements applied` : "") +
+          (result.failed ? "; inspect per-entry outcomes before retrying" : "");
+      case "tools_log":
+        return `${result.returned} Tool Calls returned on this page${result.truncated ? continuation("next_before_id") : ""}`;
+      case "memory_find":
+        return `${result.memories.length} memories returned on this page${result.next_before_id != null ? continuation("next_before_id") : ""}`;
+      case "list_workspaces": return `${result.workspaces.length} enabled Workspaces`;
+      case "discover_commands": return `${result.commands.length} available commands in the discovery catalog`;
+      case "tools_schema": return `${result.tools.length} tool descriptors returned; ${result.missing.length} names unresolved`;
+      default: return status;
+    }
+  }
+
   async function callTool(p, name, args, callInfo) {
     await waitForToolCallGate();
     const id = beginLog(
@@ -7481,7 +7679,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       const structuredContent = { ...structuredResult, ...envelope };
       const rendered = typeof structuredResult.content === "string"
         ? (includeContext ? `${structuredResult.content}\n\ncontext_handle: ${envelope.context_handle}` : structuredResult.content)
-        : `${name} ${status}. Complete result is available in structuredContent.${includeContext ? `\ncontext_handle: ${envelope.context_handle}` : ""}`;
+        : `${name}: ${toolResultSummary(name, structuredResult, status)}. Complete result is available in structuredContent.${includeContext ? `\ncontext_handle: ${envelope.context_handle}` : ""}`;
       const resultUiResourceUri = name === "publish" ? freshUiResourceUri(PUBLISH_UI_URI) : "";
       const toolResult = {
         content: [{ type: "text", text: rendered }, ...extraContent], structuredContent, isError: status !== "completed",
@@ -8159,7 +8357,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const serverInfoMeta = { "io.modelcontextprotocol/serverInfo": mcpServerInfo() };
     const instructions = fullAccess
       ? "Use list_workspaces when you need to discover enabled Workspace names. Use open_workspace(name) to open one; only pass create=true when you explicitly want a missing Workspace created as a new empty Desktop folder. If you already have the current Session handle, pass it as current_context_handle to move that same Session; omitted, empty, unknown or expired creates a new Session. The result includes workspace_name, absolute cwd, agent_guidance_path, whether this call created the Workspace, and a compact count/latest-key Memory summary for Global, Workspace and Session scopes. When guidance is non-null, read and follow it before repository work. Pass the returned context_handle unchanged on every later Session-bound tool call. " +
-        "Use fs_glob, fs_grep, fs_read, fs_navigate, fs_stat, fs_write and fs_edit directly for filesystem discovery, inspection, search and textual changes; do not spawn shell commands, uv or Python for operations those tools cover. Use fs_text_convert_encoding_eol only for explicit encoding/EOL/BOM representation conversion of named files when requested or specifically required by the task; never use it proactively to normalize a repository. Use desktop_auto for desktop observation and interaction through AAF YAML; when the model needs to see a screenshot, retain its image handle anywhere in the scenario's final state so the tool returns that image directly as MCP image content. Multiple retained screenshots and ordinary OCR/text/geometry/state values may coexist in one result. " +
+        "Use fs_glob, fs_grep, fs_read, fs_navigate, fs_stat, fs_write and fs_edit directly for filesystem discovery, inspection, textual search and changes; do not spawn shell commands, uv or Python for operations those tools cover. For symbol/caller/impact exploration, prefer a suitable discovered catalog command. Batch independent reads and request small optional context when nearby text avoids another call. Check per-entry failures, skipped_large_files and continuation fields before claiming complete coverage or successful batch changes. Use fs_text_convert_encoding_eol only for explicit encoding/EOL/BOM representation conversion of named files when requested or specifically required by the task; never use it proactively to normalize a repository. Use desktop_auto for desktop observation and interaction through AAF YAML; when the model needs to see a screenshot, retain its image handle anywhere in the scenario's final state so the tool returns that image directly as MCP image content. Multiple retained screenshots and ordinary OCR/text/geometry/state values may coexist in one result. " +
         "workspace_dev_preferences_write is strictly opt-in: call it only when the user explicitly asks to copy/save/materialize their development preferences into the current Workspace. Never call it proactively, for preference discovery, or merely because DEV_PREF.md might exist; the tool returns no preference content and calling it does not imply that DEV_PREF.md should then be read or applied. " +
         "When work may benefit from command-line capability beyond the structured tools, call discover_commands proactively before inventing workarounds or assuming a utility is unavailable. It returns the complete user-chosen available command catalog in one call; prefer a listed command when it fits, remember the catalog for the Session, and invoke its logical_name directly through exec.program without PATH probes. Use tools_schema when exact live tool descriptor data is needed instead of relying on a connector-synthesized schema view. " +
         "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; cancelling/disconnecting exec terminates its child. For persistent or interactive work, call exec_start; it immediately returns exec_id, which is the stable integer Tool Call id of that start. Pass that exec_id together with the same context_handle to exec_attach, exec_write, exec_kill or exec_status; ids from other Sessions are inaccessible. exec_list shows only currently running persistent executions in this Session. exec_status is the non-consuming way to inspect running or recently completed/killed executions and optionally retrieve all output or a tail. exec_attach with progressToken streams unread backlog plus live output through progress until process exit and then returns that complete unread transcript; without progressToken it long-polls and returns at most 16 KiB of unread output plus remaining_bytes, so call it repeatedly to drain buffered output and call it again with remaining_bytes=0/status=running to wait for future output. Disconnecting exec_attach only detaches and never kills the persistent process. " +
@@ -8382,6 +8580,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const currentIp = getCfg("public_ip", "").trim(), currentSslip = sslipHostname(currentIp),
       directHttps = directIpBase(), automaticSslipHttps = sslipBase();
     return {
+      data_directory: DATA,
       mcp_host: PUBLIC_HOST,
       mcp_port: mcpHttpsPort, mcp_port_base: HTTPS_PORT,
       mcp_http_enabled: true, mcp_http_port: mcpHttpPort, mcp_http_port_base: HTTP_PORT, mcp_http_active: mcpHttpActive,
@@ -8393,6 +8592,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       desktop_notifications_tool_call: desktopNotificationEnabled("tool_call"),
       inherit_system_path: getCfg("inherit_system_path", "1") === "1",
       git_preserve_line_endings: getCfg("git_preserve_line_endings", "1") === "1",
+      text_encoding_detection: textEncodingDetection(),
       exec_environment: getCfg("exec_environment", ""),
       tool_call_storage: toolCallStorage(),
       tool_call_payload_mode: toolCallPayloadMode(),
@@ -9018,7 +9218,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 <? } else if(section==="debug"){ const d=s.debug||{},enabled=!!s.debug?.enabled; ?><section id=debug class=page><div class=row><h2 class=grow>🐞 HTTP Debug Log</h2><button class="debug-toggle <?= enabled?'enabled':'disabled' ?>" data-action=toggle-debug-settings aria-pressed="<?= enabled?'true':'false' ?>"><?= enabled?"🟢 Logging ON · Disable":"🔴 Logging OFF · Enable" ?></button><button class=danger data-action=clear-debug>🗑️ Clear</button></div><p class=muted>Off by default. Secrets are redacted. Disabling stops new records but keeps stored data visible. Click a row for request JSON.</p><div class=row><input id=debugQuery class=grow placeholder="Search URL, headers, body or errors…" value="<?= d.query||'' ?>"><select id=debugMethod><option value="">All methods</option><? ['GET','POST','OPTIONS'].forEach(v=>{ ?><option<?= d.method===v?' selected':'' ?>><?= v ?></option><? }) ?></select><input id=debugStatus type=number placeholder="Status" value="<?= d.status||'' ?>"><button data-action=load-debug>🔎 Search</button></div><div id=debugList></div></section>
 <? } else if(section==="oauth"){ ?><section id=oauth class=page><div class=row><h2 class=grow>🔐 OAuth Clients</h2><button class=danger data-action=clear-clients<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><div id=oauthList></div></section>
 <? } else if(section==="telegram"){ const t=s.telegram||{}; ?><section id=telegram class=page><div class=row><h2 class=grow>✈️ Telegram</h2><button class=primary data-action=save-telegram<?= t.save_disabled?' disabled':'' ?>>💾 Save Telegram</button></div><div class=card><h3>🤖 Telegram Bot</h3><div class=row><label class=grow>Bot token</label><? if(t.field_warning){ ?><span class=field-warning>⚠ <?= t.field_warning ?></span><? } ?></div><input id=telegramBotToken type=password autocomplete=off value="<?= t.telegram_bot_token||'' ?>" placeholder="123456789:AA…"><p class=muted>Used only by <code>telegram_req</code> to authenticate Bot API requests. Chat IDs, channels and application state are intentionally left to the agent/Memory.</p></div></section>
-<? } else if(section==="settings"){ const tab=s.settingsTab||"network"; ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><nav class=settings-tabs aria-label="Settings sections"><? [["network","🌐","Network"],["security","🔒","Security"],["process","🖥️","Process"],["notifications","🔔","Notifications"],["maintenance","🧹","Maintenance"]].forEach(([id,icon,label])=>{ ?><button data-action=settings-tab data-settings-tab="<?= id ?>" class="<?= tab===id?'active':'' ?>"<?= tab===id?' aria-current=page':'' ?>><?= icon ?> <?= label ?></button><? }) ?></nav><div class=settings-layout><div class=settings-main><div class=card<? if(tab!=="network"){ ?> hidden<? } ?>><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card<? if(tab!=="security"){ ?> hidden<? } ?>><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card<? if(tab!=="notifications"){ ?> hidden<? } ?>><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card<? if(tab!=="process"){ ?> hidden<? } ?>><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><label><input id=gitPreserveLineEndings type=checkbox<?= settings.git_preserve_line_endings?" checked":"" ?>> Preserve Git working-tree line endings across platforms</label><p class=muted>When enabled, every managed process gets Git runtime config <code>core.autocrlf=false</code>. Repository <code>.gitattributes</code> and an explicit <code>git -c</code> can still override it.</p><div class=row><label class=grow>Environment variables for all spawned processes · one <code>NAME=value</code> per line</label><? if(settings.field_warnings?.exec_environment){ ?><span class=field-warning>⚠ <?= settings.field_warnings.exec_environment ?></span><? } ?></div><textarea id=execEnvironment rows=8 placeholder="CACHE_DIR=\${MRMCP_DIR}&#10;TOOLS=\${MRMCP_BIN}&#10;PROJECT=\${WORKSPACE}&#10;RUN_FROM=\${CWD}"><?= settings.exec_environment||'' ?></textarea><p class=muted>Available placeholders: <code>\${MRMCP_DIR}</code> = MrMCP data directory, <code>\${MRMCP_BIN}</code> = managed bin directory, <code>\${WORKSPACE}</code> = current Workspace root, <code>\${CWD}</code> = effective exec directory. Precedence: system environment → these settings → per-call <code>env</code>. Off PATH inheritance leaves child <code>PATH</code> as only <code>.mrmcp/bin</code>; PATH remains governed by this toggle rather than the generic environment list.</p></div><div class=card<? if(tab!=="maintenance"){ ?> hidden<? } ?>><h3>🧹 Tool Call History</h3><label>History storage</label><select id=toolCallStorage><option value=disk<?= settings.tool_call_storage==='disk'?' selected':'' ?>>Disk · survives restart</option><option value=memory<?= settings.tool_call_storage==='memory'?' selected':'' ?>>Memory · SQLite TEMP, volatile</option></select><p class=muted>Storage and payload retention are independent. Disk writes Tool Call history to the main SQLite database. Memory uses SQLite TEMP tables in RAM with the same Tool Call ids, GUI and tools_log behavior; rows disappear on restart.</p><label>Payload retention</label><select id=toolCallPayloadMode><option value=payload<?= settings.tool_call_payload_mode==='payload'?' selected':'' ?>>Payload · canonical MCP request and response packets</option><option value=metadata<?= settings.tool_call_payload_mode==='metadata'?' selected':'' ?>>Metadata · no Tool Call request/response payload copies</option></select><p class=muted>Payload retention affects only diagnostic copies in Tool Call history. Functional state required by tools remains available in its owning subsystem; for example persistent-process command/output state is retained independently so exec_attach and exec_status keep working.</p><div class=row><label class=grow>Disk retention hours · 0 keeps indefinitely</label><? if(settings.field_warnings?.tool_call_retention_hours){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_retention_hours ?></span><? } ?></div><input id=toolCallRetentionHours type=number min=0 step=1 value="<?= settings.tool_call_retention_hours??0 ?>"><div class=row><label class=grow>Memory retention minutes · 0 keeps until restart</label><? if(settings.field_warnings?.tool_call_memory_retention_minutes){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_memory_retention_minutes ?></span><? } ?></div><input id=toolCallMemoryRetentionMinutes type=number min=0 step=1 value="<?= settings.tool_call_memory_retention_minutes??60 ?>"><p class=muted>Retention removes completed Tool Call history from its own storage tier. Process, CDP and other functional state are unaffected. Changing the current storage or payload setting affects new Tool Calls only; existing rows retain their own storage and payload capabilities.</p><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, Memory, CDP browser state, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
+<? } else if(section==="settings"){ const tab=s.settingsTab||"network"; ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><nav class=settings-tabs aria-label="Settings sections"><? [["network","🌐","Network"],["security","🔒","Security"],["process","🖥️","Process"],["files","📄","Files"],["notifications","🔔","Notifications"],["maintenance","🧹","Maintenance"]].forEach(([id,icon,label])=>{ ?><button data-action=settings-tab data-settings-tab="<?= id ?>" class="<?= tab===id?'active':'' ?>"<?= tab===id?' aria-current=page':'' ?>><?= icon ?> <?= label ?></button><? }) ?></nav><p class=muted>📂 Data Directory · <code style="overflow-wrap:anywhere"><?= settings.data_directory||'' ?></code></p><div class=settings-layout><div class=settings-main><div class=card<? if(tab!=="network"){ ?> hidden<? } ?>><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card<? if(tab!=="security"){ ?> hidden<? } ?>><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card<? if(tab!=="notifications"){ ?> hidden<? } ?>><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card<? if(tab!=="process"){ ?> hidden<? } ?>><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><label><input id=gitPreserveLineEndings type=checkbox<?= settings.git_preserve_line_endings?" checked":"" ?>> Disable automatic Git CRLF conversion</label><p class=muted>When enabled, managed processes use <code>core.autocrlf=false</code>. An existing CRLF checkout made with <code>core.autocrlf=true</code> may then appear modified without a file edit. Turn this off to use the repository and machine Git policy. Repository <code>.gitattributes</code> and explicit <code>git -c</code> options still apply.</p><div class=row><label class=grow>Environment variables for all spawned processes · one <code>NAME=value</code> per line</label><? if(settings.field_warnings?.exec_environment){ ?><span class=field-warning>⚠ <?= settings.field_warnings.exec_environment ?></span><? } ?></div><textarea id=execEnvironment rows=8 placeholder="CACHE_DIR=\${MRMCP_DIR}&#10;TOOLS=\${MRMCP_BIN}&#10;PROJECT=\${WORKSPACE}&#10;RUN_FROM=\${CWD}"><?= settings.exec_environment||'' ?></textarea><p class=muted>Available placeholders: <code>\${MRMCP_DIR}</code> = MrMCP data directory, <code>\${MRMCP_BIN}</code> = managed bin directory, <code>\${WORKSPACE}</code> = current Workspace root, <code>\${CWD}</code> = effective exec directory. Precedence: system environment → these settings → per-call <code>env</code>. Off PATH inheritance leaves child <code>PATH</code> as only <code>.mrmcp/bin</code>; PATH remains governed by this toggle rather than the generic environment list.</p></div><div class=card<? if(tab!=="files"){ ?> hidden<? } ?>><h3>📄 Text Encoding</h3><div class=row><label class=grow for=textEncodingDetection>Automatic detection for reading and searching</label><? if(settings.field_warnings?.text_encoding_detection){ ?><span class=field-warning>⚠ <?= settings.field_warnings.text_encoding_detection ?></span><? } ?></div><select id=textEncodingDetection><option value=sample<?= (settings.text_encoding_detection||"sample")==="sample"?" selected":"" ?>>Initial 16 KiB · faster</option><option value=full<?= settings.text_encoding_detection==="full"?" selected":"" ?>>Complete file · more thorough</option></select><p class=muted>The initial sample reduces detection work on large files. If the result is uncertain or its encoding cannot decode the complete file, detection retries with the full content. A sample can miss later charset clues; choose Complete file when accuracy matters more than speed.</p><p class=muted>File edits and conversions always use the complete content. An explicitly requested encoding skips detection in both modes.</p></div><div class=card<? if(tab!=="maintenance"){ ?> hidden<? } ?>><h3>🧹 Tool Call History</h3><label>History storage</label><select id=toolCallStorage><option value=disk<?= settings.tool_call_storage==='disk'?' selected':'' ?>>Disk · survives restart</option><option value=memory<?= settings.tool_call_storage==='memory'?' selected':'' ?>>Memory · SQLite TEMP, volatile</option></select><p class=muted>Storage and payload retention are independent. Disk writes Tool Call history to the main SQLite database. Memory uses SQLite TEMP tables in RAM with the same Tool Call ids, GUI and tools_log behavior; rows disappear on restart.</p><label>Payload retention</label><select id=toolCallPayloadMode><option value=payload<?= settings.tool_call_payload_mode==='payload'?' selected':'' ?>>Payload · canonical MCP request and response packets</option><option value=metadata<?= settings.tool_call_payload_mode==='metadata'?' selected':'' ?>>Metadata · no Tool Call request/response payload copies</option></select><p class=muted>Payload retention affects only diagnostic copies in Tool Call history. Functional state required by tools remains available in its owning subsystem; for example persistent-process command/output state is retained independently so exec_attach and exec_status keep working.</p><div class=row><label class=grow>Disk retention hours · 0 keeps indefinitely</label><? if(settings.field_warnings?.tool_call_retention_hours){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_retention_hours ?></span><? } ?></div><input id=toolCallRetentionHours type=number min=0 step=1 value="<?= settings.tool_call_retention_hours??0 ?>"><div class=row><label class=grow>Memory retention minutes · 0 keeps until restart</label><? if(settings.field_warnings?.tool_call_memory_retention_minutes){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_memory_retention_minutes ?></span><? } ?></div><input id=toolCallMemoryRetentionMinutes type=number min=0 step=1 value="<?= settings.tool_call_memory_retention_minutes??60 ?>"><p class=muted>Retention removes completed Tool Call history from its own storage tier. Process, CDP and other functional state are unaffected. Changing the current storage or payload setting affects new Tool Calls only; existing rows retain their own storage and payload capabilities.</p><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, Memory, CDP browser state, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
 <? } else if(section==="help"){ ?><section id=help class=page><h2>❓ Help</h2><div class=card><h3>Connect ChatGPT Web</h3><ol><li>Make sure the Dashboard shows a trusted HTTPS certificate. ChatGPT needs a remote HTTPS MCP endpoint; use <code><?= settings.external_base_url ? settings.external_base_url + "/mcp" : "https://your-host/mcp" ?></code>.</li><li>In ChatGPT Web, enable Developer mode. In managed workspaces the current path is <b>Workspace settings → Permissions &amp; Roles → Connected Data Developer mode / Create custom MCP connectors</b>. Authorized users may also find the toggle under <b>Settings → Apps → Advanced Settings</b>.</li><li>Create a custom app from <b>Workspace settings → Apps → Create</b> or <b>Settings → Apps → Create</b>, enter the MrMCP endpoint, choose the offered authentication method, then select <b>Scan Tools</b>.</li><li>If OAuth is enabled in MrMCP, complete the authorization prompt. After the tool scan completes, create the app and select it from a new ChatGPT conversation.</li></ol></div><div class=card><h3>Authentication</h3><p>For ChatGPT, OAuth is the preferred MrMCP setup because ChatGPT can discover the authorization metadata, complete consent, and keep refresh-token connectivity. MrMCP also supports Basic authentication for MCP clients that offer it. Authentication grants access to the server; the <code>context_handle</code> selects persistent context state after authentication.</p></div><div class=card><h3>Write Access</h3><p>MrMCP does not maintain a separate read/write allowlist: every authenticated client receives every published tool. ChatGPT controls whether write/modify actions are usable through the app's permissions and action controls. As of this build, OpenAI documents full MCP write/modify support for Business, Enterprise and Edu; Pro custom MCP access is limited to read/fetch, and availability may change. Test write tools in Developer mode first. Where available, use <b>Workspace settings → Apps → Configure Actions / Action control</b> to enable the required actions. ChatGPT may still ask for confirmation before a write.</p></div><div class=card><h3>Using MrMCP in a Chat</h3><ol><li>Start a new chat and select the MrMCP app from the tools/apps menu.</li><li>If needed, call <code>list_workspaces</code> to discover the enabled Workspace names, then call <code>open_workspace</code> with the desired <code>name</code>. When continuing an existing Session, also pass its handle as <code>current_context_handle</code>; MrMCP moves that same Session to the Workspace. If the handle is omitted, empty, unknown or expired, a new Session is created.</li><li>The result already includes <code>workspace_name</code>, absolute <code>cwd</code> and <code>agent_guidance_path</code>. Read that file when non-null, then reuse the returned <code>context_handle</code> on later Session-bound calls. The Workspaces page can also move Sessions manually.</li><li>If you change ChatGPT model or thinking level, the MCP context may be recreated even inside the same conversation. Check the Sessions page if continuity matters.</li></ol><p class=muted>ChatGPT UI labels and plan availability can change. Current OpenAI references: <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt" target=_blank rel=noopener>Developer mode and MCP apps in ChatGPT</a> · <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt" target=_blank rel=noopener>Apps in ChatGPT</a>.</p></div></section><? } ?>`,
     dialogs: `<? const dialog=it.data?.state?.dialog; ?><? if(dialog){ ?><div id=dialogOverlay class=dialog-overlay><? if(dialog.kind==="root"){ const r=dialog.data||{}; ?><dialog id=rootDialog open data-managed-dialog=root><form id=rootForm><input id=rid type=hidden value="<?= r.id||'' ?>"><h2>📁 Workspace</h2><div class=row><label class=grow>Workspace name</label><? if(r.name_warning){ ?><span class=field-warning>⚠ <?= r.name_warning ?></span><? } ?></div><input id=rname value="<?= r.name||'' ?>"><div class=row><label class=grow>Directory path</label><? if(r.path_warning){ ?><span class=field-warning>⚠ <?= r.path_warning ?></span><? } else if(!r.path_checked){ ?><span class=muted>Leave the field to validate the directory.</span><? } ?></div><input id=rpath placeholder="C:\\projects\\my-workspace, /srv/my-workspace or ./project" value="<?= r.path||'' ?>"><div class=muted>Relative to the program folder.</div><label><input id=renabled type=checkbox<?= r.enabled!==false?' checked':'' ?>> Enabled</label><? if(r.form_warning){ ?><div class=field-warning>⚠ <?= r.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (r.name_warning||r.path_warning||!r.path_checked||r.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="command"){ const c=dialog.data||{}; ?><dialog id=commandDialog open data-managed-dialog=command><form id=commandForm><input id=coldName type=hidden value="<?= c.registered?c.name:'' ?>"><h2>🧰 Command Catalog Entry</h2><div class=row><label class=grow>Logical name</label><? if(c.name_warning){ ?><span class=field-warning>⚠ <?= c.name_warning ?></span><? } ?></div><input id=cname value="<?= c.name||'' ?>"><div class=row><label class=grow>Path below .mrmcp/bin</label><? if(c.path_warning){ ?><span class="<?= c.path_error?'field-warning':'muted' ?>"><?= c.path_error?'⚠ ':'' ?><?= c.path_warning ?></span><? } else if(!c.path_checked){ ?><span class=muted>Leave the field to validate the path.</span><? } ?></div><input id=cpath placeholder="Optional; defaults to logical name; Windows suffix optional" value="<?= c.path||'' ?>"><label>Description for the agent</label><textarea id=cdescription placeholder="Optional: what it does and when the agent should use it."><?= c.description||'' ?></textarea><div class=row><label class=grow>Download URL</label><? if(c.download_warning){ ?><span class=field-warning>⚠ <?= c.download_warning ?></span><? } ?></div><input id=cdownloadUrl placeholder="https://example.com/tool" value="<?= c.download_url||'' ?>"><div class=row><label class=grow>Documentation URL</label><? if(c.documentation_warning){ ?><span class=field-warning>⚠ <?= c.documentation_warning ?></span><? } ?></div><input id=cdocumentationUrl placeholder="https://example.com/docs" value="<?= c.documentation_url||'' ?>"><? if(c.form_warning){ ?><div class=field-warning>⚠ <?= c.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (c.name_warning||c.path_error||!c.path_checked||c.download_warning||c.documentation_warning||c.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="prompt"){ const p=dialog.data||{}; ?><dialog id=promptDialog open data-managed-dialog=prompt><form id=promptForm><input id=poldName type=hidden value="<?= p.old_name||'' ?>"><h2>🧭 Guided Prompt</h2><div class=row><label class=grow>Name</label><? if(p.name_warning){ ?><span class=field-warning>⚠ <?= p.name_warning ?></span><? } ?></div><input id=pname value="<?= p.name||'' ?>"><label>Title</label><input id=ptitle value="<?= p.title||'' ?>" placeholder="Human-readable title shown by MCP clients"><label>Description</label><textarea id=pdescription placeholder="What this guided prompt does."><?= p.description||'' ?></textarea><div class=row><label class=grow>Arguments · YAML list</label><? if(p.args_warning){ ?><span class=field-warning>⚠ <?= p.args_warning ?></span><? } ?></div><textarea id=parguments rows=8 placeholder="- name: focus&#10;  description: Area to focus on.&#10;  required: false"><?= p.arguments_text||'' ?></textarea><div class=row><label class=grow>Eta template</label><? if(p.template_warning){ ?><span class=field-warning>⚠ <?= p.template_warning ?></span><? } ?></div><textarea id=ptemplate rows=14 placeholder="Review the project. &lt;%= it.args.focus %&gt;"><?= p.template||'' ?></textarea><div class=muted>Standard Eta tags. Model documentation is available from Guided Prompts → Template Help.</div><? if(p.form_warning){ ?><div class=field-warning>⚠ <?= p.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (p.name_warning||p.args_warning||p.template_warning||p.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="memory"){ const m=dialog.data||{},creating=!m.id; ?><dialog id=memoryDialog open data-managed-dialog=memory><form id=memoryForm><input id=mid type=hidden value="<?= m.id||'' ?>"><h2><?= creating?'➕ New Memory':'🧠 Memory' ?></h2><? if(creating){ ?><label>Scope</label><select id=mscope><option value=global<?= m.scope==='global'?' selected':'' ?>>Global</option><option value=session<?= m.scope==='session'?' selected':'' ?><?= !(m.sessions||[]).length?' disabled':'' ?>>Session</option><option value=workspace<?= m.scope==='workspace'?' selected':'' ?><?= !(m.workspaces||[]).length?' disabled':'' ?>>Workspace</option></select><? if(m.scope==='workspace'){ ?><label>Workspace</label><select id=mworkspace><? (m.workspaces||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= String(m.workspace||'')===String(name)?' selected':'' ?>><?= name ?></option><? }) ?></select><? } else if(m.scope==='session'){ ?><label>Session</label><select id=mcontext><? (m.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(m.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><? } else { ?><div class=muted>Shared across all Sessions and Workspaces on this MrMCP server.</div><? } ?><? } else { ?><div class=muted><?= m.scope==='global'?'Global':(m.scope==='workspace'?'Workspace':'Session') ?> · <?= m.owner_name||'' ?></div><? } ?><label>Key</label><input id=mkey value="<?= m.key||'' ?>"><label>Value</label><? if(m.json){ ?><textarea id=mvalue rows=14 hidden><?= m.value_text||'' ?></textarea><div id=memoryJsonEditor class="json-editor-host memory" data-json-source=mvalue data-json-edit=memory data-json-error=memoryJsonError></div><div id=memoryJsonError class=field-warning hidden></div><? } else { ?><textarea id=mvalue rows=14><?= m.value_text||'' ?></textarea><? } ?><label><input id=mjson type=checkbox<?= m.json?' checked':'' ?>> Value is JSON · validate before saving</label><div class=muted>Switching between TEXT and JSON keeps the current draft unchanged.</div><label>TTL seconds · 0 = permanent</label><input id=mttl type=number min=0 max=315360000 value="<?= m.ttl_seconds||0 ?>"><? if(m.form_warning){ ?><div class=field-warning>⚠ <?= m.form_warning ?></div><? } ?><p class=row><button class=primary type=submit>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="confirm"){ ?><dialog id=confirmDialog open data-managed-dialog=confirm><h2>⚠️ <?= dialog.title||"Confirm Action" ?></h2><p><?= dialog.message||"Continue?" ?></p><p class=row><button class="primary danger" data-action=confirm-dialog>✓ Confirm</button><button data-action=close-dialog>✕ Cancel</button></p></dialog><? } ?></div><? } ?>`,
     status: `<? const d=it.data||{},s=d.settings||{},a=d.activity||{},bad=!!s.mcp_listen_error,warn=!!s.listener_fallback,recent=a.recent_sessions||[],inFlight=a.tool_calls_in_flight||0,errors=a.tool_calls_errors||0,invalid=a.tool_calls_invalid||0; ?><span class="status-group <?= d.live!=="connected"?(d.live==="reconnecting"?"pending":"failed"):(bad?"failed":(warn?"pending":"ok")) ?>"><?= d.live!=="connected"?(d.live==="reconnecting"?"🟡 reconnecting":"🔴 offline"):(bad?"🔴 listener error":(warn?"🟡 fallback":"🟢 live")) ?></span><span class="status-group status-link" data-action=header-settings title="HTTP / HTTPS effective listener ports; GUI uses local Tauriless assets">🔌 <span class=status-ports><?= s.mcp_http_active?s.mcp_http_port:"off" ?>/<?= s.mcp_https_active?s.mcp_https_port:"off" ?></span><? if(warn){ ?> <span class=pending>⚠</span><? } ?></span><span class=status-group title="Sessions with a Tool Call in the last <?= a.active_window_minutes||10 ?> minutes">💬 <span class="status-link <?= a.active_sessions?'ok':'muted' ?>" data-action=header-sessions><?= a.active_sessions||0 ?> active</span><? if(recent.length){ ?> · <span class=status-sessions><? recent.forEach((x,i)=>{ ?><?= i?" ":"" ?><span class=status-link data-action=session-tool-calls data-id="<?= x.id ?>">#<?= x.id ?>(<?= x.tool_calls ?>)</span><? }) ?></span><? } ?></span><span class=status-group title="Tool Calls in flight / total recorded / failed / invalid">🛠️ <span class="status-link <?= inFlight?'pending':'muted' ?>" data-action=header-tool-calls data-status=running><?= inFlight ?> in flight</span> · <span class="status-link status-total" data-action=header-tool-calls data-status=""><?= a.tool_calls_total||0 ?> total</span> · <span class="status-link <?= errors?'failed':'muted' ?>" data-action=header-tool-calls data-status=failed><?= errors ?> errors</span> · <span class="status-link <?= invalid?'invalid':'muted' ?>" data-action=header-tool-calls data-status=invalid><?= invalid ?> invalid</span></span>`,
@@ -9126,9 +9326,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   };
   const fragmentDebugPayload = source => {
     const root = mcpPacketObject(source) ?? source;
-    const render = (value, depth = 0, key = "", parent = null, allowBase64 = true) => {
-      if (value === null) return '<span class="debug-null">null</span>';
-      if (typeof value === "boolean" || typeof value === "number") return `<span class="debug-scalar">${htmlEscape(String(value))}</span>`;
+    const render = (value, depth = 0, key = null, parent = null, allowBase64 = true) => {
+      const label = key === null ? "" : `<span class="debug-key">${htmlEscape(key === "" ? '""' : key)}:</span> `;
+      if (value === null) return `${label}<span class="debug-null">null</span>`;
+      if (typeof value === "boolean" || typeof value === "number") return `${label}<span class="debug-scalar">${htmlEscape(String(value))}</span>`;
       if (typeof value === "string") {
         const text = value, trimmed = text.trim();
         const dataUrl = text.startsWith("data:") ? text.match(/^data:([^;,\s]+)(?:;[^,]*)?;base64,([A-Za-z0-9+/=\s]+)$/i) : null;
@@ -9137,11 +9338,11 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           const bytes = decodeLogBase64(base64);
           if (!bytes?.length) return "";
           mime = String(mime || sniffLogBinaryMime(bytes) || "").split(";")[0].trim().toLowerCase();
-          if (mime.startsWith("image/")) return `<figure class="debug-image"><img src="data:${htmlEscape(mime)};base64,${Buffer.from(bytes).toString("base64")}" alt="decoded ${htmlEscape(mime)}"><figcaption>${htmlEscape(mime)} · ${fragmentBytes(bytes.length)}</figcaption></figure>`;
+          if (mime.startsWith("image/")) return `${label}<figure class="debug-image"><img src="data:${htmlEscape(mime)};base64,${Buffer.from(bytes).toString("base64")}" alt="decoded ${htmlEscape(mime)}"><figcaption>${htmlEscape(mime)} · ${fragmentBytes(bytes.length)}</figcaption></figure>`;
           try {
             const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
             if (decoded && !/[\x00-\x08\x0b\x0c\x0e-\x1f]/.test(decoded))
-              return `<details class="debug-decoded" open><summary>Base64 text · ${fragmentBytes(bytes.length)}</summary>${render(decoded, depth + 1, key, parent, false)}</details>`;
+              return `<details class="debug-decoded" open><summary>${label}Base64 text · ${fragmentBytes(bytes.length)}</summary>${render(decoded, depth + 1, null, parent, false)}</details>`;
           } catch {}
           return "";
         };
@@ -9161,25 +9362,25 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         if ((trimmed.startsWith("{") && trimmed.endsWith("}")) || (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
           const parsed = parseJson(trimmed, null);
           if (parsed && typeof parsed === "object")
-            return `<details class="debug-decoded" open><summary>JSON string</summary>${render(parsed, depth + 1)}</details>`;
+            return `<details class="debug-decoded" open><summary>${label}JSON string</summary>${render(parsed, depth + 1)}</details>`;
         }
         if (text.includes("\n") && (/^\s*-\s+\S/m.test(text) || /^\s*[A-Za-z0-9_.-]+\s*:\s*/m.test(text))) {
           try {
             const parsed = parseYaml(text);
             if (parsed && typeof parsed === "object")
-              return `<details class="debug-decoded" open><summary>YAML string</summary>${render(parsed, depth + 1)}</details>`;
+              return `<details class="debug-decoded" open><summary>${label}YAML string</summary>${render(parsed, depth + 1)}</details>`;
           } catch {}
         }
-        return text.includes("\n") ? `<pre class="debug-multiline">${htmlEscape(text)}</pre>` : `<span class="debug-string">${htmlEscape(text)}</span>`;
+        return text.includes("\n") ? `${label}<pre class="debug-multiline">${htmlEscape(text)}</pre>` : `${label}<span class="debug-string">${htmlEscape(text || '""')}</span>`;
       }
       if (Array.isArray(value)) {
-        return `<details class="debug-node"${depth < 2 ? " open" : ""}><summary>Array · ${value.length}</summary><div class="debug-children">${value.map((item, index) => `<div class="debug-entry"><span class="debug-key">${index}</span>${render(item, depth + 1, String(index), value)}</div>`).join("")}</div></details>`;
+        return `<details class="debug-node"${depth < 2 ? " open" : ""}><summary>${label}Array · ${value.length}</summary><div class="debug-children">${value.map((item, index) => `<div class="debug-entry">${render(item, depth + 1, String(index), value)}</div>`).join("")}</div></details>`;
       }
       if (value && typeof value === "object") {
         const entries = Object.entries(value);
-        return `<details class="debug-node"${depth < 2 ? " open" : ""}><summary>Object · ${entries.length}</summary><div class="debug-children">${entries.map(([childKey, child]) => `<div class="debug-entry"><span class="debug-key">${htmlEscape(childKey)}</span>${render(child, depth + 1, childKey, value)}</div>`).join("")}</div></details>`;
+        return `<details class="debug-node"${depth < 2 ? " open" : ""}><summary>${label}Object · ${entries.length}</summary><div class="debug-children">${entries.map(([childKey, child]) => `<div class="debug-entry">${render(child, depth + 1, childKey, value)}</div>`).join("")}</div></details>`;
       }
-      return `<span class="debug-scalar">${htmlEscape(String(value))}</span>`;
+      return `${label}<span class="debug-scalar">${htmlEscape(String(value))}</span>`;
     };
     return `<div class="debug-payload-tree">${render(root)}</div>`;
   };
@@ -9254,6 +9455,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) warnings.tls_email = "Let's Encrypt email is not valid.";
     try { configuredExecEnvironment(settings.exec_environment || ""); }
     catch (error) { warnings.exec_environment = String(error?.message || error); }
+    if (!["sample", "full"].includes(String(settings.text_encoding_detection ?? "sample")))
+      warnings.text_encoding_detection = "Text encoding detection must use the initial sample or the complete file.";
     const retentionText = String(settings.tool_call_retention_hours ?? "0").trim();
     const retentionHours = Number(retentionText);
     if (!/^\d+$/.test(retentionText) || !Number.isSafeInteger(retentionHours) || retentionHours < 0)
@@ -9534,6 +9737,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       notifySession: "desktop_notifications_session", notifyWorkspace: "desktop_notifications_workspace",
       notifyToolCall: "desktop_notifications_tool_call", inheritSystemPath: "inherit_system_path",
       gitPreserveLineEndings: "git_preserve_line_endings", execEnvironment: "exec_environment",
+      textEncodingDetection: "text_encoding_detection",
       toolCallStorage: "tool_call_storage", toolCallPayloadMode: "tool_call_payload_mode",
       toolCallRetentionHours: "tool_call_retention_hours", toolCallMemoryRetentionMinutes: "tool_call_memory_retention_minutes",
     };
@@ -9544,15 +9748,14 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     if (id === "telegramBotToken") uiState.telegramDraft = text;
   }
   async function uiCommandRow(name, path = "") {
-    const result = await commandCatalog({ query: name, page: 1, page_size: 100, include_missing: true, admin: true });
-    return (result.commands || []).find(row => row.name === name && (!path || row.path === path));
+    const rows = await commandRows({ include_missing: true, admin: true });
+    return rows.find(row => row.name === name && (!path || row.path === path));
   }
   async function uiDownloadOne(name, overwrite = false) {
     return await uiInternalApi("/api/commands/download", { method: "POST", body: { name, overwrite } });
   }
   async function uiDownloadAll(overwrite = false) {
-    const result = await commandCatalog({ query: "", page: 1, page_size: 100, include_missing: true, admin: true });
-    const rows = (result.commands || []).filter(row => row.registered && row.download_url);
+    const rows = (await commandRows({ include_missing: true, admin: true })).filter(row => row.registered && row.download_url);
     const failures = [];
     for (const row of rows) {
       try { await uiDownloadOne(row.name, overwrite || !!row.present); }
@@ -9773,8 +9976,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         break;
       }
       case "download-all-commands": {
-        const result = await commandCatalog({ query: "", page: 1, page_size: 100, include_missing: true, admin: true });
-        const rows = (result.commands || []).filter(row => row.registered && row.download_url);
+        const rows = (await commandRows({ include_missing: true, admin: true })).filter(row => row.registered && row.download_url);
         const existing = rows.filter(row => row.present);
         if (existing.length) {
           uiConfirm("Replace Commands", `Download ${rows.length} commands and replace ${existing.length} existing file${existing.length === 1 ? "" : "s"}?`, "download-all-commands");
@@ -10013,7 +10215,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       }
       case "settings-tab": {
         const tab = String(data.settingsTab || "");
-        if (["network", "security", "process", "notifications", "maintenance"].includes(tab)) uiState.settingsTab = tab;
+        if (["network", "security", "process", "files", "notifications", "maintenance"].includes(tab)) uiState.settingsTab = tab;
         break;
       }
       case "save-settings": {
@@ -10029,6 +10231,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           inherit_system_path: !!values.inheritSystemPath,
           git_preserve_line_endings: !!values.gitPreserveLineEndings,
           exec_environment: String(values.execEnvironment || ""),
+          text_encoding_detection: String(values.textEncodingDetection ?? "sample"),
           tool_call_storage: String(values.toolCallStorage || "disk"),
           tool_call_payload_mode: String(values.toolCallPayloadMode || "payload"),
           tool_call_retention_hours: String(values.toolCallRetentionHours ?? "0"),
@@ -10168,7 +10371,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
               if (id === "ptemplate") d.template_warning = String(item.value || "").trim() ? "" : "Template is required.";
               renderDraft = true;
             }
-            if (["externalUrl", "tlsEmail", "publicIpUrls", "sslipSuffix", "acmeDirectoryUrl", "toolCallStorage", "toolCallPayloadMode", "toolCallRetentionHours", "toolCallMemoryRetentionMinutes"].includes(id)) renderDraft = true;
+            if (["externalUrl", "tlsEmail", "publicIpUrls", "sslipSuffix", "acmeDirectoryUrl", "textEncodingDetection", "toolCallStorage", "toolCallPayloadMode", "toolCallRetentionHours", "toolCallMemoryRetentionMinutes"].includes(id)) renderDraft = true;
             if (["logTool", "logQuery"].includes(id)) { uiState.logs.page = 1; filterLogs = true; }
           }
           if (renderDraft) queueUiRender("input:draft", 40);
@@ -10406,32 +10609,40 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         if (external.protocol !== "https:" || (external.port && external.port !== "443"))
           return json({ error: "Public base URL must use HTTPS on port 443" }, 400);
       }
+      const changedSettings = new Set();
+      const saveSetting = (key, value) => {
+        if (getCfg(key, null) === String(value)) return false;
+        setCfg(key, value);
+        changedSettings.add(key);
+        return true;
+      };
       for (const key of ["external_url", "tls_email", "sslip_suffix", "acme_directory_url", "telegram_bot_token"])
-        if (x[key] != null) setCfg(key, x[key]);
+        if (x[key] != null) saveSetting(key, x[key]);
       for (const key of ["desktop_notifications_session", "desktop_notifications_workspace", "desktop_notifications_tool_call"])
-        if (x[key] != null) setCfg(key, x[key] ? "1" : "0");
-      if (x.inherit_system_path != null) setCfg("inherit_system_path", x.inherit_system_path ? "1" : "0");
-      if (x.git_preserve_line_endings != null) setCfg("git_preserve_line_endings", x.git_preserve_line_endings ? "1" : "0");
+        if (x[key] != null) saveSetting(key, x[key] ? "1" : "0");
+      if (x.inherit_system_path != null) saveSetting("inherit_system_path", x.inherit_system_path ? "1" : "0");
+      if (x.git_preserve_line_endings != null) saveSetting("git_preserve_line_endings", x.git_preserve_line_endings ? "1" : "0");
+      if (x.text_encoding_detection != null) saveSetting("text_encoding_detection", String(x.text_encoding_detection));
       if (x.tool_call_retention_hours != null) {
-        setCfg("tool_call_retention_hours", String(Number(x.tool_call_retention_hours)));
-        requestToolCallRetentionSweep();
+        if (saveSetting("tool_call_retention_hours", String(Number(x.tool_call_retention_hours)))) requestToolCallRetentionSweep();
       }
-      if (x.tool_call_storage != null) setCfg("tool_call_storage", String(x.tool_call_storage).toLowerCase());
-      if (x.tool_call_payload_mode != null) setCfg("tool_call_payload_mode", String(x.tool_call_payload_mode).toLowerCase());
+      if (x.tool_call_storage != null) saveSetting("tool_call_storage", String(x.tool_call_storage).toLowerCase());
+      if (x.tool_call_payload_mode != null) saveSetting("tool_call_payload_mode", String(x.tool_call_payload_mode).toLowerCase());
       if (x.tool_call_memory_retention_minutes != null) {
-        setCfg("tool_call_memory_retention_minutes", String(Number(x.tool_call_memory_retention_minutes)));
-        requestToolCallRetentionSweep();
+        if (saveSetting("tool_call_memory_retention_minutes", String(Number(x.tool_call_memory_retention_minutes)))) requestToolCallRetentionSweep();
       }
       if (x.exec_environment != null) {
         try { configuredExecEnvironment(x.exec_environment); }
         catch (error) { return json({ error: String(error?.message || error) }, 400); }
-        setCfg("exec_environment", String(x.exec_environment));
+        saveSetting("exec_environment", String(x.exec_environment));
       }
-      if (Array.isArray(x.public_ip_urls)) setCfg("public_ip_urls_json", JSON.stringify(
+      if (Array.isArray(x.public_ip_urls)) saveSetting("public_ip_urls_json", JSON.stringify(
         x.public_ip_urls.map(String).map(value => value.trim()).filter(value => /^https:\/\//i.test(value)),
       ));
-      await restartMcp();
-      automaticRenewal().catch(() => {});
+      if (["external_url", "tls_email", "sslip_suffix", "acme_directory_url", "public_ip_urls_json"].some(key => changedSettings.has(key))) {
+        await restartMcp();
+        automaticRenewal().catch(() => {});
+      }
       return json({ ok: true });
     }
     if (u.pathname === "/api/database/clear" && req.method === "POST") {
@@ -10741,9 +10952,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       const q = (u.searchParams.get("q") || "").trim();
       const contextId = Math.max(0, Number(u.searchParams.get("context")) || 0);
       const status = u.searchParams.get("status") || "";
-      const page = Math.max(1, Number(u.searchParams.get("page")) || 1);
+      const requestedPage = Math.max(1, Math.floor(Number(u.searchParams.get("page")) || 1));
+      let page = requestedPage;
       const pageSize = Math.max(10, Math.min(Number(u.searchParams.get("page_size")) || 25, 100));
-      const offset = (page - 1) * pageSize;
+      let offset;
       let rows, total;
       const toolLike = `%${toolQuery}%`, toolFilter = `(?='' OR l.tool LIKE ? COLLATE NOCASE OR (
         l.tool LIKE 'exec%' AND EXISTS (
@@ -10763,6 +10975,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           total = one(`${hits} SELECT COUNT(*) n FROM hits h JOIN logs l ON l.id=h.log_id
             WHERE (?=0 OR l.context_id=?) AND (?='' OR l.status=?) AND ${toolFilter}`,
             q, q, contextId, contextId, status, status, toolQuery, toolLike, toolLike, toolLike)?.n || 0;
+          page = Math.min(requestedPage, Math.max(1, Math.ceil(total / pageSize)));
+          offset = (page - 1) * pageSize;
           rows = all(`${hits} SELECT l.id,l.started_at,l.completed_at,l.context_id,l.root_id,l.root_name,l.tool,l.status,l.duration_ms,l.mcp_request_json,l.progress_requested,l.payload_mode,l.storage
             FROM hits h JOIN logs l ON l.id=h.log_id
             WHERE (?=0 OR l.context_id=?) AND (?='' OR l.status=?) AND ${toolFilter}
@@ -10776,6 +10990,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           AND ${toolFilter}
           AND (?='' OR COALESCE(CAST(l.context_id AS TEXT),'')||COALESCE(l.context_handle,'')||COALESCE(l.tool,'')||COALESCE(l.payload_mode,'')||COALESCE(l.mcp_request_json,'')||COALESCE(l.mcp_response_json,'')||COALESCE(l.error,'') LIKE ?)`,
           contextId, contextId, status, status, toolQuery, toolLike, toolLike, toolLike, q, like)?.n || 0;
+        page = Math.min(requestedPage, Math.max(1, Math.ceil(total / pageSize)));
+        offset = (page - 1) * pageSize;
         rows = all(`SELECT l.id,l.started_at,l.completed_at,l.context_id,l.root_id,l.root_name,l.tool,l.status,l.duration_ms,l.mcp_request_json,l.progress_requested,l.payload_mode,l.storage FROM logs l
           WHERE (?=0 OR l.context_id=?) AND (?='' OR l.status=?)
           AND ${toolFilter}
@@ -10878,7 +11094,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 <meta http-equiv="Content-Security-Policy" content="${UI_CSP}">
 <meta name=viewport content="width=device-width,initial-scale=1"><link rel=icon href="${GUI_LOGO_DATA_URL}"><title>MrMCP</title><style>${GUI_JSONEDITOR_CSS}
 
-:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}#app>aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}#app>aside button{display:flex;align-items:center;gap:4px;width:100%;text-align:left;white-space:nowrap;margin:3px 0;padding-left:6px;padding-right:6px;background:transparent;border:0}#app>aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.notice-balloon{position:fixed;top:64px;right:16px;z-index:1900;max-width:min(520px,calc(100vw - 32px));padding:10px 12px;border:1px solid #7d3f47;border-radius:9px;background:#25191b;color:#ffb7bf;box-shadow:0 8px 28px #0008}.notice-balloon.info{border-color:#365a7d;background:#16202b;color:#a9d5ff}.notice-balloon.ok{border-color:#356849;background:#16241b;color:#9ce8b1}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.debug-toggle{font-weight:750;min-width:190px}.debug-toggle.enabled{background:#173f24;border-color:#347a49;color:#9ce8b1}.debug-toggle.disabled{background:#421d21;border-color:#7d3f47;color:#ffb7bf}.debug-toggle.enabled:hover{background:#20512f}.debug-toggle.disabled:hover{background:#53262b}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.settings-tabs{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 14px;padding-bottom:10px;border-bottom:1px solid #292c33}.settings-tabs button{background:#1b1e24;border-color:#30343d}.settings-tabs button.active{background:#2459a8;border-color:#3984e8;color:#fff;font-weight:650}.settings-layout{display:block}.settings-main,.settings-side{min-width:0}.settings-side{position:static}.settings-layout .card{max-width:980px}.settings-layout .card h3{margin-top:0}.settings-main input:not([type=checkbox]){width:100%}.settings-main textarea{min-height:96px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.tool-detail-overlay{position:fixed;top:54px;left:170px;right:0;bottom:0;z-index:1750;overflow:auto;overscroll-behavior:contain;padding:16px;background:#101114}.tool-detail-overlay .tool-detail-screen{min-height:calc(100vh - 86px)}.tool-detail-screen-head{position:sticky;top:-14px;z-index:10;margin:-14px -16px 12px;padding:12px 16px;background:#0d0f12;border-bottom:1px solid #292d34}.detail-row td{padding:0 18px 14px 28px;background:#111318}.detail-panel{border:1px solid #343944;border-left:3px solid #3984e8;border-radius:8px;background:#0d0f12;padding:14px 16px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.tool-detail-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:14px;align-items:start}.tool-detail-main{min-width:0}.tool-descriptor{min-width:0;position:sticky;top:10px;border:1px solid #343944;border-radius:8px;background:#111318;padding:12px}.tool-descriptor>.muted{margin-top:10px}.tool-descriptor p{margin:5px 0 10px;line-height:1.45}.tool-descriptor pre{margin:5px 0 10px;max-height:28vh}.descriptor-status{font-size:11px;font-weight:800;letter-spacing:.04em;padding:3px 6px;border-radius:5px}.descriptor-status.current{color:#75d58b;background:#16341f}.descriptor-status.outdated{color:#ffd166;background:#3a2f13}.http-detail-head{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #292d34}.http-detail-meta{display:flex;gap:7px 16px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:#89909b}.http-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.http-detail-block{min-width:0;border:1px solid #292d34;border-radius:8px;background:#0a0c0f;padding:10px}.http-detail-block h4{margin:0}.http-detail-block pre{max-height:30vh}.http-detail-error{margin-top:12px;border-color:#68353a;background:#1d1012}.http-detail-raw{margin-top:12px}.http-detail-raw summary{cursor:pointer;color:#89909b}@media(max-width:1100px){.tool-detail-grid,.http-detail-grid{grid-template-columns:1fr}.tool-descriptor{position:static}}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.tool-command-preview{margin-top:3px;max-width:440px;color:#c5cad3;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.debug-packet{min-width:0}.debug-payload-tree{margin-top:9px;padding:10px;border:1px solid #292d34;border-radius:8px;background:#080a0d;font:12px ui-monospace,SFMono-Regular,Consolas,monospace}.debug-node{margin:3px 0}.debug-node>summary,.debug-decoded>summary{cursor:pointer;color:#9ecbff}.debug-children{margin:5px 0 5px 12px;padding-left:10px;border-left:1px solid #292d34}.debug-entry{display:grid;grid-template-columns:minmax(80px,180px) minmax(0,1fr);gap:9px;align-items:start;padding:3px 0}.debug-key{color:#ffd166;overflow-wrap:anywhere}.debug-string{color:#9ce8b1;white-space:pre-wrap;overflow-wrap:anywhere}.debug-scalar{color:#c7a0ff}.debug-null{color:#8fd3ff}.debug-multiline{margin:0;max-height:40vh;white-space:pre-wrap}.debug-decoded{margin:3px 0;padding:5px 7px;border:1px solid #26303b;border-radius:6px;background:#0b0e12}.debug-image{margin:4px 0}.debug-image img{display:block;max-width:min(100%,720px);max-height:60vh;object-fit:contain;border-radius:6px;background:#050607}.debug-image figcaption{margin-top:4px;color:#89909b}.tool-content-detail{margin-top:12px;padding:12px;border:1px solid #343944;border-radius:8px;background:#0a0c0f}.tool-content-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:9px;margin-top:9px}.tool-content-card{position:relative;min-width:0;padding:9px;border:1px solid #292d34;border-radius:7px;background:#111318}.tool-content-path{margin-top:4px;color:#89909b;font:11px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.tool-content-preview{display:block;max-width:180px;max-height:120px;margin-top:8px;border-radius:5px;object-fit:contain;background:#07080a;transition:transform .12s ease;transform-origin:left top;position:relative;z-index:1}.tool-content-preview:hover{transform:scale(1.75);z-index:20;box-shadow:0 8px 30px #000c}.tool-content-placeholder{margin-top:8px;padding:10px;border-radius:5px;background:#090a0c;color:#89909b;font-size:12px}.json-editor-host{height:320px;min-height:180px;margin-top:8px;border-radius:8px;overflow:hidden}.json-editor-host.compact{height:240px;min-height:150px;margin:5px 0 10px}.json-editor-host.memory{height:min(58vh,620px);min-height:320px}.json-editor-host .jsoneditor{border-color:#343944;background:#090a0c}.json-editor-host div.jsoneditor-tree{background:#090a0c;color:#e8e8e8}.json-editor-host div.jsoneditor-field,.json-editor-host div.jsoneditor-value{color:#e8e8e8}.json-editor-host div.jsoneditor-readonly{color:#89909b}.json-editor-host div.jsoneditor-value.jsoneditor-string{color:#9ce8b1}.json-editor-host div.jsoneditor-value.jsoneditor-number{color:#ffd166}.json-editor-host div.jsoneditor-value.jsoneditor-boolean{color:#c7a0ff}.json-editor-host div.jsoneditor-value.jsoneditor-null{color:#8fd3ff}.json-editor-host .jsoneditor-navigation-bar{background:#111318;color:#89909b;border-color:#292d34}.json-editor-host .jsoneditor-frame{background:#111318;border-color:#343944}.json-editor-host .jsoneditor-search input{color:#eee;background:#22252b}.json-editor-host tr.jsoneditor-highlight,.json-editor-host tr.jsoneditor-selected{background:#252a33}.json-editor-host .jsoneditor-menu{background:#2459a8;border-color:#2459a8}.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.http-session{white-space:nowrap}.workspace-label{margin-top:3px;color:#89909b;font-size:12px;font-weight:600}.menu-icon{display:inline-block;width:22px;text-align:center}.menu-label{flex:1;min-width:0}.menu-badge{min-width:20px;padding:1px 6px;border-radius:999px;background:#343944;color:#d6e6ff;font-size:11px;font-weight:750;text-align:center}.trash-table td:first-child{max-width:640px;overflow-wrap:anywhere}.trash-table td:first-child code{white-space:normal}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.active-call-card{padding:0;overflow:hidden;min-height:210px}.active-call-table{margin:0;background:transparent}.active-call-table thead{position:sticky;top:0;z-index:1;background:#181a1f}.active-call-table tr{height:35px}.active-call-table th,.active-call-table td{padding:7px 9px}.active-call-table tr[data-action=process-tool-call]{cursor:pointer}.active-call-table tr[data-action=process-tool-call]:hover{background:#20242a}.active-call-summary{max-width:720px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.active-call-recent{animation:activeCallFade var(--active-call-ttl,5s) linear forwards}@keyframes activeCallFade{from{opacity:1}to{opacity:.18}}.progress-requested{color:#8fd3ff;white-space:nowrap}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}#publishedList{overflow-x:auto}.published-table{table-layout:fixed;min-width:850px}.published-table th:nth-child(1){width:130px}.published-table th:nth-child(2){width:165px}.published-table th:nth-child(3){width:135px}.published-table th:nth-child(4){width:185px}.published-table th:nth-child(5){width:105px}.published-table th:nth-child(7){width:80px}.published-id{min-width:0}.published-id code,.published-id .published-file-meta{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-reference{display:inline-flex;align-items:center;gap:4px;max-width:100%;margin:0 6px 4px 0}.published-reference .workspace-label{max-width:105px;margin-top:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-open{display:block;width:100%;max-width:100%;padding:0;border:0;background:transparent;text-align:left;color:#9ecbff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-open code{white-space:nowrap}.published-open:hover{background:transparent;text-decoration:underline}.published-file-meta{margin-top:3px;color:#89909b;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-activity{white-space:nowrap}.published-source{min-width:0}.published-source code{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout,.settings-layout{grid-template-columns:1fr}.default-root-card,.settings-side{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){#app>aside{width:130px}main{margin-left:130px}.tool-detail-overlay{left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
+:root{font:14px system-ui;color:#e8e8e8;background:#101114}*{box-sizing:border-box}[hidden]{display:none!important}body{margin:0;padding-top:54px}header{position:fixed;inset:0 0 auto 0;z-index:1000;height:54px;display:flex;align-items:center;padding:0 18px;background:#17191e;border-bottom:1px solid #292c33}header b{font-size:18px}.brand{display:flex;align-items:center;gap:8px}.brand-mark{display:block;width:32px;height:32px;flex:0 0 32px}.status{margin-left:auto;color:#8b949e;display:flex;gap:10px;align-items:center;font-size:12px;white-space:nowrap;min-width:0}.status-group{display:inline-flex;align-items:center;gap:3px}.status-link{cursor:pointer;border-radius:4px;padding:2px 3px;margin:-2px -3px}.status-link:hover{background:#252a33;text-decoration:underline}.status-ports{color:#c5cad3}.status-sessions{color:#9ecbff}.status-total{color:#9ecbff}#app>aside{position:fixed;top:54px;bottom:0;width:170px;background:#15171b;padding:12px;border-right:1px solid #292c33;overflow:auto}#app>aside button{display:flex;align-items:center;gap:4px;width:100%;text-align:left;white-space:nowrap;margin:3px 0;padding-left:6px;padding-right:6px;background:transparent;border:0}#app>aside button.nav-active{background:#252a33;color:#fff;font-weight:650;border-left:3px solid #3984e8;padding-left:6px}main{margin-left:170px;padding:16px;max-width:1500px}.page{display:block}.notice-balloon{position:fixed;top:64px;right:16px;z-index:1900;max-width:min(520px,calc(100vw - 32px));padding:10px 12px;border:1px solid #7d3f47;border-radius:9px;background:#25191b;color:#ffb7bf;box-shadow:0 8px 28px #0008}.notice-balloon.info{border-color:#365a7d;background:#16202b;color:#a9d5ff}.notice-balloon.ok{border-color:#356849;background:#16241b;color:#9ce8b1}button,input,select,textarea{font:inherit;color:#eee;background:#22252b;border:1px solid #3a3e47;border-radius:6px;padding:7px 9px}button{cursor:pointer}button:hover{background:#2d3139}.danger{color:#ff8585}.primary{background:#2459a8}.debug-toggle{font-weight:750;min-width:190px}.debug-toggle.enabled{background:#173f24;border-color:#347a49;color:#9ce8b1}.debug-toggle.disabled{background:#421d21;border-color:#7d3f47;color:#ffb7bf}.debug-toggle.enabled:hover{background:#20512f}.debug-toggle.disabled:hover{background:#53262b}.small{padding:4px 8px;font-size:12px}.spinner{display:inline-block;animation:spin .8s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px}.settings-tabs{display:flex;gap:6px;flex-wrap:wrap;margin:8px 0 14px;padding-bottom:10px;border-bottom:1px solid #292c33}.settings-tabs button{background:#1b1e24;border-color:#30343d}.settings-tabs button.active{background:#2459a8;border-color:#3984e8;color:#fff;font-weight:650}.settings-layout{display:block}.settings-main,.settings-side{min-width:0}.settings-side{position:static}.settings-layout .card{max-width:980px}.settings-layout .card h3{margin-top:0}.settings-main input:not([type=checkbox]){width:100%}.settings-main textarea{min-height:96px}.card{background:#181a1f;border:1px solid #2c3037;border-radius:10px;padding:14px;margin-bottom:10px}.tls-alert{border:2px solid #b94a4a;background:#241718}.tls-good{border:2px solid #347a49}.tls-error{max-height:180px;background:#160909}.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.grow{flex:1;min-width:180px}.urlrow{display:grid;grid-template-columns:145px minmax(0,1fr) auto;gap:8px;align-items:center;padding:7px 0;border-bottom:1px solid #292d34}.urlrow:last-child{border-bottom:0}.urlrow code{overflow-wrap:anywhere}.label,.muted{color:#89909b}.field-warning{color:#ff8585;font-size:12px;font-weight:600}label{display:block;color:#aaa;margin:8px 0 4px}table{width:100%;border-collapse:collapse;background:#181a1f}th,td{padding:8px;border-bottom:1px solid #2b2e35;text-align:left;vertical-align:top}pre{white-space:pre-wrap;word-break:break-word;background:#090a0c;padding:12px;border-radius:8px;max-height:58vh;overflow:auto}code{color:#9ecbff}.ok,.completed{color:#75d58b}.failed,.killed,.timed_out{color:#ff8585}.invalid{color:#c084fc}.pending,.running{color:#ffd166}#logStatus.completed,#logStatus option.completed{color:#75d58b}#logStatus.failed,#logStatus option.failed{color:#ff8585}#logStatus.invalid,#logStatus option.invalid{color:#c084fc}#logStatus.running,#logStatus option.running{color:#ffd166}#logStatus option{background:#22252b}.tools{columns:3;min-width:500px}.dialog-overlay{position:fixed;inset:0;z-index:2000;display:grid;place-items:center;padding:24px;background:#0009}.dialog-overlay dialog{position:static;margin:0;color:#eee;background:#17191e;border:1px solid #444;border-radius:10px;width:min(880px,94vw);max-height:calc(100vh - 48px);overflow:auto}textarea{width:100%;min-height:78px}h2{margin-top:0}.nowrap{white-space:nowrap}tr[data-action=select-log],tr[data-action=select-debug]{cursor:pointer}tr[data-action=select-log]:hover,tr[data-action=select-debug]:hover{background:#20242a}.tool-detail-overlay{position:fixed;top:54px;left:170px;right:0;bottom:0;z-index:1750;overflow:auto;overscroll-behavior:contain;padding:16px;background:#101114}.tool-detail-overlay .tool-detail-screen{min-height:calc(100vh - 86px)}.tool-detail-screen-head{position:sticky;top:-14px;z-index:10;margin:-14px -16px 12px;padding:12px 16px;background:#0d0f12;border-bottom:1px solid #292d34}.detail-row td{padding:0 18px 14px 28px;background:#111318}.detail-panel{border:1px solid #343944;border-left:3px solid #3984e8;border-radius:8px;background:#0d0f12;padding:14px 16px}.detail-panel pre{margin:8px 0 0;max-height:46vh}.tool-detail-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(320px,.75fr);gap:14px;align-items:start}.tool-detail-main{min-width:0}.tool-descriptor{min-width:0;position:sticky;top:10px;border:1px solid #343944;border-radius:8px;background:#111318;padding:12px}.tool-descriptor>.muted{margin-top:10px}.tool-descriptor p{margin:5px 0 10px;line-height:1.45}.tool-descriptor pre{margin:5px 0 10px;max-height:28vh}.descriptor-status{font-size:11px;font-weight:800;letter-spacing:.04em;padding:3px 6px;border-radius:5px}.descriptor-status.current{color:#75d58b;background:#16341f}.descriptor-status.outdated{color:#ffd166;background:#3a2f13}.http-detail-head{padding-bottom:10px;margin-bottom:12px;border-bottom:1px solid #292d34}.http-detail-meta{display:flex;gap:7px 16px;flex-wrap:wrap;margin-top:5px;font-size:12px;color:#89909b}.http-detail-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}.http-detail-block{min-width:0;border:1px solid #292d34;border-radius:8px;background:#0a0c0f;padding:10px}.http-detail-block h4{margin:0}.http-detail-block pre{max-height:30vh}.http-detail-error{margin-top:12px;border-color:#68353a;background:#1d1012}.http-detail-raw{margin-top:12px}.http-detail-raw summary{cursor:pointer;color:#89909b}@media(max-width:1100px){.tool-detail-grid,.http-detail-grid{grid-template-columns:1fr}.tool-descriptor{position:static}}.terminal-detail{margin-top:12px;border:1px solid #343944;border-radius:8px;background:#080a0d;overflow:hidden}.terminal-title{padding:9px 11px;background:#11151a;border-bottom:1px solid #292d34}.terminal-command{padding:10px 12px;border-bottom:1px solid #20242b;font-family:ui-monospace,SFMono-Regular,Consolas,monospace}.terminal-command .prompt{color:#75d58b;margin-right:8px}.tool-command-preview{margin-top:3px;max-width:440px;color:#c5cad3;font:12px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.terminal-cwd{padding:7px 12px;color:#89909b;border-bottom:1px solid #20242b}.terminal-stream-label{padding:7px 12px 0;color:#89909b;font-size:12px;text-transform:uppercase;letter-spacing:.04em}.terminal-detail pre{margin:5px 10px 10px;max-height:30vh;border-radius:6px}.json-detail{margin-top:12px}.json-detail+.json-detail{padding-top:12px;border-top:1px solid #292d34}.debug-packet{min-width:0}.debug-payload-tree{min-width:0;overflow:auto;line-height:1.5;margin-top:9px;padding:10px;border:1px solid #292d34;border-radius:8px;background:#080a0d;font:12px ui-monospace,SFMono-Regular,Consolas,monospace}.debug-node{min-width:0;margin:3px 0}.debug-node>summary,.debug-decoded>summary{cursor:pointer;color:#9ecbff;overflow-wrap:anywhere}.debug-children{margin:5px 0 5px 6px;padding-left:8px;border-left:1px solid #292d34}.debug-entry{min-width:0;padding:3px 0;overflow-wrap:anywhere}.debug-key{color:#ffd166;margin-right:6px;overflow-wrap:anywhere}.debug-string{color:#9ce8b1;white-space:pre-wrap;overflow-wrap:anywhere}.debug-scalar{color:#c7a0ff}.debug-null{color:#8fd3ff}.debug-multiline{max-width:100%;margin:4px 0;max-height:40vh;white-space:pre-wrap}.debug-decoded{margin:3px 0;padding:5px 7px;border:1px solid #26303b;border-radius:6px;background:#0b0e12}.debug-image{margin:4px 0}.debug-image img{display:block;max-width:min(100%,720px);max-height:60vh;object-fit:contain;border-radius:6px;background:#050607}.debug-image figcaption{margin-top:4px;color:#89909b}.tool-content-detail{margin-top:12px;padding:12px;border:1px solid #343944;border-radius:8px;background:#0a0c0f}.tool-content-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:9px;margin-top:9px}.tool-content-card{position:relative;min-width:0;padding:9px;border:1px solid #292d34;border-radius:7px;background:#111318}.tool-content-path{margin-top:4px;color:#89909b;font:11px ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.tool-content-preview{display:block;max-width:180px;max-height:120px;margin-top:8px;border-radius:5px;object-fit:contain;background:#07080a;transition:transform .12s ease;transform-origin:left top;position:relative;z-index:1}.tool-content-preview:hover{transform:scale(1.75);z-index:20;box-shadow:0 8px 30px #000c}.tool-content-placeholder{margin-top:8px;padding:10px;border-radius:5px;background:#090a0c;color:#89909b;font-size:12px}.json-editor-host{height:320px;min-height:180px;margin-top:8px;border-radius:8px;overflow:hidden}.json-editor-host.compact{height:240px;min-height:150px;margin:5px 0 10px}.json-editor-host.memory{height:min(58vh,620px);min-height:320px}.json-editor-host .jsoneditor{border-color:#343944;background:#090a0c}.json-editor-host div.jsoneditor-tree{background:#090a0c;color:#e8e8e8}.json-editor-host div.jsoneditor-field,.json-editor-host div.jsoneditor-value{color:#e8e8e8}.json-editor-host div.jsoneditor-readonly{color:#89909b}.json-editor-host div.jsoneditor-value.jsoneditor-string{color:#9ce8b1}.json-editor-host div.jsoneditor-value.jsoneditor-number{color:#ffd166}.json-editor-host div.jsoneditor-value.jsoneditor-boolean{color:#c7a0ff}.json-editor-host div.jsoneditor-value.jsoneditor-null{color:#8fd3ff}.json-editor-host .jsoneditor-navigation-bar{background:#111318;color:#89909b;border-color:#292d34}.json-editor-host .jsoneditor-frame{background:#111318;border-color:#343944}.json-editor-host .jsoneditor-search input{color:#eee;background:#22252b}.json-editor-host tr.jsoneditor-highlight,.json-editor-host tr.jsoneditor-selected{background:#252a33}.json-editor-host .jsoneditor-menu{background:#2459a8;border-color:#2459a8}
+/* Embedded JSONEditor tables must not inherit administration table/detail-row chrome. */
+.json-editor-host .jsoneditor table{background:transparent}.json-editor-host .jsoneditor td,.json-editor-host .jsoneditor th{padding:0;border:0;background:transparent}.json-editor-host .jsoneditor button.jsoneditor-button{filter:invert(.85)}.json-editor-host .jsoneditor button.jsoneditor-button:hover{filter:invert(1)}.json-editor-host .jsoneditor tr.jsoneditor-highlight,.json-editor-host .jsoneditor tr.jsoneditor-selected{background:#252a33}.json-editor-host .jsoneditor div.jsoneditor-field[contenteditable=true]:focus,.json-editor-host .jsoneditor div.jsoneditor-value[contenteditable=true]:focus{background:#252a33;border-color:#6088ad}.json-editor-host .jsoneditor .jsoneditor-treepath-element:hover{background:#252a33}
+.idcell{font-variant-numeric:tabular-nums;white-space:nowrap}.http-session{white-space:nowrap}.workspace-label{margin-top:3px;color:#89909b;font-size:12px;font-weight:600}.menu-icon{display:inline-block;width:22px;text-align:center}.menu-label{flex:1;min-width:0}.menu-badge{min-width:20px;padding:1px 6px;border-radius:999px;background:#343944;color:#d6e6ff;font-size:11px;font-weight:750;text-align:center}.trash-table td:first-child{max-width:640px;overflow-wrap:anywhere}.trash-table td:first-child code{white-space:normal}.context-id{overflow-wrap:anywhere}.log-pagination{margin:8px 0 10px}.pagination{display:flex;gap:3px;align-items:center}.page-button{min-width:34px;height:34px;padding:4px 8px;border-color:#30343d;background:#1b1e24}.page-button.active{background:#3984e8;border-color:#3984e8;color:white}.page-button:disabled{opacity:.35;cursor:default}.page-ellipsis{min-width:26px;text-align:center;color:#89909b}.active-call-card{padding:0;overflow:hidden;min-height:210px}.active-call-table{margin:0;background:transparent}.active-call-table thead{position:sticky;top:0;z-index:1;background:#181a1f}.active-call-table tr{height:35px}.active-call-table th,.active-call-table td{padding:7px 9px}.active-call-table tr[data-action=process-tool-call]{cursor:pointer}.active-call-table tr[data-action=process-tool-call]:hover{background:#20242a}.active-call-summary{max-width:720px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.active-call-recent{animation:activeCallFade var(--active-call-ttl,5s) linear forwards}@keyframes activeCallFade{from{opacity:1}to{opacity:.18}}.progress-requested{color:#8fd3ff;white-space:nowrap}.dashboard-grid{display:grid;grid-template-columns:minmax(320px,1fr) minmax(420px,1.25fr);gap:14px}.context-dates{min-width:240px}.context-dates>div{margin-bottom:4px}.oauth-table{table-layout:fixed}.oauth-table th:nth-child(1){width:30%}.oauth-table th:nth-child(2){width:26%}.oauth-table th:nth-child(3){width:30%}.oauth-table th:nth-child(4){width:130px}.oauth-client,.oauth-meta{line-height:1.45}.oauth-client-id{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin:2px 0 5px}.oauth-client-id code{font-size:12px}.oauth-meta{font-size:12px}.oauth-meta>div{margin-top:3px}.oauth-count{font-size:13px;margin-bottom:3px}.oauth-tokens{display:grid;grid-template-columns:1fr 1fr;gap:8px}.oauth-token{min-width:0;padding-right:8px;border-right:1px solid #2b2e35}.oauth-token:last-child{padding-right:0;border-right:0}.oauth-actions{width:130px}.oauth-actions button{display:block;width:100%;white-space:nowrap;margin-bottom:5px}.oauth-actions button:last-child{margin-bottom:0}.commands-table .command-description{width:30%;max-width:360px;overflow-wrap:anywhere}.command-action-cell{width:104px}.command-actions{display:flex;flex-direction:column;gap:5px}.command-actions button{width:100%;white-space:nowrap}#publishedList{overflow-x:auto}.published-table{table-layout:fixed;min-width:850px}.published-table th:nth-child(1){width:130px}.published-table th:nth-child(2){width:165px}.published-table th:nth-child(3){width:135px}.published-table th:nth-child(4){width:185px}.published-table th:nth-child(5){width:105px}.published-table th:nth-child(7){width:80px}.published-id{min-width:0}.published-id code,.published-id .published-file-meta{display:block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-reference{display:inline-flex;align-items:center;gap:4px;max-width:100%;margin:0 6px 4px 0}.published-reference .workspace-label{max-width:105px;margin-top:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-open{display:block;width:100%;max-width:100%;padding:0;border:0;background:transparent;text-align:left;color:#9ecbff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-open code{white-space:nowrap}.published-open:hover{background:transparent;text-decoration:underline}.published-file-meta{margin-top:3px;color:#89909b;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.published-activity{white-space:nowrap}.published-source{min-width:0}.published-source code{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.roots-layout{display:grid;grid-template-columns:minmax(0,2fr) minmax(300px,1fr);gap:14px;align-items:start}.root-card h3,.default-root-card h3{margin:0 0 4px}.root-card-header{display:flex;gap:12px;align-items:flex-start}.root-session-list{display:flex;flex-direction:column;gap:6px;min-height:48px;margin-top:10px;padding:8px;border:1px dashed #3a3e47;border-radius:8px}.session-chip{display:block;padding:7px 9px;border:1px solid #343944;border-radius:7px;background:#202329;cursor:grab}.session-chip-main{display:flex;gap:8px;align-items:center}.session-chip .grow{min-width:0;overflow-wrap:anywhere}.session-chip-meta{display:flex;gap:5px 16px;align-items:center;flex-wrap:wrap;margin-top:6px;padding-left:30px;font-size:12px;line-height:1.35}.session-chip-meta>span{white-space:nowrap}.session-chip:active{cursor:grabbing}.root-drop-empty{padding:6px 2px;color:#89909b}.root-disabled .root-session-list{opacity:.65}.default-root-card{position:sticky;top:70px}@media(max-width:1000px){.roots-layout,.settings-layout{grid-template-columns:1fr}.default-root-card,.settings-side{position:static}}@media(max-width:900px){.dashboard-grid{grid-template-columns:1fr}}@media(max-width:800px){#app>aside{width:130px}main{margin-left:130px}.tool-detail-overlay{left:130px}.urlrow{grid-template-columns:1fr}.tools{columns:1;min-width:0}}
 </style></head><body>
 <div id=app data-section=dashboard><header><div class=brand><img class=brand-mark src="${GUI_LOGO_DATA_URL}" alt=""><b>MrMCP <span class=muted>v${VERSION}</span></b></div><div class=status><span class=pending>starting…</span></div></header><main style="margin-left:0"><div class=card>Starting the local MrMCP UI…</div></main></div>
 <script nonce="${UI_SCRIPT_NONCE}">__MRMCP_BROWSER_JS__</script></body></html>` : "";
@@ -11261,7 +11480,8 @@ async function stopBackendWorker(worker) {
   }
 }
 async function desktop() {
-  const { worker: backendWorker, payload, earlyMessages } = await spawnBackendWorker();
+  const { worker: backendWorker, payload: initialPayload, earlyMessages } = await spawnBackendWorker();
+  let payload = initialPayload;
   const { Tauriless } = await import("npm:@mefistofelix/tauriless");
   const tauriless = new Tauriless(), pending = new Map();
   const nativeIcon = () => {
@@ -11388,7 +11608,15 @@ async function desktop() {
     } });
   };
   const handleWorkerMessage = data => {
-    if (data?.type === "ui-render") {
+    if (data?.type === "ready" && data.gui && payload.startup_recovery && !data.startup_recovery) {
+      payload = data;
+      webviewMessagesReady = false;
+      workerMessageQueue.length = 0;
+      pendingRenderPayload = null;
+      backendWorker.postMessage({ type: "ui-visibility", visible: windowRenderVisible });
+      void emitToWebview("mrmcp://startup-ready", {}).catch(error => console.error("MrMCP recovery navigation failed", error));
+    } else if (data?.type === "startup-cancelled") resolveClosed();
+    else if (data?.type === "ui-render") {
       if (!windowRenderVisible) return;
       void deliverLatestRender(data.payload);
     } else if (data?.type === "os-notification") {
@@ -11428,7 +11656,11 @@ async function desktop() {
         else if (message.event === "tauri://destroyed") resolveClosed();
         else if (["tauri://resize", "tauri://focus", "tauri://blur"].includes(message.event)) queueWindowRenderVisibilitySync();
         else if (message.event === UI_INPUT_EVENT) {
-          if (message.payload?.event?.type === "bootstrap") resolveWebviewReady(true);
+          if (message.payload?.event?.type === "bootstrap") {
+            resolveWebviewReady(true);
+            webviewMessagesReady = true;
+            for (const queued of workerMessageQueue.splice(0)) handleWorkerMessage(queued);
+          }
           backendWorker.postMessage({ type: "ui-input", payload: message.payload });
         }
         else if (message.event === "tauri://drag-drop") backendWorker.postMessage({
@@ -11498,17 +11730,17 @@ async function desktop() {
   }
 }
 
-if (IS_BACKEND_WORKER) await backend();
+if (IS_BACKEND_WORKER) await runBackend();
 else if (import.meta.main) {
   if (Deno.args[0] === "--add-workspace") {
     if (Deno.args.length !== 3) {
       console.error("Usage: mrmcp --add-workspace <name> <path>");
       Deno.exit(2);
     }
-    try { await backend({ addWorkspace: { name: Deno.args[1], path: Deno.args[2] } }); }
+    try { await runBackend({ addWorkspace: { name: Deno.args[1], path: Deno.args[2] } }); }
     catch (error) { console.error(String(error?.message || error)); Deno.exit(1); }
     Deno.exit(0);
   }
-  if (Deno.args.includes("--backend")) await backend();
+  if (Deno.args.includes("--backend")) await runBackend();
   else { await desktop(); Deno.exit(0); }
 }
