@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.130
+# MrMCP 0.10.131
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated `/mcp` endpoint, Workspace-scoped Sessions, filesystem and process tools, OAuth/Basic authentication, TLS automation, and a local Tauriless administration UI.
 
@@ -114,7 +114,7 @@ Commands and execution:
 
 Filesystem removal is reversible: `fs_trash`/`fs_untrash` use explicit `trash_id` transactions instead of a permanent delete tool. All Workspaces share the single MrMCP-managed `APP_DIR/.mrmcp/trash/` payload store; MrMCP never creates `.mrmcp` metadata directories inside named Workspaces. Trash transaction/item metadata lives in SQLite (`trash_transactions` / `trash_items`) with original path, cached type and cached byte size for non-directory payloads; directory size is deliberately left unknown to avoid recursively scanning a tree before a rename; no JSON manifest copy is written. The desktop **Trash** page uses the DB for inventory/sidebar counts and checks each tracked payload live on disk, making missing payloads explicit while preserving their cached metadata until deleted. Restore/delete and Empty Trash remain independent of Tool Call logging.
 
-Foreground `exec` is deliberately request-bounded to **45 seconds**; use `exec_start` for longer jobs and poll them with `exec_status` or bounded `exec_attach` calls. `exec_attach` also accepts `timeout_ms` up to 45 seconds and returns `wait_timed_out=true` when only the attachment wait expires while the persistent child remains running. Persistent processes use the integer `exec_id` returned by `exec_start`; follow-up process tools require the same Session `context_handle`. Process runtime/history is owned by the process subsystem and remains independent of Tool Call Disk/Memory storage, payload retention, retention pruning and Tool Call Clear.
+Foreground `exec` defaults to **45 seconds** but `timeout_ms` may be raised up to **1 hour**. High request timeouts deserve care: some clients/proxies/gateways retry or replay long requests (a ~60-second replay boundary was observed in ChatGPT testing). `exec` and `exec_start` therefore accept optional client-chosen `operation_id`: within the same Session and tool, identical retries reuse the original process while it is active and for **5 minutes after completion**; different process arguments with the same live key are rejected, and the key may be reused normally after the grace period. This key is transient replay protection, not a permanent Session-wide identifier. Prefer `exec_start` for long or non-idempotent jobs and poll with `exec_status` or bounded `exec_attach` calls. `exec_attach` defaults to 45 seconds, allows up to 1 hour, and returns `wait_timed_out=true` when only the attachment wait expires while the persistent child remains running; shorter repeated attaches avoid overlapping retry windows. Persistent processes use the integer `exec_id` returned by `exec_start`; a replay-protected `exec_start` returns that same `exec_id`. Follow-up process tools require the same Session `context_handle`. Process runtime/history is owned by the process subsystem and remains independent of Tool Call Disk/Memory storage, payload retention, retention pruning and Tool Call Clear.
 
 ## Guided prompts
 
@@ -124,7 +124,7 @@ Foreground `exec` is deliberately request-bounded to **45 seconds**; use `exec_s
 
 Authenticated OAuth or Basic clients receive the published tools; anonymous clients do not.
 
-The only public MCP protocol endpoint is `/mcp`. MrMCP advertises MCP `2026-07-28` and does not use `Mcp-Session-Id` transport sessions. Ordinary calls return JSON. Foreground process calls can use request-scoped SSE progress when `_meta.progressToken` is supplied, while the final result still contains the complete transcript; request-scoped process waits remain capped below 60 seconds, while longer work lives in persistent `exec_start` processes.
+The only public MCP protocol endpoint is `/mcp`. MrMCP advertises MCP `2026-07-28` and does not use `Mcp-Session-Id` transport sessions. Ordinary calls return JSON. Foreground process calls can use request-scoped SSE progress when `_meta.progressToken` is supplied, while the final result still contains the complete transcript; request-scoped process waits default below common retry boundaries but may be explicitly increased; persistent `exec_start` remains the recommended path for long work because its child is independent of one HTTP request lifetime.
 
 Base public ports are:
 
@@ -157,8 +157,7 @@ The macOS app is currently ad-hoc signed; warning-free first launch of an Intern
 - `guided_prompts.yaml` — editable MCP guided-prompt catalog and Eta templates.
 - `README.md` — current user/operator overview.
 - `CHANGELOG.md` — release history.
-- `AGENTS.md` — implementation invariants and release checks.
-- `WEBGUI_PREF.md` — portable server-authoritative Web GUI, Morphlex, state and front/back channel rules.
+- `AGENTS.md` — implementation invariants, server-authoritative Web GUI/Morphlex/state/channel rules and release checks.
 - `.github/workflows/` — release and native macOS GUI test workflows.
 - `assets/` — Morphlex, branding, icons and screenshots.
 

@@ -1,8 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.10.131
 
-- Bounded request-scoped process calls below common client/gateway retry windows: foreground `exec` and configured foreground commands now hard-cap at 45 seconds, while longer work remains on `exec_start`. Added bounded `exec_attach(timeout_ms)` with `wait_timed_out` so silent/streaming attachments release their single-attach slot before the same retry boundary without terminating the persistent process, and request-scoped process cleanup now also listens to the HTTP `Request.signal` when the runtime exposes a client abort. The bounded wait remains the fallback when a transport cannot surface disconnect before a response exists.
+- Removed the separate `WEBGUI_PREF.md`; the authoritative Web GUI/Morphlex/state/channel architecture now lives only in `AGENTS.md`, avoiding a second specification that can drift from the implementation guide.
+
+- Added optional client-chosen `operation_id` replay protection to `exec`, `exec_start` and configured foreground commands. Within one Session/tool, identical retries share the original process while it is active and for five minutes after completion; mismatched process arguments are rejected during that window, `exec_start` replays return the same `exec_id`, and the opaque key becomes reusable after expiry. Kept the index in memory only, scoped by Workspace-aware canonical process arguments.
+
+- Made request-scoped process waits retry-aware without imposing a client-specific hard cap: foreground `exec`, configured foreground commands and `exec_attach` now default to 45 seconds but accept explicit values up to 1 hour. Their descriptors warn that high request lifetimes can cross client/proxy retry or replay windows (including the ~60-second replay observed during ChatGPT testing), recommend `exec_start` for long/non-idempotent work, and distinguish `exec_attach.wait_timed_out` from process timeout. Request-scoped cleanup also listens to HTTP `Request.signal` when the runtime exposes a client abort; bounded waits remain the fallback when disconnect is not surfaced.
+
+- Fixed tray Quit losing its callback with Tauriless 0.1.18: create Quit as a retained Tauri MenuItem resource before inserting its resource reference into the tray menu. Selecting Quit now reaches the existing graceful shutdown path instead of only dismissing the menu.
 
 ## 0.10.130
 

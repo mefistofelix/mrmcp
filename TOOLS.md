@@ -619,19 +619,20 @@ Additional fields:
 - `env` — per-call string environment overrides. Before those overrides, every managed child receives the global Settings → Process Environment `NAME=value` entries. Their values may use `${MRMCP_DIR}` (MrMCP data directory), `${MRMCP_BIN}` (managed bin directory), `${WORKSPACE}` (current Workspace root) and `${CWD}` (effective exec directory); placeholders are expanded when the process starts so Workspace/CWD remain dynamic. Precedence is system environment → global configured environment → per-call `env`. The Process Environment Git line-ending option is enabled by default and appends runtime `core.autocrlf=false` to every managed child, so direct and nested Git invocations ignore machine/platform `core.autocrlf` conversion without changing the user's Git config. Disabling the option stops that injection. An existing CRLF checkout created with `core.autocrlf=true` can appear modified under the forced `false` policy even though no file bytes changed; disable the option to use the repository/machine policy for that checkout. This setting governs Git conversion, independently of `fs_write` / `fs_edit` representation handling. Repository `.gitattributes` remains authoritative, and explicit `git -c core.autocrlf=...` can override the runtime default.
 - `stdin` — initial stdin data.
 - `stdin_encoding` — `text|base64`; default `text`.
-- `timeout_ms` — tool-specific timeout. Request-scoped process calls are bounded to keep them safely below common client/gateway retry windows; persistent `exec_start` keeps its longer independent process timeout.
+- `operation_id` — optional client-chosen opaque replay key (1–256 characters). Within the same `context_handle` and tool, identical process requests reuse the original process while it is active and for 5 minutes after completion. Reusing the key with different process arguments during that window is rejected. The key is deliberately temporary and may be reused after the grace period; it is not a Session-wide permanent identifier.
+- `timeout_ms` — tool-specific timeout. Request-scoped `exec`/`exec_attach` default to 45 seconds but allow longer explicit waits. High values can cross client/proxy retry or replay windows; use `exec_start` for long or non-idempotent work. Persistent `exec_start` keeps its independent process timeout.
 - `context_handle`.
 
 `exec` also has `separate_streams`; `exec_start` deliberately does not because it returns before process output is consumed.
 
 ### `exec`
 
-Runs a foreground process until exit or the request-safe hard timeout.
+Runs a foreground process until exit or its requested timeout.
 
-- `timeout_ms` default **45000**, maximum **45000**. Use `exec_start` for any command that may take longer.
+- `timeout_ms` default **45000**, maximum **3600000** (1 hour). Values above the default are deliberately allowed, but may cross retry/replay boundaries imposed by the MCP client, proxy or gateway. In ChatGPT testing a request replay was observed around 60 seconds; a repeated foreground call can duplicate a non-idempotent command. Prefer `exec_start` for long, expensive or non-idempotent work.
 - `separate_streams` optionally adds stdout/stderr snapshots; combined observed-order output remains the default.
 
-If the MCP request uses a progress token and SSE, output can stream as progress while the final result still contains the complete transcript. When the HTTP runtime observes cancellation/disconnect it terminates the child; the 45-second hard timeout is the fallback for transports that cannot surface a disconnect before a response exists.
+If `operation_id` is supplied, concurrent or replayed identical `exec` requests share one process and return the same retained result; the 5-minute completion grace also prevents a just-finished foreground command from being executed again by a delayed retry. If the MCP request uses a progress token and SSE, output can stream as progress while the final result still contains the complete transcript. When the HTTP runtime observes cancellation/disconnect it terminates the child; the selected `timeout_ms` remains the fallback for transports that cannot surface a disconnect before a response exists.
 
 ### `exec_start`
 
@@ -639,7 +640,7 @@ Starts a persistent interactive/background process and returns immediately.
 
 - `timeout_ms` default 0 (no timeout), maximum 604800000.
 
-Returns `exec_id`, which is always the stable integer Tool Call id of the originating `exec_start`, independent of Disk/Memory history storage or Payload/Metadata retention mode. Pass it unchanged with the same `context_handle` to the follow-up exec tools. Runtime process state and complete normalized transcript are owned by the process subsystem and remain available for the process lifetime/retention even when Tool Call payload mode is Metadata; process runtime state does not survive server restart.
+Returns `exec_id`, which is always the stable integer Tool Call id of the originating `exec_start`, independent of Disk/Memory history storage or Payload/Metadata retention mode. With `operation_id`, identical retries in the same Session/tool return that same `exec_id` while active and during the 5-minute completion grace; after the grace the opaque key may be reused to create a new process. Pass `exec_id` unchanged with the same `context_handle` to the follow-up exec tools. Runtime process state and complete normalized transcript are owned by the process subsystem and remain available for the process lifetime/retention even when Tool Call payload mode is Metadata; process runtime state does not survive server restart.
 
 ### `exec_attach`
 
@@ -648,7 +649,7 @@ Consumes unread output from a persistent process and advances that process's att
 Arguments:
 
 - `exec_id`.
-- `timeout_ms` — attachment wait/stream timeout, default **45000**, maximum **45000**. This never terminates the persistent child.
+- `timeout_ms` — attachment wait/stream timeout, default **45000**, maximum **3600000** (1 hour). This never terminates the persistent child. High values may cross client/proxy retry windows; an overlapping retry can encounter the intentional single-attach guard, so shorter repeated attaches or `exec_status` are preferable when transport behavior is uncertain.
 - `separate_streams` — include complete stdout/stderr snapshots in the final result; default false.
 - `context_handle`.
 
