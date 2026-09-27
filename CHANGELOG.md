@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Bounded request-scoped process calls below common client/gateway retry windows: foreground `exec` and configured foreground commands now hard-cap at 45 seconds, while longer work remains on `exec_start`. Added bounded `exec_attach(timeout_ms)` with `wait_timed_out` so silent/streaming attachments release their single-attach slot before the same retry boundary without terminating the persistent process, and request-scoped process cleanup now also listens to the HTTP `Request.signal` when the runtime exposes a client abort. The bounded wait remains the fallback when a transport cannot surface disconnect before a response exists.
+
 ## 0.10.130
 
 - Replaced generic completion text for filesystem and common retrieval tools with concise metadata-only summaries of counts, per-entry failures and continuations, keeping full results solely in `structuredContent`. `fs_grep` now echoes `max_file_bytes` and reports page-local `skipped_large_files`, with incomplete-coverage summaries for skipped files or read/decode errors. Clarified tool selection, optional context and batched reads while retaining the existing Cymbal catalog route for symbol/caller exploration.

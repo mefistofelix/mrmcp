@@ -114,7 +114,7 @@ Commands and execution:
 
 Filesystem removal is reversible: `fs_trash`/`fs_untrash` use explicit `trash_id` transactions instead of a permanent delete tool. All Workspaces share the single MrMCP-managed `APP_DIR/.mrmcp/trash/` payload store; MrMCP never creates `.mrmcp` metadata directories inside named Workspaces. Trash transaction/item metadata lives in SQLite (`trash_transactions` / `trash_items`) with original path, cached type and cached byte size for non-directory payloads; directory size is deliberately left unknown to avoid recursively scanning a tree before a rename; no JSON manifest copy is written. The desktop **Trash** page uses the DB for inventory/sidebar counts and checks each tracked payload live on disk, making missing payloads explicit while preserving their cached metadata until deleted. Restore/delete and Empty Trash remain independent of Tool Call logging.
 
-Persistent processes use the integer `exec_id` returned by `exec_start`; follow-up process tools require the same Session `context_handle`. Process runtime/history is owned by the process subsystem and remains independent of Tool Call Disk/Memory storage, payload retention, retention pruning and Tool Call Clear.
+Foreground `exec` is deliberately request-bounded to **45 seconds**; use `exec_start` for longer jobs and poll them with `exec_status` or bounded `exec_attach` calls. `exec_attach` also accepts `timeout_ms` up to 45 seconds and returns `wait_timed_out=true` when only the attachment wait expires while the persistent child remains running. Persistent processes use the integer `exec_id` returned by `exec_start`; follow-up process tools require the same Session `context_handle`. Process runtime/history is owned by the process subsystem and remains independent of Tool Call Disk/Memory storage, payload retention, retention pruning and Tool Call Clear.
 
 ## Guided prompts
 
@@ -124,7 +124,7 @@ Persistent processes use the integer `exec_id` returned by `exec_start`; follow-
 
 Authenticated OAuth or Basic clients receive the published tools; anonymous clients do not.
 
-The only public MCP protocol endpoint is `/mcp`. MrMCP advertises MCP `2026-07-28` and does not use `Mcp-Session-Id` transport sessions. Ordinary calls return JSON. Foreground process calls can use request-scoped SSE progress when `_meta.progressToken` is supplied, while the final result still contains the complete transcript.
+The only public MCP protocol endpoint is `/mcp`. MrMCP advertises MCP `2026-07-28` and does not use `Mcp-Session-Id` transport sessions. Ordinary calls return JSON. Foreground process calls can use request-scoped SSE progress when `_meta.progressToken` is supplied, while the final result still contains the complete transcript; request-scoped process waits remain capped below 60 seconds, while longer work lives in persistent `exec_start` processes.
 
 Base public ports are:
 

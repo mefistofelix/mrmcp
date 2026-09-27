@@ -165,6 +165,9 @@ async function bodyText(req, max = MAX_REQUEST_BODY) {
 const bodyJson = async req => JSON.parse(await bodyText(req) || "{}");
 const form = async req => new URLSearchParams(await bodyText(req));
 const MCP_PROGRESS_BATCH_BYTES = 16 * 1024, MCP_PROGRESS_BATCH_MS = 100;
+// Keep request-scoped process calls comfortably below client/gateway retry boundaries.
+// Longer work belongs to exec_start + exec_status/exec_attach.
+const MCP_FOREGROUND_EXEC_TIMEOUT_MS = 45_000, MCP_ATTACH_WAIT_TIMEOUT_MS = 45_000;
 const MCP_ATTACH_RESPONSE_BYTES = MCP_PROGRESS_BATCH_BYTES, MCP_ATTACH_RESPONSE_MS = MCP_PROGRESS_BATCH_MS;
 function progressTextChunks(value, maxBytes = MCP_PROGRESS_BATCH_BYTES) {
   let text = String(value ?? "");
@@ -4987,10 +4990,10 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         } },
       ],
       exec: [
-        "Run one foreground command and keep the Tool Call open until it exits. The complete normalized combined stdout/stderr transcript is retained server-side for this call. When the request supplies _meta.progressToken and accepts SSE, new output is also sent incrementally as standard MCP notifications/progress in batches of at most 16 KiB or 100 ms; after exit the final result still contains the complete transcript from process start. Without a progressToken, no incremental progress notifications are emitted and the call returns the complete transcript only when the process exits. If the client disconnects or cancels the request, the foreground child is terminated. For normal direct execution use program + args; use shell_command only for actual shell syntax. Pass argv verbatim and consult --help when syntax is uncertain. Use structured filesystem/text tools instead of exec when they cover the operation.",
+        "Run one foreground command and keep the Tool Call open until it exits, with a hard request-safe timeout of 45 seconds. Use exec_start plus exec_status/exec_attach for work that may run longer. The complete normalized combined stdout/stderr transcript is retained server-side for this call. When the request supplies _meta.progressToken and accepts SSE, new output is also sent incrementally as standard MCP notifications/progress in batches of at most 16 KiB or 100 ms; after exit the final result still contains the complete transcript from process start. Without a progressToken, no incremental progress notifications are emitted and the call returns the complete transcript only when the process exits. When the HTTP runtime reports client disconnect/cancellation, the foreground child is terminated; the hard timeout remains the fallback when a transport cannot surface disconnect before a response exists. For normal direct execution use program + args; use shell_command only when shell syntax is required. Pass argv verbatim and consult --help when syntax is uncertain. Use structured filesystem/text tools instead of exec when they cover the operation.",
         { oneOf: [{ required: ["program"] }, { required: ["shell_command"] }], properties: {
           ...execInput,
-          timeout_ms: { type: "integer", minimum: 1, maximum: 3600000, default: 120000 },
+          timeout_ms: { type: "integer", minimum: 1, maximum: MCP_FOREGROUND_EXEC_TIMEOUT_MS, default: MCP_FOREGROUND_EXEC_TIMEOUT_MS, description: "Foreground child timeout in milliseconds. Hard-capped at 45000 so the Tool Call returns before common client/gateway retry windows; use exec_start for longer work." },
         } },
       ],
       exec_start: [
@@ -5001,9 +5004,10 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         } },
       ],
       exec_attach: [
-        "Consume unread output from one persistent process created by exec_start. Pass the exact exec_id returned by exec_start and the same context_handle; ids from another Session are inaccessible. Each successful attach advances an internal cursor so already-returned combined output is not repeated. With _meta.progressToken, exec_attach sends all unread backlog and then new combined stdout/stderr incrementally as standard MCP notifications/progress until the process exits; the final result contains the complete unread transcript covered by that attachment and remaining_bytes is 0. Without a progressToken, exec_attach is a long-poll read: if unread output already exists it returns immediately with at most 16 KiB; otherwise, while the process is running, it waits for output and returns when 16 KiB accumulate or 100 ms have elapsed after the first new data. remaining_bytes reports how many already-buffered UTF-8 bytes still follow the returned chunk. Call exec_attach again immediately while remaining_bytes>0; when it is 0 and status is running, call it again whenever you want to wait for future output. If the process exits or is killed while attached, the final available chunk and final status are returned. A client disconnect detaches only and never terminates the persistent process. Only one exec_attach may be active for an exec_id at a time. Use exec_status when you need a non-consuming status/full-output/tail snapshot, including after completion or kill.",
+        "Consume unread output from one persistent process created by exec_start. Pass the exact exec_id returned by exec_start and the same context_handle; ids from another Session are inaccessible. Each successful attach advances an internal cursor so already-returned combined output is not repeated. Every attachment is request-bounded: timeout_ms defaults to and is capped at 45 seconds, after which a still-running process returns normally with wait_timed_out=true and may be attached again. With _meta.progressToken, exec_attach sends unread backlog and live output until process exit, disconnect, or that wait timeout, then returns the unread transcript covered by this attachment. Without a progressToken, existing unread data returns immediately up to 16 KiB; otherwise the call long-polls only within the same bounded wait. remaining_bytes reports already-buffered UTF-8 bytes after the returned chunk. Call again while remaining_bytes>0 or when wait_timed_out=true/status=running. When the HTTP runtime reports a client disconnect, the attachment detaches without terminating the persistent child; the bounded wait still releases the slot when a transport cannot surface disconnect before a response exists. Only one attachment may be active per exec id. Use exec_status for non-consuming snapshots.",
         { properties: {
           exec_id: execIdInput,
+          timeout_ms: { type: "integer", minimum: 1, maximum: MCP_ATTACH_WAIT_TIMEOUT_MS, default: MCP_ATTACH_WAIT_TIMEOUT_MS, description: "Maximum time this attachment may wait/stream before returning while the process remains running. Reattach to continue." },
           separate_streams: { type: "boolean", default: false, description: "Also return complete current stdout/stderr snapshots in the final result; live MCP progress remains the combined observed-order output." },
           ...contextInput,
         }, required: ["exec_id"] },
@@ -5314,8 +5318,9 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         ...processProperties,
         remaining_bytes: {
           type: "integer", minimum: 0,
-          description: "UTF-8 bytes already buffered after the output returned by this attach call. When greater than zero, call exec_attach again immediately to drain the next chunk. When zero and status is running, exec_attach may still be called again and will wait for new output or process termination.",
+          description: "UTF-8 bytes already buffered after the output returned by this attach call. When greater than zero, call exec_attach again immediately to drain the next chunk.",
         },
+        wait_timed_out: { type: "boolean", description: "True when this attachment's bounded wait expired while the persistent process was still running. This does not mean the process itself timed out." },
       }),
       exec_write: outputSchema({ exec_id: { type: "integer", minimum: 1 }, bytes_written: { type: "integer" }, stdin_open: { type: "boolean" } }),
       exec_kill: outputSchema({ exec_id: { type: "integer", minimum: 1 }, killed: { type: "boolean" }, signal: { type: "string" } }),
@@ -5371,11 +5376,11 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     for (const custom of all("SELECT * FROM custom_tools WHERE server_id=? ORDER BY name", p.id)) tools.push({
       name: custom.name,
       title: custom.name.replaceAll("_", " ").replace(/\b\w/g, value => value.toUpperCase()),
-      description: `${custom.description || `Run configured command: ${custom.command}`} This is a foreground command: normalized combined output may stream as request-scoped progress, the final result contains buffered status/output, and client disconnect/cancellation terminates the child. ${CONTEXT_HANDLE_RULE}`,
+      description: `${custom.description || `Run configured command: ${custom.command}`} This is a foreground command with the same hard 45-second request timeout as exec: normalized combined output may stream as request-scoped progress, the final result contains buffered status/output, and client disconnect/cancellation terminates the child. Use exec_start for longer work. ${CONTEXT_HANDLE_RULE}`,
       inputSchema: schema({ properties: {
         args: { type: "array", items: { type: "string" }, default: [], description: "Argument vector appended verbatim and in order to the configured command." }, shell_command_suffix: { type: "string" },
         cwd: { type: "string", default: "." }, env: { type: "object", additionalProperties: { type: "string" } },
-        stdin: { type: "string" }, separate_streams: { type: "boolean", default: false }, timeout_ms: { type: "integer", minimum: 1, maximum: 3600000, default: 120000 },
+        stdin: { type: "string" }, separate_streams: { type: "boolean", default: false }, timeout_ms: { type: "integer", minimum: 1, maximum: MCP_FOREGROUND_EXEC_TIMEOUT_MS, default: MCP_FOREGROUND_EXEC_TIMEOUT_MS },
         ...contextInput,
       }, required: ["context_handle"] }),
       outputSchema: processOutputSchema,
@@ -5441,7 +5446,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         workspace_dev_preferences_write: ["path", "status", "created"],
         desktop_auto: ["results", "state", "images"],
         exec_start: ["exec_id"],
-        exec_attach: ["exec_id", "output", "remaining_bytes"],
+        exec_attach: ["exec_id", "output", "remaining_bytes", "wait_timed_out"],
         exec_status: ["exec_id", "status", "output_mode"],
       };
       for (const key of expectedOutputs[tool.name] || [])
@@ -5478,7 +5483,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       telegram_req: ["request"],
       tools_schema: ["names"],
       tools_log: ["id", "detail", "limit", "tool", "status", "query", "before_id"],
-      exec_attach: ["exec_id"], exec_write: ["exec_id"], exec_kill: ["exec_id"], exec_status: ["exec_id", "output", "tail_lines"],
+      exec_attach: ["exec_id", "timeout_ms"], exec_write: ["exec_id"], exec_kill: ["exec_id"], exec_status: ["exec_id", "output", "tail_lines"],
     };
     for (const key of expectedInputs[tool.name] || [])
       if (!tool.inputSchema.properties?.[key]) errors.push(`inputSchema missing property ${key}`);
@@ -5489,7 +5494,18 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     if (["exec", "exec_start", "exec_attach"].includes(tool.name) && tool.outputSchema.properties?.pid)
       errors.push(`${tool.name} output must not expose OS pid`);
     if (tool.name === "exec_attach" && ["wait_ms", "output_offset", "stdout_offset", "stderr_offset"].some(key => tool.inputSchema.properties?.[key]))
-      errors.push("exec_attach must not expose polling or offset arguments");
+      errors.push("exec_attach must not expose offsets or a second polling-duration argument");
+    if (tool.name === "exec") {
+      const timeout = tool.inputSchema.properties?.timeout_ms;
+      if (!timeout || timeout.default !== MCP_FOREGROUND_EXEC_TIMEOUT_MS || timeout.maximum !== MCP_FOREGROUND_EXEC_TIMEOUT_MS)
+        errors.push("exec foreground timeout must be request-safe and hard-capped");
+    }
+    if (tool.name === "exec_attach") {
+      const timeout = tool.inputSchema.properties?.timeout_ms;
+      if (!timeout || timeout.default !== MCP_ATTACH_WAIT_TIMEOUT_MS || timeout.maximum !== MCP_ATTACH_WAIT_TIMEOUT_MS)
+        errors.push("exec_attach wait timeout must be request-safe and hard-capped");
+      if (!tool.outputSchema.properties?.wait_timed_out) errors.push("exec_attach output missing wait_timed_out");
+    }
     if (tool.name === "exec_start" && tool.inputSchema.properties?.separate_streams)
       errors.push("exec_start must not expose separate_streams because it does not return process output");
     return errors;
@@ -6330,9 +6346,10 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   }
   async function startManagedProcess(p, args, persistent, execution = {}) {
     const target = await resolveWorkspacePath(execution.selection, args.cwd || ".");
-    const defaultTimeout = persistent ? 0 : 120000;
+    const defaultTimeout = persistent ? 0 : MCP_FOREGROUND_EXEC_TIMEOUT_MS;
+    const maxTimeout = persistent ? 604800000 : MCP_FOREGROUND_EXEC_TIMEOUT_MS;
     const spec = commandSpec(args), timeout = Math.max(0, Math.min(
-      Number(args.timeout_ms ?? defaultTimeout), 604800000,
+      Number(args.timeout_ms ?? defaultTimeout), maxTimeout,
     ));
     if (!spec.shell) {
       const mapped = await catalogProgram(spec.program);
@@ -6464,25 +6481,29 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   }
   const processIsRunning = rec => ["starting", "running"].includes(rec.status);
   const processOutputEnd = rec => processTextLength(rec);
-  function attachProcessView(rec, start, end, args, remainingBytes) {
+  function attachProcessView(rec, start, end, args, remainingBytes, waitTimedOut = false) {
     const view = processView(rec, { include_output: false, separate_streams: args.separate_streams === true });
     const from = Math.max(0, Number(start || 0)), to = Math.max(from, Math.min(Number(end ?? processOutputEnd(rec)), processOutputEnd(rec)));
     view.output = processTextRange(rec, "output", from, to);
     view.remaining_bytes = Math.max(0, Number(remainingBytes || 0));
+    view.wait_timed_out = !!waitTimedOut;
     return view;
   }
-  async function waitAttachBatch(rec, startBytes, disconnected) {
+  async function waitAttachBatch(rec, startBytes, disconnected, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
     if (rec.output_bytes > startBytes || !processIsRunning(rec)) return "ready";
     while (rec.output_bytes <= startBytes && processIsRunning(rec)) {
-      const wait = processActivityWait(rec);
+      const delay = deadline - Date.now();
+      if (delay <= 0) return "timeout";
+      const wait = processActivityWait(rec, delay);
       const reason = await Promise.race([wait.promise, disconnected]);
       wait.cancel();
-      if (reason === "disconnected") return reason;
+      if (reason === "disconnected" || reason === "timeout") return reason;
     }
     if (rec.output_bytes <= startBytes || !processIsRunning(rec)) return "ready";
-    const deadline = Date.now() + MCP_ATTACH_RESPONSE_MS;
+    const batchDeadline = Math.min(deadline, Date.now() + MCP_ATTACH_RESPONSE_MS);
     while (processIsRunning(rec) && rec.output_bytes - startBytes < MCP_ATTACH_RESPONSE_BYTES) {
-      const delay = deadline - Date.now();
+      const delay = batchDeadline - Date.now();
       if (delay <= 0) break;
       const wait = processActivityWait(rec, delay);
       const reason = await Promise.race([wait.promise, disconnected]);
@@ -6496,8 +6517,9 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     if (!rec.persistent) throw new Error("exec_attach can attach only to a persistent process created by exec_start");
     if (rec.attachment) throw new Error(`Persistent exec_id ${rec.log_id} already has an active exec_attach`);
     const progressMode = !!execution.progressRequested, progress = progressMode ? execution.progress : null;
+    const timeoutMs = Math.max(1, Math.min(Number(args.timeout_ms ?? MCP_ATTACH_WAIT_TIMEOUT_MS), MCP_ATTACH_WAIT_TIMEOUT_MS));
     const start = Math.max(0, rec.attach_cursor), startBytes = rec.attach_cursor_bytes;
-    let sentCursor = start, sentBytes = startBytes, detached = false, detach;
+    let sentCursor = start, sentBytes = startBytes, detached = false, detach, progressTimeoutTimer = null;
     const attachment = { progress, progress_requested: progressMode };
     const disconnected = new Promise(resolve => { detach = resolve; });
     if (progress) progress.setAfterFlush((message, bytes) => {
@@ -6518,27 +6540,38 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           processOutputRangeEach(rec, start, processOutputEnd(rec), text => progress.push(text));
           progress.flush();
         }
-        if (processIsRunning(rec)) await Promise.race([rec.done, disconnected]);
-        if (detached) return attachProcessView(
-          rec, start, sentCursor, args, Math.max(0, rec.output_bytes - sentBytes),
+        let reason = "ready";
+        if (processIsRunning(rec)) {
+          const timedOut = new Promise(resolve => {
+            progressTimeoutTimer = setTimeout(() => resolve("timeout"), timeoutMs);
+          });
+          reason = await Promise.race([rec.done.then(() => "ready"), disconnected, timedOut]);
+        }
+        if (detached || reason === "disconnected") return attachProcessView(
+          rec, start, sentCursor, args, Math.max(0, rec.output_bytes - sentBytes), false,
         );
         progress?.flush();
         const end = processOutputEnd(rec);
         rec.attach_cursor = end; rec.attach_cursor_bytes = rec.output_bytes;
-        return attachProcessView(rec, start, end, args, 0);
+        return attachProcessView(rec, start, end, args, 0, reason === "timeout" && processIsRunning(rec));
       }
 
-      const reason = await waitAttachBatch(rec, startBytes, disconnected);
+      const reason = await waitAttachBatch(rec, startBytes, disconnected, timeoutMs);
       if (reason === "disconnected" || detached) return attachProcessView(
-        rec, start, start, args, Math.max(0, rec.output_bytes - startBytes),
+        rec, start, start, args, Math.max(0, rec.output_bytes - startBytes), false,
+      );
+      if (reason === "timeout" && rec.output_bytes <= startBytes) return attachProcessView(
+        rec, start, start, args, Math.max(0, rec.output_bytes - startBytes), processIsRunning(rec),
       );
       const chunk = processOutputPrefix(rec, start, MCP_ATTACH_RESPONSE_BYTES);
       const end = chunk.end;
       rec.attach_cursor = end; rec.attach_cursor_bytes = startBytes + chunk.bytes;
       return attachProcessView(
         rec, start, end, args, Math.max(0, rec.output_bytes - rec.attach_cursor_bytes),
+        reason === "timeout" && processIsRunning(rec),
       );
     } finally {
+      if (progressTimeoutTimer) clearTimeout(progressTimeoutTimer);
       if (rec.attachment === attachment) rec.attachment = null;
       progress?.setAfterFlush(null);
     }
@@ -7661,7 +7694,19 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const executionState = {
       ...callInfo, logId: id, payloadMode,
       progress: callInfo.requestStream?.progress || null,
-      onDisconnect(callback) { callInfo.requestStream?.onDisconnect(callback); },
+      onDisconnect(callback) {
+        if (typeof callback !== "function") return;
+        let called = false;
+        const once = () => {
+          if (called) return;
+          called = true;
+          Promise.resolve().then(callback).catch(() => {});
+        };
+        callInfo.requestStream?.onDisconnect(once);
+        const signal = callInfo.requestSignal;
+        if (signal?.aborted) once();
+        else signal?.addEventListener?.("abort", once, { once: true });
+      },
       setCancel(cancel, metadata = {}) {
         control.cancel = cancel; Object.assign(control, metadata);
         emitUiChange(["logs"], "tool-call-cancellable");
@@ -8360,7 +8405,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         "Use fs_glob, fs_grep, fs_read, fs_navigate, fs_stat, fs_write and fs_edit directly for filesystem discovery, inspection, textual search and changes; do not spawn shell commands, uv or Python for operations those tools cover. For symbol/caller/impact exploration, prefer a suitable discovered catalog command. Batch independent reads and request small optional context when nearby text avoids another call. Check per-entry failures, skipped_large_files and continuation fields before claiming complete coverage or successful batch changes. Use fs_text_convert_encoding_eol only for explicit encoding/EOL/BOM representation conversion of named files when requested or specifically required by the task; never use it proactively to normalize a repository. Use desktop_auto for desktop observation and interaction through AAF YAML; when the model needs to see a screenshot, retain its image handle anywhere in the scenario's final state so the tool returns that image directly as MCP image content. Multiple retained screenshots and ordinary OCR/text/geometry/state values may coexist in one result. " +
         "workspace_dev_preferences_write is strictly opt-in: call it only when the user explicitly asks to copy/save/materialize their development preferences into the current Workspace. Never call it proactively, for preference discovery, or merely because DEV_PREF.md might exist; the tool returns no preference content and calling it does not imply that DEV_PREF.md should then be read or applied. " +
         "When work may benefit from command-line capability beyond the structured tools, call discover_commands proactively before inventing workarounds or assuming a utility is unavailable. It returns the complete user-chosen available command catalog in one call; prefer a listed command when it fits, remember the catalog for the Session, and invoke its logical_name directly through exec.program without PATH probes. Use tools_schema when exact live tool descriptor data is needed instead of relying on a connector-synthesized schema view. " +
-        "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; cancelling/disconnecting exec terminates its child. For persistent or interactive work, call exec_start; it immediately returns exec_id, which is the stable integer Tool Call id of that start. Pass that exec_id together with the same context_handle to exec_attach, exec_write, exec_kill or exec_status; ids from other Sessions are inaccessible. exec_list shows only currently running persistent executions in this Session. exec_status is the non-consuming way to inspect running or recently completed/killed executions and optionally retrieve all output or a tail. exec_attach with progressToken streams unread backlog plus live output through progress until process exit and then returns that complete unread transcript; without progressToken it long-polls and returns at most 16 KiB of unread output plus remaining_bytes, so call it repeatedly to drain buffered output and call it again with remaining_bytes=0/status=running to wait for future output. Disconnecting exec_attach only detaches and never kills the persistent process. " +
+        "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; observed cancellation/disconnect terminates exec's child, while the hard timeout covers transports that cannot report a disconnect before a response exists. Foreground exec and configured foreground commands are hard-capped at 45 seconds; for longer or uncertain work use exec_start, which immediately returns exec_id and leaves the persistent child independent of request lifetime. Pass that exec_id together with the same context_handle to exec_attach, exec_write, exec_kill or exec_status; ids from other Sessions are inaccessible. exec_list shows only currently running persistent executions in this Session. exec_status is the non-consuming way to inspect running or recently completed/killed executions and optionally retrieve all output or a tail. exec_attach is also request-bounded: timeout_ms defaults to and is capped at 45 seconds, returns wait_timed_out=true when only the attachment wait expires while the child remains running, and can then be called again. With progressToken it streams unread backlog/live output only until exit/disconnect/that bounded wait; without progressToken it returns at most 16 KiB of unread output per call. An observed disconnect or the bounded attachment timeout detaches and never kills the persistent process; the timeout is also the fallback when a transport cannot report disconnect. " +
         "Use publish to present content to the user from exactly one of path, text or base64. Supply the real MIME type and optional filename; presentation=auto lets the smart MCP App choose an inline preview or file action, while inline/download are presentation hints. title and description appear above the published element. " +
         "Every authenticated client can invoke every published tool; context_handle is the bearer capability selecting the persistent Session and its current Workspace."
       : "The endpoint is reachable, but anonymous access exposes no tools. Authenticate with OAuth or Basic authentication.";
@@ -8484,7 +8529,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
               if (["list_workspaces", "tools_schema"].includes(x.params.name)) {
                 toolResult = await callTool(
                   p, x.params.name, toolArgs,
-                  { authKind: auth.kind, contextHandle: "", selection: null, descriptor, requestStream, progressRequested, mcpRequest: x, mcpResponse: wrapResult },
+                  { authKind: auth.kind, contextHandle: "", selection: null, descriptor, requestStream, requestSignal: req.signal, progressRequested, mcpRequest: x, mcpResponse: wrapResult },
                 );
               } else if (x.params.name === "open_workspace") {
                 delete toolArgs.context_handle;
@@ -8520,7 +8565,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
                   const selection = { context: record, root: runtimeWorkspaceRoot(workspace) };
                   toolResult = await callTool(
                     p, x.params.name, toolArgs,
-                    { authKind: auth.kind, contextHandle: record.handle, selection, descriptor, requestStream, progressRequested, workspaceCreated, mcpRequest: x, mcpResponse: wrapResult },
+                    { authKind: auth.kind, contextHandle: record.handle, selection, descriptor, requestStream, requestSignal: req.signal, progressRequested, workspaceCreated, mcpRequest: x, mcpResponse: wrapResult },
                   );
                 }
               } else {
@@ -8529,7 +8574,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
                   const selection = { context: resolution.record, root: selectedContextRoot(p, resolution.record) };
                   toolResult = await callTool(
                     p, x.params.name, toolArgs,
-                    { authKind: auth.kind, contextHandle: resolution.record.handle, selection, descriptor, requestStream, progressRequested, mcpRequest: x, mcpResponse: wrapResult },
+                    { authKind: auth.kind, contextHandle: resolution.record.handle, selection, descriptor, requestStream, requestSignal: req.signal, progressRequested, mcpRequest: x, mcpResponse: wrapResult },
                   );
                 } else toolResult = contextControlToolResult(p, x.params.name, toolArgs, resolution, descriptor, progressRequested, x, wrapResult);
               }

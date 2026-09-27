@@ -619,19 +619,19 @@ Additional fields:
 - `env` — per-call string environment overrides. Before those overrides, every managed child receives the global Settings → Process Environment `NAME=value` entries. Their values may use `${MRMCP_DIR}` (MrMCP data directory), `${MRMCP_BIN}` (managed bin directory), `${WORKSPACE}` (current Workspace root) and `${CWD}` (effective exec directory); placeholders are expanded when the process starts so Workspace/CWD remain dynamic. Precedence is system environment → global configured environment → per-call `env`. The Process Environment Git line-ending option is enabled by default and appends runtime `core.autocrlf=false` to every managed child, so direct and nested Git invocations ignore machine/platform `core.autocrlf` conversion without changing the user's Git config. Disabling the option stops that injection. An existing CRLF checkout created with `core.autocrlf=true` can appear modified under the forced `false` policy even though no file bytes changed; disable the option to use the repository/machine policy for that checkout. This setting governs Git conversion, independently of `fs_write` / `fs_edit` representation handling. Repository `.gitattributes` remains authoritative, and explicit `git -c core.autocrlf=...` can override the runtime default.
 - `stdin` — initial stdin data.
 - `stdin_encoding` — `text|base64`; default `text`.
-- `timeout_ms` — tool-specific timeout.
+- `timeout_ms` — tool-specific timeout. Request-scoped process calls are bounded to keep them safely below common client/gateway retry windows; persistent `exec_start` keeps its longer independent process timeout.
 - `context_handle`.
 
 `exec` also has `separate_streams`; `exec_start` deliberately does not because it returns before process output is consumed.
 
 ### `exec`
 
-Runs a foreground process until exit.
+Runs a foreground process until exit or the request-safe hard timeout.
 
-- `timeout_ms` default 120000, maximum 3600000.
+- `timeout_ms` default **45000**, maximum **45000**. Use `exec_start` for any command that may take longer.
 - `separate_streams` optionally adds stdout/stderr snapshots; combined observed-order output remains the default.
 
-If the MCP request uses a progress token and SSE, output can stream as progress while the final result still contains the complete transcript. Cancelling/disconnecting the foreground Tool Call terminates the child.
+If the MCP request uses a progress token and SSE, output can stream as progress while the final result still contains the complete transcript. When the HTTP runtime observes cancellation/disconnect it terminates the child; the 45-second hard timeout is the fallback for transports that cannot surface a disconnect before a response exists.
 
 ### `exec_start`
 
@@ -643,15 +643,16 @@ Returns `exec_id`, which is always the stable integer Tool Call id of the origin
 
 ### `exec_attach`
 
-Consumes unread output from a persistent process and advances that process's attach cursor.
+Consumes unread output from a persistent process and advances that process's attach cursor. The attachment itself is bounded even when the child is intentionally long-lived.
 
 Arguments:
 
 - `exec_id`.
+- `timeout_ms` — attachment wait/stream timeout, default **45000**, maximum **45000**. This never terminates the persistent child.
 - `separate_streams` — include complete stdout/stderr snapshots in the final result; default false.
 - `context_handle`.
 
-Only one attachment may be active for an `exec_id`. `remaining_bytes` tells the caller whether already-buffered output remains.
+Only one attachment may be active for an `exec_id`. `remaining_bytes` tells the caller whether already-buffered output remains. `wait_timed_out=true` means only this attachment's wait expired while the process was still running; call `exec_attach` again or use `exec_status`. An observed client disconnect also detaches, but the bounded wait is the fallback on transports where disconnect is not observable until a response exists. A process-level timeout remains reported separately through `timed_out`/`status`.
 
 ### `exec_write`
 
