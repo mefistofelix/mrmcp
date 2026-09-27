@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.132
+
+- Fixed tray Quit against the actual Tauriless 0.1.18 Windows event path. A native probe proved that an inline item with the Menu handler does not emit the item click, while a retained standalone `MenuItem` with its own handler emits `message:"tray-quit"` and exits correctly. MrMCP now uses three distinct channels (Quit item, Menu and tray), routes Quit only from the dedicated MenuItem channel, inserts the retained item resource into the Menu, and verifies that exact resource through `plugin:menu|get` before creating the tray icon.
+
 ## 0.10.131
 
 - Removed the separate `WEBGUI_PREF.md`; the authoritative Web GUI/Morphlex/state/channel architecture now lives only in `AGENTS.md`, avoiding a second specification that can drift from the implementation guide.

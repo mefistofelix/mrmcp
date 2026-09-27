@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.131 — Replay-safe process execution and tray reliability.
+MrMCP 0.10.132 — Fix tray-menu event routing.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -98,7 +98,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.131";
+const VERSION = "0.10.132";
 const DB_SCHEMA_VERSION = 3;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -11640,9 +11640,12 @@ async function desktop() {
     return { rgba: Array.from(rgba), width, height };
   };
   let nextId = 1, drainTimer = null, windowVisibilityTimer = null, notificationPermission = null, closed = false, webviewMessagesReady = false, notificationsReady = false, windowRenderVisible = false, resolveClosed, resolveWebviewReady;
-  let renderDeliveryRunning = false, pendingRenderPayload = null;
+  let renderDeliveryRunning = false, pendingRenderPayload = null, quitItemChannelId = null, menuChannelId = null, trayChannelId = null;
   const workerMessageQueue = [], notificationQueue = [];
-  const channel = () => `__CHANNEL__:${crypto.getRandomValues(new Uint32Array(1))[0]}`;
+  const channel = () => {
+    const id = crypto.getRandomValues(new Uint32Array(1))[0];
+    return { id, token: `__CHANNEL__:${id}` };
+  };
   const windowClosed = new Promise(resolve => { resolveClosed = resolve; });
   const webviewReady = new Promise(resolve => { resolveWebviewReady = resolve; });
   const request = (cmd, requestPayload = {}) => new Promise((resolve, reject) => {
@@ -11777,9 +11780,12 @@ async function desktop() {
       } else if (message.kind === "channel") {
         let event = message.message;
         if (typeof event === "string") try { event = JSON.parse(event); } catch {}
-        if (event === "tray-quit" || event?.id === "tray-quit" || event?.payload?.id === "tray-quit") resolveClosed();
-        else if (event?.type === "Click" && event.button === "Left" && event.buttonState === "Up")
+        if (message.id === quitItemChannelId) {
+          const menuId = typeof event === "string" ? event : event?.id ?? event?.payload?.id;
+          if (menuId === "tray-quit") resolveClosed();
+        } else if (message.id === trayChannelId && event?.type === "Click" && event.button === "Left" && event.buttonState === "Up") {
           void toggleWindow().catch(console.error);
+        }
       }
     }
   };
@@ -11812,18 +11818,31 @@ async function desktop() {
     if (!await waitFor(webviewReady, 10_000, null)) throw new Error("Tauriless WebView input bootstrap timed out");
     webviewMessagesReady = true;
     for (const message of workerMessageQueue.splice(0)) handleWorkerMessage(message);
+    const quitItemChannel = channel();
+    quitItemChannelId = quitItemChannel.id;
+    // Tauri's menu plugin keys MenuChannels by the resource's own MenuId. A click
+    // emits the selected item id, so Quit must own its channel directly. This exact
+    // shape is verified against Tauriless 0.1.18 with a native Windows tray click.
+    const [quitRid, quitId] = await request("plugin:menu|new", {
+      kind: "MenuItem", options: { id: "tray-quit", text: "Quit", enabled: true },
+      handler: quitItemChannel.token,
+    });
+    if (quitId !== "tray-quit") throw new Error("Tauriless tray Quit MenuItem id mismatch");
     const menuChannel = channel();
-    // Retain the item in Tauri's resource table: dropping an inline item removes its channel.
-    const [quitRid] = await request("plugin:menu|new", {
-      kind: "MenuItem", options: { id: "tray-quit", text: "Quit", enabled: true }, handler: menuChannel,
-    });
+    menuChannelId = menuChannel.id;
     const [menuRid] = await request("plugin:menu|new", {
-      kind: "Menu", options: { id: "mrmcp-tray-menu", items: [[quitRid, "MenuItem"]] }, handler: menuChannel,
+      kind: "Menu", options: { id: "mrmcp-tray-menu", items: [[quitRid, "MenuItem"]] },
+      handler: menuChannel.token,
     });
+    const quitItem = await request("plugin:menu|get", { rid: menuRid, kind: "Menu", id: "tray-quit" });
+    if (!Array.isArray(quitItem) || quitItem[1] !== "tray-quit" || quitItem[2] !== "MenuItem")
+      throw new Error("Tauriless tray Quit MenuItem was not retained in the tray menu");
+    const trayChannel = channel();
+    trayChannelId = trayChannel.id;
     await request("plugin:tray|new", { options: {
       id: "mrmcp-tray", menu: [menuRid, "Menu"], icon: nativeIcon(),
       tooltip: `MrMCP ${VERSION}`, showMenuOnLeftClick: false, iconAsTemplate: Deno.build.os === "darwin",
-    }, handler: channel() });
+    }, handler: trayChannel.token });
     await showWindow();
     notificationsReady = true;
     for (const message of notificationQueue.splice(0))
