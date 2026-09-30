@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.10.145
+
+- Goals now load page images by default. Disable page images remains available in Settings → Goals and starts off for new configurations. Existing saved choices are preserved; changes apply on the next dedicated browser launch. SQLite schema remains 4.
+- Desktop Tool Call notifications now default off; Session and Workspace notifications still default on. Existing saved notification preferences are preserved.
+
+## 0.10.144
+
+- Added one Settings → Goals → Login ChatGPT action with automatic login detection for the separate Chrome profile, independent of the user enable/disable flag. Automatic goal work requires successful setup; unknown/login-expired profiles remain paused without repeated browser opening. Explicit setup uses a visible browser with images, observes fresh site-requested recent-chat data to verify login, preserves drafts and never re-arms failed matches. Login readiness persists in config; schema remains 4.
+
+- Added Settings → Goals → Retry missing chat matches at startup, disabled by default. Restart now leaves all missing matches stopped, including attempts queued before shutdown. When opted in and global goal management is enabled, startup schedules one attempt per active unassociated goal, preserving its text/timeout/explicit-set priority and excluding expired, cleared and uncertain-delivery states. Saving the setting does not trigger matching immediately; failed attempts do not loop. SQLite schema remains 4.
+
+## 0.10.143
+
+- ChatGPT association now runs once per explicit nonempty chat_set_goal request for an unassociated Session. The attempt is consumed before opening Chrome; missing login, no match, errors and interruption leave it unscheduled with a manual re-trigger hint. Background ticks, activity, settings changes and restart do not repeat it. A new set re-arms matching; existing associations and recurring goal delivery keep their normal behavior. Added persisted matching state and interrupted-attempt recovery using existing Session fields; SQLite schema remains 4.
+
+## 0.10.142
+
+- Goal prompts now attempt submission when their inactivity timeout expires even if ChatGPT is responding or an older Tool Call remains in flight. New Tool Call activity still postpones delivery. Added the persisted Settings → Goals option Stop the current response before sending (default off); enabled attempts click the verified Stop control and wait briefly for readiness before submission. Stop is excluded from submit discovery, active native forms can accept queued prompts without a visible Send button, and busy markers no longer mask structural UI errors. Updated docs and regression coverage; SQLite schema remains 4.
+
+## 0.10.141
+
+- Continue directly from ChatGPT Session association to an already-due goal send in the same scheduler pass, reusing the matched page without a reload and rechecking current activity/revision. A response in the previously visited chat no longer blocks discovery or delivery for other chats; matching can proceed while a candidate responds, and only a busy destination's send is deferred. After UI acknowledgement, reset the interval and continue the next goal without waiting for the assistant answer. Preserve drafts, cancellation and uncertain-delivery safeguards. Updated the complete Goals documentation; SQLite schema remains 4.
+
+## 0.10.140
+
+- Resolved the unversioned cdp.js dependency to npm latest 0.1.2. Added `browser.images` for CDP tools and a persisted Disable page images option in Settings → Goals, enabled by default for monitoring. Image loading uses the library's public launch option; screenshots remain available. Changes apply on the next browser launch. General CDP `windowsHide` now defaults to headless, matching cdp.js. SQLite schema remains 4.
+- Documented the complete Goals lifecycle in TOOLS.md: exact Session association, activity/deadline calculation, repeated UI submission and confirmation, global settings, shared-tab behavior, cancellation, status recovery, persistence and bounded capture. Clarified that goals do not evaluate completion and that ordinary chat/other-connector activity does not reset the MrMCP timer.
+
+## 0.10.139
+
+- Added Settings → Goals with global enablement (default on), configurable default inactivity timeout (5 minutes), headless launch (off) and spawned-process visibility (automatic: windowsHide follows headless). Disable stops background work and capture while preserving saved goals/profile; chat_set_goal remains published and returns disabled. Added cdp.js-based passive network monitoring of recent chats and exact Session arguments on the active history branch, bounded in-memory capture, push hints and rendered-detail fallback. One dedicated tab is reused.
+
+- Replaced the embedded CDP transport/session/bootstrap/XPath implementation with the unversioned `@mefistofelix/cdp.js` npm library. Launch defaults and profile preferences come from its public browser APIs; MrMCP retains detached browser lifetime, stable ports/profiles/target ids, runtime options, batched raw responses, subscription rings, screenshot conversion, Replay and ChatGPT goals. New targets follow the library’s unpaused auto-attach policy. Added configurable per-command `request_timeout_ms` (default 30000) and retention of late actual responses after timeout. SQLite schema remains 4.
+
+## 0.10.138
+
+- Removed locale-dependent ChatGPT control matching from goals. The DOM adapter now uses machine attributes, native form ownership/submit semantics, navigation regions and explicit ARIA/native disclosure relationships, with structural fallbacks for renamed editors and controls. Tool matching parses complete JSON with an exact Session property and tool provenance instead of searching text fragments. Every operation resolves the current DOM again; ambiguous composers/submits, open dialogs and missing receipt identity prevent delivery and produce bounded diagnostics. SQLite schema remains 4.
+
+## 0.10.137
+
+- Added `chat_set_goal` with a required Session capability, exact textual goal, optional inactivity timeout (default 300 seconds) and empty-goal cancellation. A dedicated persistent Chrome profile supports interactive ChatGPT login, rendered tool-call matching against recent conversations, and serialized follow-up delivery. Sessions exposes status, association, last send, next check, login access and immediate stop. Activity, drafts, running calls/responses, concurrent changes and uncertain delivery prevent unwanted repeated sends. Goal state is independent of Tool Call history. SQLite schema is now 4; previous data requires the existing archive-and-Start-Fresh flow, with no migration or automatic reset.
+- Fixed Clear Operational Data compaction when the temporary combined-history view shadows the disk history table: temporarily remove/recreate that view around synchronous VACUUM, preserving both history tiers' normal query contract.
+
+## 0.10.136
+
+- Separated chat Session initialization from Workspace operations with argument-free `init_chat_session`. Every subsequent built-in/custom tool now requires `chat_session`, including Workspace discovery/opening and schema diagnostics; results use the same envelope. Workspace opening preserves the existing Session and never creates one. New Sessions have no implicit working directory: file operations, new processes/kernels and path publication require an explicit Workspace, while Workspace-independent tools remain usable. Updated guided prompts, agent instructions, notifications, diagnostics and UI; internal SQLite identity columns and schema version are unchanged.
+
+## 0.10.135
+
+- Added the MIT license for MrMCP, with copyright attributed to mefistofelix.
+- Added attachment through debugging port/host or HTTP(S) discovery plus configurable connection timeouts. Extended logical targets to accept native creation parameters and independent startup controls for Runtime, Network, Page, ServiceWorker, focus, binding and BackgroundService, including skipping all optional setup. Options remain runtime-only, with conflict checks, reconnect/recreation reuse, and initialization deferred until a newly attached page is identified. Updated Browser diagnostics and Replay for advanced target objects; SQLite schema is unchanged.
+
+## 0.10.134
+
+- Added the advanced `browser` object to CDP calls, subscriptions and polling while retaining the string form. Its required `name` selects runtime-only options for headless/local launches, executable path, profile directory, extra argv or direct browser WebSocket attachment. Reusing a name retains the options until server restart; conflicting live configurations fail explicitly. Direct endpoints never launch a local browser, and Browser diagnostics/replay resolve object names correctly. SQLite schema and persisted browser identity remain unchanged.
+
+## 0.10.133
+
+- Unified custom CDP operations with the standard `call.method` field: `_.click` and `_.find` now use the reserved `_.` namespace instead of the separate `_mrmcp` selector. Updated input schemas, dispatch, retained response method names, Browser counters/replay and documentation; standard CDP parameters and XPath behavior remain unchanged.
+
 ## 0.10.132
 
 - Fixed tray Quit against the actual Tauriless 0.1.18 Windows event path. A native probe proved that an inline item with the Menu handler does not emit the item click, while a retained standalone `MenuItem` with its own handler emits `message:"tray-quit"` and exits correctly. MrMCP now uses three distinct channels (Quit item, Menu and tray), routes Quit only from the dedicated MenuItem channel, inserts the retained item resource into the Menu, and verifies that exact resource through `plugin:menu|get` before creating the tray icon.

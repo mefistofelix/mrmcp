@@ -13,7 +13,7 @@ prompts:
         title: Review focus
         description: Area, component, bug, or behavior to inspect.
         required: true
-      - name: context_handle
+      - name: chat_session
         title: Session handle
         description: Optional MrMCP Session handle when Session and Workspace context is useful.
         required: false

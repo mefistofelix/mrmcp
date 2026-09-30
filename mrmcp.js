@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.132 — Fix tray-menu event routing.
+MrMCP 0.10.145 — Goal images enabled and Tool Call notifications disabled by default.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -13,6 +13,7 @@ import { Buffer } from "node:buffer";
 import chardet from "npm:chardet@2.1.1";
 import iconv from "npm:iconv-lite@0.7.0";
 import * as auto from "npm:@mefistofelix/auto.js";
+import * as cdp from "npm:@mefistofelix/cdp.js";
 const loadAutoVips = async () => auto.vips;
 import { inflateRawSync, inflateSync } from "node:zlib";
 import { Readable, Writable } from "node:stream";
@@ -85,7 +86,7 @@ const DEV_PREF_SOURCE_PATH = join(Deno.build.standalone ? STANDALONE_DIR : MODUL
 const PORT_FALLBACK_STEP = 50;
 const UI_INPUT_EVENT = "tauriless://webview-message", UI_RENDER_EVENT = "mrmcp://ui-render";
 const BASE_TOOLS = [
-  "list_workspaces", "open_workspace", "workspace_dev_preferences_write",
+  "init_chat_session", "chat_set_goal", "list_workspaces", "open_workspace", "workspace_dev_preferences_write",
   "fs_glob", "fs_grep", "fs_read", "fs_navigate", "fs_stat",
   "fs_write", "fs_edit", "fs_text_convert_encoding_eol", "fs_mkdir", "fs_copy", "fs_move", "fs_trash", "fs_untrash",
   "desktop_auto", "publish", "cdp_call", "cdp_subs", "cdp_poll", "memory_find", "memory_set", "telegram_req", "discover_commands", "tools_schema", "tools_log", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
@@ -98,14 +99,14 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.132";
-const DB_SCHEMA_VERSION = 3;
+const VERSION = "0.10.145";
+const DB_SCHEMA_VERSION = 4;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, ACTIVE_TOOL_CALL_TTL_MS = 5000;
-const CONTEXT_HANDLE_INPUT_DESCRIPTION = "Required opaque capability returned by open_workspace. Pass the exact value unchanged; never invent, modify, shorten, derive or substitute it.";
-const CONTEXT_HANDLE_OUTPUT_DESCRIPTION = "Opaque capability identifying a persistent Session. Pass this exact value unchanged as context_handle on later calls.";
-const CONTEXT_HANDLE_RULE = "Requires the exact Session context_handle returned by open_workspace.";
+const CHAT_SESSION_INPUT_DESCRIPTION = "Required opaque capability returned by init_chat_session. Pass the exact value unchanged; never invent, modify, shorten, derive or substitute it.";
+const CHAT_SESSION_OUTPUT_DESCRIPTION = "Opaque capability identifying a persistent Session. Pass this exact value unchanged as chat_session on every subsequent tool call.";
+const CHAT_SESSION_RULE = "Requires the exact chat_session returned by init_chat_session.";
 const MCP_UI_EXTENSION = "io.modelcontextprotocol/ui";
 const MCP_UI_MIME_TYPE = "text/html;profile=mcp-app";
 const PUBLISH_UI_URI = "ui://mrmcp/publish-v3.html";
@@ -866,11 +867,24 @@ async function backend({ addWorkspace = null } = {}) {
       oauth_client_id TEXT NOT NULL DEFAULT '',
       client_name TEXT NOT NULL DEFAULT '',
       user_agent TEXT NOT NULL DEFAULT '',
+      chatgpt_chat_id TEXT NOT NULL DEFAULT '',
+      goal_text TEXT NOT NULL DEFAULT '',
+      goal_timeout_seconds INTEGER NOT NULL DEFAULT 300,
+      goal_revision INTEGER NOT NULL DEFAULT 0,
+      goal_updated_at INTEGER NOT NULL DEFAULT 0,
+      goal_activity_at INTEGER NOT NULL DEFAULT 0,
+      goal_status TEXT NOT NULL DEFAULT 'disabled',
+      goal_next_check_at INTEGER NOT NULL DEFAULT 0,
+      goal_last_sent_at INTEGER NOT NULL DEFAULT 0,
+      goal_error TEXT NOT NULL DEFAULT '',
       FOREIGN KEY(server_id) REFERENCES server_config(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS contexts_server ON contexts(server_id,updated_at DESC);
     CREATE INDEX IF NOT EXISTS contexts_active ON contexts(last_active_at DESC);
     CREATE INDEX IF NOT EXISTS contexts_root ON contexts(server_id,root_id);
+    CREATE INDEX IF NOT EXISTS contexts_goals ON contexts(goal_next_check_at) WHERE goal_text<>'';
+    CREATE INDEX IF NOT EXISTS contexts_chat_id ON contexts(chatgpt_chat_id) WHERE chatgpt_chat_id<>'';
+    CREATE UNIQUE INDEX IF NOT EXISTS contexts_chat_goal ON contexts(chatgpt_chat_id) WHERE chatgpt_chat_id<>'' AND goal_text<>'';
     CREATE TABLE IF NOT EXISTS process_runs(
       id TEXT PRIMARY KEY,
       log_id INTEGER NOT NULL DEFAULT 0,
@@ -1036,7 +1050,7 @@ async function backend({ addWorkspace = null } = {}) {
   const run = (sql, ...args) => statement(sql).run(...args);
   const configCache = new Map(all("SELECT key,value FROM config").map(row => [String(row.key), String(row.value)]));
   const getCfg = (key, fallback) => configCache.has(String(key)) ? configCache.get(String(key)) : fallback;
-  const desktopNotificationEnabled = type => getCfg(`desktop_notifications_${type}`, getCfg("desktop_notifications", "1")) === "1";
+  const desktopNotificationEnabled = type => getCfg(`desktop_notifications_${type}`, getCfg("desktop_notifications", type === "tool_call" ? "0" : "1")) === "1";
   const postOsNotification = (type, title, body) => {
     if (IS_BACKEND_WORKER && desktopNotificationEnabled(type)) self.postMessage({ type: "os-notification", title, body });
   };
@@ -1048,7 +1062,7 @@ async function backend({ addWorkspace = null } = {}) {
     return `${Math.floor(hours / 24)}d`;
   };
   const TOOL_PREVIEW_ARG_LIMIT = 6, TOOL_PREVIEW_ARG_CHARS = 48, TOOL_PREVIEW_TOTAL_CHARS = 180;
-  const TOOL_PREVIEW_HIDDEN_ARGS = new Set(["context_handle", "current_context_handle"]);
+  const TOOL_PREVIEW_HIDDEN_ARGS = new Set(["chat_session"]);
   const compactPreviewValue = (value, limit = TOOL_PREVIEW_ARG_CHARS) => {
     const text = String(value ?? "").replace(/\s+/g, " ").trim();
     if (text.length <= limit) return text;
@@ -1088,7 +1102,7 @@ async function backend({ addWorkspace = null } = {}) {
     if (!String(tool || "").startsWith("exec")) return "";
     let spec = args && typeof args === "object" ? args : {}, execPrefix = "";
     if (!["exec", "exec_start"].includes(tool)) {
-      const execId = Number(spec.exec_id || 0), handle = String(spec.context_handle || "");
+      const execId = Number(spec.exec_id || 0), handle = String(spec.chat_session || "");
       execPrefix = execId ? `#${execId} ` : "";
       const live = execId ? [...processes.values()].find(record =>
         record.persistent && record.log_id === execId && (!handle || record.context_handle === handle)) : null;
@@ -1125,7 +1139,7 @@ async function backend({ addWorkspace = null } = {}) {
     const count = toolCalls == null ? sessionToolStats(p, context.id).tool_calls : Number(toolCalls || 0);
     const workspace = workspaceName || (Number(context.root_id || 0)
       ? one("SELECT name FROM roots WHERE server_id=? AND id=?", p.id, Number(context.root_id))?.name
-      : "Program folder") || "Program folder";
+      : "No Workspace") || "No Workspace";
     return `💬 Session #${context.id}\n• 📁 ${workspace}\n• 🕒 ${notificationAge(context.created_at, now)}\n• 🛠️ ${count} Tool Call${count === 1 ? "" : "s"}`;
   };
   const compactNotificationError = value => {
@@ -1165,6 +1179,14 @@ async function backend({ addWorkspace = null } = {}) {
     console.log(`Workspace added: ${name} -> ${path}`);
     return;
   }
+  const toolCallLogViewSql = `CREATE TEMP VIEW logs AS
+    SELECT id,started_at,completed_at,server_id,server_name,tool,status,mcp_request_json,mcp_response_json,error,
+      duration_ms,context_id,context_handle,root_id,root_name,root_path,progress_requested,payload_mode,'disk' storage
+    FROM main.logs
+    UNION ALL
+    SELECT id,started_at,completed_at,server_id,server_name,tool,status,mcp_request_json,mcp_response_json,error,
+      duration_ms,context_id,context_handle,root_id,root_name,root_path,progress_requested,payload_mode,'memory' storage
+    FROM logs_memory;`;
   db.exec(`
     CREATE TEMP TABLE logs_memory(
       id INTEGER PRIMARY KEY,
@@ -1196,14 +1218,7 @@ async function backend({ addWorkspace = null } = {}) {
       log_id INTEGER PRIMARY KEY,
       descriptor_json TEXT NOT NULL
     );
-    CREATE TEMP VIEW logs AS
-      SELECT id,started_at,completed_at,server_id,server_name,tool,status,mcp_request_json,mcp_response_json,error,
-        duration_ms,context_id,context_handle,root_id,root_name,root_path,progress_requested,payload_mode,'disk' storage
-      FROM main.logs
-      UNION ALL
-      SELECT id,started_at,completed_at,server_id,server_name,tool,status,mcp_request_json,mcp_response_json,error,
-        duration_ms,context_id,context_handle,root_id,root_name,root_path,progress_requested,payload_mode,'memory' storage
-      FROM logs_memory;
+    ${toolCallLogViewSql}
     CREATE TEMP VIEW tool_call_descriptor_records AS
       SELECT calls.log_id,descriptors.descriptor_json,'disk' storage
       FROM main.tool_call_descriptors calls JOIN main.tool_descriptors descriptors ON descriptors.id=calls.descriptor_id
@@ -1266,6 +1281,10 @@ async function backend({ addWorkspace = null } = {}) {
     ["inherit_system_path", "1"], ["git_preserve_line_endings", "1"], ["exec_environment", ""],
     ["text_encoding_detection", "sample"],
     ["tool_call_storage", "disk"], ["tool_call_payload_mode", "payload"],
+    ["chat_goals_enabled", "1"], ["chat_goal_timeout_minutes", "5"], ["chat_goal_headless", "0"], ["chat_goal_windows_hide", "auto"], ["chat_goal_disable_images", "0"],
+    ["chat_goal_stop_before_send", "0"],
+    ["chat_goal_match_on_startup", "0"],
+    ["chat_goal_login_verified_at", "0"],
     ["tool_call_retention_hours", "0"], ["tool_call_memory_retention_minutes", "60"],
     ["command_discovery_enabled", "1"], ["telegram_bot_token", ""],
   ]) if (!configCache.has(k)) setCfg(k, v);
@@ -1279,45 +1298,51 @@ async function backend({ addWorkspace = null } = {}) {
     "MrMCP", 1, Date.now(),
   );
   const processes = new Map(), processOperations = new Map(), jsKernels = new Map(), activeCallControls = new Map(),
-    cdpBrowsers = new Map(), cdpConnectPromises = new Map(), cdpSubscriptions = new Map(), cdpBrowserSequences = new Map(),
+    cdpBrowsers = new Map(), cdpBrowserOptions = new Map(), cdpTargetOptions = new Map(), cdpTargetReservations = new Map(), cdpConnectPromises = new Map(), cdpSubscriptions = new Map(), cdpBrowserSequences = new Map(),
     oauthConsents = new Map(), rateBuckets = new Map();
 
   const CDP_PORT_MIN = 43000, CDP_PORT_MAX = 49999;
   const CDP_RING_MAX_MESSAGES = 10000, CDP_RING_MAX_BYTES = 32 * 1024 * 1024;
-  const CDP_BINDING_NAME = "_send_to_cdp";
   const CDP_CALL_DOCS = "https://chromedevtools.github.io/devtools-protocol/";
-  const CDP_LAUNCH_ARGS = [
-    "--enable-automation",
-    "--mute-audio",
-    "--hide-crash-restore-bubble",
-    "--disable-field-trial-config",
-    "--disable-background-networking",
-    "--enable-features=NetworkService,NetworkServiceInProcess",
-    "--disable-background-timer-throttling",
-    "--disable-backgrounding-occluded-windows",
-    "--disable-renderer-backgrounding",
-    "--disable-back-forward-cache",
-    "--disable-breakpad",
-    "--no-default-browser-check",
-    "--disable-default-apps",
-    "--disable-dev-shm-usage",
-    "--disable-extensions",
-    "--disable-component-extensions-with-background-pages",
-    "--disable-component-update",
-    "--disable-features=InfiniteSessionRestore,LazyFrameLoading,GlobalMediaControls,DestroyProfileOnBrowserClose,MediaRouter,DialMediaRouteProvider,AcceptCHFrame,AutoExpandDetailsElement,AvoidUnnecessaryBeforeUnloadCheckSync,Translate,PaintHolding",
-    "--disable-popup-blocking",
-    "--allow-pre-commit-input",
-    "--disable-hang-monitor",
-    "--disable-prompt-on-repost",
-    "--force-color-profile=srgb",
-    "--metrics-recording-only",
-    "--no-first-run",
-    "--password-store=basic",
-    "--use-mock-keychain",
-    "--no-service-autorun",
-    "--export-tagged-pdf",
-    "--disable-search-engine-choice-screen",
-  ];
+  const CDP_BROWSER_INPUT = {
+    anyOf: [
+      { type: "string", minLength: 1, maxLength: 64 },
+      { type: "object", additionalProperties: false, properties: {
+        name: { type: "string", minLength: 1, maxLength: 64, description: "Required persistent logical browser label. The string form is shorthand for this name." },
+        headless: { type: "boolean", description: "Launch without a visible browser window. Defaults false for a new name; applies only to local launches." },
+        windowsHide: { type: "boolean", description: "Hide the spawned process console/window where supported by the OS (Node windowsHide). Defaults to the effective headless value; an explicit value overrides it. Applies only to local launches." },
+        images: { type: "boolean", description: "Load page images. Defaults true; false disables image loading through cdp.js launch settings. Applies only to local launches and does not disable screenshots." },
+        executable_path: { type: "string", maxLength: 4096, description: "Chromium executable path for local launches. Relative paths resolve against the application directory. Empty resets automatic discovery, including MRMCP_CDP_BROWSER." },
+        user_data_dir: { type: "string", maxLength: 4096, description: "Local browser profile directory. Relative paths resolve against the application directory. Empty resets .mrmcp/cdp/<name>." },
+        args: { type: "array", maxItems: 100, items: { type: "string", maxLength: 8192 }, description: "Additional verbatim argv for local launches. Matching switches override built-in launch defaults. Headless, user-data-dir and remote-debugging switches are managed separately and cannot be supplied here. Empty clears extra arguments." },
+        websocket_url: { type: "string", maxLength: 8192, description: "Direct browser-level ws:// or wss:// CDP endpoint. Connects without local executable discovery, profile creation or browser launch; cannot be combined with local launch options in the same object. Empty switches back to managed local mode." },
+        http_url: { type: "string", maxLength: 8192, description: "HTTP(S) debugging base URL or exact /json/version URL. Discovers the browser WebSocket without launching Chrome. Empty returns to managed local mode." },
+        port: { anyOf: [{ type: "integer", minimum: 1, maximum: 65535 }, { type: "null" }], description: "Connect to an existing debugging port, without launching Chrome. Uses host or 127.0.0.1. null returns to managed local mode." },
+        host: { type: "string", minLength: 1, maxLength: 253, description: "Hostname or IPv4/IPv6 address for port attachment; defaults 127.0.0.1. Requires an effective port." },
+        request_timeout_ms: { type: "integer", minimum: 100, maximum: 86400000, description: "Timeout for individual CDP commands, including page setup. Defaults 30000; raise it for long Runtime.evaluate promises or XPath retries. A timeout does not cancel browser execution." },
+        connect_timeout_ms: { type: "integer", minimum: 100, maximum: 60000, description: "Timeout for each discovery, WebSocket handshake and connection setup phase; also bounds local launch readiness. Defaults 15000." },
+      }, required: ["name"] },
+    ],
+    description: "Browser name string, or advanced object with required name. Explicit options update that name's configuration in memory only; omitted options retain it, and subsequent string calls reuse it until server restart. Reapply advanced options after restart. Conflicting options for a connected/connecting browser fail rather than restarting it. Launch options apply only when a local browser must be started.",
+  };
+  const CDP_TARGET_INPUT = {
+    anyOf: [
+      { type: "string", minLength: 1, maxLength: 128 },
+      { type: "object", additionalProperties: false, properties: {
+        name: { type: "string", minLength: 1, maxLength: 128, description: "Required persistent logical page label." },
+        create_params: { type: "object", additionalProperties: true, description: "Native Target.createTarget params merged over url=about:blank and background=true, e.g. url, newWindow, width, height, browserContextId or hidden. Used only when this logical page must be created; passed unchanged to Chrome. forTab=true is unsupported because logical targets route to pages." },
+        initialize: { type: "boolean", description: "Defaults true. false skips all optional page setup below; the debugger pause is always released." },
+        runtime: { anyOf: [{ type: "boolean" }, { type: "string", enum: ["bootstrap"] }], description: "Defaults bootstrap: Runtime.enable during setup then Runtime.disable. true keeps Runtime reporting enabled; false sends neither. Does not disable JavaScript execution." },
+        page: { type: "boolean", description: "Send Page.enable during setup; defaults true." },
+        network: { type: "boolean", description: "Send Network.enable during setup; defaults true. false disables automatic network reporting, not network access." },
+        service_worker: { type: "boolean", description: "Send ServiceWorker.enable during setup; defaults true." },
+        focus_emulation: { type: "boolean", description: "Enable focus emulation during setup; defaults true." },
+        binding: { type: "boolean", description: "Install the _send_to_cdp Runtime binding during setup; defaults true, independent of Runtime reporting." },
+        background_service: { type: "boolean", description: "Clear, observe and record pushMessaging BackgroundService events during setup; defaults true." },
+      }, required: ["name"] },
+    ],
+    description: "Optional logical page name or advanced object with required name. Required by _.click/_.find; omit for browser-level calls. Options are remembered per browser/name only during this server run and reapplied on reconnect/recreation. Omitted options retain their values. Changing options for a live or opening page fails; close it first or choose a new name. Creation parameters do not navigate an existing page.",
+  };
   const cdpBrowserName = value => {
     const browser = String(value ?? "").trim();
     if (!browser || browser.length > 64 || /[<>:"/\\|?*\x00-\x1f\x7f]/.test(browser) || /[. ]$/.test(browser) || browser === "." || browser === "..")
@@ -1331,39 +1356,107 @@ async function backend({ addWorkspace = null } = {}) {
     return target;
   };
   const cdpPathKey = value => Deno.build.os === "windows" ? resolve(value).toLowerCase() : resolve(value);
+  const cdpLaunchSwitch = value => String(value).match(Deno.build.os === "windows" ? /^(?:--?|\/)([^=]+)(?:=|$)/ : /^--?([^=]+)(?:=|$)/)?.[1].toLowerCase() || "";
+  const cdpBrowserLabel = value => String(value && typeof value === "object" ? value.name ?? "" : value ?? "").trim();
+  const cdpConnectionMode = options => options?.websocket_url ? "websocket" : options?.http_url ? "http" : options?.port ? "port" : "local";
+  function cdpEndpoint(value, protocols, field) {
+    let url;
+    try { url = new URL(value); } catch { throw new Error(`${field} must be an absolute ${protocols.join(" or ")} URL`); }
+    if (!protocols.includes(url.protocol) || !url.hostname || url.hash || url.username || url.password)
+      throw new Error(`${field} must be a ${protocols.join(" or ")} URL without credentials or a fragment`);
+    return url;
+  }
+  function cdpDiscoveryUrl(options) {
+    const url = options.http_url ? new URL(options.http_url) : new URL(`http://${options.host}:${options.port}`);
+    if (!/\/json\/version\/?$/.test(url.pathname)) url.pathname = url.pathname.replace(/\/$/, "") + "/json/version";
+    return url.href;
+  }
+  function cdpBrowserSpec(value) {
+    const error = inputSchemaError(CDP_BROWSER_INPUT.anyOf[typeof value === "string" ? 0 : 1], value, "browser");
+    if (error) throw new Error(error);
+    const browser = cdpBrowserName(cdpBrowserLabel(value)), options = typeof value === "string" ? {} : { ...value };
+    delete options.name;
+    const endpoints = ["websocket_url", "http_url", "port"];
+    if (endpoints.filter(key => Object.hasOwn(options, key)).length > 1)
+      throw new Error("Specify only one browser endpoint: websocket_url, http_url or port");
+    if (options.websocket_url) options.websocket_url = cdpEndpoint(options.websocket_url, ["ws:", "wss:"], "browser.websocket_url").href;
+    if (options.http_url) options.http_url = cdpEndpoint(options.http_url, ["http:", "https:"], "browser.http_url").href;
+    if (Object.hasOwn(options, "host")) {
+      const host = options.host;
+      if (/[\s/@?#\\]/.test(host)) throw new Error("browser.host must be a hostname or IP address without a scheme, path or port");
+      const bare = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+      if (host.includes(":") && isIP(bare) !== 6) throw new Error("browser.host must not include a scheme or port");
+      const authority = isIP(bare) === 6 ? `[${bare}]` : bare;
+      let url;
+      try { url = new URL(`http://${authority}`); } catch { throw new Error("browser.host must be a hostname or IP address without a port"); }
+      if (url.port || !url.hostname) throw new Error("browser.host must not include a port");
+      options.host = url.hostname;
+    }
+    for (const key of ["executable_path", "user_data_dir"]) if (Object.hasOwn(options, key)) {
+      const path = options[key];
+      if (path.includes("\0") || path && !path.trim()) throw new Error(`browser.${key} must be a valid path or an empty string`);
+      options[key] = path ? resolve(APP_DIR, path) : key === "user_data_dir" ? join(CDP_DIR, browser) : "";
+    }
+    if (options.args) for (const arg of options.args) {
+      if (arg.includes("\0")) throw new Error("browser.args must not contain NUL characters");
+      const flag = cdpLaunchSwitch(arg);
+      if (arg === "--" || ["headless", "user-data-dir", "remote-debugging"].includes(flag) || flag.startsWith("remote-debugging-"))
+        throw new Error("browser.args cannot override managed headless, user-data-dir or remote-debugging switches");
+    }
+    return { browser, options };
+  }
+  function cdpConfiguredOptions(spec, saved = cdpBrowserOptions.get(spec.browser)) {
+    const options = {
+      headless: false, windowsHide: undefined, images: true, executable_path: "", user_data_dir: join(CDP_DIR, spec.browser), args: [],
+      websocket_url: "", http_url: "", port: null, host: "127.0.0.1", connect_timeout_ms: 15000, request_timeout_ms: 30000,
+      ...saved,
+    };
+    if (["websocket_url", "http_url", "port"].some(key => Object.hasOwn(spec.options, key)))
+      Object.assign(options, { websocket_url: "", http_url: "", port: null });
+    Object.assign(options, spec.options);
+    if (cdpConnectionMode(options) !== "local" && ["headless", "windowsHide", "images", "executable_path", "user_data_dir", "args"].some(key => Object.hasOwn(spec.options, key)))
+      throw new Error("Browser attachment cannot be combined with local launch options; clear its endpoint to return to local mode");
+    if (Object.hasOwn(spec.options, "host") && cdpConnectionMode(options) !== "port")
+      throw new Error("browser.host requires browser.port attachment");
+    return options;
+  }
+  const cdpOptionsKey = options => JSON.stringify({
+    ...options, executable_path: options.executable_path ? cdpPathKey(options.executable_path) : "",
+    user_data_dir: cdpPathKey(options.user_data_dir),
+  });
+  const cdpOptionsConflict = browser => new Error(`Browser '${browser}' is already connected, connecting or running with different options. Reuse its options or choose another browser name.`);
+  function cdpReuseBrowser(record, spec) {
+    if (cdpOptionsKey(cdpConfiguredOptions(spec, record.options)) !== cdpOptionsKey(record.options)) throw cdpOptionsConflict(spec.browser);
+    return record;
+  }
+  function cdpTargetSpec(value) {
+    const error = inputSchemaError(CDP_TARGET_INPUT.anyOf[typeof value === "string" ? 0 : 1], value, "target");
+    if (error) throw new Error(error);
+    const target = cdpTargetName(cdpBrowserLabel(value)), options = typeof value === "string" ? {} : { ...value };
+    delete options.name;
+    if (options.create_params?.forTab === true) throw new Error("target.create_params.forTab=true is unsupported: logical targets must be pages");
+    return { target, options };
+  }
+  const cdpTargetKey = (browser, target) => JSON.stringify([browser, target]);
+  const cdpSortedJson = value => JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item)
+    ? Object.fromEntries(Object.keys(item).sort().map(key => [key, item[key]])) : item);
+  function cdpConfigureTarget(browser, spec) {
+    const key = cdpTargetKey(browser, spec.target), saved = cdpTargetOptions.get(key);
+    const options = { create_params: {}, initialize: true, runtime: "bootstrap", page: true, network: true,
+      service_worker: true, focus_emulation: true, binding: true, background_service: true, ...saved, ...spec.options };
+    const record = cdpBrowsers.get(browser), targetId = record?.label_targets.get(spec.target);
+    if (saved && cdpSortedJson(options) !== cdpSortedJson(saved) &&
+        (cdpTargetReservations.has(key) || cdpConnectPromises.has(browser) || record?.target_promises.has(spec.target) || targetId && record.live_targets.has(targetId)))
+      throw new Error(`Target '${spec.target}' is already open or opening with different options. Close it first or choose another target name.`);
+    cdpTargetOptions.set(key, options);
+    return options;
+  }
   const cdpFileExists = async path => {
     try { return (await Deno.stat(path)).isFile; }
     catch (error) { if (error instanceof Deno.errors.NotFound) return false; throw error; }
   };
-  const cdpBrowserCandidates = () => {
-    const override = String(Deno.env.get("MRMCP_CDP_BROWSER") || "").trim();
-    if (override) return [override];
-    const home = nativeHomeDir();
-    if (Deno.build.os === "windows") {
-      const programFiles = String(Deno.env.get("ProgramFiles") || "C:\\Program Files");
-      const programFilesX86 = String(Deno.env.get("ProgramFiles(x86)") || "C:\\Program Files (x86)");
-      const local = String(Deno.env.get("LOCALAPPDATA") || join(home, "AppData", "Local"));
-      return [
-        join(programFiles, "Google", "Chrome", "Application", "chrome.exe"),
-        join(programFilesX86, "Google", "Chrome", "Application", "chrome.exe"),
-        join(local, "Google", "Chrome", "Application", "chrome.exe"),
-        join(programFiles, "Microsoft", "Edge", "Application", "msedge.exe"),
-        join(programFilesX86, "Microsoft", "Edge", "Application", "msedge.exe"),
-      ];
-    }
-    if (Deno.build.os === "darwin") return [
-      "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-      join(home, "Applications", "Google Chrome.app", "Contents", "MacOS", "Google Chrome"),
-      "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-    ];
-    return [
-      "/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/usr/bin/chromium", "/usr/bin/chromium-browser",
-      "/usr/bin/microsoft-edge", "/usr/bin/microsoft-edge-stable",
-    ];
-  };
   async function cdpBrowserExecutable() {
-    for (const candidate of cdpBrowserCandidates()) if (await cdpFileExists(candidate)) return candidate;
-    throw new Error("No CDP-compatible Chromium browser found. Set MRMCP_CDP_BROWSER to an executable path.");
+    return String(Deno.env.get("MRMCP_CDP_BROWSER") || "").trim() || cdp.browser.find_executable_path();
   }
   async function cdpCanBind(port) {
     let listener;
@@ -1397,39 +1490,47 @@ async function backend({ addWorkspace = null } = {}) {
     }
     throw new Error(`No free CDP port in ${CDP_PORT_MIN}-${CDP_PORT_MAX}`);
   }
-  async function cdpVersion(port, timeoutMs = 800) {
+  async function cdpVersion(endpoint, timeoutMs = 800) {
     const controller = new AbortController(), timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: controller.signal });
+      const response = await fetch(typeof endpoint === "number" ? `http://127.0.0.1:${endpoint}/json/version` : endpoint, { signal: controller.signal });
       if (!response.ok) return null;
       const value = await response.json();
-      return value && typeof value.webSocketDebuggerUrl === "string" ? value : null;
+      if (!value || typeof value.webSocketDebuggerUrl !== "string") return null;
+      value.webSocketDebuggerUrl = cdpEndpoint(value.webSocketDebuggerUrl, ["ws:", "wss:"], "CDP discovery endpoint").href;
+      return value;
     } catch { return null; }
     finally { clearTimeout(timer); }
   }
   async function cdpLaunchBrowser(record) {
-    await Deno.mkdir(record.user_data_dir, { recursive: true });
-    const executable = await cdpBrowserExecutable();
-    const args = [
-      ...CDP_LAUNCH_ARGS,
-      `--user-data-dir=${record.user_data_dir}`,
-      `--remote-debugging-port=${record.port}`,
-      "about:blank",
-    ];
-    const child = nodeSpawn(executable, args, { detached: true, stdio: "ignore", windowsHide: true });
+    const options = record.options;
+    const executable = options.executable_path || await cdpBrowserExecutable();
+    if (!await cdpFileExists(executable)) throw new Error("browser.executable_path does not point to an existing file");
+    // Use the package's launch policy; MrMCP additionally needs a stable port,
+    // verbatim argv and a detached process that survives backend shutdown.
+    const defaults = cdp.browser.build_args({ headless: options.headless, images: options.images, user_data_dir: record.user_data_dir });
+    defaults["remote-debugging-port"] = record.port;
+    const overrides = new Set(options.args.map(cdpLaunchSwitch).filter(Boolean));
+    const args = [...cdp.util.args_to_strings(defaults).filter(arg => !overrides.has(cdpLaunchSwitch(arg))), ...options.args, "about:blank"];
+    const profileIndex = args.findLastIndex(arg => arg === "--profile-directory" || arg.startsWith("--profile-directory="));
+    const profile = profileIndex < 0 ? "Default" : args[profileIndex] === "--profile-directory" ? args[profileIndex + 1] : args[profileIndex].slice("--profile-directory=".length);
+    await cdp.browser.update_profile_preferences(join(record.user_data_dir, profile, "Preferences"), {
+      "translate.enabled": false, "signin.allowed": false, "signin.allowed_on_next_startup": false,
+    });
+    const child = nodeSpawn(executable, args, { detached: true, stdio: "ignore", windowsHide: options.windowsHide ?? options.headless });
     await new Promise((resolveSpawn, rejectSpawn) => {
       child.once("spawn", resolveSpawn);
       child.once("error", rejectSpawn);
     });
     child.unref();
-    const deadline = Date.now() + 15000;
+    const deadline = Date.now() + options.connect_timeout_ms;
     while (Date.now() < deadline) {
       const version = await cdpVersion(record.port, 500);
       if (version) return version;
       if (child.exitCode != null) throw new Error(`Browser exited before CDP became ready (exit ${child.exitCode})`);
       await sleep(100);
     }
-    throw new Error(`Browser did not expose CDP on 127.0.0.1:${record.port} within 15 seconds`);
+    throw new Error(`Browser did not expose CDP on 127.0.0.1:${record.port} within ${options.connect_timeout_ms} ms`);
   }
   const cdpPublicMessage = message => {
     const { _bytes, ...publicMessage } = message;
@@ -1489,7 +1590,7 @@ async function backend({ addWorkspace = null } = {}) {
     return stored;
   }
   const cdpMessageTarget = (record, message) => {
-    let sessionId = typeof message.sessionId === "string" ? message.sessionId : "";
+    let sessionId = String(message.sessionId || (message.method === "Target.detachedFromTarget" ? message.params?.sessionId : "") || "");
     let targetId = sessionId ? String(record.session_to_target.get(sessionId) || "") : "";
     const params = message.params || {};
     if (!targetId && message.method === "Target.attachedToTarget") {
@@ -1506,244 +1607,160 @@ async function backend({ addWorkspace = null } = {}) {
       target: targetId ? record.target_labels.get(targetId) || null : null,
     };
   };
-  function cdpResolveAttachWaiters(record, targetId, sessionId) {
-    const waiters = record.attach_waiters.get(targetId);
-    if (!waiters) return;
-    record.attach_waiters.delete(targetId);
-    for (const resolveWaiter of waiters) resolveWaiter(sessionId);
-  }
-  function cdpWaitForAttach(record, targetId, timeoutMs = 400) {
-    const existing = record.target_to_session.get(targetId);
-    if (existing) return Promise.resolve(existing);
-    return new Promise(resolveWaiter => {
-      const waiters = record.attach_waiters.get(targetId) || [];
-      waiters.push(resolveWaiter);
-      record.attach_waiters.set(targetId, waiters);
-      const timer = setTimeout(() => {
-        const current = record.attach_waiters.get(targetId) || [];
-        const index = current.indexOf(resolveWaiter);
-        if (index >= 0) current.splice(index, 1);
-        if (!current.length) record.attach_waiters.delete(targetId);
-        resolveWaiter(null);
-      }, timeoutMs);
-      const original = resolveWaiter;
-      resolveWaiter = value => { clearTimeout(timer); original(value); };
-      waiters[waiters.length - 1] = resolveWaiter;
-    });
-  }
-  function cdpProtocolError(method, raw) {
-    const message = String(raw?.error?.message || raw?.error || "CDP protocol error");
-    const error = new Error(`${method}: ${message}`);
-    error.cdp = raw;
-    return error;
-  }
   function cdpRequest(record, method, params = {}, sessionId = "", options = {}) {
     if (!record.open || record.ws.readyState !== WebSocket.OPEN) throw new Error(`CDP browser ${record.browser} is not connected`);
-    const id = record.next_id++;
-    const request = { id, method, params: params && typeof params === "object" && !Array.isArray(params) ? params : {} };
+    const request = { method, params };
     if (sessionId) request.sessionId = sessionId;
-    let resolveResponse, rejectResponse;
-    const promise = options.wait === false ? null : new Promise((resolvePromise, rejectPromise) => {
-      resolveResponse = resolvePromise; rejectResponse = rejectPromise;
-    });
-    record.pending.set(id, {
+    // jsrpc owns allocation, wire serialization, protocol errors and response waits.
+    // Native params stay untouched: MrMCP routing lives outside CDP params.
+    const response = record.ws.req(request), id = record.ws.id;
+    const pending = {
       id, method: String(options.logical_method || method), wire_method: method, session_id: sessionId || null,
-      target: options.target || null, target_id: options.target_id || null,
-      expose: !!options.expose, resolve: resolveResponse, reject: rejectResponse,
-      reject_on_error: !!options.reject_on_error,
+      target: options.target || null, target_id: options.target_id || null, expose: !!options.expose, raw: null,
+    };
+    record.pending.set(id, pending);
+    const promise = response.then(result => pending.raw || { id, result, ...(sessionId ? { sessionId } : {}) }, error => {
+      if (error.cdp && !options.reject_on_error) return error.cdp;
+      throw error;
+    }).finally(() => {
+      // Keep correlation for a late response after a package request timeout.
+      // It still belongs in the ring; timeout never implies browser cancellation.
+      if (pending.raw || !record.open) record.pending.delete(id);
     });
-    try { record.ws.send(JSON.stringify(request)); }
-    catch (error) { record.pending.delete(id); rejectResponse?.(error); throw error; }
+    if (options.wait === false) { void promise.catch(() => {}); return { id, promise: null }; }
     return { id, promise };
   }
   async function cdpInternal(record, method, params = {}, sessionId = "") {
     const { promise } = cdpRequest(record, method, params, sessionId, { wait: true, reject_on_error: true });
-    const raw = await promise;
-    return raw?.result || {};
+    return (await promise)?.result || {};
   }
-  async function cdpInitializePageSession(record, targetId, sessionId) {
-    if (record.session_init_promises.has(sessionId)) return await record.session_init_promises.get(sessionId);
-    const promise = (async () => {
-      const errors = [];
-      const steps = [
-        ["Runtime.enable", {}],
-        ["Page.enable", {}],
-        ["Network.enable", {}],
-        ["ServiceWorker.enable", {}],
-        ["Emulation.setFocusEmulationEnabled", { enabled: true }],
-        ["Runtime.addBinding", { name: CDP_BINDING_NAME }],
-        ["BackgroundService.clearEvents", { service: "pushMessaging" }],
-        ["BackgroundService.startObserving", { service: "pushMessaging" }],
-        ["BackgroundService.setRecording", { service: "pushMessaging", shouldRecord: true }],
-      ];
-      for (const [method, params] of steps) {
-        try { await cdpInternal(record, method, params, sessionId); }
-        catch (error) { errors.push(`${method}: ${String(error?.message || error)}`); }
-      }
-      try { await cdpInternal(record, "Runtime.disable", {}, sessionId); }
-      catch (error) { errors.push(`Runtime.disable: ${String(error?.message || error)}`); }
-      try { await cdpInternal(record, "Runtime.runIfWaitingForDebugger", {}, sessionId); }
-      catch (error) { errors.push(`Runtime.runIfWaitingForDebugger: ${String(error?.message || error)}`); }
-      record.session_setup_errors.set(sessionId, errors);
-      return errors;
-    })();
-    record.session_init_promises.set(sessionId, promise);
-    try { return await promise; }
-    finally { if (!record.open) record.session_init_promises.delete(sessionId); }
-  }
-  async function cdpResumeNonPageSession(record, sessionId) {
-    try { await cdpInternal(record, "Runtime.runIfWaitingForDebugger", {}, sessionId); }
-    catch {}
-  }
-  function cdpHandleNotificationState(record, message) {
-    const params = message.params || {};
-    if (message.method === "Target.attachedToTarget") {
-      const sessionId = String(params.sessionId || ""), targetId = String(params.targetInfo?.targetId || "");
-      if (sessionId && targetId) {
-        record.target_to_session.set(targetId, sessionId);
-        record.session_to_target.set(sessionId, targetId);
-        if (params.targetInfo) record.live_targets.set(targetId, params.targetInfo);
-        const target = record.target_labels.get(targetId) || one("SELECT target FROM cdp_targets WHERE browser=? AND target_id=?", record.browser, targetId)?.target || "";
-        if (target) { record.target_labels.set(targetId, target); record.label_targets.set(target, targetId); }
-        cdpResolveAttachWaiters(record, targetId, sessionId);
-        if (params.targetInfo?.type === "page") void cdpInitializePageSession(record, targetId, sessionId);
-        else if (params.waitingForDebugger) void cdpResumeNonPageSession(record, sessionId);
-      }
-    } else if (message.method === "Target.detachedFromTarget") {
-      const sessionId = String(params.sessionId || ""), targetId = String(record.session_to_target.get(sessionId) || params.targetId || "");
-      if (sessionId) {
-        record.session_to_target.delete(sessionId);
-        record.session_init_promises.delete(sessionId);
-        record.session_setup_errors.delete(sessionId);
-      }
-      if (targetId && record.target_to_session.get(targetId) === sessionId) record.target_to_session.delete(targetId);
-    } else if (message.method === "Target.targetCreated" || message.method === "Target.targetInfoChanged") {
-      const info = params.targetInfo;
-      if (info?.targetId) record.live_targets.set(String(info.targetId), info);
-    } else if (message.method === "Target.targetDestroyed") {
-      const targetId = String(params.targetId || ""), sessionId = String(record.target_to_session.get(targetId) || "");
-      if (sessionId) {
-        record.target_to_session.delete(targetId); record.session_to_target.delete(sessionId);
-        record.session_init_promises.delete(sessionId); record.session_setup_errors.delete(sessionId);
-      }
-      record.live_targets.delete(targetId);
-      const target = record.target_labels.get(targetId);
-      if (target && record.label_targets.get(target) === targetId) record.label_targets.delete(target);
-      record.target_labels.delete(targetId);
-    } else if (message.method === "Target.targetCrashed") {
-      const targetId = String(params.targetId || "");
-      if (targetId) record.live_targets.delete(targetId);
+  function cdpSyncTargets(record) {
+    // These maps are UI/ring projections. The package owns live target/session state.
+    const engine = record.engine;
+    record.live_targets = new Map(Object.entries(engine.target_info || {}));
+    record.session_to_target = new Map(Object.entries(engine.session_targets || {}));
+    record.target_to_session = new Map([...record.session_to_target].map(([session, target]) => [target, session]));
+    record.target_labels.clear(); record.label_targets.clear(); record.session_setup_errors.clear();
+    for (const [name, entry] of Object.entries(engine.targets)) {
+      if (!entry.targetId) continue;
+      record.target_labels.set(entry.targetId, name); record.label_targets.set(name, entry.targetId);
+      if (entry.sessionId) record.session_setup_errors.set(entry.sessionId, [...(entry.setup_errors || [])]);
     }
   }
   function cdpHandleMessage(record, data) {
     let message;
-    try {
-      const text = typeof data === "string" ? data : data instanceof ArrayBuffer ? dec.decode(new Uint8Array(data)) : String(data);
-      message = JSON.parse(text);
-    } catch { return; }
+    try { message = JSON.parse(data); } catch { return; }
     if (message && Number.isInteger(message.id)) {
       const pending = record.pending.get(message.id);
-      if (pending) record.pending.delete(message.id);
+      if (pending) { pending.raw = message; record.pending.delete(message.id); }
       if (pending?.expose) cdpRecordMessage(record, {
-        browser: record.browser, type: "response", id: Number(message.id), method: pending.method,
-        target: pending.target || null, target_id: pending.target_id || null, session_id: pending.session_id || null,
-        cdp: message,
+        browser: record.browser, type: "response", id: message.id, method: pending.method,
+        target: pending.target, target_id: pending.target_id, session_id: pending.session_id, cdp: message,
       });
-      if (pending?.resolve) {
-        if (message.error && pending.reject_on_error) pending.reject?.(cdpProtocolError(pending.wire_method || pending.method, message));
-        else pending.resolve(message);
-      }
       return;
     }
     if (!message || typeof message.method !== "string") return;
-    cdpHandleNotificationState(record, message);
-    const targetMeta = cdpMessageTarget(record, message);
+    // Resolve detach/destroy metadata before refreshing the projection.
+    const previous = cdpMessageTarget(record, message);
+    if (message.method.startsWith("Target.")) cdpSyncTargets(record);
+    const current = cdpMessageTarget(record, message);
     const envelope = {
       browser: record.browser, type: "notification", id: null, method: message.method,
-      ...targetMeta, cdp: message,
+      ...(current.target_id ? current : previous), cdp: message,
     };
     let serialized;
-    const regexText = () => serialized ??= JSON.stringify(envelope.cdp ?? null);
+    const regexText = () => serialized ??= JSON.stringify(message);
     for (const subscription of cdpSubscriptions.values()) {
       if (!cdpSubscriptionMatches(subscription, envelope, regexText)) continue;
-      cdpRecordMessage(record, envelope);
-      break;
+      cdpRecordMessage(record, envelope); break;
     }
   }
-  function cdpDisconnect(record, reason = "CDP connection closed") {
+  function cdpDisconnect(record) {
     if (!record.open) return;
     record.open = false;
     if (cdpBrowsers.get(record.browser) === record) cdpBrowsers.delete(record.browser);
-    const error = new Error(reason);
-    for (const pending of record.pending.values()) pending.reject?.(error);
-    record.pending.clear();
-    for (const waiters of record.attach_waiters.values()) for (const resolveWaiter of waiters) resolveWaiter(null);
-    record.attach_waiters.clear();
-    record.target_to_session.clear(); record.session_to_target.clear();
+    record.pending.clear(); record.target_to_session.clear(); record.session_to_target.clear();
     queueCdpUiRender();
   }
   async function cdpOpenConnection(browserRecord, version) {
-    const startSeq = cdpBrowserSequences.get(browserRecord.browser) || 0;
-    const ws = new WebSocket(version.webSocketDebuggerUrl);
-    const record = {
-      browser: browserRecord.browser, port: browserRecord.port, user_data_dir: browserRecord.user_data_dir,
-      ws, open: true, connection_id: randomToken(8), start_seq: startSeq,
-      next_id: Math.floor(Math.random() * 0x3fffffff) + 1, pending: new Map(),
-      target_to_session: new Map(), session_to_target: new Map(), target_labels: new Map(), label_targets: new Map(), live_targets: new Map(),
-      attach_waiters: new Map(), session_init_promises: new Map(), session_setup_errors: new Map(), target_promises: new Map(),
-      ring: [], ring_head: 0, ring_bytes: 0, dropped: 0, message_chain: Promise.resolve(),
+    const client = new cdp.cdp({ base_path: CDP_DIR });
+    const browser = {
+      name: browserRecord.browser, websocket_url: version.webSocketDebuggerUrl,
+      connect_timeout_ms: browserRecord.options.connect_timeout_ms,
+      request_timeout_ms: browserRecord.options.request_timeout_ms,
     };
-    for (const row of all("SELECT target,target_id FROM cdp_targets WHERE browser=?", browserRecord.browser)) {
-      record.target_labels.set(String(row.target_id), String(row.target));
-      record.label_targets.set(String(row.target), String(row.target_id));
+    // call() creates the documented browser/socket record synchronously for a
+    // direct endpoint. Observe that public socket before connection events arrive.
+    const ready = client.call({ method: "Browser.getVersion", params: { browser } });
+    const engine = client.browsers[browser.name], ws = engine.socket;
+    ws.id = Math.floor(Math.random() * 0x3fffffff) + 1;
+    const record = {
+      ...browserRecord, client, engine, ws, open: true, connection_id: randomToken(8),
+      start_seq: cdpBrowserSequences.get(browser.name) || 0, pending: new Map(),
+      target_to_session: new Map(), session_to_target: new Map(), target_labels: new Map(), label_targets: new Map(), live_targets: new Map(),
+      session_setup_errors: new Map(), target_promises: new Map(),
+      ring: [], ring_head: 0, ring_bytes: 0, dropped: 0,
+    };
+    for (const row of all("SELECT target,target_id FROM cdp_targets WHERE browser=?", browser.name)) {
+      const options = cdpConfigureTarget(browser.name, { target: row.target, options: {} });
+      engine.targets[row.target] = { name: row.target, targetId: row.target_id, sessionId: null, ...options };
     }
-    await new Promise((resolveOpen, rejectOpen) => {
-      const onOpen = () => { cleanup(); resolveOpen(); };
-      const onError = () => { cleanup(); rejectOpen(new Error(`Unable to open CDP WebSocket for ${browserRecord.browser}`)); };
-      const cleanup = () => { ws.removeEventListener("open", onOpen); ws.removeEventListener("error", onError); };
-      ws.addEventListener("open", onOpen); ws.addEventListener("error", onError);
-    });
-    ws.addEventListener("message", event => {
-      record.message_chain = record.message_chain.then(async () => {
-        let data = event.data;
-        if (data instanceof Blob) data = await data.text();
-        cdpHandleMessage(record, data);
-      }).catch(() => {});
-    });
+    cdpSyncTargets(record);
+    ws.addEventListener("message", event => cdpHandleMessage(record, event.data));
     ws.addEventListener("close", () => cdpDisconnect(record));
-    ws.addEventListener("error", () => { if (ws.readyState === WebSocket.CLOSED) cdpDisconnect(record, "CDP WebSocket failed"); });
+    let timer, setupTimedOut = false;
     try {
-      await cdpInternal(record, "Target.setAutoAttach", { autoAttach: true, flatten: true, waitForDebuggerOnStart: true });
-      await cdpInternal(record, "Target.setDiscoverTargets", { discover: true });
-      const targets = await cdpInternal(record, "Target.getTargets", {});
-      for (const info of targets.targetInfos || []) if (info?.targetId) record.live_targets.set(String(info.targetId), info);
-      try {
-        const commandLine = await cdpInternal(record, "Browser.getBrowserCommandLine", {});
-        const prefix = "--user-data-dir=";
-        const actual = (commandLine.arguments || []).find(argument => String(argument).startsWith(prefix));
-        if (actual && cdpPathKey(String(actual).slice(prefix.length)) !== cdpPathKey(browserRecord.user_data_dir))
-          throw new Error(`CDP port ${browserRecord.port} belongs to a browser using a different user-data-dir`);
+      await Promise.race([ready, new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          setupTimedOut = true;
+          cdpDisconnect(record);
+          try { ws.close(); } catch {}
+          reject(new Error("CDP connection setup timed out"));
+        }, browser.connect_timeout_ms);
+      })]);
+      const targets = await cdpInternal(record, "Target.getTargets");
+      for (const info of targets.targetInfos || []) if (info.targetId)
+        Object.assign(engine.target_info[info.targetId] ??= {}, info);
+      cdpSyncTargets(record);
+      if (cdpConnectionMode(record.options) === "local") try {
+        const commandLine = await cdpInternal(record, "Browser.getBrowserCommandLine");
+        const actual = (commandLine.arguments || []).find(argument => String(argument).startsWith("--user-data-dir="));
+        if (actual && cdpPathKey(String(actual).slice("--user-data-dir=".length)) !== cdpPathKey(record.user_data_dir))
+          throw new Error(`CDP port ${record.port} belongs to a browser using a different user-data-dir`);
+        const headless = (commandLine.arguments || []).some(argument => /^--headless(?:=|$)/.test(String(argument)));
+        if (headless !== record.options.headless) throw new Error(`CDP port ${record.port} belongs to a browser using a different headless setting`);
       } catch (error) {
-        if (String(error?.message || error).includes("different user-data-dir")) throw error;
+        if (/different (?:user-data-dir|headless setting)/.test(String(error?.message || error))) throw error;
       }
-      run("UPDATE cdp_browsers SET updated_at=? WHERE browser=?", Date.now(), browserRecord.browser);
+      if (!record.open) throw new Error("CDP connection closed during setup");
+      run("UPDATE cdp_browsers SET updated_at=? WHERE browser=?", Date.now(), browser.name);
       return record;
     } catch (error) {
-      try { ws.close(1000, "CDP setup failed"); } catch {}
-      cdpDisconnect(record, `CDP setup failed: ${String(error?.message || error)}`);
+      try { ws.close(); } catch {}
+      cdpDisconnect(record);
+      if (setupTimedOut) throw new Error("CDP connection setup timed out");
       throw error;
-    }
+    } finally { clearTimeout(timer); }
   }
   async function ensureCdpBrowser(rawBrowser) {
-    const browser = cdpBrowserName(rawBrowser);
+    const spec = cdpBrowserSpec(rawBrowser), browser = spec.browser;
     const live = cdpBrowsers.get(browser);
-    if (live?.open && live.ws.readyState === WebSocket.OPEN) return live;
+    if (live?.open && live.ws.readyState === WebSocket.OPEN) return cdpReuseBrowser(live, spec);
     const connecting = cdpConnectPromises.get(browser);
-    if (connecting) return await connecting;
+    if (connecting) return cdpReuseBrowser(await connecting, spec);
     const promise = (async () => {
-      const persistent = await cdpPersistentBrowser(browser);
-      await Deno.mkdir(persistent.user_data_dir, { recursive: true });
-      let version = await cdpVersion(persistent.port);
+      const saved = cdpBrowserOptions.get(browser), options = cdpConfiguredOptions(spec, saved);
+      const persistent = { ...await cdpPersistentBrowser(browser), options };
+      if (saved && cdpOptionsKey(saved) !== cdpOptionsKey(options) && cdpConnectionMode(saved) === "local" && await cdpVersion(persistent.port))
+        throw cdpOptionsConflict(browser);
+      cdpBrowserOptions.set(browser, options);
+      const mode = cdpConnectionMode(options);
+      persistent.user_data_dir = mode === "local" ? options.user_data_dir : null;
+      if (mode !== "local") persistent.port = mode === "port" ? options.port : null;
+      let version = mode === "websocket" ? { webSocketDebuggerUrl: options.websocket_url }
+        : mode === "local" ? await cdpVersion(persistent.port)
+        : await cdpVersion(cdpDiscoveryUrl(options), options.connect_timeout_ms);
+      if (!version && mode !== "local") throw new Error(`Unable to discover CDP browser '${browser}' through ${mode} attachment`);
       if (!version) version = await cdpLaunchBrowser(persistent);
       const record = await cdpOpenConnection(persistent, version);
       cdpBrowsers.set(browser, record);
@@ -1753,80 +1770,803 @@ async function backend({ addWorkspace = null } = {}) {
     try { return await promise; }
     finally { cdpConnectPromises.delete(browser); }
   }
-  async function cdpEnsureSession(record, targetId, preferAutoAttach = false) {
-    let sessionId = record.target_to_session.get(targetId);
-    if (!sessionId && preferAutoAttach) sessionId = await cdpWaitForAttach(record, targetId);
-    if (!sessionId) {
-      const attached = await cdpInternal(record, "Target.attachToTarget", { targetId, flatten: true });
-      sessionId = String(attached.sessionId || "");
-      if (!sessionId) throw new Error(`CDP did not return a sessionId for target ${targetId}`);
-      record.target_to_session.set(targetId, sessionId); record.session_to_target.set(sessionId, targetId);
-    }
-    const info = record.live_targets.get(targetId);
-    if (info?.type === "page" || !info) await cdpInitializePageSession(record, targetId, sessionId);
-    return sessionId;
-  }
   async function cdpEnsureTarget(record, rawTarget) {
-    const target = cdpTargetName(rawTarget);
-    const existingPromise = record.target_promises.get(target);
-    if (existingPromise) return await existingPromise;
+    const spec = cdpTargetSpec(rawTarget), target = spec.target, options = cdpConfigureTarget(record.browser, spec);
+    const existing = record.target_promises.get(target);
+    if (existing) return await existing;
     const promise = (async () => {
-      let row = one("SELECT target_id FROM cdp_targets WHERE browser=? AND target=?", record.browser, target);
-      let targetId = String(row?.target_id || ""), created = false;
-      const info = targetId ? record.live_targets.get(targetId) : null;
-      if (!targetId || !info || info.type !== "page") {
-        const result = await cdpInternal(record, "Target.createTarget", { url: "about:blank", background: true });
-        targetId = String(result.targetId || "");
-        if (!targetId) throw new Error("Target.createTarget returned no targetId");
-        created = true;
-        const now = Date.now();
-        run(`INSERT INTO cdp_targets(browser,target,target_id,created_at,updated_at) VALUES(?,?,?,?,?)
-          ON CONFLICT(browser,target) DO UPDATE SET target_id=excluded.target_id,updated_at=excluded.updated_at`,
-          record.browser, target, targetId, now, now);
-        record.target_labels.set(targetId, target); record.label_targets.set(target, targetId);
-      } else {
-        record.target_labels.set(targetId, target); record.label_targets.set(target, targetId);
-        run("UPDATE cdp_targets SET updated_at=? WHERE browser=? AND target=?", Date.now(), record.browser, target);
+      let entry = record.engine.targets[target];
+      if (entry && !entry.sessionId) Object.assign(entry, options);
+      if (!entry?.sessionId) {
+        // Resolve/create/setup through the package's public API. This read has no
+        // page-side effects and leaves native dispatch independent of routing keys.
+        await record.client.call({ method: "Page.getFrameTree", params: { browser: record.browser, target: { name: target, ...options } } });
+        entry = record.engine.targets[target];
       }
-      const sessionId = await cdpEnsureSession(record, targetId, created);
-      return { target, target_id: targetId, session_id: sessionId };
+      if (!entry?.targetId || !entry.sessionId) throw new Error("CDP did not resolve the logical page");
+      cdpSyncTargets(record);
+      const now = Date.now();
+      run(`INSERT INTO cdp_targets(browser,target,target_id,created_at,updated_at) VALUES(?,?,?,?,?)
+        ON CONFLICT(browser,target) DO UPDATE SET target_id=excluded.target_id,updated_at=excluded.updated_at`,
+        record.browser, target, entry.targetId, now, now);
+      return { target, target_id: entry.targetId, session_id: entry.sessionId };
     })();
     record.target_promises.set(target, promise);
     try { return await promise; }
     finally { record.target_promises.delete(target); }
   }
-  const cdpAugmentedXPath = value => String(value || "")
-    .replace(/ends-with\(([^,]+),([^\)]+)\)/gm, "(substring($1, string-length($1)- string-length($2) + 1) = $2)")
-    .replace(/icontains\(([^,]+),([^\)]+)\)/gm, "contains(translate($1,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),$2)");
-  function cdpSpecialRequest(name, params = {}) {
-    const special = String(name || "").trim();
-    const xpath = cdpAugmentedXPath(params.xpath);
-    if (!xpath) throw new Error(`_${"mrmcp"}.${special || "special"} requires params.xpath`);
-    const quotedXpath = JSON.stringify(xpath);
-    if (special === "click") {
-      const attempts = Math.max(1, Math.min(Number(params.attempts || 5), 20));
-      const intervalMs = Math.max(0, Math.min(Number(params.interval_ms ?? 300), 5000));
-      if (!Number.isInteger(attempts) || !Number.isInteger(intervalMs)) throw new Error("_mrmcp click attempts/interval_ms must be integers");
-      return {
-        wire_method: "Runtime.evaluate", logical_method: "_mrmcp.click", special,
-        params: {
-          returnByValue: true, awaitPromise: true, silent: true, userGesture: true,
-          expression: `new Promise(resolve=>{let n=0;const run=()=>{const el=document.evaluate(${quotedXpath},document,null,XPathResult.FIRST_ORDERED_NODE_TYPE,null).singleNodeValue;if(el){el.click?.();resolve(true);return;}n+=1;if(n>=${attempts}){resolve(false);return;}setTimeout(run,${intervalMs});};run();})`,
-        },
-      };
+
+  const CHAT_GOAL_BROWSER = "mrmcp-chatgpt", CHAT_GOAL_RETRY_MS = 60000;
+  const CHAT_GOAL_STATUSES = ["disabled", "pending", "matching", "ready", "waiting_login", "not_found", "busy", "draft_present", "error", "sending", "delivery_uncertain", "expired"];
+  let chatGoalTimer = null, chatGoalTask = null, chatGoalGeneration = 0;
+  let chatGoalLoginActive = false, chatGoalLoginBusy = false, chatGoalLoginDetail = "";
+  let chatGoalLoginTimer = null, chatGoalLoginTask = null, chatGoalLoginPage = null, chatGoalLoginRefresh = false;
+  const chatGoalMonitors = new Set();
+  const chatGoalsEnabled = () => getCfg("chat_goals_enabled", "1") === "1";
+  const chatGoalLoginReady = () => Number(getCfg("chat_goal_login_verified_at", "0")) > 0;
+  const chatGoalsOperational = () => chatGoalsEnabled() && chatGoalLoginReady() && !chatGoalLoginActive;
+  const CHAT_GOAL_LOGIN_HINT = "Select Login ChatGPT in Settings → Goals and sign in in the dedicated Chrome window. Login is detected automatically.";
+  const chatGoalDefaultTimeout = () => Math.max(1, Math.min(1440, Number(getCfg("chat_goal_timeout_minutes", "5")) || 5)) * 60;
+  const chatGoalWindowsHide = (headless = getCfg("chat_goal_headless", "0") === "1") => {
+    const mode = getCfg("chat_goal_windows_hide", "auto");
+    return mode === "auto" ? headless : mode === "hide";
+  };
+  function recoverChatGoals() {
+    run("UPDATE contexts SET goal_status='delivery_uncertain',goal_error='Server stopped during a send. Inspect the chat before setting the goal again.' WHERE goal_status='sending' AND goal_text<>''");
+    run("UPDATE contexts SET goal_status='error',goal_next_check_at=0,goal_error='Server stopped during matching. Call chat_set_goal again to retry matching.' WHERE goal_status='matching' AND chatgpt_chat_id='' AND goal_text<>''");
+    // Restart does not inherit queued matching work by default. Only this
+    // startup hook may opt into one new attempt; ordinary settings saves cannot.
+    run("UPDATE contexts SET goal_revision=goal_revision+1,goal_status='error',goal_next_check_at=0,goal_error='Matching was not resumed at startup. Call chat_set_goal again to retry matching.' WHERE goal_status='pending' AND chatgpt_chat_id='' AND goal_text<>''");
+    if (chatGoalsOperational() && getCfg("chat_goal_match_on_startup", "0") === "1") {
+      const now = Date.now();
+      run(`UPDATE contexts SET goal_revision=goal_revision+1,goal_status='pending',goal_next_check_at=?,goal_error=''
+        WHERE chatgpt_chat_id='' AND goal_text<>'' AND goal_status NOT IN ('disabled','expired','sending','delivery_uncertain')
+          AND COALESCE(NULLIF(last_active_at,0),created_at,0)>=?`, now + 1000, now - CONTEXT_TTL_MS);
     }
-    if (special === "find") {
-      const limit = Math.max(1, Math.min(Number(params.limit || 20), 100));
-      if (!Number.isInteger(limit)) throw new Error("_mrmcp find limit must be an integer");
-      return {
-        wire_method: "Runtime.evaluate", logical_method: "_mrmcp.find", special,
-        params: {
-          returnByValue: true, awaitPromise: false, silent: true,
-          expression: `(()=>{const x=document.evaluate(${quotedXpath},document,null,XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,null),items=[];for(let i=0;i<Math.min(x.snapshotLength,${limit});i++){const n=x.snapshotItem(i);if(n&&n.nodeType===1){const r=n.getBoundingClientRect();items.push({tag:String(n.tagName||'').toLowerCase(),text:String(n.innerText??n.textContent??'').trim().slice(0,2000),id:String(n.id||''),class:String(n.className||''),href:String(n.href||''),value:n.value==null?null:String(n.value),rect:{x:r.x,y:r.y,width:r.width,height:r.height}});}else items.push({node_type:n?.nodeType??null,node_name:String(n?.nodeName||''),text:String(n?.textContent||'').trim().slice(0,2000)});}return {count:x.snapshotLength,items};})()`,
-        },
-      };
+  }
+  function chatGoalConfigure() {
+    chatGoalGeneration++;
+    if (chatGoalTimer) clearInterval(chatGoalTimer);
+    for (const monitor of [...chatGoalMonitors]) if (!monitor.login_setup || !chatGoalLoginActive) monitor.stop();
+    chatGoalTimer = null;
+    if (!chatGoalsOperational()) {
+      const record = cdpBrowsers.get(CHAT_GOAL_BROWSER);
+      if (record && !chatGoalLoginActive) { try { record.ws.close(); } catch {} cdpDisconnect(record); }
+    } else if (!shuttingDown) chatGoalTimer = setInterval(chatGoalTick, 5000);
+    serverToolCache.clear();
+    changed({ ui: ["sessions", "settings"] }, "chat-goal-config");
+  }
+  const chatGoalUrl = id => id ? `https://chatgpt.com/c/${id}` : "https://chatgpt.com/";
+  const chatGoalChatId = url => {
+    try {
+      const u = new URL(url);
+      return u.origin === "https://chatgpt.com" ? u.pathname.match(/\/c\/([a-z0-9-]{8,80})\/?$/i)?.[1] || "" : "";
+    } catch { return ""; }
+  };
+  function chatGoalView(context) {
+    const loginRequired = !!context.goal_text && !chatGoalLoginReady() && !["disabled", "expired", "sending", "delivery_uncertain"].includes(context.goal_status);
+    return {
+      goal: context.goal_text, timeout_seconds: Number(context.goal_timeout_seconds), status: !chatGoalsEnabled() ? "disabled" : loginRequired ? "waiting_login" : context.goal_status,
+      chatgpt_chat_id: context.chatgpt_chat_id || null, chat_url: context.chatgpt_chat_id ? chatGoalUrl(context.chatgpt_chat_id) : null,
+      next_check_at: chatGoalsOperational() && context.goal_text && context.goal_next_check_at ? Number(context.goal_next_check_at) : null,
+      last_sent_at: context.goal_last_sent_at ? Number(context.goal_last_sent_at) : null,
+      detail: !chatGoalsEnabled() ? "Chat goal management is disabled in Settings → Goals." : loginRequired ? CHAT_GOAL_LOGIN_HINT + (context.chatgpt_chat_id ? "" : " Then call chat_set_goal again to retry matching.") : context.goal_error || null,
+      browser: CHAT_GOAL_BROWSER, user_data_dir: join(CDP_DIR, CHAT_GOAL_BROWSER),
+    };
+  }
+  function setChatGoal(context, goal, timeoutSeconds = chatGoalDefaultTimeout()) {
+    if (typeof goal !== "string" || goal.length > 32000) throw new Error("goal must be a string of at most 32000 characters");
+    if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 30 || timeoutSeconds > 86400)
+      throw new Error("timeout_seconds must be an integer between 30 and 86400");
+    if (!chatGoalsEnabled() && goal.trim()) return chatGoalView(context);
+    const text = goal.trim() ? goal : "", now = Date.now();
+    // The latest explicit set wins if several Sessions belong to the same ChatGPT conversation.
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      if (text && context.chatgpt_chat_id) disableOtherChatGoals(context.id, context.chatgpt_chat_id);
+      run(`UPDATE contexts SET goal_text=?,goal_timeout_seconds=?,goal_revision=goal_revision+1,goal_updated_at=?,
+        goal_status=?,goal_next_check_at=?,goal_error='',updated_at=? WHERE id=?`,
+        text, timeoutSeconds, now, text ? context.chatgpt_chat_id ? "ready" : "pending" : "disabled",
+        text ? context.chatgpt_chat_id ? now + timeoutSeconds * 1000 : now + 1000 : 0, now, context.id);
+      db.exec("COMMIT");
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+    if (text && !chatGoalLoginReady()) chatGoalState(one("SELECT * FROM contexts WHERE id=?", context.id), "waiting_login", CHAT_GOAL_LOGIN_HINT, 0);
+    changed({ ui: ["sessions"] }, "chat-goal-set");
+    return chatGoalView(one("SELECT * FROM contexts WHERE id=?", context.id));
+  }
+  function disableOtherChatGoals(id, chatId) {
+    run(`UPDATE contexts SET goal_text='',goal_revision=goal_revision+1,goal_status='disabled',goal_next_check_at=0,
+      goal_error='Replaced by another Session in this ChatGPT conversation.' WHERE id<>? AND chatgpt_chat_id=? AND goal_text<>''`, id, chatId);
+  }
+  function chatGoalState(context, status, detail = "", next = Date.now() + CHAT_GOAL_RETRY_MS) {
+    if (shuttingDown) return;
+    if (!CHAT_GOAL_STATUSES.includes(status)) status = "error";
+    if (!context.chatgpt_chat_id && !["pending", "matching", "disabled", "expired"].includes(status)) {
+      next = 0;
+      detail = `${String(detail).slice(0, 350)} Call chat_set_goal again to retry matching.`.trim();
     }
-    throw new Error(`Unknown _mrmcp CDP operation: ${special}`);
+    run(`UPDATE contexts SET goal_status=?,goal_error=?,goal_next_check_at=? WHERE id=? AND goal_revision=? AND goal_text<>''`,
+      status, String(detail).slice(0, 500), next, context.id, context.goal_revision);
+    changed({ ui: ["sessions"] }, "chat-goal-state");
+  }
+  function chatGoalCurrent(context) {
+    if (!chatGoalsOperational() || shuttingDown) return null;
+    const fresh = one("SELECT * FROM contexts WHERE id=? AND goal_revision=? AND goal_text<>''", context.id, context.goal_revision);
+    return fresh && !contextExpired(fresh) ? fresh : null;
+  }
+  function noteChatGoalActivity(handle) {
+    if (!chatGoalsEnabled()) return;
+    if (typeof handle !== "string" || !handle || handle.length > 256) return;
+    const context = one("SELECT * FROM contexts WHERE handle=?", handle);
+    if (!context || contextExpired(context)) return;
+    run(`UPDATE contexts SET goal_activity_at=? WHERE goal_text<>'' AND (handle=? OR (chatgpt_chat_id<>'' AND chatgpt_chat_id=?))`,
+      Date.now(), handle, context.chatgpt_chat_id);
+  }
+  const chatGoalDue = context => Math.max(context.last_active_at, context.goal_activity_at, context.goal_updated_at, context.goal_last_sent_at) + context.goal_timeout_seconds * 1000;
+  async function chatGoalRpc(page, method, params = {}) {
+    if (!(page.login_setup ? chatGoalLoginActive : chatGoalsOperational()) || shuttingDown) throw new Error("Chat goal management is disabled, awaiting login or stopping");
+    const { id, promise } = cdpRequest(page.record, method, params, page.session_id, { wait: true, reject_on_error: true });
+    let timer;
+    try {
+      const raw = await Promise.race([promise, new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`ChatGPT browser timed out: ${method}`)), 15000);
+      })]);
+      return raw?.result || {};
+    } finally { clearTimeout(timer); page.record.pending.delete(id); }
+  }
+  // Re-resolve rendered DOM on every operation. Never classify controls by translated text, generated CSS or icons.
+  function chatGoalDom(action, input) {
+    if (location.origin !== "https://chatgpt.com" || location.pathname.startsWith("/auth/")) return { status: "waiting_login", url: location.href };
+    const selectors = {
+      editor: '#prompt-textarea,#mobile-composer-prompt,[data-mobile-composer-prompt],textarea[name="prompt"],[contenteditable="true"][data-testid="prompt-textarea"]',
+      editable: 'textarea,[contenteditable="true"],[contenteditable="plaintext-only"]',
+      send: '[data-testid="send-button"]',
+      stop: '[data-testid="stop-button"]',
+      busy: '[data-testid="stop-button"],[data-is-streaming="true"],[data-state="streaming"],[data-message-author-role="assistant"][aria-busy="true"]',
+      history: 'nav,[role="navigation"],aside,#history',
+      user: '[data-message-author-role="user"]',
+      assistant: '[data-message-author-role="assistant"],article[data-testid^="conversation-turn-"]',
+      tool: '[data-message-author-role="tool"],[data-tool-call-id],[data-testid*="tool-call"],[data-testid*="tool-message"],[data-testid*="connector-call"]',
+      disclosure: 'button[aria-expanded][aria-controls],[role="button"][aria-expanded][aria-controls],details>summary',
+      code: 'pre,code,[role="code"]',
+    };
+    const visible = el => !!el && !el.closest('[hidden],[inert],[aria-hidden="true"]') && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== "hidden";
+    const nodes = (selector, root = document) => [...root.querySelectorAll(selector)].filter(visible);
+    const unique = values => [...new Set(values)];
+    const available = el => !el.disabled && !el.readOnly && el.getAttribute("aria-disabled") !== "true";
+    const inModal = el => !!el.closest('[role="dialog"],[role="alertdialog"],[aria-modal="true"]');
+    const formOf = el => el.form || el.closest("form");
+    const formSubmits = form => nodes('button,input[type="submit"]').filter(el => el.form === form && el.type === "submit" && !el.matches(selectors.stop));
+    const formEditors = form => nodes(selectors.editable).filter(el => formOf(el) === form);
+    const knownEditors = nodes(selectors.editor).filter(el => !inModal(el));
+    // Native form ownership also covers submit controls outside the form via their HTML form attribute.
+    const fallbackEditors = nodes('main textarea,[role="main"] textarea,main [role="textbox"][contenteditable],[role="main"] [role="textbox"][contenteditable]').filter(el => {
+      const form = formOf(el);
+      return !inModal(el) && form && formEditors(form).length === 1 && (formSubmits(form).length === 1 ||
+        !formSubmits(form).length && nodes(selectors.stop).some(control => control.form === form || form.contains(control))) &&
+        !nodes('input:not([type="hidden"]):not([type="file"]):not([type="submit"]):not([type="button"]),select', form).length;
+    });
+    const editors = knownEditors.length ? knownEditors : fallbackEditors;
+    const editor = editors.length === 1 ? editors[0] : null, form = editor ? formOf(editor) : null;
+    const editorText = () => editor ? (editor instanceof HTMLTextAreaElement ? editor.value : editor.innerText).replace(/\r\n?/g, "\n") : "";
+    let composer = form;
+    if (editor && !composer) {
+      for (let parent = editor.parentElement, depth = 0; parent && !parent.matches('body,main,[role="main"]') && depth < 5; parent = parent.parentElement, depth++) {
+        if (nodes(`${selectors.send},${selectors.stop}`, parent).length && nodes(selectors.editable, parent).length === 1) { composer = parent; break; }
+      }
+    }
+    const knownSubmits = nodes(selectors.send).filter(el => !el.matches(selectors.stop) && (form ? el.form === form || form.contains(el) : composer?.contains(el)));
+    const submits = unique(knownSubmits.length ? knownSubmits : form && formEditors(form).length === 1 ? formSubmits(form) : []);
+    const login = nodes('[data-logged-out],form[action*="/auth/"],form[action^="/unauth-"]').length > 0 ||
+      nodes('a[href]').some(el => { try { const url = new URL(el.href); return url.origin === location.origin && /^\/auth\/login(?:[\/_]|$)/.test(url.pathname); } catch { return false; } });
+    const busy = nodes(selectors.busy).length > 0 || !!composer?.closest('[aria-busy="true"]') || !!(composer && nodes('[aria-busy="true"]', composer).length);
+    const users = nodes(selectors.user).slice(-12).map(el => ({ id: el.getAttribute("data-message-id") || el.closest('[data-message-id]')?.getAttribute("data-message-id") || el.id || "", text: el.innerText.slice(0, 32001) }));
+    const dialogs = nodes('[role="dialog"],[role="alertdialog"],[aria-modal="true"]');
+    const reason = login ? "login_required" : dialogs.length ? "dialog_open" : editors.length > 1 ? "composer_ambiguous" : !editor ? "composer_missing" :
+      !available(editor) ? "composer_disabled" : busy ? "response_busy" : "ready";
+    const diagnostics = { adapter: "dom-v2", reason, editors: editors.length, submit_controls: submits.length };
+    const base = { status: login ? "waiting_login" : reason === "response_busy" ? "busy" : reason === "ready" ? "ready" : "not_ready", responding: busy, url: location.href, draft: editorText(), users, diagnostics,
+      detail: reason === "ready" ? "" : `ChatGPT DOM: ${reason} (editors=${editors.length}, submit_controls=${submits.length}).` };
+    const controls = el => el.matches("summary") && el.parentElement?.matches("details") ? [el.parentElement] :
+      (el.getAttribute("aria-controls") || "").split(/\s+/).filter(Boolean).map(id => document.getElementById(id)).filter(Boolean);
+    const disclosure = el => available(el) && !el.closest('form,pre,code,[role="code"]') &&
+      (el.matches("summary") || el.getAttribute("aria-expanded") !== null && !!el.getAttribute("aria-controls")?.trim());
+    const expand = el => { if (el.matches("summary") ? !el.parentElement.open : el.getAttribute("aria-expanded") === "false") el.click(); };
+    const chatUrl = raw => {
+      try { const url = new URL(raw, location.href); return url.origin === location.origin && /\/c\/[a-z0-9-]{8,80}\/?$/i.test(url.pathname) ? url.href : ""; }
+      catch { return ""; }
+    };
+    const historyLinks = root => nodes('a[href]', root).map(el => chatUrl(el.href)).filter(Boolean);
+    if (action === "state") return base;
+    if (action === "stop") {
+      const stops = nodes(selectors.stop).filter(el => !inModal(el) && el.matches('button,[role="button"],input[type="button"],input[type="submit"]'));
+      const stopReason = location.pathname !== `/c/${input.chatId}` ? "conversation_changed" :
+        login || dialogs.length || editors.length > 1 ? reason : base.draft.trim() ? "draft_present" :
+        !busy ? "ready" : !stops.length ? "stop_missing" : stops.length > 1 ? "stop_ambiguous" : !available(stops[0]) ? "stop_disabled" : "ready";
+      if (stopReason !== "ready") return { ...base, stop_ok: false, stopped: false, detail: `ChatGPT DOM: ${stopReason}.` };
+      if (busy) stops[0].click();
+      return { ...base, stop_ok: true, stopped: busy };
+    }
+    if (action === "recent") {
+      const history = nodes(selectors.history), urls = unique(history.flatMap(historyLinks));
+      if (!urls.length) {
+        const openers = nodes(selectors.disclosure).filter(el => disclosure(el) && controls(el).some(target =>
+          target.matches(selectors.history) || target.querySelector(selectors.history)));
+        if (openers.length === 1) expand(openers[0]);
+      }
+      return { ...base, urls: urls.slice(0, 20), detail: urls.length ? "" : "ChatGPT DOM: no conversation links in navigation regions; sign in or check the website layout." };
+    }
+    if (action === "match" || action === "expand") {
+      const assistants = nodes(selectors.assistant).filter(el => !el.closest(selectors.user) && !el.querySelector(selectors.user)).slice(-12);
+      const candidates = unique(assistants.flatMap(el => nodes(selectors.disclosure, el)).filter(disclosure)).reverse();
+      const marked = nodes(selectors.tool).filter(el => !el.closest(selectors.user));
+      const related = unique(candidates.flatMap(controls)).filter(visible);
+      // Only complete JSON values count. A quoted handle or a JSON fragment in prose is not evidence.
+      const hasSession = (value, trusted, depth = 0) => {
+        if (depth > 10 || !value) return false;
+        if (trusted && typeof value === "string" && value.length <= 262144) {
+          try { return hasSession(JSON.parse(value), trusted, depth + 1); } catch { return false; }
+        }
+        if (typeof value !== "object") return false;
+        if (Array.isArray(value)) return value.slice(0, 100).some(item => hasSession(item, trusted, depth + 1));
+        if (trusted && Object.hasOwn(value, "chat_session") && value.chat_session === input.handle) return true;
+        const call = value.method === "tools/call" && typeof value.params?.name === "string";
+        const named = typeof value.name === "string" && (input.tool_names || []).some(name => value.name === name || value.name.endsWith(`__${name}`) || value.name.endsWith(`.${name}`));
+        if (call && hasSession(value.params.arguments, true, depth + 1) || named && hasSession(value.arguments, true, depth + 1)) return true;
+        // Follow protocol wrappers, never arbitrary goal/message strings containing an example packet.
+        return ["params", "arguments", "result", "structuredContent", "input", "output"].some(key => hasSession(value[key], trusted, depth + 1));
+      };
+      const surfaces = unique([...marked, ...related]);
+      const match = surfaces.some(el => {
+        const trusted = marked.some(marker => marker === el || marker.contains(el));
+        const code = el.matches(selectors.code) ? [el] : nodes(selectors.code, el);
+        return unique(code).slice(0, 40).some(block => {
+          const text = block.innerText;
+          if (text.length > 262144) return false;
+          try { return hasSession(JSON.parse(text), trusted); } catch { return false; }
+        });
+      });
+      if (action === "match" || match) return { ...base, match };
+      const candidate = candidates[input.index || 0];
+      if (candidate) expand(candidate);
+      return { ...base, match: false, expanded: !!candidate };
+    }
+    if (action === "focus") {
+      if (!["ready", "busy"].includes(base.status) || !users.at(-1)?.id || base.draft.trim() || location.pathname !== `/c/${input.chatId}`) return { ...base, focused: false };
+      editor.focus();
+      return { ...base, focused: document.activeElement === editor };
+    }
+    if (action === "clear") {
+      if (editor && location.pathname === `/c/${input.chatId}` && editorText() === input.text) {
+        editor.focus();
+        if (editor instanceof HTMLTextAreaElement) { Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(editor, ""); editor.dispatchEvent(new Event("input", { bubbles: true })); }
+        else { const range = document.createRange(); range.selectNodeContents(editor); const selection = getSelection(); selection.removeAllRanges(); selection.addRange(range); document.execCommand("delete"); }
+      }
+      return { cleared: !!editor && !editorText() };
+    }
+    if (action === "send") {
+      // During generation the site's native form may accept a queued prompt
+      // while its only visible button is Stop. Never click Stop as a submit.
+      const formSend = busy && !submits.length && form instanceof HTMLFormElement && formEditors(form).length === 1;
+      const sendReason = !["ready", "busy"].includes(base.status) ? reason : location.pathname !== `/c/${input.chatId}` ? "conversation_changed" :
+        busy && input.require_stopped ? "response_still_active" : editorText() !== input.text ? "draft_changed" : !submits.length && !formSend ? "submit_missing" : submits.length > 1 ? "submit_ambiguous" :
+        submits.length && !available(submits[0]) ? "submit_disabled" : "ready";
+      if (sendReason !== "ready")
+        return { sent: false, status: base.status, diagnostics: { ...diagnostics, reason: sendReason }, detail: `ChatGPT DOM: ${sendReason} (submit_controls=${submits.length}).` };
+      if (formSend) HTMLFormElement.prototype.requestSubmit.call(form);
+      else submits[0].click();
+      return { sent: true };
+    }
+    return base;
+  }
+
+  async function chatGoalEvaluate(page, action, input = {}) {
+    const result = await chatGoalRpc(page, "Runtime.evaluate", {
+      expression: `(${chatGoalDom.toString()})(${JSON.stringify(action)},${JSON.stringify({ ...input, tool_names: BASE_TOOLS })})`, returnByValue: true, userGesture: true,
+    });
+    if (result.exceptionDetails) throw new Error("The ChatGPT page could not be inspected. Its interface may have changed.");
+    const state = result.result?.value || { status: "not_ready" };
+    if (!page.login_setup && state.status === "waiting_login" && state.url && !state.url.startsWith("about:")) chatGoalLoginLost();
+    return state;
+  }
+  function chatGoalLoginLost() {
+    if (!chatGoalLoginReady()) return;
+    setCfg("chat_goal_login_verified_at", "0");
+    chatGoalLoginDetail = "ChatGPT login was lost. " + CHAT_GOAL_LOGIN_HINT;
+    for (const context of all("SELECT * FROM contexts WHERE goal_text<>'' AND goal_status NOT IN ('disabled','expired','sending','delivery_uncertain')"))
+      chatGoalState(context, "waiting_login", CHAT_GOAL_LOGIN_HINT, 0);
+    chatGoalConfigure();
+  }
+  function chatGoalHistorySessions(data, chatId) {
+    if (data?.conversation_id && data.conversation_id !== chatId) throw new Error("Conversation response identity mismatch");
+    if (!data?.mapping || typeof data.current_node !== "string") throw new Error("Unsupported or incomplete conversation history");
+    const seen = new Set(), handles = new Set();
+    for (let id = data.current_node; id != null;) {
+      if (seen.has(id) || seen.size >= 20000) throw new Error("Invalid conversation branch");
+      seen.add(id);
+      const node = data.mapping[id];
+      if (!node || !Object.hasOwn(node, "parent")) throw new Error("Incomplete conversation branch");
+      const message = node.message;
+      if (message?.author?.role === "assistant" && message.recipient === "api_tool.call_tool" && typeof message.content?.text === "string") {
+        let request;
+        try { request = JSON.parse(message.content.text); } catch {}
+        const tool = typeof request?.path === "string" ? request.path.split("/").at(-1) : "";
+        const handle = request?.args?.chat_session;
+        if (BASE_TOOLS.includes(tool) && typeof handle === "string" && /^ctx_[A-Za-z0-9_-]+$/.test(handle) && handle.length <= 256 && handles.size < 100)
+          handles.add(handle);
+      }
+      id = node.parent;
+    }
+    return handles;
+  }
+  function chatGoalMonitor(page) {
+    if (page.record.goal_monitor?.session_id === page.session_id && page.record.goal_monitor.login_setup === !!page.login_setup && !page.record.goal_monitor.stopped) return page.record.goal_monitor;
+    page.record.goal_monitor?.stop();
+    const { client } = page.record, requests = new Map(), epochs = new Map(), recent = new Map(), histories = new Map(), pending = new Set();
+    const monitor = { session_id: page.session_id, login_setup: !!page.login_setup, recent, histories, pending, stopped: false, error: "", list_at: 0, generation: 0 };
+    const active = () => !monitor.stopped && (page.login_setup ? chatGoalLoginActive : chatGoalsOperational()) && !shuttingDown && page.record.open;
+    const fromPage = event => active() && event.detail.browser === page.record.browser && event.detail.target === page.target;
+    const boundedSet = (map, key, value, limit) => {
+      map.delete(key); map.set(key, value);
+      while (map.size > limit) map.delete(map.keys().next().value);
+    };
+    const started = event => {
+      if (!fromPage(event)) return;
+      let url;
+      try { url = new URL(event.detail.request.url); } catch { return; }
+      if (url.origin === "https://chatgpt.com" && /^\/backend-api\/conversations?(?:\/|$)/.test(url.pathname))
+        boundedSet(epochs, event.detail.requestId, monitor.generation, 100);
+    };
+    const response = event => {
+      if (!fromPage(event)) return;
+      const p = event.detail, r = p.response;
+      let url;
+      try { url = new URL(r.url); } catch { return; }
+      if (url.origin === "https://chatgpt.com" && /^\/backend-api\/conversations?(?:\/|$)/.test(url.pathname) && r.status === 401) {
+        monitor.generation++; monitor.list_at = 0;
+        if (!page.login_setup) chatGoalLoginLost();
+        return;
+      }
+      if (url.origin !== "https://chatgpt.com" || r.status !== 200 || !String(r.mimeType).includes("json")) return;
+      const list = url.pathname === "/backend-api/conversations";
+      const id = url.pathname.match(/^\/backend-api\/conversations?\/([a-z0-9-]{8,80})$/i)?.[1];
+      if (!list && !id || list && url.searchParams.get("is_archived") === "true") return;
+      boundedSet(requests, p.requestId, { list, id, at: Date.now(), generation: epochs.get(p.requestId) }, 100);
+    };
+    const finished = event => {
+      if (!fromPage(event)) return;
+      const p = event.detail, request = requests.get(p.requestId);
+      requests.delete(p.requestId);
+      epochs.delete(p.requestId);
+      if (!request || pending.size >= 8 || page.login_setup && request.generation !== monitor.generation) return;
+      if (!request.list && request.generation !== monitor.generation) return;
+      // Read only bodies already requested by the web application, on their own
+      // inspector session. Never copy cookies/headers or issue authenticated fetches.
+      const task = (async () => {
+        try {
+          if (Number(p.encodedDataLength) > 8 * 1024 * 1024) throw new Error("Conversation capture exceeds size limit");
+          const body = await chatGoalRpc(page, "Network.getResponseBody", { requestId: p.requestId });
+          if (!active() || (!request.list || page.login_setup) && request.generation !== monitor.generation) return;
+          if (typeof body.body !== "string" || body.body.length > 12 * 1024 * 1024) throw new Error("Conversation capture exceeds size limit");
+          const data = JSON.parse(body.base64Encoded ? Buffer.from(body.body, "base64").toString("utf8") : body.body);
+          if (request.list) {
+            if (!Array.isArray(data.items)) throw new Error("Unsupported conversation list");
+            for (const item of data.items.slice(0, 200)) if (/^[a-z0-9-]{8,80}$/i.test(item?.id)) {
+              const updated = typeof item.update_time === "number" ? item.update_time : Date.parse(item.update_time) / 1000;
+              boundedSet(recent, item.id, { id: item.id, updated: Number.isFinite(updated) ? updated : 0 }, 200);
+            }
+            monitor.list_at = Date.now();
+          } else {
+            const handles = chatGoalHistorySessions(data, request.id);
+            boundedSet(histories, request.id, { handles, at: request.at }, 20);
+          }
+          monitor.error = "";
+        } catch (error) {
+          if (active()) monitor.error = error instanceof SyntaxError ? "Invalid conversation capture" : "Conversation capture unavailable or unsupported";
+        }
+      })().finally(() => pending.delete(task));
+      pending.add(task);
+    };
+    const failed = event => { if (fromPage(event)) { requests.delete(event.detail.requestId); epochs.delete(event.detail.requestId); } };
+    const frame = event => {
+      if (!fromPage(event) || event.detail.response?.opcode !== 1) return;
+      const text = event.detail.response.payloadData;
+      if (typeof text !== "string" || text.length > 65536) return;
+      let messages;
+      try { messages = JSON.parse(text); } catch { return; }
+      if (!Array.isArray(messages)) return;
+      for (const message of messages.slice(0, 100)) {
+        const notification = message?.type === "message" && message.payload, id = notification?.payload?.conversation_id;
+        if (!/^[a-z0-9-]{8,80}$/i.test(id || "") || !["conversation-created", "conversation-turn-complete"].includes(notification.type)) continue;
+        // A push is only a discovery hint. Association still requires a captured
+        // active-branch tool call or explicit rendered tool details.
+        boundedSet(recent, id, { id, updated: Date.now() / 1000 }, 200);
+        histories.delete(id);
+      }
+    };
+    const listeners = [["Network.requestWillBeSent", started], ["Network.responseReceived", response], ["Network.loadingFinished", finished],
+      ["Network.loadingFailed", failed], ["Network.webSocketFrameReceived", frame]];
+    for (const [name, listener] of listeners) client.addEventListener(name, listener);
+    monitor.stop = () => {
+      monitor.stopped = true;
+      for (const [name, listener] of listeners) client.removeEventListener(name, listener);
+      requests.clear(); epochs.clear(); recent.clear(); histories.clear();
+      chatGoalMonitors.delete(monitor);
+      page.record.ws.removeEventListener("close", monitor.stop);
+    };
+    page.record.ws.addEventListener("close", monitor.stop);
+    chatGoalMonitors.add(monitor); page.record.goal_monitor = monitor;
+    return monitor;
+  }
+  async function chatGoalPage(context = null, loginSetup = false) {
+    const allowed = () => !shuttingDown && (loginSetup ? chatGoalLoginActive : chatGoalsOperational());
+    if (!allowed()) throw new Error(CHAT_GOAL_LOGIN_HINT);
+    const generation = chatGoalGeneration;
+    const saved = cdpBrowserOptions.get(CHAT_GOAL_BROWSER), port = one("SELECT port FROM cdp_browsers WHERE browser=?", CHAT_GOAL_BROWSER)?.port;
+    if (saved && (cdpConnectionMode(saved) !== "local" || cdpPathKey(saved.user_data_dir) !== cdpPathKey(join(CDP_DIR, CHAT_GOAL_BROWSER))))
+      throw new Error("The goals browser name is in use with a different profile or endpoint. Release it before initializing the dedicated login profile.");
+    const running = saved && (cdpBrowsers.get(CHAT_GOAL_BROWSER)?.open || port && await cdpVersion(Number(port)));
+    if (!allowed() || generation !== chatGoalGeneration) throw new Error("Chat goal configuration changed");
+    const record = await ensureCdpBrowser(running ? CHAT_GOAL_BROWSER : {
+      name: CHAT_GOAL_BROWSER, headless: loginSetup ? false : getCfg("chat_goal_headless", "0") === "1", windowsHide: loginSetup ? false : chatGoalWindowsHide(),
+      images: loginSetup || getCfg("chat_goal_disable_images", "0") !== "1",
+      user_data_dir: join(CDP_DIR, CHAT_GOAL_BROWSER), args: [], executable_path: "", websocket_url: "", connect_timeout_ms: 15000,
+    });
+    if (!allowed() || generation !== chatGoalGeneration) {
+      try { record.ws.close(); } catch {} cdpDisconnect(record);
+      throw new Error("Chat goal management is disabled or stopping");
+    }
+    let timer;
+    try {
+      const target = await Promise.race([
+        cdpEnsureTarget(record, { name: "goals", create_params: { url: "about:blank", background: false }, initialize: false }),
+        new Promise((_, reject) => { timer = setTimeout(() => {
+          try { record.ws.close(1000, "Chat goal page setup timed out"); } catch {}
+          cdpDisconnect(record, "Chat goal page setup timed out");
+          reject(new Error("The dedicated ChatGPT tab did not become available."));
+        }, 20000); }),
+      ]);
+      if (!allowed() || generation !== chatGoalGeneration) throw new Error("Chat goal configuration changed");
+      const page = { record, ...target, login_setup: loginSetup }, monitor = chatGoalMonitor(page);
+      if (!monitor.enabled) {
+        await chatGoalRpc(page, "Network.enable");
+        monitor.enabled = true;
+      }
+      if (record.live_targets.get(target.target_id)?.url === "about:blank") await chatGoalRpc(page, "Page.navigate", { url: chatGoalUrl("") });
+      return page;
+    } finally { clearTimeout(timer); }
+  }
+  function chatGoalLoginStop() {
+    if (chatGoalLoginTimer) clearInterval(chatGoalLoginTimer);
+    chatGoalLoginTimer = null;
+    chatGoalLoginActive = false;
+    chatGoalLoginPage?.record.goal_monitor?.stop();
+    chatGoalLoginPage = null;
+  }
+  function chatGoalLoginTick() {
+    if (!chatGoalLoginActive || shuttingDown || chatGoalLoginTask) return chatGoalLoginTask;
+    const page = chatGoalLoginPage;
+    if (!page) return;
+    chatGoalLoginTask = (async () => {
+      if (!page.record.open) throw new Error("The login window was closed or disconnected. Select Login ChatGPT again to continue.");
+      const state = await chatGoalEvaluate(page, "state");
+      if (!chatGoalLoginActive || chatGoalLoginPage !== page || shuttingDown) return;
+      const monitor = page.record.goal_monitor;
+      if (!monitor || monitor.stopped) throw new Error("Login observation stopped. Select Login ChatGPT again to continue.");
+      if (state.status === "waiting_login" && monitor.list_at) { monitor.generation++; monitor.list_at = 0; }
+      // The site requests its own recent-list data after login. Never inspect
+      // authentication/session payloads; a public composer is not proof of login.
+      if (monitor.list_at && ["ready", "busy"].includes(state.status)) {
+        setCfg("chat_goal_login_verified_at", String(Date.now()));
+        chatGoalLoginStop();
+        chatGoalLoginDetail = "ChatGPT login detected. Linked goals can run when goal management is enabled. Call chat_set_goal again for missing matches. Close this Chrome window to apply saved monitoring launch options.";
+        chatGoalConfigure();
+        return;
+      }
+      // A browser already signed in may have loaded its data before attachment.
+      // Refresh once, as part of the explicit Login action, preserving drafts.
+      if (chatGoalLoginRefresh && ["ready", "busy"].includes(state.status) && !state.draft?.trim()) {
+        chatGoalLoginRefresh = false;
+        monitor.generation++;
+        const navigation = await chatGoalRpc(page, "Page.navigate", { url: chatGoalUrl("") });
+        if (navigation.errorText) throw new Error(`ChatGPT navigation failed: ${navigation.errorText}`);
+      }
+      const detail = state.draft?.trim() ? "Login observation is preserving a draft. Send or remove it to allow the page refresh if login has not been detected." :
+        monitor.error ? "ChatGPT is open, but its recent-chat data could not be recognized. Finish any challenge; a website change may require an adapter update." :
+        state.status === "not_ready" ? "Waiting for the ChatGPT page or challenge to become ready. " + (state.detail || "") :
+        "Waiting for ChatGPT login and fresh recent-chat data in this window. Login will be detected automatically.";
+      if (chatGoalLoginDetail !== detail) { chatGoalLoginDetail = detail; changed({ ui: ["settings"] }, "chat-goal-login-wait"); }
+    })().catch(error => {
+      if (shuttingDown || chatGoalLoginPage !== page) return;
+      chatGoalLoginDetail = String(error?.message || error).slice(0, 500);
+      chatGoalLoginStop();
+      chatGoalConfigure();
+    }).finally(() => {
+      chatGoalLoginTask = null;
+      if (!shuttingDown && !chatGoalLoginActive) changed({ ui: ["settings", "sessions"] }, "chat-goal-login-observed");
+    });
+    return chatGoalLoginTask;
+  }
+  async function chatGoalLogin() {
+    if (chatGoalLoginBusy) throw new Error("ChatGPT login setup is already running.");
+    chatGoalLoginBusy = true;
+    chatGoalLoginDetail = "";
+    changed({ ui: ["settings"] }, "chat-goal-login-start");
+    try {
+      {
+        chatGoalLoginStop();
+        if (chatGoalLoginTask) await chatGoalLoginTask;
+        chatGoalLoginActive = true;
+        setCfg("chat_goal_login_verified_at", "0");
+        chatGoalConfigure();
+        // Drain the previous pass before giving the one shared tab to the user.
+        if (chatGoalTask) await chatGoalTask;
+        for (const context of all("SELECT * FROM contexts WHERE goal_text<>'' AND goal_status NOT IN ('disabled','expired','sending','delivery_uncertain')"))
+          chatGoalState(context, "waiting_login", CHAT_GOAL_LOGIN_HINT, 0);
+        const port = one("SELECT port FROM cdp_browsers WHERE browser=?", CHAT_GOAL_BROWSER)?.port;
+        const version = port && await cdpVersion(Number(port)), saved = cdpBrowserOptions.get(CHAT_GOAL_BROWSER);
+        if (saved && (cdpConnectionMode(saved) !== "local" || cdpPathKey(saved.user_data_dir) !== cdpPathKey(join(CDP_DIR, CHAT_GOAL_BROWSER))))
+          throw new Error("The goals browser name is in use with a different profile or endpoint. It cannot be restarted for login.");
+        // An explicit login request may restart this dedicated browser to expose
+        // a window and images. Never close a draft, response or dialog to do so.
+        if (version && (saved?.headless || saved?.images === false || /HeadlessChrome\//.test(version["User-Agent"] || ""))) {
+          const record = await ensureCdpBrowser(saved ? CHAT_GOAL_BROWSER : { name: CHAT_GOAL_BROWSER, headless: true });
+          const targetId = one("SELECT target_id FROM cdp_targets WHERE browser=? AND target='goals'", CHAT_GOAL_BROWSER)?.target_id;
+          if (targetId && record.live_targets.has(targetId)) {
+            const target = await cdpEnsureTarget(record, { name: "goals", initialize: false });
+            const state = await chatGoalEvaluate({ record, ...target, login_setup: true }, "state");
+            if (state.draft?.trim() || state.responding || state.diagnostics?.reason === "dialog_open" ||
+                !["ready", "waiting_login"].includes(state.status) && state.url !== "about:blank" ||
+                state.status === "waiting_login" && state.url !== "about:blank" && !state.url?.startsWith("https://chatgpt.com/"))
+              throw new Error("The dedicated browser must restart for visible login. Finish its response, draft or dialog and try again; its profile is retained.");
+          }
+          await cdpInternal(record, "Browser.close");
+          const deadline = Date.now() + 10000;
+          while (await cdpVersion(Number(port))) {
+            if (Date.now() >= deadline) throw new Error("The dedicated browser is still closing. Try Login ChatGPT again.");
+            await sleep(100);
+          }
+          try { record.ws.close(); } catch {} cdpDisconnect(record);
+        }
+        const page = await chatGoalPage(null, true);
+        await cdpInternal(page.record, "Target.activateTarget", { targetId: page.target_id });
+        chatGoalLoginPage = page;
+        chatGoalLoginRefresh = true;
+        chatGoalLoginDetail = "Sign in or finish any challenge in the dedicated Chrome window. Login is detected automatically; automatic goals remain paused until then. If already signed in, the page may reload once unless it contains a draft.";
+        chatGoalLoginTimer = setInterval(chatGoalLoginTick, 1000);
+      }
+      return chatGoalLoginDetail;
+    } catch (error) {
+      chatGoalLoginDetail = String(error?.message || error).slice(0, 500);
+      chatGoalLoginStop();
+      chatGoalConfigure();
+      throw error;
+    } finally {
+      chatGoalLoginBusy = false;
+      changed({ ui: ["sessions", "settings"] }, "chat-goal-login-finish");
+    }
+  }
+  async function chatGoalNavigate(page, url, context) {
+    if (url !== chatGoalUrl("") && !chatGoalChatId(url)) throw new Error("Invalid ChatGPT conversation URL");
+    if (!chatGoalCurrent(context)) return null;
+    const chatId = chatGoalChatId(url);
+    if (page.record.goal_monitor) {
+      page.record.goal_monitor.generation++;
+      if (chatId) page.record.goal_monitor.histories.delete(chatId);
+    }
+    const navigation = await chatGoalRpc(page, "Page.navigate", { url });
+    if (navigation.errorText) throw new Error(`ChatGPT navigation failed: ${navigation.errorText}`);
+    const deadline = Date.now() + 15000;
+    let lastState = null;
+    while (Date.now() < deadline && chatGoalCurrent(context)) {
+      const state = await chatGoalEvaluate(page, "state");
+      lastState = state;
+      if (state.status === "waiting_login") return state;
+      if (state.url === url && (["ready", "busy"].includes(state.status) || state.responding)) return state;
+      await sleep(250);
+    }
+    return chatGoalCurrent(context) && lastState ? { ...lastState, status: "not_ready", detail: lastState.detail || "ChatGPT DOM: the expected conversation did not become ready." } : null;
+  }
+  async function chatGoalFindChat(page, context) {
+    const initial = await chatGoalEvaluate(page, "state");
+    // Preserve user interaction; a response in another conversation does not own the shared tab.
+    if (initial.status === "waiting_login" && !initial.url.startsWith("about:")) return { status: "waiting_login" };
+    if (initial.draft?.trim()) return { status: "draft_present" };
+    if (initial.diagnostics?.reason === "dialog_open") return { status: "error", detail: initial.detail };
+    const state = await chatGoalNavigate(page, chatGoalUrl(""), context);
+    if (!state) return { status: "error", detail: "ChatGPT did not become ready." };
+    if (state.status === "waiting_login") return state;
+    if (state.status === "not_ready") return { status: "error", detail: state.detail };
+    let recent = await chatGoalEvaluate(page, "recent");
+    if (!recent.urls?.length) { await sleep(500); recent = await chatGoalEvaluate(page, "recent"); }
+    const monitor = page.record?.goal_monitor, listDeadline = Date.now() + 2000;
+    while (monitor && !monitor.stopped && !monitor.list_at && Date.now() < listDeadline && chatGoalCurrent(context)) await sleep(100);
+    const captured = monitor && !monitor.stopped ? [...monitor.recent.values()].sort((a, b) => b.updated - a.updated).map(item => item.id) : [];
+    const ids = [...new Set([...captured, ...(recent.urls || []).map(chatGoalChatId).filter(Boolean)])].slice(0, 20), deadline = Date.now() + 90000;
+    if (!ids.length) return { status: "not_found", detail: recent.detail };
+    for (const id of ids) {
+      if (!chatGoalCurrent(context) || toolCallGate || Date.now() >= deadline) return { status: "busy", detail: "Matching was interrupted or reached its time budget." };
+      const loaded = await chatGoalNavigate(page, chatGoalUrl(id), context);
+      if (loaded?.status === "waiting_login") return loaded;
+      if (!loaded || !["ready", "busy"].includes(loaded.status)) continue;
+      const captureDeadline = Math.min(deadline, Date.now() + 3000);
+      while (monitor && !monitor.stopped && !monitor.histories.has(id) && Date.now() < captureDeadline && chatGoalCurrent(context) && !toolCallGate) await sleep(100);
+      if (!chatGoalCurrent(context) || toolCallGate) return { status: "busy" };
+      const history = monitor?.histories.get(id);
+      if (history) {
+        if (history.handles.has(context.handle)) return { status: "ready", chatId: id };
+        continue;
+      }
+      for (let index = 0; index < 12; index++) {
+        const result = await chatGoalEvaluate(page, "expand", { handle: context.handle, index });
+        if (result.match && chatGoalChatId(result.url) === id) return { status: "ready", chatId: id };
+        if (!result.expanded) break;
+        for (let attempt = 0; attempt < 8; attempt++) {
+          await sleep(250);
+          if (!chatGoalCurrent(context) || toolCallGate || Date.now() >= deadline) return { status: "busy" };
+          const match = await chatGoalEvaluate(page, "match", { handle: context.handle });
+          if (match.match && chatGoalChatId(match.url) === id) return { status: "ready", chatId: id };
+        }
+      }
+    }
+    return { status: "not_found", detail: monitor?.error || "No exact chat_session was found in captured active-branch calls or rendered tool details in the recent chats." };
+  }
+  function chatGoalBind(context, chatId) {
+    if (!/^[a-z0-9-]{8,80}$/i.test(chatId) || !chatGoalCurrent(context)) return false;
+    const newer = one("SELECT id FROM contexts WHERE chatgpt_chat_id=? AND goal_text<>'' AND (goal_updated_at>? OR (goal_updated_at=? AND id>?))",
+      chatId, context.goal_updated_at, context.goal_updated_at, context.id);
+    if (newer) { setChatGoal(context, "", context.goal_timeout_seconds); return false; }
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      disableOtherChatGoals(context.id, chatId);
+      run("UPDATE contexts SET chatgpt_chat_id=?,goal_status='ready',goal_error='',goal_next_check_at=? WHERE id=? AND goal_revision=?",
+        chatId, chatGoalDue(context), context.id, context.goal_revision);
+      db.exec("COMMIT");
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+    changed({ ui: ["sessions"] }, "chat-goal-linked");
+    return true;
+  }
+  async function chatGoalSend(page, context) {
+    let inserted = false, attempted = false;
+    try {
+      const initial = await chatGoalEvaluate(page, "state");
+      if (initial.draft?.trim()) { chatGoalState(context, "draft_present", "The dedicated ChatGPT tab contains a draft; it was left untouched."); return; }
+      if (initial.diagnostics?.reason === "dialog_open") { chatGoalState(context, "error", initial.detail); return; }
+      if (initial.status === "waiting_login" && !initial.url.startsWith("about:")) {
+        chatGoalState(context, "waiting_login", "Sign in to ChatGPT in the dedicated Chrome window."); return;
+      }
+      const url = chatGoalUrl(context.chatgpt_chat_id);
+      // Discovery may already have opened this conversation. After a confirmed
+      // send, another conversation's response must not block the next goal.
+      let state = initial.url === url && (["ready", "busy"].includes(initial.status) || initial.responding)
+        ? initial : await chatGoalNavigate(page, url, context);
+      if (!state) throw new Error("ChatGPT did not become ready.");
+      const stopBeforeSend = getCfg("chat_goal_stop_before_send", "0") === "1";
+      if (stopBeforeSend) {
+        const current = chatGoalCurrent(context);
+        if (!current || toolCallGate || chatGoalDue(current) > Date.now()) return;
+        const stopped = await chatGoalEvaluate(page, "stop", { chatId: context.chatgpt_chat_id });
+        if (!stopped.stop_ok) { chatGoalState(context, stopped.draft?.trim() ? "draft_present" : "error", stopped.detail || "ChatGPT Stop control is unavailable."); return; }
+        const deadline = Date.now() + 5000;
+        do {
+          const current = chatGoalCurrent(context);
+          if (!current || toolCallGate || chatGoalDue(current) > Date.now()) return;
+          state = await chatGoalEvaluate(page, "state");
+          if (!state.responding && state.status === "ready") break;
+          if (state.url !== url || state.status === "waiting_login" || state.draft?.trim() || state.diagnostics?.reason === "dialog_open") break;
+          await sleep(100);
+        } while (Date.now() < deadline);
+        if (state.responding || state.status !== "ready") {
+          chatGoalState(context, state.draft?.trim() ? "draft_present" : "error", "ChatGPT did not become ready after Stop; no prompt was sent."); return;
+        }
+      }
+      if (!["ready", "busy"].includes(state.status)) { chatGoalState(context, state.status, state.detail || "ChatGPT's composer is unavailable."); return; }
+      const focused = await chatGoalEvaluate(page, "focus", { chatId: context.chatgpt_chat_id });
+      if (!focused.focused) { chatGoalState(context, focused.draft?.trim() ? "draft_present" : "error", focused.detail || "ChatGPT DOM: composer, conversation or message receipt identity is unavailable."); return; }
+      const fresh = chatGoalCurrent(context);
+      if (!fresh || toolCallGate || chatGoalDue(fresh) > Date.now()) return;
+      inserted = true;
+      await chatGoalRpc(page, "Input.insertText", { text: context.goal_text });
+      const beforeSend = chatGoalCurrent(context);
+      if (!beforeSend || toolCallGate || chatGoalDue(beforeSend) > Date.now()) return;
+      // Commit before dispatch: a crash/uncertain acknowledgement must never cause an automatic duplicate.
+      chatGoalState(context, "sending", "Waiting for ChatGPT to acknowledge the message.", 0);
+      attempted = true;
+      const sent = await chatGoalEvaluate(page, "send", { chatId: context.chatgpt_chat_id, text: context.goal_text, require_stopped: stopBeforeSend });
+      if (!sent.sent) { attempted = false; chatGoalState(context, "error", sent.detail || "ChatGPT's submit control was unavailable; no message was sent."); return; }
+      const previousIds = new Set(focused.users.map(user => user.id).filter(Boolean));
+      for (let step = 0; step < 40 && chatGoalsEnabled() && !shuttingDown; step++) {
+        const after = await chatGoalEvaluate(page, "state"), last = after.users?.at(-1);
+        if (chatGoalChatId(after.url) === context.chatgpt_chat_id && !after.draft && last?.id && !previousIds.has(last.id) && last.text === context.goal_text) {
+          if (chatGoalCurrent(context)) {
+            const now = Date.now();
+            run("UPDATE contexts SET goal_last_sent_at=?,goal_status='ready',goal_error='',goal_next_check_at=? WHERE id=? AND goal_revision=?",
+              now, now + context.goal_timeout_seconds * 1000, context.id, context.goal_revision);
+            changed({ ui: ["sessions"] }, "chat-goal-sent");
+          }
+          return;
+        }
+        await sleep(250);
+      }
+      chatGoalState(context, "delivery_uncertain", "The send was dispatched but could not be confirmed. Automatic sending is paused; inspect the conversation before setting the goal again.", 0);
+    } catch (error) {
+      chatGoalState(context, attempted ? "delivery_uncertain" : "error", attempted
+        ? "The send outcome is uncertain. Automatic sending is paused; inspect the conversation before setting the goal again."
+        : String(error?.message || error), attempted ? 0 : Date.now() + CHAT_GOAL_RETRY_MS);
+    } finally {
+      if (inserted && !attempted && chatGoalsEnabled() && !shuttingDown) await chatGoalEvaluate(page, "clear", { chatId: context.chatgpt_chat_id, text: context.goal_text }).catch(() => {});
+    }
+  }
+  async function chatGoalRun(context) {
+    context = chatGoalCurrent(context);
+    if (!context || toolCallGate) return;
+    const matchAttempt = context.chatgpt_chat_id ? null : context;
+    if (matchAttempt) {
+      if (context.goal_status !== "pending" || context.goal_next_check_at <= 0) return;
+      // Consume the explicit request before opening Chrome. Failures, reloads
+      // and restart must not silently create another matching attempt.
+      chatGoalState(context, "matching", "Matching this Session to a recent ChatGPT conversation.", 0);
+    }
+    if (context.chatgpt_chat_id && chatGoalDue(context) > Date.now()) {
+      chatGoalState(context, "ready", "", chatGoalDue(context)); return;
+    }
+    try {
+      const page = await chatGoalPage(context);
+      context = chatGoalCurrent(context);
+      if (!context || toolCallGate) return;
+      if (!context.chatgpt_chat_id) {
+        const found = await chatGoalFindChat(page, context);
+        if (!found.chatId) {
+          chatGoalState(context, found.status, found.status === "waiting_login" ? "Sign in to ChatGPT in the dedicated Chrome window." : found.detail || "The dedicated ChatGPT tab is unavailable.");
+          return;
+        }
+        if (!chatGoalBind(context, found.chatId)) return;
+      }
+      // Continue directly from association to delivery, using fresh activity
+      // and revision state instead of waiting for another scheduler tick.
+      context = chatGoalCurrent(context);
+      if (!context || toolCallGate) return;
+      if (chatGoalDue(context) > Date.now()) { chatGoalState(context, "ready", "", chatGoalDue(context)); return; }
+      await chatGoalSend(page, context);
+    } catch (error) { chatGoalState(context, "error", String(error?.message || error)); }
+    finally {
+      if (matchAttempt && !shuttingDown) {
+        const interrupted = one("SELECT * FROM contexts WHERE id=? AND goal_revision=? AND goal_status='matching' AND chatgpt_chat_id='' AND goal_text<>''", matchAttempt.id, matchAttempt.goal_revision);
+        if (interrupted) chatGoalState(interrupted, "error", "Matching was interrupted.", 0);
+      }
+    }
+  }
+  function chatGoalTick() {
+    if (!chatGoalsOperational() || shuttingDown || toolCallGate || chatGoalTask) return chatGoalTask;
+    chatGoalTask = (async () => {
+      const rows = all("SELECT * FROM contexts WHERE goal_text<>'' AND goal_status NOT IN ('sending','delivery_uncertain','expired') AND (chatgpt_chat_id<>'' OR (goal_status='pending' AND goal_next_check_at>0)) AND goal_next_check_at<=? ORDER BY goal_next_check_at,id", Date.now());
+      for (const context of rows) {
+        if (!chatGoalsOperational() || shuttingDown || toolCallGate) break;
+        if (contextExpired(context)) { chatGoalState(context, "expired", "The chat Session has expired.", 0); continue; }
+        await chatGoalRun(context);
+      }
+    })().catch(error => { if (!shuttingDown) console.error("Chat goal scheduler:", String(error?.message || error)); }).finally(() => { chatGoalTask = null; });
+    return chatGoalTask;
+  }
+  // Compile the package's public XPath helpers into one native request, preserving
+  // MrMCP ids, raw responses, wait=false and logical method names in the ring.
+  const cdpExtensionCompiler = new cdp.cdp();
+  cdpExtensionCompiler.call = request => request;
+  function cdpExtensionRequest(method, params = {}) {
+    if (method !== "_.click" && method !== "_.find") throw new Error(`Unknown CDP extension method: ${method}`);
+    const validated = { ...params, xpath: String(params.xpath || ""), target: "page" };
+    if (!validated.xpath) throw new Error(`${method} requires params.xpath`);
+    if (method === "_.click") {
+      validated.attempts = Math.max(1, Math.min(Number(params.attempts || 5), 20));
+      validated.interval_ms = Math.max(0, Math.min(Number(params.interval_ms ?? 300), 5000));
+      if (!Number.isInteger(validated.attempts) || !Number.isInteger(validated.interval_ms)) throw new Error("_.click attempts/interval_ms must be integers");
+    } else {
+      validated.limit = Math.max(1, Math.min(Number(params.limit || 20), 100));
+      if (!Number.isInteger(validated.limit)) throw new Error("_.find limit must be an integer");
+    }
+    const request = cdpExtensionCompiler.custom_methods[method].call(cdpExtensionCompiler, validated);
+    const { browser: _browser, target: _target, ...native } = request.params;
+    return { wire_method: request.method, logical_method: method, params: native };
   }
   const cdpPollMatches = (message, filters) => {
     if (filters.type && filters.type !== "all" && message.type !== filters.type) return false;
@@ -1887,7 +2627,7 @@ async function backend({ addWorkspace = null } = {}) {
     };
   }
   async function cdpSubs(args) {
-    const browser = cdpBrowserName(args.browser);
+    const { browser } = cdpBrowserSpec(args.browser);
     if (args.add === undefined && args.remove === undefined) throw new Error("cdp_subs requires add and/or remove");
     if (typeof args.add === "string" && args.add !== "*") throw new Error("cdp_subs add string must be '*'");
     if (typeof args.remove === "string" && args.remove !== "*") throw new Error("cdp_subs remove string must be '*'");
@@ -1906,7 +2646,7 @@ async function backend({ addWorkspace = null } = {}) {
       : Array.isArray(args.add) ? args.add : [];
     const added = [];
     if (additions.length) {
-      const record = await ensureCdpBrowser(browser);
+      const record = await ensureCdpBrowser(args.browser);
       for (const spec of additions) added.push(cdpSubscriptionOutput(cdpCreateSubscription(record, spec || {})));
     }
     const subscriptions = [...cdpSubscriptions.values()].filter(subscription => subscription.browser === browser).map(cdpSubscriptionOutput);
@@ -1918,7 +2658,9 @@ async function backend({ addWorkspace = null } = {}) {
     if (args.subscription) {
       subscription = cdpSubscriptions.get(String(args.subscription));
       if (!subscription) throw new Error("Unknown or expired CDP subscription");
-      record = await ensureCdpBrowser(subscription.browser);
+      if (args.browser !== undefined && cdpBrowserSpec(args.browser).browser !== subscription.browser)
+        throw new Error("browser must name the selected subscription's browser");
+      record = await ensureCdpBrowser(args.browser ?? subscription.browser);
       if (subscription.connection_id !== record.connection_id) {
         subscription.connection_id = record.connection_id;
         subscription.cursor = record.start_seq;
@@ -2388,8 +3130,10 @@ async function backend({ addWorkspace = null } = {}) {
         db.exec("ROLLBACK");
         throw error;
       }
-      db.exec("VACUUM");
-      statementCache.clear();
+      // SQLite's VACUUM recreates main indexes by name; the TEMP logs view otherwise shadows main.logs.
+      db.exec("DROP VIEW temp.logs");
+      try { db.exec("VACUUM"); }
+      finally { db.exec(toolCallLogViewSql); statementCache.clear(); }
       db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
       await Deno.remove(PUBLISH_DIR, { recursive: true }).catch(error => {
         if (!(error instanceof Deno.errors.NotFound)) throw error;
@@ -3903,13 +4647,13 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     }
   }
 
-  // Session context handles are globally unique bearer capabilities over the stateless MCP transport.
-  // Each Session has exactly one current Workspace; workspace id 0 is the program-folder fallback.
+  // Chat Session handles are globally unique bearer capabilities over the stateless MCP transport.
+  // Workspace id 0 means no selected Workspace; initialization never grants an implicit working directory.
   const serverRoots = p => all(
     "SELECT * FROM roots WHERE server_id=? AND enabled=1 ORDER BY id", p.id,
   );
-  const fallbackWorkspaceRoot = p => ({
-    id: 0, server_id: p.id, name: "Program folder", path: APP_DIR, enabled: 1, fallback: true,
+  const unassignedWorkspaceRoot = p => ({
+    id: 0, server_id: p.id, name: "", path: "", enabled: 0,
   });
   const configuredRootPath = configuredWorkspacePath;
   const lstatIfExists = async path => {
@@ -4051,19 +4795,19 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     `SELECT * FROM roots WHERE server_id=? AND name=?${enabledOnly ? " AND enabled=1" : ""}`,
     p.id, String(name || "").trim(),
   );
-  function createContext(p, workspace, protocolVersion = "", client = {}) {
+  function createContext(p, protocolVersion = "", client = {}) {
     let handle;
     do handle = `ctx_${randomToken(24)}`;
     while (one("SELECT 1 FROM contexts WHERE handle=?", handle));
     const now = Date.now();
     run(`INSERT INTO contexts(handle,server_id,root_id,label,created_at,updated_at,last_active_at,protocol_version,auth_kind,oauth_client_id,client_name,user_agent)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, handle, p.id, Number(workspace.id), "", now, now, now, String(protocolVersion || ""),
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`, handle, p.id, 0, "", now, now, now, String(protocolVersion || ""),
       String(client.auth_kind || ""), String(client.oauth_client_id || ""), String(client.client_name || ""),
       String(client.user_agent || "").slice(0, 512));
     changed({ ui: ["sessions", "roots", "logs", "memory", "dashboard", "oauth"] }, "session-created");
     const record = one("SELECT * FROM contexts WHERE handle=?", handle);
     const clientLabel = String(record.client_name || record.oauth_client_id || record.user_agent || record.auth_kind || "remote client").slice(0, 120);
-    postOsNotification("session", "✨ New Session", `${sessionNotificationLabel(p, record, 0, now, workspace.name)}\n• 👤 ${clientLabel}`);
+    postOsNotification("session", "✨ New Session", `${sessionNotificationLabel(p, record, 0, now)}\n• 👤 ${clientLabel}`);
     return record;
   }
   const contextExpired = context => !!context &&
@@ -4084,8 +4828,8 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   }
   function getContextRecord(p, handle = "") {
     const context = contextByHandle(p, handle);
-    if (!context) throw new Error("Unknown context_handle");
-    if (contextExpired(context)) throw new Error("The context_handle has expired");
+    if (!context) throw new Error("Unknown chat_session");
+    if (contextExpired(context)) throw new Error("The chat_session has expired");
     return context;
   }
   function selectedContextRoot(p, context) {
@@ -4096,21 +4840,21 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       changed({ ui: ["sessions", "roots"] }, "session-workspace-repair");
       context.root_id = 0;
     }
-    return root ? runtimeWorkspaceRoot(root) : fallbackWorkspaceRoot(p);
+    return root ? runtimeWorkspaceRoot(root) : unassignedWorkspaceRoot(p);
   }
   function contextSnapshot(p, context) {
     const roots = serverRoots(p), root = selectedContextRoot(p, context);
     return {
       id: context.id,
       pk: context.id,
-      context_handle: context.handle,
+      chat_session: context.handle,
       label: context.label || `#${context.id}`,
       expired: contextExpired(context),
       protocol_version: context.protocol_version || "unknown",
       workspace_id: root.id,
       workspace_name: root.name,
       workspace_path: root.path,
-      fallback_workspace: root.id === 0,
+      workspace_selected: root.id !== 0,
       created_at: context.created_at,
       updated_at: context.updated_at,
       last_active_at: context.last_active_at,
@@ -4127,7 +4871,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     return contextSnapshot(p, getContextRecord(p, context.handle));
   }
   function selectedRoot(p, args = {}) {
-    const context = getContextRecord(p, String(args.context_handle || ""));
+    const context = getContextRecord(p, String(args.chat_session || ""));
     return { context, root: selectedContextRoot(p, context) };
   }
   async function resolveWorkspacePath(selection, path = ".", knownRootReal = "") {
@@ -4467,7 +5211,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         title: Review focus
         description: Area to focus on.
         required: false
-      - name: context_handle
+      - name: chat_session
         description: Optional MrMCP Session handle when Session/Workspace context is needed.
         required: false
     template: |
@@ -4478,9 +5222,9 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   const GUIDED_PROMPTS_HELP_MODEL = JSON.stringify({
     args: { focus: "string argument values supplied by the client" },
     prompt: { name: "project_review", title: "Project review", description: "...", arguments: ["..."] },
-    session: "current Session snapshot when a valid context_handle argument is supplied; otherwise null",
-    workspace: "current Workspace when a valid context_handle argument is supplied; otherwise null",
-    workspaces: [{ id: 0, name: "fallback", path: "...", fallback: true }],
+    session: "current Session snapshot when a valid chat_session argument is supplied; otherwise null",
+    workspace: "selected Workspace when chat_session is valid and has an open Workspace; otherwise null",
+    workspaces: [{ id: 1, name: "Project", path: "..." }],
     server: { name: "MrMCP", version: VERSION, public_base_url: "...", mcp_url: "...", protocol_version: MCP_MODERN_PROTOCOL, protocol_versions: MCP_PROTOCOLS },
     client: { auth_kind: "oauth|basic|anonymous", client_id: "...", client_name: "...", user_agent: "..." },
     request: { url: "...", method: "POST", transport: "http|https", remote_host: "..." },
@@ -4608,9 +5352,9 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       description: "Name of the enabled Workspace to open. Any enabled Workspace name may be supplied; the value is validated when the tool runs. The selected Session is attached to this Workspace immediately.",
     };
     const contextInput = {
-      context_handle: {
+      chat_session: {
         type: "string", minLength: 12, maxLength: 256,
-        pattern: "^ctx_[A-Za-z0-9_-]+$", description: CONTEXT_HANDLE_INPUT_DESCRIPTION,
+        pattern: "^ctx_[A-Za-z0-9_-]+$", description: CHAT_SESSION_INPUT_DESCRIPTION,
       },
     };
     const inputEncoding = {
@@ -4655,7 +5399,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     };
     const execIdInput = {
       type: "integer", minimum: 1,
-      description: "Persistent execution id returned by exec_start. It is the stable Tool Call id of the exec_start operation and is valid only with the same context_handle that created it.",
+      description: "Persistent execution id returned by exec_start. It is the stable Tool Call id of the exec_start operation and is valid only with the same chat_session that created it.",
     };
     const operationIdInput = {
       type: "string", minLength: 1, maxLength: 256,
@@ -4687,19 +5431,26 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     delete execStartInput.separate_streams;
 
     const defs = {
+      init_chat_session: [
+        "Initialize a new persistent chat Session independently of Workspaces. Call once at the start of a chat, then pass the exact returned chat_session on every subsequent tool call, including list_workspaces, open_workspace and tools_schema. This tool accepts no arguments and always creates a new Session; reuse a valid existing chat_session instead of initializing again. It does not open or create a Workspace.",
+        { properties: {} },
+      ],
+      chat_set_goal: [
+        "The global Settings → Goals switch defaults enabled. When off, this tool remains available but returns status=disabled without setting a goal; background monitoring and browser opening stop. Set a persistent goal for this ChatGPT conversation, or clear it with goal=\"\". Use only when the user asks for automatic follow-ups. First initialize the dedicated Chrome profile in Settings → Goals: select Login ChatGPT and sign in; login is detected automatically. Without a verified login, this tool saves the goal as waiting_login and opens no browser; after setup call it again to trigger an unassociated match. Settings → Goals also controls headless/process visibility. For an unassociated Session, each explicit nonempty set schedules one matching attempt after this call returns. It examines up to 20 recent chats ordered by observed update time, with rendered sidebar fallback, and links only one whose captured active-branch tool call or rendered tool details contain this exact chat_session. An unsuccessful attempt, missing login or interrupted match is not retried continuously: inspect status/detail and call chat_set_goal again to retry. Restart does not resume matching by default; Settings → Goals can enable one missing-match attempt per active unassociated goal at startup. No message is sent before association. An existing association is reused. After timeout_seconds without Tool Call activity (including completion), the server sends the exact goal in the linked conversation and repeats after each idle interval. Association continues directly to an already-due send on the same page. When the inactivity interval expires, it attempts delivery even while ChatGPT is responding or an earlier Tool Call is still running. Settings → Goals can optionally stop the current response first (off by default). New Tool Call activity still resets the timer; existing drafts and maintenance defer delivery. After confirming submission it moves to other goals without waiting for the assistant answer. A send with uncertain delivery pauses automatically until explicitly rearmed. The newest goal replaces any earlier goal on another Session linked to that same conversation. Goal, association and timer survive server restart; no Workspace is needed. Inspect state or stop the goal in Sessions. Never claim the chat is linked when status is pending.",
+        { properties: {
+          goal: { type: "string", maxLength: 32000, description: "Exact follow-up message. Empty or whitespace-only text disables automatic follow-ups and retains the chat association." },
+          timeout_seconds: { type: "integer", minimum: 30, maximum: 86400, default: chatGoalDefaultTimeout(), description: "Inactivity interval in seconds. When omitted, uses Settings → Goals default timeout (initially 5 minutes). Each goal retains the interval selected when set." },
+        }, required: ["goal"] },
+      ],
       list_workspaces: [
-        "List the names of all enabled Workspaces that may be passed to open_workspace. This tool does not require a Session.",
+        "List the names of all enabled Workspaces that may be passed to open_workspace. Requires a chat Session but does not open or create a Workspace.",
         { properties: {} },
       ],
       open_workspace: [
-        "Open the named Workspace and return the Session context_handle to use afterward. Pass create=true only when you explicitly want a missing Workspace created as a new empty Desktop folder; otherwise a missing/disabled name is an error. Pass current_context_handle to move an existing active Session without changing its handle; omitted/empty/unknown/expired creates a new Session. The result includes workspace identity/guidance plus a compact Memory summary (counts and up to five latest keys for Global, Workspace and Session scope). Read agent_guidance_path when non-null before repository work.",
+        "Attach the existing chat Session to the named Workspace without changing chat_session or creating a Session. Pass create=true only when you explicitly want a missing Workspace created as a new empty Desktop folder; otherwise a missing/disabled name is an error. The result includes workspace identity/guidance plus a compact Memory summary (counts and up to five latest keys for Global, Workspace and Session scope). Read agent_guidance_path when non-null before repository work.",
         { properties: {
           name: workspaceNameInput,
           create: { type: "boolean", default: false, description: "Explicitly create the named Workspace on the Desktop only when it does not already exist. false never creates implicitly." },
-          current_context_handle: {
-            type: "string",
-            description: "Optional current Session capability. An active handle is reused and switched to the named Workspace; an omitted, empty, unknown or expired handle causes a new Session to be created.",
-          },
         }, required: ["name"] },
       ],
       workspace_dev_preferences_write: [
@@ -4872,18 +5623,17 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         }, required: ["mime_type"] },
       ],
       cdp_call: [
-        `Send one or more CDP operations in one batch. Each entry selects an optional browser/profile, optional logical page target, and call; omitted browser defaults to the persistent profile label main. A call is either an untouched standard CDP {method,params} or one MrMCP extension {_mrmcp,params}; _mrmcp currently supports click and find with augmented XPath ends-with()/icontains() rewrites. Different browsers/targets may be mixed. MrMCP owns JSON-RPC ids/session routing and preserves result order. wait=true waits for every response independently; wait=false returns assigned ids for later cdp_poll. Page.captureScreenshot natively returns Base64 in the CDP response and is never implicitly saved to disk. Optional outer _image requests response post-processing without changing CDP screenshot params: original preserves the CDP bytes; webp uses public Auto.js auto.vips to decode/scale/re-encode at its current fixed WebP Q=80. Official protocol documentation: ${CDP_CALL_DOCS}`,
+        `Send one or more CDP operations in one batch. Each entry selects an optional browser name or advanced browser object with required name, optional logical page target, and call; omitted browser defaults to the persistent profile label main. Browser objects support local launch options (headless, executable_path, user_data_dir, args), existing browser attachment (port plus optional host, http_url, or direct websocket_url), and connect_timeout_ms. target also accepts an object with required name, native create_params and startup controls initialize/runtime/page/network/service_worker/focus_emulation/binding/background_service. Both configurations are reused by name only for this server run. Every call uses {method,params}: standard CDP methods pass through unchanged; local extension methods use the reserved _. namespace, currently _.click and _.find with augmented XPath ends-with()/icontains() rewrites. These extensions require a target and translate internally to Runtime.evaluate. Different browsers/targets may be mixed. MrMCP owns JSON-RPC ids/session routing and preserves result order. wait=true waits for every response independently; wait=false returns assigned ids for later cdp_poll. Page.captureScreenshot natively returns Base64 in the CDP response and is never implicitly saved to disk. Optional outer _image requests response post-processing without changing CDP screenshot params: original preserves the CDP bytes; webp uses public Auto.js auto.vips to decode/scale/re-encode at its current fixed WebP Q=80. Official protocol documentation: ${CDP_CALL_DOCS}`,
         { properties: {
           wait: { type: "boolean", default: true, description: "Apply to the whole batch. true waits for every dispatched response; false returns after all dispatch attempts and leaves responses for cdp_poll. _image requires wait=true." },
           calls: { type: "array", minItems: 1, maxItems: 100, items: {
             type: "object", additionalProperties: false, properties: {
-              browser: { type: "string", minLength: 1, maxLength: 64, default: "main", description: "Optional persistent browser/profile label under .mrmcp/cdp with one persisted debugging port. Omit it to use main." },
-              target: { type: "string", minLength: 1, maxLength: 128, description: "Optional persistent logical page label. Required by _mrmcp click/find; omit for browser-level standard CDP methods." },
-              call: { type: "object", additionalProperties: false, oneOf: [{ required: ["method"], not: { required: ["_mrmcp"] } }, { required: ["_mrmcp"], not: { required: ["method"] } }], properties: {
-                method: { type: "string", minLength: 3, maxLength: 200, description: "Exact standard CDP method, for example Page.navigate, Runtime.evaluate or Page.captureScreenshot." },
-                _mrmcp: { type: "string", enum: ["click", "find"], description: "MrMCP-local CDP extension, never sent as a protocol method. click retries an augmented XPath and invokes element.click(); find returns compact element/text/rect metadata for augmented XPath matches." },
-                params: { type: "object", additionalProperties: true, default: {}, description: "For standard method: raw CDP params unchanged. For _mrmcp click: xpath plus optional attempts (1-20) and interval_ms (0-5000). For _mrmcp find: xpath plus optional limit (1-100)." },
-              } },
+              browser: { ...CDP_BROWSER_INPUT, default: "main", description: `${CDP_BROWSER_INPUT.description} Omit browser to use main.` },
+              target: CDP_TARGET_INPUT,
+              call: { type: "object", additionalProperties: false, properties: {
+                method: { type: "string", minLength: 3, maxLength: 200, description: "Exact standard CDP method, for example Page.navigate, Runtime.evaluate or Page.captureScreenshot, or local extension _.click / _.find. _.click retries an augmented XPath and invokes element.click(); _.find returns compact element/text/rect metadata. The _. namespace is reserved for local extensions." },
+                params: { type: "object", additionalProperties: true, default: {}, description: "For standard methods: raw CDP params unchanged. For _.click: xpath plus optional attempts (1-20) and interval_ms (0-5000). For _.find: xpath plus optional limit (1-100)." },
+              }, required: ["method"] },
               _image: { type: "object", additionalProperties: false, properties: {
                 return: { type: "string", enum: ["base64"], description: "Explicitly keep the screenshot payload as Base64 in cdp.result.data after optional post-processing." },
                 format: { type: "string", enum: ["original", "webp"], default: "original", description: "original leaves CDP image encoding unchanged; webp decodes the returned screenshot and re-encodes WebP through the public Auto.js vips helpers." },
@@ -4898,7 +5648,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       cdp_subs: [
         "Add and/or remove global runtime CDP subscriptions for one browser in one call; removals are applied before additions. add accepts subscription specs or '*' for one catch-all subscription; remove accepts opaque subscription ids or '*' to remove every subscription for that browser. Each spec can filter logical targets (including '*'), exact methods/prefixes (including '*'), browser-level traffic, and an optional JavaScript-compatible regex tested against JSON.stringify of the complete raw inbound CDP message. Filters are AND across target/method/regex dimensions and OR within exact+prefix methods. Subscriptions are runtime-global, not Session-owned, and disappear on restart.",
         { properties: {
-          browser: { type: "string", minLength: 1, maxLength: 64 },
+          browser: CDP_BROWSER_INPUT,
           add: { anyOf: [
             { type: "string", const: "*" },
             { type: "array", maxItems: 100, items: { type: "object", additionalProperties: false, properties: {
@@ -4918,22 +5668,22 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         }, required: ["browser"] },
       ],
       cdp_poll: [
-        "Read retained CDP traffic. With subscription, read matching traffic forward from that subscription's cursor; advance defaults true and moves only that cursor. Subscription target/method/wildcard/full-message-regex filters are applied first. Without subscription, browser is required and the tool returns the latest matching retained messages from the tail without consuming them. wait=false responses are retained independently of notification subscriptions and may be selected by id. type, target, methods and method_prefixes are additional ad-hoc filters; method filters use the remembered standard or logical _mrmcp request name for responses. The per-browser ring is bounded by count and bytes; dropped and stream_resets make loss/reconnection explicit.",
+        "Read retained CDP traffic. With subscription, read matching traffic forward from that subscription's cursor; advance defaults true and moves only that cursor. Subscription target/method/wildcard/full-message-regex filters are applied first. Without subscription, browser is required and the tool returns the latest matching retained messages from the tail without consuming them. wait=false responses are retained independently of notification subscriptions and may be selected by id. type, target, methods and method_prefixes are additional ad-hoc filters; method filters use the remembered standard or logical _. extension request name for responses. The per-browser ring is bounded by count and bytes; dropped and stream_resets make loss/reconnection explicit.",
         { anyOf: [{ required: ["subscription"] }, { required: ["browser"] }], properties: {
           subscription: { type: "string", pattern: "^cdpsub_[A-Za-z0-9_-]+$" },
-          browser: { type: "string", minLength: 1, maxLength: 64, description: "Required for ad-hoc polling when subscription is omitted." },
+          browser: { ...CDP_BROWSER_INPUT, description: `${CDP_BROWSER_INPUT.description} Required for ad-hoc polling when subscription is omitted; when supplied with subscription, its name must match that subscription's browser.` },
           target: { type: "string", minLength: 1, maxLength: 128, description: "Optional additional logical target filter." },
           type: { type: "string", enum: ["all", "notification", "response"], default: "all" },
           id: { type: "integer", minimum: 1, description: "Optional JSON-RPC response id, especially for a previous cdp_call(wait=false)." },
-          methods: { type: "array", maxItems: 100, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 200 }, default: [], description: "Exact method filter; '*' matches every method. For responses this is the remembered standard method or logical _mrmcp operation name." },
-          method_prefixes: { type: "array", maxItems: 100, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 200 }, default: [], description: "Method prefixes such as Network. or _mrmcp.; '*' matches every method. For responses this filters the remembered standard/logical request method." },
+          methods: { type: "array", maxItems: 100, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 200 }, default: [], description: "Exact method filter; '*' matches every method. For responses this is the remembered standard method or logical _. extension method." },
+          method_prefixes: { type: "array", maxItems: 100, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 200 }, default: [], description: "Method prefixes such as Network. or _.; '*' matches every method. For responses this filters the remembered standard/logical request method." },
           limit: { type: "integer", minimum: 1, maximum: 200, default: 50 },
           advance: { type: "boolean", default: true, description: "With subscription, advance its cursor through the scanned retained stream. Ignored for ad-hoc browser polling." },
           ...contextInput,
         } },
       ],
       memory_find: [
-        "Find persistent key-value memories across one or more explicitly selected scopes. scope accepts global, session, workspace, an array of those scopes, or '*' for all three. Session results are always restricted to the current context_handle's Session. Workspace scope searches every registered Workspace when workspace is omitted, or one named Workspace when supplied. Each result reports its stable id, public scope/owner, key, explicit json type, value, TTL and set/expiry timestamps. Expired TTL entries are removed before searching. key is exact, key_prefix matches the start of keys, and query searches key plus stored value text as a case-insensitive literal by default or as a JavaScript regex when regex=true. set_after/set_before filter the set timestamp and before_id provides stable backward pagination. Exact-key lookup through this tool replaces a separate memory_get surface.",
+        "Find persistent key-value memories across one or more explicitly selected scopes. scope accepts global, session, workspace, an array of those scopes, or '*' for all three. Session results are always restricted to the current chat_session's Session. Workspace scope searches every registered Workspace when workspace is omitted, or one named Workspace when supplied. Each result reports its stable id, public scope/owner, key, explicit json type, value, TTL and set/expiry timestamps. Expired TTL entries are removed before searching. key is exact, key_prefix matches the start of keys, and query searches key plus stored value text as a case-insensitive literal by default or as a JavaScript regex when regex=true. set_after/set_before filter the set timestamp and before_id provides stable backward pagination. Exact-key lookup through this tool replaces a separate memory_get surface.",
         { properties: {
           scope: { anyOf: [
             { type: "string", enum: ["global", "session", "workspace", "*"] },
@@ -4953,7 +5703,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         }, required: ["scope"] },
       ],
       memory_set: [
-        "Set, replace, or delete one persistent key-value memory in an explicitly selected scope. global scope is shared across the whole MrMCP server, session scope belongs to the current context_handle's Session, and workspace scope requires a Workspace label and is shared by every Session using that Workspace. When setting, value is text and json must explicitly say how to interpret it: json=true validates the text with JSON.parse and rejects invalid JSON; json=false stores ordinary text unchanged. ttl_seconds=0 means no expiry; positive TTL is measured from this set operation. Every replacement gets a new set timestamp/id. Use delete=true without value/json to remove the key.",
+        "Set, replace, or delete one persistent key-value memory in an explicitly selected scope. global scope is shared across the whole MrMCP server, session scope belongs to the current chat_session's Session, and workspace scope requires a Workspace label and is shared by every Session using that Workspace. When setting, value is text and json must explicitly say how to interpret it: json=true validates the text with JSON.parse and rejects invalid JSON; json=false stores ordinary text unchanged. ttl_seconds=0 means no expiry; positive TTL is measured from this set operation. Every replacement gets a new set timestamp/id. Use delete=true without value/json to remove the key.",
         { properties: {
           scope: { type: "string", enum: ["global", "session", "workspace"], description: "Required explicit memory scope." },
           workspace: { type: "string", minLength: 1, maxLength: 128, description: "Workspace label required only when scope=workspace; omit for global and session scope." },
@@ -4977,13 +5727,13 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         { properties: { ...contextInput } },
       ],
       tools_schema: [
-        "Return the canonical complete MCP tool descriptors generated by the same serverTools source used by tools/list for exact published tool names. This exposes name, title, full description, inputSchema, outputSchema, annotations and _meta without connector summarization. Publication View resource URIs are canonical here; tools/list may add a fresh ?instance suffix solely for cache busting. This authenticated diagnostic tool does not require a Session.",
+        "Return the canonical complete MCP tool descriptors generated by the same serverTools source used by tools/list for exact published tool names. This exposes name, title, full description, inputSchema, outputSchema, annotations and _meta without connector summarization. Publication View resource URIs are canonical here; tools/list may add a fresh ?instance suffix solely for cache busting. This diagnostic tool requires a chat Session but no Workspace.",
         { properties: {
           names: { type: "array", minItems: 1, maxItems: 50, uniqueItems: true, items: { type: "string", minLength: 1, maxLength: 128 }, description: "Exact published tool names to inspect, returned in this order when present. Duplicate names are rejected at execution time." },
         }, required: ["names"] },
       ],
       tools_log: [
-        "Query Tool Call history for this exact context_handle across both Disk and Memory storage. summary is the default. Every row reports storage and payload_mode: payload retains the canonical MCP JSON-RPC request and response packets, while metadata retains no MCP payload. detail=full returns mcp_request and mcp_response only when retained; payload_retained and payload_complete make availability explicit. Filters may be combined. query is a case-insensitive literal substring search across retained MCP packets and metadata; before_id pages backward by stable Tool Call id. When truncated=true, pass next_before_id back as before_id with the same filters. An upstream-blocked request cannot appear here.",
+        "Query Tool Call history for this exact chat_session across both Disk and Memory storage. summary is the default. Every row reports storage and payload_mode: payload retains the canonical MCP JSON-RPC request and response packets, while metadata retains no MCP payload. detail=full returns mcp_request and mcp_response only when retained; payload_retained and payload_complete make availability explicit. Filters may be combined. query is a case-insensitive literal substring search across retained MCP packets and metadata; before_id pages backward by stable Tool Call id. When truncated=true, pass next_before_id back as before_id with the same filters. An upstream-blocked request cannot appear here.",
         { properties: {
           id: { type: "integer", minimum: 1, description: "Inspect one exact stable Tool Call id. When present, before_id is ignored and at most one matching call is returned." },
           detail: { type: "string", enum: ["summary", "full"], default: "summary", description: "summary avoids returning stored packet bodies; full includes retained mcp_request and mcp_response packets." },
@@ -5003,14 +5753,14 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         } },
       ],
       exec_start: [
-        "Start a persistent interactive/background command and return immediately; this tool never carries live process output. Optional operation_id provides replay protection: matching retries in the same Session return the same exec_id while the process is active and for 5 minutes after completion, and the key may be reused after that grace period. The result contains exec_id, the integer Tool Call id of the original exec_start call. Pass that exact exec_id together with the same context_handle to exec_attach, exec_write, exec_kill or exec_status. The process keeps running after this Tool Call ends or its client disconnects. The complete normalized stdout/stderr transcript is retained in memory for the process lifetime and for up to 24 hours after completion, and stdin writes are retained internally for diagnostics. Use exec_attach to consume incremental output and exec_status to inspect state or retrieve all/tail output without consuming the attach cursor. Persistent state does not survive a server restart. stdin remains open until exec_write closes it or the process exits.",
+        "Start a persistent interactive/background command and return immediately; this tool never carries live process output. Optional operation_id provides replay protection: matching retries in the same Session return the same exec_id while the process is active and for 5 minutes after completion, and the key may be reused after that grace period. The result contains exec_id, the integer Tool Call id of the original exec_start call. Pass that exact exec_id together with the same chat_session to exec_attach, exec_write, exec_kill or exec_status. The process keeps running after this Tool Call ends or its client disconnects. The complete normalized stdout/stderr transcript is retained in memory for the process lifetime and for up to 24 hours after completion, and stdin writes are retained internally for diagnostics. Use exec_attach to consume incremental output and exec_status to inspect state or retrieve all/tail output without consuming the attach cursor. Persistent state does not survive a server restart. stdin remains open until exec_write closes it or the process exits.",
         { oneOf: [{ required: ["program"] }, { required: ["shell_command"] }], properties: {
           ...execStartInput,
           timeout_ms: { type: "integer", minimum: 0, maximum: 604800000, default: 0 },
         } },
       ],
       exec_attach: [
-        "Consume unread output from one persistent process created by exec_start. Pass the exact exec_id returned by exec_start and the same context_handle; ids from another Session are inaccessible. Each successful attach advances an internal cursor so already-returned combined output is not repeated. Every attachment is request-bounded: timeout_ms defaults to 45 seconds and may be increased up to 1 hour; after it expires, a still-running process returns normally with wait_timed_out=true and may be attached again. Be careful with high attachment timeouts because client/proxy retries can overlap the still-active attachment and receive the intentional already-active error; short repeated attaches or exec_status are safer across uncertain gateways. With _meta.progressToken, exec_attach sends unread backlog and live output until process exit, disconnect, or that wait timeout, then returns the unread transcript covered by this attachment. Without a progressToken, existing unread data returns immediately up to 16 KiB; otherwise the call long-polls only within the same bounded wait. remaining_bytes reports already-buffered UTF-8 bytes after the returned chunk. Call again while remaining_bytes>0 or when wait_timed_out=true/status=running. When the HTTP runtime reports a client disconnect, the attachment detaches without terminating the persistent child; the bounded wait still releases the slot when a transport cannot surface disconnect before a response exists. Only one attachment may be active per exec id. Use exec_status for non-consuming snapshots.",
+        "Consume unread output from one persistent process created by exec_start. Pass the exact exec_id returned by exec_start and the same chat_session; ids from another Session are inaccessible. Each successful attach advances an internal cursor so already-returned combined output is not repeated. Every attachment is request-bounded: timeout_ms defaults to 45 seconds and may be increased up to 1 hour; after it expires, a still-running process returns normally with wait_timed_out=true and may be attached again. Be careful with high attachment timeouts because client/proxy retries can overlap the still-active attachment and receive the intentional already-active error; short repeated attaches or exec_status are safer across uncertain gateways. With _meta.progressToken, exec_attach sends unread backlog and live output until process exit, disconnect, or that wait timeout, then returns the unread transcript covered by this attachment. Without a progressToken, existing unread data returns immediately up to 16 KiB; otherwise the call long-polls only within the same bounded wait. remaining_bytes reports already-buffered UTF-8 bytes after the returned chunk. Call again while remaining_bytes>0 or when wait_timed_out=true/status=running. When the HTTP runtime reports a client disconnect, the attachment detaches without terminating the persistent child; the bounded wait still releases the slot when a transport cannot surface disconnect before a response exists. Only one attachment may be active per exec id. Use exec_status for non-consuming snapshots.",
         { properties: {
           exec_id: execIdInput,
           timeout_ms: { type: "integer", minimum: 1, maximum: MCP_REQUEST_PROCESS_MAX_TIMEOUT_MS, default: MCP_ATTACH_DEFAULT_TIMEOUT_MS, description: "Maximum time this attachment may wait/stream before returning while the process remains running. Defaults to 45000 and allows up to 1 hour. High values may cross client/proxy retry windows and cause overlapping attach attempts; prefer shorter repeated attaches or exec_status when transport behavior is uncertain." },
@@ -5018,19 +5768,19 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           ...contextInput,
         }, required: ["exec_id"] },
       ],
-      exec_write: ["Write data to the open stdin of a persistent process created by exec_start. Pass the exact exec_id returned by exec_start and the same context_handle. This call does not attach to output. Set close=true to close stdin after the optional write.", { properties: {
+      exec_write: ["Write data to the open stdin of a persistent process created by exec_start. Pass the exact exec_id returned by exec_start and the same chat_session. This call does not attach to output. Set close=true to close stdin after the optional write.", { properties: {
         exec_id: execIdInput, data: { type: "string", default: "" },
         encoding: { type: "string", enum: ["text", "base64"], default: "text" },
         close: { type: "boolean", default: false }, ...contextInput,
       }, required: ["exec_id"] }],
-      exec_kill: ["Terminate a still-running persistent process created by exec_start. Pass its exec_id and the same context_handle. Foreground exec calls are cancelled by cancelling/disconnecting their own Tool Call and are not controlled through exec_kill. After termination, use exec_status with output=all or output=tail to inspect retained output.", { properties: {
+      exec_kill: ["Terminate a still-running persistent process created by exec_start. Pass its exec_id and the same chat_session. Foreground exec calls are cancelled by cancelling/disconnecting their own Tool Call and are not controlled through exec_kill. After termination, use exec_status with output=all or output=tail to inspect retained output.", { properties: {
         exec_id: execIdInput, signal: { type: "string", enum: ["SIGTERM", "SIGKILL"], default: "SIGTERM" },
         ...contextInput,
       }, required: ["exec_id"] }],
       exec_list: ["List only the persistent processes that are currently running for this exact Session. Each row includes exec_id, command, state and attachment/stdin state. Completed, failed, timed-out and killed processes are intentionally omitted; query a known completed exec_id with exec_status instead. Persistent process state is in memory and does not survive a server restart.", { properties: {
         limit: { type: "integer", minimum: 1, maximum: 200, default: 50 }, ...contextInput,
       } }],
-      exec_status: ["Inspect one persistent process created by exec_start without consuming its exec_attach cursor. Pass the exact exec_id and the same context_handle. This works while the process is running and after completion, failure, timeout or kill while its in-memory record is retained (normally up to 24 hours after completion; records do not survive a server restart). output=none returns status/metadata only; output=all returns the complete retained normalized combined stdout/stderr transcript; output=tail returns the last tail_lines normalized lines. separate_streams=true additionally applies the same output selection to stdout and stderr.", { properties: {
+      exec_status: ["Inspect one persistent process created by exec_start without consuming its exec_attach cursor. Pass the exact exec_id and the same chat_session. This works while the process is running and after completion, failure, timeout or kill while its in-memory record is retained (normally up to 24 hours after completion; records do not survive a server restart). output=none returns status/metadata only; output=all returns the complete retained normalized combined stdout/stderr transcript; output=tail returns the last tail_lines normalized lines. separate_streams=true additionally applies the same output selection to stdout and stderr.", { properties: {
         exec_id: execIdInput,
         output: { type: "string", enum: ["none", "all", "tail"], default: "none" },
         tail_lines: { type: "integer", minimum: 1, maximum: 10000, default: 200 },
@@ -5156,21 +5906,16 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     };
     const stringArray = { type: "array", items: { type: "string" } };
     const envelopeProperties = {
-      context_handle: { type: "string", description: CONTEXT_HANDLE_OUTPUT_DESCRIPTION },
+      chat_session: { type: "string", description: CHAT_SESSION_OUTPUT_DESCRIPTION },
       error: { type: "string" },
     };
     const outputSchema = (properties = {}) => ({
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       type: "object", additionalProperties: false,
       properties: { ...envelopeProperties, ...properties },
-      required: ["context_handle"],
+      required: ["chat_session"],
     });
-    const strictOutputSchema = properties => ({ ...outputSchema(properties), required: ["context_handle", ...Object.keys(properties)] });
-    const sessionlessOutputSchema = (properties = {}) => ({
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      type: "object", additionalProperties: false,
-      properties, required: Object.keys(properties),
-    });
+    const strictOutputSchema = properties => ({ ...outputSchema(properties), required: ["chat_session", ...Object.keys(properties)] });
     const inspectedToolOutput = {
       type: "object", additionalProperties: false,
       properties: {
@@ -5234,7 +5979,15 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       stdin_open: { type: "boolean" }, success: { type: "boolean" },
     };
     const outputSchemas = {
-      list_workspaces: sessionlessOutputSchema({ workspaces: stringArray }),
+      init_chat_session: outputSchema(),
+      chat_set_goal: outputSchema({
+        goal: { type: "string" }, timeout_seconds: { type: "integer" }, status: { type: "string", enum: CHAT_GOAL_STATUSES },
+        chatgpt_chat_id: nullableString, chat_url: nullableString, detail: nullableString,
+        next_check_at: { anyOf: [{ type: "integer" }, { type: "null" }], description: "Next scheduler check as Unix milliseconds; null when disabled or suspended." },
+        last_sent_at: { anyOf: [{ type: "integer" }, { type: "null" }], description: "Last confirmed message as Unix milliseconds." },
+        browser: { type: "string" }, user_data_dir: { type: "string" },
+      }),
+      list_workspaces: outputSchema({ workspaces: stringArray }),
       open_workspace: outputSchema({
         workspace_name: { type: "string", description: "Unique Workspace name selected for the returned Session." },
         cwd: { type: "string", description: "Absolute path of the selected Workspace." },
@@ -5314,10 +6067,11 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           required: ["logical_name", "description"],
         },
       } }),
-      tools_schema: sessionlessOutputSchema({ tools: { type: "array", items: inspectedToolOutput }, missing: stringArray }),
+      tools_schema: outputSchema({ tools: { type: "array", items: inspectedToolOutput }, missing: stringArray }),
       tools_log: outputSchema({ detail: { type: "string", enum: ["summary", "full"] }, returned: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1 }, next_before_id: { anyOf: [{ type: "integer", minimum: 1 }, { type: "null" }] }, truncated: { type: "boolean" }, calls: objectArray }),
       exec: outputSchema(processProperties),
       exec_start: outputSchema({
+        operation_id: processProperties.operation_id,
         exec_id: { type: "integer", minimum: 1 }, status: { type: "string" }, command: {},
         cwd: { type: "string" }, started_at: { type: "string" }, stdin_open: { type: "boolean" },
       }),
@@ -5345,7 +6099,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const processOutputSchema = outputSchema(processProperties);
 
     const titles = {
-      list_workspaces: "List Workspaces", open_workspace: "Open Workspace",
+      init_chat_session: "Initialize Chat Session", chat_set_goal: "Set Chat Goal", list_workspaces: "List Workspaces", open_workspace: "Open Workspace",
       fs_glob: "FS Glob", fs_grep: "FS Grep", fs_read: "FS Read", fs_navigate: "FS Navigate", fs_stat: "FS Stat",
       fs_write: "FS Write", fs_edit: "FS Edit", fs_mkdir: "FS Mkdir", fs_copy: "FS Copy", fs_move: "FS Move", fs_trash: "FS Trash", fs_untrash: "FS Untrash",
       desktop_auto: "Desktop Auto", publish: "Publish to User", cdp_call: "CDP Call", cdp_subs: "CDP Subscriptions", cdp_poll: "CDP Poll", memory_find: "Memory Find", memory_set: "Memory Set", telegram_req: "Telegram Request", discover_commands: "Discover Commands", tools_schema: "Tools Schema", tools_log: "Tools Log",
@@ -5366,14 +6120,15 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     });
     const withRequiredContext = value => ({
       ...value,
-      required: [...new Set([...(value.required || []), "context_handle"])],
+      properties: { ...contextInput, ...value.properties },
+      required: [...new Set([...(value.required || []), "chat_session"])],
     });
     const tools = [...available].filter(name => defs[name]).map(name => {
-      const requiresContext = !["list_workspaces", "open_workspace", "tools_schema"].includes(name);
+      const requiresContext = name !== "init_chat_session";
       return {
         name,
         title: titles[name] || name.replaceAll("_", " ").replace(/\b\w/g, value => value.toUpperCase()),
-        description: requiresContext ? `${defs[name][0]} ${CONTEXT_HANDLE_RULE}` : defs[name][0],
+        description: requiresContext ? `${defs[name][0]} ${CHAT_SESSION_RULE}` : defs[name][0],
         inputSchema: schema(requiresContext ? withRequiredContext(defs[name][1]) : defs[name][1]),
         outputSchema: outputSchemas[name] || genericOutputSchema,
         annotations: annotations(name),
@@ -5383,13 +6138,13 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     for (const custom of all("SELECT * FROM custom_tools WHERE server_id=? ORDER BY name", p.id)) tools.push({
       name: custom.name,
       title: custom.name.replaceAll("_", " ").replace(/\b\w/g, value => value.toUpperCase()),
-      description: `${custom.description || `Run configured command: ${custom.command}`} This is a foreground command with the same replay/timeout contract as exec: optional operation_id deduplicates identical retries for the active process plus a 5-minute completion grace, and timeout_ms defaults to 45 seconds but is configurable up to 1 hour. High request timeouts can cross client/proxy retry or replay windows and may run non-idempotent commands more than once, so prefer exec_start for long-running work. Normalized combined output may stream as request-scoped progress, the final result contains buffered status/output, and client disconnect/cancellation terminates the child. ${CONTEXT_HANDLE_RULE}`,
+      description: `${custom.description || `Run configured command: ${custom.command}`} This is a foreground command with the same replay/timeout contract as exec: optional operation_id deduplicates identical retries for the active process plus a 5-minute completion grace, and timeout_ms defaults to 45 seconds but is configurable up to 1 hour. High request timeouts can cross client/proxy retry or replay windows and may run non-idempotent commands more than once, so prefer exec_start for long-running work. Normalized combined output may stream as request-scoped progress, the final result contains buffered status/output, and client disconnect/cancellation terminates the child. ${CHAT_SESSION_RULE}`,
       inputSchema: schema({ properties: {
         args: { type: "array", items: { type: "string" }, default: [], description: "Argument vector appended verbatim and in order to the configured command." }, shell_command_suffix: { type: "string" },
         cwd: { type: "string", default: "." }, env: { type: "object", additionalProperties: { type: "string" } },
         stdin: { type: "string" }, operation_id: operationIdInput, separate_streams: { type: "boolean", default: false }, timeout_ms: { type: "integer", minimum: 1, maximum: MCP_REQUEST_PROCESS_MAX_TIMEOUT_MS, default: MCP_FOREGROUND_EXEC_DEFAULT_TIMEOUT_MS },
         ...contextInput,
-      }, required: ["context_handle"] }),
+      }, required: ["chat_session"] }),
       outputSchema: processOutputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     });
@@ -5429,11 +6184,10 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     else {
       if (tool.outputSchema.type !== "object") errors.push("outputSchema.type must be object");
       if (tool.outputSchema.additionalProperties !== false) errors.push("outputSchema.additionalProperties must be false");
-      if (!["list_workspaces", "tools_schema"].includes(tool.name) && !tool.outputSchema.required?.includes("context_handle"))
-        errors.push("outputSchema missing required context_handle");
-      if (["list_workspaces", "tools_schema"].includes(tool.name) && tool.outputSchema.properties?.context_handle)
-        errors.push(`${tool.name} output must not expose context_handle`);
+      if (!tool.outputSchema.required?.includes("chat_session"))
+        errors.push("outputSchema missing required chat_session");
       const expectedOutputs = {
+        chat_set_goal: ["goal", "timeout_seconds", "status", "chatgpt_chat_id", "chat_url", "next_check_at", "last_sent_at", "detail", "browser", "user_data_dir"],
         list_workspaces: ["workspaces"],
         open_workspace: ["workspace_name", "cwd", "agent_guidance_path", "workspace_created", "memory_summary"],
         tools_schema: ["tools", "missing"],
@@ -5463,19 +6217,20 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       const workspaceName = tool.inputSchema?.properties?.name;
       if (workspaceName?.type !== "string") errors.push("open_workspace name must be a string");
       if (workspaceName?.enum) errors.push("open_workspace name must not enumerate configured Workspace names");
-      if (tool.inputSchema?.properties?.context_handle) errors.push("open_workspace must not accept context_handle");
       if (!tool.inputSchema?.properties?.create || tool.inputSchema.properties.create.type !== "boolean") errors.push("open_workspace missing optional boolean create");
       if (tool.inputSchema?.required?.includes("create")) errors.push("open_workspace create must be optional");
-      if (!tool.inputSchema?.properties?.current_context_handle) errors.push("open_workspace missing optional current_context_handle");
-      if (tool.inputSchema?.required?.includes("current_context_handle")) errors.push("open_workspace current_context_handle must be optional");
-    } else if (["list_workspaces", "tools_schema"].includes(tool.name)) {
-      if (tool.inputSchema?.properties?.context_handle) errors.push(`${tool.name} must not accept context_handle`);
+    }
+    if (tool.inputSchema?.properties?.context_handle || tool.inputSchema?.properties?.current_context_handle || tool.inputSchema?.properties?.current_chat_session)
+      errors.push("inputSchema exposes an obsolete Session argument");
+    if (tool.name === "init_chat_session") {
+      if (Object.keys(tool.inputSchema?.properties || {}).length || tool.inputSchema?.required?.length) errors.push("init_chat_session must accept no arguments");
     } else {
-      if (!tool.inputSchema?.properties?.context_handle) errors.push("inputSchema missing context_handle");
-      if (!tool.inputSchema?.required?.includes("context_handle")) errors.push("inputSchema context_handle must be required");
+      if (!tool.inputSchema?.properties?.chat_session) errors.push("inputSchema missing chat_session");
+      if (!tool.inputSchema?.required?.includes("chat_session")) errors.push("inputSchema chat_session must be required");
     }
     const expectedInputs = {
-      open_workspace: ["name", "create", "current_context_handle"],
+      chat_set_goal: ["goal", "timeout_seconds", "chat_session"],
+      open_workspace: ["name", "create", "chat_session"],
       fs_glob: ["path", "include", "exclude", "gitignore", "hidden", "metadata", "limit", "after_path"],
       fs_grep: ["pattern", "path", "include", "exclude", "gitignore", "hidden", "regex", "case_sensitive", "encoding", "context_lines_before", "context_lines_after", "mode", "max_file_bytes", "limit", "resume_after"],
       fs_read: ["files", "max_output_bytes_per_file"], fs_navigate: ["pattern", "files", "regex", "case_sensitive", "context_lines_before", "context_lines_after"], fs_stat: ["paths", "fingerprint"],
@@ -5538,26 +6293,35 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const memorySetTool = tools.find(tool => tool.name === "memory_set");
     if (!publishTool || tools.some(tool => ["publish_file", "publish_html"].includes(tool.name)))
       uiErrors.push("unified publish tool surface is invalid");
-    if (!openWorkspaceTool || tools.some(tool => tool.name === "create_workspace") ||
-        !openWorkspaceTool.inputSchema?.properties?.create || openWorkspaceTool.inputSchema?.properties?.context_handle ||
+    if (!tools.some(tool => tool.name === "init_chat_session") || !openWorkspaceTool || tools.some(tool => tool.name === "create_workspace") ||
+        !openWorkspaceTool.inputSchema?.properties?.create || !openWorkspaceTool.inputSchema?.required?.includes("chat_session") ||
         !openWorkspaceTool.outputSchema?.properties?.memory_summary?.required?.includes("global") ||
         !openWorkspaceTool.outputSchema?.properties?.workspace_created)
       uiErrors.push("Workspace open/create surface is invalid");
-    if (!publishSchema?.required?.includes("mime_type") || !publishSchema?.required?.includes("context_handle") || publishSchema?.oneOf?.length !== 3 ||
+    if (!publishSchema?.required?.includes("mime_type") || !publishSchema?.required?.includes("chat_session") || publishSchema?.oneOf?.length !== 3 ||
         !["path", "text", "base64"].every(name => publishSchema.oneOf.some(branch => branch.required?.length === 1 && branch.required[0] === name)))
       uiErrors.push("publish source/MIME schema is invalid");
     if (!cdpCallTool || !cdpSubsTool || !cdpPollTool || tools.some(tool => ["cdp_launch", "cdp_subscribe", "cdp_unsubscribe"].includes(tool.name)))
       uiErrors.push("CDP tool surface is invalid");
     const cdpCallSchema = cdpCallTool?.inputSchema;
     const cdpCallItem = cdpCallSchema?.properties?.calls?.items;
-    if (!cdpCallSchema?.required?.includes("calls") || !cdpCallSchema?.required?.includes("context_handle") ||
+    const cdpOperationSchema = cdpCallItem?.properties?.call;
+    const cdpBrowserSchemaValid = schema => schema?.anyOf?.some(option => option.type === "string") &&
+      schema.anyOf.some(option => option.type === "object" && option.additionalProperties === false && option.required?.includes("name") &&
+        ["name", "headless", "executable_path", "user_data_dir", "args", "websocket_url", "http_url", "port", "host", "connect_timeout_ms"].every(key => option.properties?.[key]));
+    if (!cdpCallSchema?.required?.includes("calls") || !cdpCallSchema?.required?.includes("chat_session") ||
         cdpCallSchema?.properties?.browser || cdpCallSchema?.properties?.call || cdpCallSchema?.properties?.target ||
         cdpCallSchema?.properties?.calls?.minItems !== 1 || cdpCallItem?.required?.includes("browser") || !cdpCallItem?.required?.includes("call") ||
-        cdpCallItem?.properties?.browser?.default !== "main" ||
-        !cdpCallItem?.properties?._image || !cdpCallItem?.properties?.call?.properties?._mrmcp ||
-        cdpCallItem?.properties?.call?.properties?.id || cdpCallItem?.properties?.call?.properties?.sessionId)
-      uiErrors.push("CDP call schema must be always-batched with optional browser defaulting to main, standard/private operations, optional image post-processing, and server-owned transport routing");
+        cdpCallItem?.properties?.browser?.default !== "main" || !cdpBrowserSchemaValid(cdpCallItem?.properties?.browser) ||
+        !cdpCallItem?.properties?.target?.anyOf?.some(option => option.type === "string") ||
+        !cdpCallItem?.properties?.target?.anyOf?.some(option => option.type === "object" && option.additionalProperties === false && option.required?.includes("name") &&
+          ["create_params", "initialize", "runtime", "page", "network", "service_worker", "focus_emulation", "binding", "background_service"].every(key => option.properties?.[key])) ||
+        !cdpCallItem?.properties?._image || !cdpOperationSchema?.required?.includes("method") ||
+        !cdpOperationSchema?.properties?.method || !cdpOperationSchema?.properties?.params || cdpOperationSchema?.additionalProperties !== false ||
+        Object.keys(cdpOperationSchema?.properties || {}).some(key => !["method", "params"].includes(key)))
+      uiErrors.push("CDP call schema must be always-batched with optional browser defaulting to main, method/params operations with _. extensions, optional image post-processing, and server-owned transport routing");
     if (!cdpSubsTool?.inputSchema?.properties?.add || !cdpSubsTool?.inputSchema?.properties?.remove ||
+        !cdpBrowserSchemaValid(cdpSubsTool?.inputSchema?.properties?.browser) || !cdpBrowserSchemaValid(cdpPollTool?.inputSchema?.properties?.browser) ||
         !JSON.stringify(cdpSubsTool.inputSchema).includes("regex_flags") || !JSON.stringify(cdpSubsTool.inputSchema).includes('"const":"*"') ||
         !cdpPollTool?.inputSchema?.properties?.subscription || !cdpPollTool?.inputSchema?.properties?.id || !cdpPollTool?.inputSchema?.properties?.advance)
       uiErrors.push("CDP subscription/poll schema is incomplete");
@@ -6188,7 +6952,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       ...(rec.persistent ? { exec_id: rec.log_id } : {}),
       ...(rec.operation_id ? { operation_id: rec.operation_id } : {}),
       status: rec.status, command: rec.display,
-      cwd: rec.cwd_display, context_handle: rec.context_handle,
+      cwd: rec.cwd_display, chat_session: rec.context_handle,
       started_at: new Date(rec.started_at).toISOString(),
       completed_at: rec.completed_at ? new Date(rec.completed_at).toISOString() : null,
       exit_code: rec.exit_code, signal: rec.signal || null, requested_signal: rec.requested_signal || null,
@@ -6207,7 +6971,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   function processStartView(rec) {
     return {
       exec_id: rec.log_id, ...(rec.operation_id ? { operation_id: rec.operation_id } : {}), status: rec.status, command: rec.display,
-      cwd: rec.cwd_display, context_handle: rec.context_handle,
+      cwd: rec.cwd_display, chat_session: rec.context_handle,
       started_at: new Date(rec.started_at).toISOString(), stdin_open: !!rec.stdin_writer,
     };
   }
@@ -6257,7 +7021,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     return {
       process_id: String(row?.id || ""), pid: row?.pid == null ? null : Number(row.pid), progress_requested: false,
       stdin_history: [], exec_id: Number(row?.log_id || 0), status: String(row?.status || ""), command,
-      cwd: String(row?.cwd || ""), context_handle: String(row?.context_handle || ""),
+      cwd: String(row?.cwd || ""), chat_session: String(row?.context_handle || ""),
       started_at: row?.started_at ? new Date(Number(row.started_at)).toISOString() : null,
       completed_at: row?.completed_at ? new Date(Number(row.completed_at)).toISOString() : null,
       exit_code: row?.exit_code == null ? null : Number(row.exit_code), signal: String(row?.signal || ""),
@@ -6359,7 +7123,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   }
   function processOperationSignature(args, selection) {
     const processArgs = Object.fromEntries(Object.entries(args || {}).filter(([key]) =>
-      key !== "operation_id" && key !== "context_handle"));
+      key !== "operation_id" && key !== "chat_session"));
     return createHash("sha256").update(JSON.stringify(processOperationCanonical({
       root_id: Number(selection?.root?.id || 0),
       root_path: String(selection?.root?.path || ""),
@@ -6738,21 +7502,30 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const wait = args.wait !== false, calls = Array.isArray(args.calls) ? args.calls : [];
     if (!calls.length || calls.length > 100) throw new Error("cdp_call calls must contain 1-100 entries");
     const results = await Promise.all(calls.map(async spec => {
-      const browserInput = String(spec?.browser ?? "main").trim() || "main", targetInput = spec?.target == null ? null : String(spec.target).trim();
+      const browserInput = spec?.browser ?? "main", targetInput = spec?.target == null ? null : cdpBrowserLabel(spec.target);
+      let targetReservation = "";
       let base = {
-        browser: browserInput, port: null, user_data_dir: null, target: targetInput, target_id: null, session_id: null,
+        browser: cdpBrowserLabel(browserInput), port: null, user_data_dir: null, target: targetInput, target_id: null, session_id: null,
         id: null, queued: false, cdp: null, image: null, setup_errors: [], success: false, error: null,
       };
       try {
-        const rawMethod = String(spec?.call?.method || "").trim(), special = String(spec?.call?._mrmcp || "").trim();
-        if (!!rawMethod === !!special) throw new Error("call requires exactly one of method or _mrmcp");
+        const rawMethod = String(spec?.call?.method || "").trim(), extension = rawMethod.startsWith("_.");
+        if (!rawMethod) throw new Error("call requires method");
         const rawParams = spec?.call?.params == null ? {} : spec.call.params;
         if (!rawParams || typeof rawParams !== "object" || Array.isArray(rawParams)) throw new Error("call.params must be an object");
-        if (special && spec.target === undefined) throw new Error(`_mrmcp.${special} requires target`);
+        if (extension && !targetInput) throw new Error(`${rawMethod} requires target`);
         if (spec._image && (!rawMethod || rawMethod !== "Page.captureScreenshot")) throw new Error("_image is supported only with standard Page.captureScreenshot");
         if (spec._image && !wait) throw new Error("_image requires cdp_call wait=true");
         if (spec._image && spec._image.return !== "base64") throw new Error("_image.return must be base64");
-        const operation = special ? cdpSpecialRequest(special, rawParams) : { wire_method: rawMethod, logical_method: rawMethod, params: rawParams, special: null };
+        const operation = extension ? cdpExtensionRequest(rawMethod, rawParams) : { wire_method: rawMethod, logical_method: rawMethod, params: rawParams };
+        const browserSpec = cdpBrowserSpec(browserInput);
+        cdpConfiguredOptions(browserSpec);
+        if (spec.target !== undefined) {
+          const targetSpec = cdpTargetSpec(spec.target);
+          cdpConfigureTarget(browserSpec.browser, targetSpec);
+          targetReservation = cdpTargetKey(browserSpec.browser, targetSpec.target);
+          cdpTargetReservations.set(targetReservation, (cdpTargetReservations.get(targetReservation) || 0) + 1);
+        }
         const record = await ensureCdpBrowser(browserInput);
         let target = null, targetId = null, sessionId = null;
         if (spec.target !== undefined) {
@@ -6778,6 +7551,12 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         return { ...base, ...processed, success: !processed.cdp?.error, error: processed.cdp?.error ? String(processed.cdp.error.message || processed.cdp.error) : null };
       } catch (error) {
         return { ...base, success: false, error: String(error?.message || error) };
+      } finally {
+        if (targetReservation) {
+          const remaining = (cdpTargetReservations.get(targetReservation) || 1) - 1;
+          if (remaining) cdpTargetReservations.set(targetReservation, remaining);
+          else cdpTargetReservations.delete(targetReservation);
+        }
       }
     }));
     return { wait, results };
@@ -6785,10 +7564,29 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
 
   async function executeTool(p, name, args, execution) {
     const selection = execution.selection;
+    if (!selection?.context) throw new Error("Chat Session selection is missing");
+    if (name === "init_chat_session") return {};
     if (name === "list_workspaces") return {
       workspaces: all("SELECT name FROM roots WHERE server_id=? AND enabled=1 ORDER BY name", p.id).map(row => row.name),
     };
-    if (name === "open_workspace") return await workspaceInfo(selection, { created: !!execution.workspaceCreated });
+    if (name === "open_workspace") {
+      let workspace = workspaceByName(p, args.name), created = false;
+      if (!workspace && args.create === true) {
+        await createDesktopWorkspace(p, args.name);
+        workspace = workspaceByName(p, args.name);
+        created = true;
+      }
+      if (!workspace) throw new Error(`Unknown or disabled Workspace: ${String(args.name || "")}`);
+      const root = runtimeWorkspaceRoot(workspace);
+      const result = await workspaceInfo({ context: selection.context, root }, { created });
+      selectContextRoot(p, selection.context, workspace.id);
+      selection.context = getContextRecord(p, selection.context.handle);
+      selection.root = root;
+      updateLog(execution.logId, { root_id: root.id, root_name: root.name, root_path: root.path });
+      postOsNotification("session", "📂 Workspace Opened", sessionNotificationLabel(p, selection.context, null, Date.now(), root.name));
+      return result;
+    }
+    if (name === "chat_set_goal") return setChatGoal(selection.context, args.goal, args.timeout_seconds ?? chatGoalDefaultTimeout());
     if (name === "tools_schema") {
       const published = new Map(serverTools(p, true).map(tool => [tool.name, tool]));
       const names = (args.names || []).map(name => String(name));
@@ -6798,7 +7596,9 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         missing: names.filter(name => !published.has(name)),
       };
     }
-    if (!selection?.context || !selection?.root) throw new Error("Session Workspace selection is missing");
+    const requiresWorkspace = name.startsWith("fs_") || ["workspace_dev_preferences_write", "exec", "exec_start", "js", "js_add_node_module_dir", "js_reset"].includes(name) ||
+      name === "publish" && args.path !== undefined || !BASE_TOOLS.includes(name);
+    if (requiresWorkspace && !selection.root?.id) throw new Error("No Workspace is open for this chat_session. Call open_workspace with the same chat_session before this operation.");
     if (name === "desktop_auto") {
       const result = await runDesktopScenario(args.yaml);
       const images = [], seenImages = new WeakMap();
@@ -7517,7 +8317,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       const options = {
         filename: args.filename, mime_type: args.mime_type, presentation: args.presentation,
         title: args.title, description: args.description, height: args.height,
-        server_id: p.id, context_handle: args.context_handle,
+        server_id: p.id, context_handle: args.chat_session,
         context_id: selection.context.id, root_id: selection.root.id, root_name: selection.root.name, root_path: selection.root.path,
       };
       if (args.path !== undefined) {
@@ -7545,7 +8345,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       const exactId = args.id == null ? 0 : Math.max(1, Number(args.id));
       const detail = args.detail === "full" ? "full" : "summary", limit = exactId ? 1 : requestedLimit;
       const conditions = ["context_handle=?", "id<>?"];
-      const values = [args.context_handle, Number(execution.logId || 0)];
+      const values = [args.chat_session, Number(execution.logId || 0)];
       const tool = String(args.tool || "").trim(), status = String(args.status || "").trim();
       const query = String(args.query || "").trim();
       if (exactId) { conditions.push("id=?"); values.push(exactId); }
@@ -7627,10 +8427,10 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       return processStartView(record);
     }
     if (name === "exec_attach") return await attachManagedProcess(
-      persistentProcess(args.exec_id, args.context_handle), args, execution,
+      persistentProcess(args.exec_id, args.chat_session), args, execution,
     );
     if (name === "exec_write") {
-      const record = persistentProcess(args.exec_id, args.context_handle);
+      const record = persistentProcess(args.exec_id, args.chat_session);
       if (!record.stdin_writer) throw new Error(`Persistent exec_id ${record.log_id} stdin is closed`);
       if (args.data) {
         recordProcessInput(record, args.data, args.encoding);
@@ -7647,15 +8447,15 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         stdin_open: !!record.stdin_writer };
     }
     if (name === "exec_kill") {
-      const record = persistentProcess(args.exec_id, args.context_handle);
+      const record = persistentProcess(args.exec_id, args.chat_session);
       return { exec_id: record.log_id, killed: await terminateProcess(record, args.signal || "SIGTERM"),
         signal: args.signal || "SIGTERM" };
     }
     if (name === "exec_list") return { processes: activeProcesses(
-      args.context_handle, Math.min(Number(args.limit || 50), 200),
+      args.chat_session, Math.min(Number(args.limit || 50), 200),
     ) };
     if (name === "exec_status") return processStatusView(
-      persistentProcess(args.exec_id, args.context_handle), args,
+      persistentProcess(args.exec_id, args.chat_session), args,
     );
     const custom = one("SELECT * FROM custom_tools WHERE server_id=? AND name=?", p.id, name);
     if (!custom) throw new Error("Unknown tool");
@@ -7674,12 +8474,12 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     return text.replace(/\/published\/[A-Za-z0-9_-]{24,}\//g, "/published/[REDACTED]/");
   }
   function contextEnvelope(handle, extras = {}) {
-    return { context_handle: String(handle || ""), ...extras };
+    return { chat_session: String(handle || ""), ...extras };
   }
   function contextControlMessage(kind) {
-    if (kind === "missing") return "context_handle is required. Call open_workspace with the Workspace name, then repeat this tool call with the exact handle returned.";
-    if (kind === "expired") return "The Session context_handle has expired. Call open_workspace with the Workspace name, then repeat the requested tool call.";
-    if (kind === "invalid") return "The Session context_handle is invalid. Reuse a valid handle or call open_workspace with a Workspace name.";
+    if (kind === "missing") return "chat_session is required. Call init_chat_session, then repeat this tool call with the exact value returned.";
+    if (kind === "expired") return "The chat_session has expired. Call init_chat_session to create a new Session, then open a Workspace if needed before repeating this tool call.";
+    if (kind === "invalid") return "The chat_session is invalid. Reuse a valid value or call init_chat_session.";
     return "";
   }
   function contextControlToolResult(p, name, args, resolution, descriptor = null, progressRequested = false, mcpRequest = null, mcpResponse = null) {
@@ -7737,6 +8537,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         return `${result.returned} Tool Calls returned on this page${result.truncated ? continuation("next_before_id") : ""}`;
       case "memory_find":
         return `${result.memories.length} memories returned on this page${result.next_before_id != null ? continuation("next_before_id") : ""}`;
+      case "chat_set_goal": return result.status === "disabled" ? "goal management disabled" : result.goal ? `goal ${result.status}; inactivity ${result.timeout_seconds} s; ${result.chatgpt_chat_id ? "conversation linked" : "conversation unassociated"}` : "goal disabled";
       case "list_workspaces": return `${result.workspaces.length} enabled Workspaces`;
       case "discover_commands": return `${result.commands.length} available commands in the discovery catalog`;
       case "tools_schema": return `${result.tools.length} tool descriptors returned; ${result.missing.length} names unresolved`;
@@ -7746,12 +8547,17 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
 
   async function callTool(p, name, args, callInfo) {
     await waitForToolCallGate();
+    if (name === "init_chat_session" && callInfo.descriptor) {
+      const context = createContext(p, callInfo.protocolVersion || "", callInfo.clientMetadata || {});
+      callInfo.contextHandle = context.handle;
+      callInfo.selection = { context, root: unassignedWorkspaceRoot(p) };
+    }
     const id = beginLog(
       p, name, args, callInfo.contextHandle, callInfo.selection?.root, callInfo.descriptor, true, !!callInfo.progressRequested,
       callInfo.selection?.context || null, callInfo.mcpRequest || null,
     ), started = Date.now(), policy = toolCallPolicyById.get(id) || { storage: "disk", payloadMode: "payload" }, payloadMode = policy.payloadMode;
     if (!activeCallControls.size) toolCallsIdle = new Promise(resolve => { resolveToolCallsIdle = resolve; });
-    const control = { log_id: id, cancel: null, kind: "", process_id: "", kernel_id: "", progress_requested: !!callInfo.progressRequested };
+    const control = { log_id: id, context_handle: callInfo.contextHandle, cancel: null, kind: "", process_id: "", kernel_id: "", progress_requested: !!callInfo.progressRequested };
     activeCallControls.set(id, control);
     emitToolCallActivity();
     const executionState = {
@@ -7782,12 +8588,11 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       const extraContent = Array.isArray(publicResult[TOOL_RESULT_CONTENT]) ? publicResult[TOOL_RESULT_CONTENT] : [];
       const { [TOOL_RESULT_CONTENT]: _toolResultContent, ...structuredResult } = publicResult;
       const status = structuredResult.success === false ? "failed" : "completed";
-      const includeContext = !["list_workspaces", "tools_schema"].includes(name);
-      const envelope = includeContext ? contextEnvelope(callInfo.contextHandle) : {};
+      const envelope = contextEnvelope(callInfo.contextHandle);
       const structuredContent = { ...structuredResult, ...envelope };
       const rendered = typeof structuredResult.content === "string"
-        ? (includeContext ? `${structuredResult.content}\n\ncontext_handle: ${envelope.context_handle}` : structuredResult.content)
-        : `${name}: ${toolResultSummary(name, structuredResult, status)}. Complete result is available in structuredContent.${includeContext ? `\ncontext_handle: ${envelope.context_handle}` : ""}`;
+        ? `${structuredResult.content}\n\nchat_session: ${envelope.chat_session}`
+        : `${name}: ${toolResultSummary(name, structuredResult, status)}. Complete result is available in structuredContent.\nchat_session: ${envelope.chat_session}`;
       const resultUiResourceUri = name === "publish" ? freshUiResourceUri(PUBLISH_UI_URI) : "";
       const toolResult = {
         content: [{ type: "text", text: rendered }, ...extraContent], structuredContent, isError: status !== "completed",
@@ -7809,10 +8614,9 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       return toolResult;
     } catch (error) {
       const message = String(error?.stack || error);
-      const includeContext = !["list_workspaces", "tools_schema"].includes(name);
-      const envelope = includeContext ? contextEnvelope(callInfo.contextHandle) : {};
+      const envelope = contextEnvelope(callInfo.contextHandle);
       const structuredContent = { error: String(error?.message || error), ...envelope };
-      const text = includeContext ? `${String(error?.message || error)}\ncontext_handle: ${envelope.context_handle}` : String(error?.message || error);
+      const text = `${String(error?.message || error)}\nchat_session: ${envelope.chat_session}`;
       const toolResult = { content: [{ type: "text", text }], structuredContent, isError: true };
       const responsePacket = typeof callInfo.mcpResponse === "function"
         ? callInfo.mcpResponse(toolResult) : toolCallMcpResponse(toolResult, callInfo.mcpResponse);
@@ -7826,6 +8630,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       return toolResult;
     } finally {
       activeCallControls.delete(id);
+      if (callInfo.selection?.context) noteChatGoalActivity(callInfo.selection.context.handle);
       if (!activeCallControls.size && resolveToolCallsIdle) {
         resolveToolCallsIdle();
         resolveToolCallsIdle = null;
@@ -8037,9 +8842,9 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         if (responseCapture) responseBody = formatDebugBody(responseCapture.text(), responseType);
         const requestJson = parseJson(requestBody, null), responseJson = parseJson(responseBody, null);
         const contextHandle = String(
-          responseJson?.result?.structuredContent?.context_handle ||
-          requestJson?.params?.arguments?.context_handle ||
-          requestJson?.params?.arguments?.current_context_handle || "",
+          responseJson?.result?.structuredContent?.chat_session ||
+          requestJson?.params?.arguments?.chat_session ||
+          "",
         );
         if (contextHandle) {
           const tool = String(requestJson?.params?.name || ""), finished = Date.now();
@@ -8049,11 +8854,11 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
                 ORDER BY abs(started_at-?) ASC,id DESC LIMIT 1`, contextHandle, tool, started - 1000, finished + 1000, started)
             : null;
           const snapshot = call || one(`SELECT c.id context_id,c.root_id,
-              COALESCE(r.name,'Program folder') root_name,COALESCE(r.path,?) root_path
-              FROM contexts c LEFT JOIN roots r ON r.id=c.root_id WHERE c.handle=?`, APP_DIR, contextHandle);
+              COALESCE(r.name,'') root_name,COALESCE(r.path,'') root_path
+              FROM contexts c LEFT JOIN roots r ON r.id=c.root_id WHERE c.handle=?`, contextHandle);
           if (snapshot) run(`INSERT OR REPLACE INTO debug_log_workspaces(debug_log_id,context_id,root_id,root_name,root_path)
               VALUES(?,?,?,?,?)`, debugId, Number(snapshot.context_id || 0), Number(snapshot.root_id || 0),
-            String(snapshot.root_name || "Program folder"), String(snapshot.root_path || APP_DIR));
+            String(snapshot.root_name || ""), String(snapshot.root_path || ""));
         }
         const errors = [handlerError, debugError, deliveryError ? `Response delivery error: ${String(deliveryError?.stack || deliveryError)}` : ""]
           .filter(Boolean).join("\n");
@@ -8161,13 +8966,13 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       if (argument.required && !Object.hasOwn(args, argument.name)) throw new Error(`Missing required argument: ${argument.name}`);
 
     let session = null, workspace = null;
-    const contextHandle = typeof args.context_handle === "string" ? args.context_handle : "";
+    const contextHandle = typeof args.chat_session === "string" ? args.chat_session : "";
     if (contextHandle) {
       const context = contextByHandle(p, contextHandle);
-      if (!context || contextExpired(context)) throw new Error("Unknown or expired context_handle in prompt arguments");
+      if (!context || contextExpired(context)) throw new Error("Unknown or expired chat_session in prompt arguments");
       session = contextSnapshot(p, context);
       const root = selectedContextRoot(p, context);
-      workspace = { id: root.id, name: root.name, path: root.path, fallback: root.id === 0 };
+      workspace = root.id ? { id: root.id, name: root.name, path: root.path } : null;
     }
     const now = new Date();
     const model = {
@@ -8175,8 +8980,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       prompt: guidedPromptDescriptor(row),
       session,
       workspace,
-      workspaces: [fallbackWorkspaceRoot(p), ...serverRoots(p).map(runtimeWorkspaceRoot)].map(root => ({
-        id: root.id, name: root.name, path: root.path, fallback: root.id === 0,
+      workspaces: serverRoots(p).map(runtimeWorkspaceRoot).map(root => ({
+        id: root.id, name: root.name, path: root.path,
       })),
       server: {
         name: "MrMCP", version: VERSION, public_base_url: publicBase(), mcp_url: mcpUrl(),
@@ -8403,7 +9208,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       const descriptor = fullAccess ? serverToolDescriptor(p, toolName) : null;
       return rejectToolCall(
         p, toolName, x.params?.arguments || x.params || {}, message,
-        String(x.params?.arguments?.context_handle || ""), "invalid", result, descriptor, progressRequested, x, result,
+        String(x.params?.arguments?.chat_session || ""), "invalid", result, descriptor, progressRequested, x, result,
       );
     };
     const rpcError = (status, code, message, data = undefined, logInvalid = false) => {
@@ -8464,13 +9269,13 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 
     const serverInfoMeta = { "io.modelcontextprotocol/serverInfo": mcpServerInfo() };
     const instructions = fullAccess
-      ? "Use list_workspaces when you need to discover enabled Workspace names. Use open_workspace(name) to open one; only pass create=true when you explicitly want a missing Workspace created as a new empty Desktop folder. If you already have the current Session handle, pass it as current_context_handle to move that same Session; omitted, empty, unknown or expired creates a new Session. The result includes workspace_name, absolute cwd, agent_guidance_path, whether this call created the Workspace, and a compact count/latest-key Memory summary for Global, Workspace and Session scopes. When guidance is non-null, read and follow it before repository work. Pass the returned context_handle unchanged on every later Session-bound tool call. " +
+      ? "Start a chat by calling init_chat_session with no arguments, unless you already have its valid chat_session. Reuse the exact returned chat_session on every subsequent tool call, including list_workspaces and tools_schema. Initialization creates no Workspace and selects no working directory. Use list_workspaces to discover enabled Workspace names, then open_workspace(chat_session,name) to attach or move this same Session. Only pass create=true when you explicitly want a missing Workspace created as a new empty Desktop folder. Filesystem tools, new processes, configured commands and JavaScript kernels require an open Workspace; desktop/CDP, discovery, diagnostics, memory, Telegram and text/base64 publication work without one. Existing process follow-ups remain available by chat_session after its Workspace is removed. The result includes workspace_name, absolute cwd, agent_guidance_path, whether this call created the Workspace, and a compact count/latest-key Memory summary for Global, Workspace and Session scopes. When guidance is non-null, read and follow it before repository work. Workspace changes preserve chat_session; only init_chat_session creates a Session. Invalid or expired values never create replacement Sessions implicitly. " +
         "Use fs_glob, fs_grep, fs_read, fs_navigate, fs_stat, fs_write and fs_edit directly for filesystem discovery, inspection, textual search and changes; do not spawn shell commands, uv or Python for operations those tools cover. For symbol/caller/impact exploration, prefer a suitable discovered catalog command. Batch independent reads and request small optional context when nearby text avoids another call. Check per-entry failures, skipped_large_files and continuation fields before claiming complete coverage or successful batch changes. Use fs_text_convert_encoding_eol only for explicit encoding/EOL/BOM representation conversion of named files when requested or specifically required by the task; never use it proactively to normalize a repository. Use desktop_auto for desktop observation and interaction through AAF YAML; when the model needs to see a screenshot, retain its image handle anywhere in the scenario's final state so the tool returns that image directly as MCP image content. Multiple retained screenshots and ordinary OCR/text/geometry/state values may coexist in one result. " +
         "workspace_dev_preferences_write is strictly opt-in: call it only when the user explicitly asks to copy/save/materialize their development preferences into the current Workspace. Never call it proactively, for preference discovery, or merely because DEV_PREF.md might exist; the tool returns no preference content and calling it does not imply that DEV_PREF.md should then be read or applied. " +
-        "When work may benefit from command-line capability beyond the structured tools, call discover_commands proactively before inventing workarounds or assuming a utility is unavailable. It returns the complete user-chosen available command catalog in one call; prefer a listed command when it fits, remember the catalog for the Session, and invoke its logical_name directly through exec.program without PATH probes. Use tools_schema when exact live tool descriptor data is needed instead of relying on a connector-synthesized schema view. " +
-        "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; observed cancellation/disconnect terminates exec's child, while the hard timeout covers transports that cannot report a disconnect before a response exists. Foreground exec and configured foreground commands default to 45 seconds but may be raised to 1 hour; high request timeouts can cross client/proxy retry or replay windows, so for long, expensive or non-idempotent work use exec_start, which immediately returns exec_id and leaves the persistent child independent of request lifetime. Pass that exec_id together with the same context_handle to exec_attach, exec_write, exec_kill or exec_status; ids from other Sessions are inaccessible. exec_list shows only currently running persistent executions in this Session. exec_status is the non-consuming way to inspect running or recently completed/killed executions and optionally retrieve all output or a tail. exec_attach is also request-bounded: timeout_ms defaults to 45 seconds and may be raised to 1 hour; high values can overlap client/proxy retries, so shorter repeated attaches or exec_status are safer, returns wait_timed_out=true when only the attachment wait expires while the child remains running, and can then be called again. With progressToken it streams unread backlog/live output only until exit/disconnect/that bounded wait; without progressToken it returns at most 16 KiB of unread output per call. An observed disconnect or the bounded attachment timeout detaches and never kills the persistent process; the timeout is also the fallback when a transport cannot report disconnect. " +
+        "When work may benefit from command-line capability beyond the structured tools, call discover_commands proactively before inventing workarounds or assuming a utility is unavailable. It returns the complete user-chosen available command catalog in one call; prefer a listed command when it fits, remember the catalog for the Session, and invoke its logical_name directly through exec.program without PATH probes. Use chat_set_goal only for user-requested automatic ChatGPT follow-ups; goal empty stops them. It opens a dedicated Chrome login profile, tries to match the chat once per explicit set, and uses the configured default Tool Call inactivity timeout (initially 5 minutes). When globally disabled it returns disabled and performs no monitoring. After a failed/login/interrupted match, call chat_set_goal again only when a new attempt is wanted; background ticks and login completion do not retry it. Startup matching is an optional global setting, off by default. Check status before claiming the association is ready. Use tools_schema when exact live tool descriptor data is needed instead of relying on a connector-synthesized schema view. " +
+        "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; observed cancellation/disconnect terminates exec's child, while the hard timeout covers transports that cannot report a disconnect before a response exists. Foreground exec and configured foreground commands default to 45 seconds but may be raised to 1 hour; high request timeouts can cross client/proxy retry or replay windows, so for long, expensive or non-idempotent work use exec_start, which immediately returns exec_id and leaves the persistent child independent of request lifetime. Pass that exec_id together with the same chat_session to exec_attach, exec_write, exec_kill or exec_status; ids from other Sessions are inaccessible. exec_list shows only currently running persistent executions in this Session. exec_status is the non-consuming way to inspect running or recently completed/killed executions and optionally retrieve all output or a tail. exec_attach is also request-bounded: timeout_ms defaults to 45 seconds and may be raised to 1 hour; high values can overlap client/proxy retries, so shorter repeated attaches or exec_status are safer, returns wait_timed_out=true when only the attachment wait expires while the child remains running, and can then be called again. With progressToken it streams unread backlog/live output only until exit/disconnect/that bounded wait; without progressToken it returns at most 16 KiB of unread output per call. An observed disconnect or the bounded attachment timeout detaches and never kills the persistent process; the timeout is also the fallback when a transport cannot report disconnect. " +
         "Use publish to present content to the user from exactly one of path, text or base64. Supply the real MIME type and optional filename; presentation=auto lets the smart MCP App choose an inline preview or file action, while inline/download are presentation hints. title and description appear above the published element. " +
-        "Every authenticated client can invoke every published tool; context_handle is the bearer capability selecting the persistent Session and its current Workspace."
+        "Every authenticated client can invoke every published tool; chat_session is the bearer capability selecting the persistent Session and its current Workspace."
       : "The endpoint is reachable, but anonymous access exposes no tools. Authenticate with OAuth or Basic authentication.";
 
     const r = { jsonrpc: "2.0", id: x.id };
@@ -8557,7 +9362,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           r.error = { code: -32001, message: "Authentication required for tool execution" };
           const logId = rejectToolCall(
             p, toolName, x.params?.arguments || x.params || {}, r.error.message,
-            String(x.params?.arguments?.context_handle || ""), "failed", r.error, null, progressRequested,
+            String(x.params?.arguments?.chat_session || ""), "failed", r.error, null, progressRequested,
             x, { jsonrpc: "2.0", id: x.id, error: r.error },
           );
           responseStatus = 403;
@@ -8565,11 +9370,12 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           r.error = { code: -32602, message: "tools/call requires params.name" };
           rejectToolCall(
             p, "(invalid tools/call)", x.params || {}, r.error.message,
-            String(x.params?.arguments?.context_handle || ""), "invalid", r.error, null, progressRequested,
+            String(x.params?.arguments?.chat_session || ""), "invalid", r.error, null, progressRequested,
             x, { jsonrpc: "2.0", id: x.id, error: r.error },
           );
         } else {
           const rawToolArgs = x.params?.arguments ?? {};
+          noteChatGoalActivity(rawToolArgs?.chat_session);
           const descriptor = serverToolDescriptor(p, x.params.name);
           const validationError = descriptor
             ? inputSchemaError(descriptor.inputSchema, rawToolArgs)
@@ -8578,7 +9384,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
             r.error = { code: -32602, message: validationError };
             rejectToolCall(
               p, x.params.name, rawToolArgs, validationError,
-              String(rawToolArgs?.context_handle || ""), "invalid", r.error, descriptor, progressRequested,
+              String(rawToolArgs?.chat_session || ""), "invalid", r.error, descriptor, progressRequested,
               x, { jsonrpc: "2.0", id: x.id, error: r.error },
             );
           } else {
@@ -8589,50 +9395,15 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
             });
             const invokeTool = async requestStream => {
               let toolResult;
-              if (["list_workspaces", "tools_schema"].includes(x.params.name)) {
-                toolResult = await callTool(
-                  p, x.params.name, toolArgs,
-                  { authKind: auth.kind, contextHandle: "", selection: null, descriptor, requestStream, requestSignal: req.signal, progressRequested, mcpRequest: x, mcpResponse: wrapResult },
-                );
-              } else if (x.params.name === "open_workspace") {
-                delete toolArgs.context_handle;
-                let workspace = workspaceByName(p, toolArgs.name), workspaceCreated = false;
-                if (!workspace && toolArgs.create === true) {
-                  await createDesktopWorkspace(p, toolArgs.name);
-                  workspace = workspaceByName(p, toolArgs.name);
-                  workspaceCreated = true;
-                }
-                if (!workspace) {
-                  const current = resolveContext(p, toolArgs.current_context_handle, observedProtocol);
-                  const handle = current.kind === "active" ? current.record.handle : "";
-                  const error = `Unknown or disabled Workspace: ${String(toolArgs.name || "")}`;
-                  const structuredContent = contextEnvelope(handle, { error });
-                  toolResult = { content: [{ type: "text", text: error }], structuredContent, isError: true };
-                  rejectToolCall(p, x.params.name, toolArgs, error, handle, "invalid", toolResult, descriptor, progressRequested, x, wrapResult(toolResult));
-                } else {
-                  const current = resolveContext(p, toolArgs.current_context_handle, observedProtocol);
-                  let record;
-                  if (current.kind === "active") {
-                    run("UPDATE contexts SET root_id=?,updated_at=? WHERE handle=?", workspace.id, Date.now(), current.record.handle);
-                    changed({ ui: ["sessions", "roots", "dashboard"] }, "workspace-opened");
-                    record = getContextRecord(p, current.record.handle);
-                  } else {
-                    record = createContext(p, workspace, observedProtocol, {
-                      auth_kind: auth.kind,
-                      oauth_client_id: auth.clientId || "",
-                      client_name: auth.clientName || "",
-                      user_agent: req.headers.get("user-agent") || "",
-                    });
-                  }
-                  postOsNotification("session", "📂 Workspace Opened", sessionNotificationLabel(p, record, null, Date.now(), workspace.name));
-                  const selection = { context: record, root: runtimeWorkspaceRoot(workspace) };
-                  toolResult = await callTool(
-                    p, x.params.name, toolArgs,
-                    { authKind: auth.kind, contextHandle: record.handle, selection, descriptor, requestStream, requestSignal: req.signal, progressRequested, workspaceCreated, mcpRequest: x, mcpResponse: wrapResult },
-                  );
-                }
+              if (x.params.name === "init_chat_session") {
+                toolResult = await callTool(p, x.params.name, toolArgs, {
+                  authKind: auth.kind, contextHandle: "", selection: null, descriptor, requestStream,
+                  requestSignal: req.signal, progressRequested, mcpRequest: x, mcpResponse: wrapResult,
+                  protocolVersion: observedProtocol,
+                  clientMetadata: { auth_kind: auth.kind, oauth_client_id: auth.clientId || "", client_name: auth.clientName || "", user_agent: req.headers.get("user-agent") || "" },
+                });
               } else {
-                const resolution = resolveContext(p, toolArgs.context_handle, observedProtocol);
+                const resolution = resolveContext(p, toolArgs.chat_session, observedProtocol);
                 if (resolution.kind === "active") {
                   const selection = { context: resolution.record, root: selectedContextRoot(p, resolution.record) };
                   toolResult = await callTool(
@@ -8700,6 +9471,17 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       desktop_notifications_tool_call: desktopNotificationEnabled("tool_call"),
       inherit_system_path: getCfg("inherit_system_path", "1") === "1",
       git_preserve_line_endings: getCfg("git_preserve_line_endings", "1") === "1",
+      chat_goals_enabled: chatGoalsEnabled(),
+      chat_goal_login_verified_at: Number(getCfg("chat_goal_login_verified_at", "0")) || 0,
+      chat_goal_login_active: chatGoalLoginActive,
+      chat_goal_login_busy: chatGoalLoginBusy,
+      chat_goal_login_detail: chatGoalLoginDetail,
+      chat_goal_timeout_minutes: chatGoalDefaultTimeout() / 60,
+      chat_goal_headless: getCfg("chat_goal_headless", "0") === "1",
+      chat_goal_disable_images: getCfg("chat_goal_disable_images", "0") === "1",
+      chat_goal_stop_before_send: getCfg("chat_goal_stop_before_send", "0") === "1",
+      chat_goal_match_on_startup: getCfg("chat_goal_match_on_startup", "0") === "1",
+      chat_goal_windows_hide: getCfg("chat_goal_windows_hide", "auto"),
       text_encoding_detection: textEncodingDetection(),
       exec_environment: getCfg("exec_environment", ""),
       tool_call_storage: toolCallStorage(),
@@ -8765,34 +9547,39 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     return {
       roots: roots.map(root => ({ ...root, sessions: byRoot.get(Number(root.id)) || [] })),
       default_sessions: defaultSessions,
-      default_root: { name: "Program folder" },
+      default_root: { name: "No Workspace" },
     };
   };
 
   const contextProjection = (serverId, roots = rootsProjection(serverId), oauthClientId = "") => {
     const oauthFilter = String(oauthClientId || ""), toolCounts = sessionToolCountProjection(serverId),
       rootsById = new Map(roots.filter(root => root.enabled).map(root => [Number(root.id), root]));
-    const rows = all(`SELECT c.id,c.handle,c.label,c.root_id,c.created_at,c.updated_at,c.last_active_at,c.protocol_version,c.auth_kind,c.oauth_client_id,c.client_name,c.user_agent
+    const rows = all(`SELECT c.id,c.handle,c.label,c.root_id,c.created_at,c.updated_at,c.last_active_at,c.protocol_version,c.auth_kind,c.oauth_client_id,c.client_name,c.user_agent,
+      c.chatgpt_chat_id,c.goal_text,c.goal_timeout_seconds,c.goal_status,c.goal_next_check_at,c.goal_last_sent_at,c.goal_error
       FROM contexts c WHERE c.server_id=? AND c.handle LIKE 'ctx_%' ${oauthFilter ? "AND c.oauth_client_id=?" : ""}
       ORDER BY c.last_active_at DESC,c.created_at DESC LIMIT 500`,
       ...(oauthFilter ? [serverId, oauthFilter] : [serverId]));
     return rows.map(context => {
       const selected = Number(context.root_id || 0);
       const root = selected ? rootsById.get(selected) || null : null;
+      const goal = chatGoalView(context);
       return {
         ...context,
+        goal_status: goal.status,
+        goal_next_check_at: goal.next_check_at || 0,
+        goal_error: goal.detail || "",
         tool_calls: toolCounts.get(Number(context.id)) || 0,
         id: context.id,
         pk: context.id,
-        context_handle: context.handle,
-        kind: "context_handle",
+        chat_session: context.handle,
+        kind: "chat_session",
         display_label: `#${context.id}`,
         expired: contextExpired(context),
         expires_at: Number(context.last_active_at || context.created_at || 0) + CONTEXT_TTL_MS,
-        workspace_name: root?.name || "Program folder",
-        workspace_path: root?.path || APP_DIR,
+        workspace_name: root?.name || "No Workspace",
+        workspace_path: root?.path || "",
         workspace_id: root?.id || 0,
-        fallback_workspace: !root,
+        workspace_selected: !!root,
       };
     });
   };
@@ -8921,7 +9708,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       sslip_https_mcp_url: mcpTlsActive && automaticSslipHttps ? `${automaticSslipHttps}/mcp` : "",
       sslip_metadata_url: mcpTlsActive && automaticSslipHttps
         ? `${automaticSslipHttps}/.well-known/oauth-protected-resource/mcp` : "",
-      fallback_workspace_path: APP_DIR,
+      unassigned_workspace_label: "No Workspace",
       protocol_versions: MCP_PROTOCOLS,
       context_ttl_days: Math.round(CONTEXT_TTL_MS / 86400000),
     };
@@ -9125,7 +9912,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       for (const row of logRows) {
         const input = mcpToolArgsFromPacket(row.mcp_request_json), resolved = mcpToolStructuredResultFromPacket(row.mcp_response_json), calls = Array.isArray(input.calls) ? input.calls : [];
         for (let index = 0; index < calls.length; index++) {
-          const spec = calls[index], browser = String(spec?.browser ?? "main").trim() || "main", target = spec?.target == null ? "" : String(spec.target),
+          const spec = calls[index], browser = cdpBrowserLabel(spec?.browser ?? "main"), target = spec?.target == null ? "" : cdpBrowserLabel(spec.target),
             call = spec?.call && typeof spec.call === "object" ? spec.call : {}, live = cdpBrowsers.get(browser),
             active = !!(live?.open && live.ws?.readyState === WebSocket.OPEN),
             operationResult = Array.isArray(resolved?.results) ? resolved.results[index] : null, contextId = Number(row.context_id) || 0;
@@ -9138,7 +9925,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           const operation = {
             log_id: Number(row.id), call_index: index, batch_size: calls.length, started_at: Number(row.started_at), completed_at: Number(row.completed_at || 0),
             context_id: contextId, root_name: String(row.root_name || ""), status: String(row.status), duration_ms: row.duration_ms,
-            browser, target, active, method: call._mrmcp ? `_mrmcp.${call._mrmcp}` : String(call.method || ""),
+            browser, target, active, method: String(call.method || ""),
             wait: input.wait !== false, call: spec, response: operationResult ? cdpAdminMessage(operationResult) : null,
             success: operationResult ? operationResult.success !== false && !operationResult.error : null,
             images: operationResult ? adminInlineImages(operationResult, "output") : [],
@@ -9179,8 +9966,11 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           type: String(info?.type || ""), title: String(info?.title || ""), url: String(info?.url || ""), attached: !!info?.attached,
         };
       }).sort((a, b) => (a.label || a.type || a.target_id).localeCompare(b.label || b.type || b.target_id)) : [];
+      const options = live?.options || cdpBrowserOptions.get(browser), mode = cdpConnectionMode(options), remote = mode !== "local";
       return {
-        browser, port: Number(saved.port || live?.port || 0), user_data_dir: live?.user_data_dir || join(CDP_DIR, browser), active,
+        browser, port: remote ? options?.port || null : Number(saved.port || live?.port || 0),
+        user_data_dir: remote ? null : options?.user_data_dir || join(CDP_DIR, browser), active,
+        connection_mode: mode, host: mode === "port" ? options.host : null, headless: remote ? null : options?.headless ?? false,
         connection_id: live?.connection_id || "", pending: live?.pending?.size || 0,
         ring_count: live ? cdpRingLength(live) : 0, ring_bytes: live?.ring_bytes || 0, dropped: live?.dropped || 0,
         recorded_sequence: cdpBrowserSequences.get(browser) || 0, notifications: ringStats.notifications, responses: ringStats.responses,
@@ -9316,7 +10106,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 <? } else if(section==="roots"){ ?><section id=roots class=page><div class=row><h2 class=grow>📁 Workspaces</h2><button class=primary data-action=new-root>➕ Add Workspace</button><button class=danger data-action=clear-workspaces<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Workspace names are unique. Drag Sessions to change where future Tool Calls run; running processes stay in their original folder.</p><div id=rootList></div></section>
 <? } else if(section==="commands"){ const c=s.commands||{}, discoveryEnabled=c.discoveryEnabled!==false; ?><section id=commands class=page><div class=row><h2 class=grow>🧰 Extra Commands</h2><button class="<?= discoveryEnabled?'ok':'failed' ?>" data-action=toggle-command-discovery><?= discoveryEnabled?'🟢 Agent Discovery Enabled':'🔴 Agent Discovery Disabled' ?></button><button data-action=download-all-commands>⬇️ Download All</button><button class=primary data-action=new-command>➕ Register Command</button></div><p class=muted><code>commands.yaml</code> defines catalog entries. Executables in <code>.mrmcp/bin</code> appear automatically.</p><div class=row><input id=commandQuery class=grow placeholder="Search name, path or description…" value="<?= c.query||'' ?>"><select id=commandFilter><option value=""<?= !c.filter?' selected':'' ?>>All Commands</option><option value=available<?= c.filter==='available'?' selected':'' ?>>Available</option><option value=unavailable<?= c.filter==='unavailable'?' selected':'' ?>>Unavailable</option><option value=yaml<?= c.filter==='yaml'?' selected':'' ?>>YAML Metadata</option><option value=disk<?= c.filter==='disk'?' selected':'' ?>>Disk Only</option></select><select id=commandPageSize><? [5,10,25,50].forEach(n=>{ ?><option<?= Number(c.pageSize||5)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-commands>🔎 Search</button></div><div id=commandList></div></section>
 <? } else if(section==="prompts"){ const p=s.prompts||{}; ?><section id=prompts class=page><div class=row><h2 class=grow>🧭 Guided Prompts</h2><button data-action=prompt-help>❓ Template Help</button><button class=primary data-action=new-prompt>➕ Add Prompt</button></div><p class=muted><code>guided_prompts.yaml</code> is authoritative. Entries are exposed through MCP <code>prompts/list</code> and rendered on demand through <code>prompts/get</code>.</p><div class=row><input id=promptQuery class=grow placeholder="Search name, title, description or arguments…" value="<?= p.query||'' ?>"><select id=promptPageSize><? [5,10,25,50].forEach(n=>{ ?><option<?= Number(p.pageSize||5)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-prompts>🔎 Search</button></div><div id=promptList></div></section>
-<? } else if(section==="prompt_help"){ const h=s.promptHelp||{}; ?><section id=prompt_help class=page><div class=row><h2 class=grow>🧭 Guided Prompt Templates</h2><button data-action=prompts-back>← Guided Prompts</button></div><div class=card><h3>YAML shape</h3><p><code>guided_prompts.yaml</code> contains a top-level <code>prompts</code> array. Prompt arguments are MCP string arguments with <code>name</code> plus optional <code>title</code>, <code>description</code> and <code>required</code>; <code>required</code> controls whether the client must supply them.</p><pre><?= h.yaml||'' ?></pre></div><div class=card><h3>Eta</h3><p>The <code>template</code> is rendered with Eta using standard tags and no HTML escaping. Read values with <code>&lt;%= it.args.focus %&gt;</code>, use normal JavaScript in <code>&lt;% ... %&gt;</code>, and branch on any model field. Templates are trusted local configuration and are not sandboxed.</p><pre><?= h.model||'' ?></pre></div><div class=card><h3>Session / Workspace context</h3><p><code>it.session</code> and <code>it.workspace</code> are populated only when the prompt declares a <code>context_handle</code> argument and the client supplies a valid active MrMCP Session handle. <code>it.workspaces</code> is always available and includes the fallback Workspace plus enabled named Workspaces.</p></div></section>
+<? } else if(section==="prompt_help"){ const h=s.promptHelp||{}; ?><section id=prompt_help class=page><div class=row><h2 class=grow>🧭 Guided Prompt Templates</h2><button data-action=prompts-back>← Guided Prompts</button></div><div class=card><h3>YAML shape</h3><p><code>guided_prompts.yaml</code> contains a top-level <code>prompts</code> array. Prompt arguments are MCP string arguments with <code>name</code> plus optional <code>title</code>, <code>description</code> and <code>required</code>; <code>required</code> controls whether the client must supply them.</p><pre><?= h.yaml||'' ?></pre></div><div class=card><h3>Eta</h3><p>The <code>template</code> is rendered with Eta using standard tags and no HTML escaping. Read values with <code>&lt;%= it.args.focus %&gt;</code>, use normal JavaScript in <code>&lt;% ... %&gt;</code>, and branch on any model field. Templates are trusted local configuration and are not sandboxed.</p><pre><?= h.model||'' ?></pre></div><div class=card><h3>Session / Workspace context</h3><p><code>it.session</code> and <code>it.workspace</code> are populated only when the prompt declares a <code>chat_session</code> argument and the client supplies a valid active MrMCP Session handle. For a Session with no selected Workspace, <code>it.workspace</code> remains null. <code>it.workspaces</code> is always available and includes the fallback Workspace plus enabled named Workspaces.</p></div></section>
 <? } else if(section==="logs"){ const l=s.logs||{}; ?><section id=logs class=page><div class=row><h2 class=grow>🛠️ Tool Calls</h2><button class=danger data-action=clear-tool-calls<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Click a row for details. Terminate active work from Actions.</p><div class=row><input id=logTool placeholder="Tool / command…" value="<?= l.toolQuery||'' ?>"><input id=logQuery class=grow placeholder="Search input, output, errors…" value="<?= l.query||'' ?>"><select id=logContext><option value="">All sessions</option><? (s.contextValues||[]).forEach(v=>{ ?><option value="<?= v.pk ?>"<?= String(l.context||"")===String(v.pk)?" selected":"" ?>>#<?= v.pk ?></option><? }) ?></select><select id=logStatus class="<?= l.status||'' ?>"><option value="">All states</option><? ['completed','failed','invalid','running'].forEach(v=>{ ?><option class="<?= v ?>" value="<?= v ?>"<?= l.status===v?' selected':'' ?>><?= v ?></option><? }) ?></select><select id=logPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(l.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=clear-log-filters>🧹 Clear Filters</button></div><? if(l.selfTest){ ?><div id=logSelfTest class=card><div class=row><h3 class=grow>🧪 MCP Self-Test</h3><button class=small data-action=copy-detail data-target=logDetail>📋 Copy JSON</button><button class=small data-action=close-self-test>✕ Close</button></div><pre id=logDetail><?= it.pretty(l.selfTest) ?></pre></div><? } ?><div id=logList></div></section>
 <? } else if(section==="browser"){ ?><section id=browser class=page><div class=row><h2 class=grow>🌐 Browser</h2><span class=muted>CDP state · retained traffic · replay</span></div><p class=muted>Diagnostic view over existing CDP browser/profile state, logical targets, subscriptions and retained ring traffic. Recorded request/response inspection and Replay use only Tool Calls retained with Payload mode.</p><div id=browserList></div></section>
 <? } else if(section==="automation"){ ?><section id=automation class=page><div class=row><h2 class=grow>🖱️ Automation</h2><span class=muted>AAF scenarios · screenshots · replay</span></div><p class=muted>Diagnostic view over <code>desktop_auto</code> Tool Calls retained with Payload mode. Open a scenario/result to inspect its retained payloads, or replay it through the same stateless Auto.js engine.</p><div id=automationList></div></section>
@@ -9326,8 +10116,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 <? } else if(section==="debug"){ const d=s.debug||{},enabled=!!s.debug?.enabled; ?><section id=debug class=page><div class=row><h2 class=grow>🐞 HTTP Debug Log</h2><button class="debug-toggle <?= enabled?'enabled':'disabled' ?>" data-action=toggle-debug-settings aria-pressed="<?= enabled?'true':'false' ?>"><?= enabled?"🟢 Logging ON · Disable":"🔴 Logging OFF · Enable" ?></button><button class=danger data-action=clear-debug>🗑️ Clear</button></div><p class=muted>Off by default. Secrets are redacted. Disabling stops new records but keeps stored data visible. Click a row for request JSON.</p><div class=row><input id=debugQuery class=grow placeholder="Search URL, headers, body or errors…" value="<?= d.query||'' ?>"><select id=debugMethod><option value="">All methods</option><? ['GET','POST','OPTIONS'].forEach(v=>{ ?><option<?= d.method===v?' selected':'' ?>><?= v ?></option><? }) ?></select><input id=debugStatus type=number placeholder="Status" value="<?= d.status||'' ?>"><button data-action=load-debug>🔎 Search</button></div><div id=debugList></div></section>
 <? } else if(section==="oauth"){ ?><section id=oauth class=page><div class=row><h2 class=grow>🔐 OAuth Clients</h2><button class=danger data-action=clear-clients<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><div id=oauthList></div></section>
 <? } else if(section==="telegram"){ const t=s.telegram||{}; ?><section id=telegram class=page><div class=row><h2 class=grow>✈️ Telegram</h2><button class=primary data-action=save-telegram<?= t.save_disabled?' disabled':'' ?>>💾 Save Telegram</button></div><div class=card><h3>🤖 Telegram Bot</h3><div class=row><label class=grow>Bot token</label><? if(t.field_warning){ ?><span class=field-warning>⚠ <?= t.field_warning ?></span><? } ?></div><input id=telegramBotToken type=password autocomplete=off value="<?= t.telegram_bot_token||'' ?>" placeholder="123456789:AA…"><p class=muted>Used only by <code>telegram_req</code> to authenticate Bot API requests. Chat IDs, channels and application state are intentionally left to the agent/Memory.</p></div></section>
-<? } else if(section==="settings"){ const tab=s.settingsTab||"network"; ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><nav class=settings-tabs aria-label="Settings sections"><? [["network","🌐","Network"],["security","🔒","Security"],["process","🖥️","Process"],["files","📄","Files"],["notifications","🔔","Notifications"],["maintenance","🧹","Maintenance"]].forEach(([id,icon,label])=>{ ?><button data-action=settings-tab data-settings-tab="<?= id ?>" class="<?= tab===id?'active':'' ?>"<?= tab===id?' aria-current=page':'' ?>><?= icon ?> <?= label ?></button><? }) ?></nav><p class=muted>📂 Data Directory · <code style="overflow-wrap:anywhere"><?= settings.data_directory||'' ?></code></p><div class=settings-layout><div class=settings-main><div class=card<? if(tab!=="network"){ ?> hidden<? } ?>><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card<? if(tab!=="security"){ ?> hidden<? } ?>><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card<? if(tab!=="notifications"){ ?> hidden<? } ?>><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card<? if(tab!=="process"){ ?> hidden<? } ?>><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><label><input id=gitPreserveLineEndings type=checkbox<?= settings.git_preserve_line_endings?" checked":"" ?>> Disable automatic Git CRLF conversion</label><p class=muted>When enabled, managed processes use <code>core.autocrlf=false</code>. An existing CRLF checkout made with <code>core.autocrlf=true</code> may then appear modified without a file edit. Turn this off to use the repository and machine Git policy. Repository <code>.gitattributes</code> and explicit <code>git -c</code> options still apply.</p><div class=row><label class=grow>Environment variables for all spawned processes · one <code>NAME=value</code> per line</label><? if(settings.field_warnings?.exec_environment){ ?><span class=field-warning>⚠ <?= settings.field_warnings.exec_environment ?></span><? } ?></div><textarea id=execEnvironment rows=8 placeholder="CACHE_DIR=\${MRMCP_DIR}&#10;TOOLS=\${MRMCP_BIN}&#10;PROJECT=\${WORKSPACE}&#10;RUN_FROM=\${CWD}"><?= settings.exec_environment||'' ?></textarea><p class=muted>Available placeholders: <code>\${MRMCP_DIR}</code> = MrMCP data directory, <code>\${MRMCP_BIN}</code> = managed bin directory, <code>\${WORKSPACE}</code> = current Workspace root, <code>\${CWD}</code> = effective exec directory. Precedence: system environment → these settings → per-call <code>env</code>. Off PATH inheritance leaves child <code>PATH</code> as only <code>.mrmcp/bin</code>; PATH remains governed by this toggle rather than the generic environment list.</p></div><div class=card<? if(tab!=="files"){ ?> hidden<? } ?>><h3>📄 Text Encoding</h3><div class=row><label class=grow for=textEncodingDetection>Automatic detection for reading and searching</label><? if(settings.field_warnings?.text_encoding_detection){ ?><span class=field-warning>⚠ <?= settings.field_warnings.text_encoding_detection ?></span><? } ?></div><select id=textEncodingDetection><option value=sample<?= (settings.text_encoding_detection||"sample")==="sample"?" selected":"" ?>>Initial 16 KiB · faster</option><option value=full<?= settings.text_encoding_detection==="full"?" selected":"" ?>>Complete file · more thorough</option></select><p class=muted>The initial sample reduces detection work on large files. If the result is uncertain or its encoding cannot decode the complete file, detection retries with the full content. A sample can miss later charset clues; choose Complete file when accuracy matters more than speed.</p><p class=muted>File edits and conversions always use the complete content. An explicitly requested encoding skips detection in both modes.</p></div><div class=card<? if(tab!=="maintenance"){ ?> hidden<? } ?>><h3>🧹 Tool Call History</h3><label>History storage</label><select id=toolCallStorage><option value=disk<?= settings.tool_call_storage==='disk'?' selected':'' ?>>Disk · survives restart</option><option value=memory<?= settings.tool_call_storage==='memory'?' selected':'' ?>>Memory · SQLite TEMP, volatile</option></select><p class=muted>Storage and payload retention are independent. Disk writes Tool Call history to the main SQLite database. Memory uses SQLite TEMP tables in RAM with the same Tool Call ids, GUI and tools_log behavior; rows disappear on restart.</p><label>Payload retention</label><select id=toolCallPayloadMode><option value=payload<?= settings.tool_call_payload_mode==='payload'?' selected':'' ?>>Payload · canonical MCP request and response packets</option><option value=metadata<?= settings.tool_call_payload_mode==='metadata'?' selected':'' ?>>Metadata · no Tool Call request/response payload copies</option></select><p class=muted>Payload retention affects only diagnostic copies in Tool Call history. Functional state required by tools remains available in its owning subsystem; for example persistent-process command/output state is retained independently so exec_attach and exec_status keep working.</p><div class=row><label class=grow>Disk retention hours · 0 keeps indefinitely</label><? if(settings.field_warnings?.tool_call_retention_hours){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_retention_hours ?></span><? } ?></div><input id=toolCallRetentionHours type=number min=0 step=1 value="<?= settings.tool_call_retention_hours??0 ?>"><div class=row><label class=grow>Memory retention minutes · 0 keeps until restart</label><? if(settings.field_warnings?.tool_call_memory_retention_minutes){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_memory_retention_minutes ?></span><? } ?></div><input id=toolCallMemoryRetentionMinutes type=number min=0 step=1 value="<?= settings.tool_call_memory_retention_minutes??60 ?>"><p class=muted>Retention removes completed Tool Call history from its own storage tier. Process, CDP and other functional state are unaffected. Changing the current storage or payload setting affects new Tool Calls only; existing rows retain their own storage and payload capabilities.</p><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, Memory, CDP browser state, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
-<? } else if(section==="help"){ ?><section id=help class=page><h2>❓ Help</h2><div class=card><h3>Connect ChatGPT Web</h3><ol><li>Make sure the Dashboard shows a trusted HTTPS certificate. ChatGPT needs a remote HTTPS MCP endpoint; use <code><?= settings.external_base_url ? settings.external_base_url + "/mcp" : "https://your-host/mcp" ?></code>.</li><li>In ChatGPT Web, enable Developer mode. In managed workspaces the current path is <b>Workspace settings → Permissions &amp; Roles → Connected Data Developer mode / Create custom MCP connectors</b>. Authorized users may also find the toggle under <b>Settings → Apps → Advanced Settings</b>.</li><li>Create a custom app from <b>Workspace settings → Apps → Create</b> or <b>Settings → Apps → Create</b>, enter the MrMCP endpoint, choose the offered authentication method, then select <b>Scan Tools</b>.</li><li>If OAuth is enabled in MrMCP, complete the authorization prompt. After the tool scan completes, create the app and select it from a new ChatGPT conversation.</li></ol></div><div class=card><h3>Authentication</h3><p>For ChatGPT, OAuth is the preferred MrMCP setup because ChatGPT can discover the authorization metadata, complete consent, and keep refresh-token connectivity. MrMCP also supports Basic authentication for MCP clients that offer it. Authentication grants access to the server; the <code>context_handle</code> selects persistent context state after authentication.</p></div><div class=card><h3>Write Access</h3><p>MrMCP does not maintain a separate read/write allowlist: every authenticated client receives every published tool. ChatGPT controls whether write/modify actions are usable through the app's permissions and action controls. As of this build, OpenAI documents full MCP write/modify support for Business, Enterprise and Edu; Pro custom MCP access is limited to read/fetch, and availability may change. Test write tools in Developer mode first. Where available, use <b>Workspace settings → Apps → Configure Actions / Action control</b> to enable the required actions. ChatGPT may still ask for confirmation before a write.</p></div><div class=card><h3>Using MrMCP in a Chat</h3><ol><li>Start a new chat and select the MrMCP app from the tools/apps menu.</li><li>If needed, call <code>list_workspaces</code> to discover the enabled Workspace names, then call <code>open_workspace</code> with the desired <code>name</code>. When continuing an existing Session, also pass its handle as <code>current_context_handle</code>; MrMCP moves that same Session to the Workspace. If the handle is omitted, empty, unknown or expired, a new Session is created.</li><li>The result already includes <code>workspace_name</code>, absolute <code>cwd</code> and <code>agent_guidance_path</code>. Read that file when non-null, then reuse the returned <code>context_handle</code> on later Session-bound calls. The Workspaces page can also move Sessions manually.</li><li>If you change ChatGPT model or thinking level, the MCP context may be recreated even inside the same conversation. Check the Sessions page if continuity matters.</li></ol><p class=muted>ChatGPT UI labels and plan availability can change. Current OpenAI references: <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt" target=_blank rel=noopener>Developer mode and MCP apps in ChatGPT</a> · <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt" target=_blank rel=noopener>Apps in ChatGPT</a>.</p></div></section><? } ?>`,
+<? } else if(section==="settings"){ const tab=s.settingsTab||"network"; ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><nav class=settings-tabs aria-label="Settings sections"><? [["network","🌐","Network"],["security","🔒","Security"],["process","🖥️","Process"],["files","📄","Files"],["goals","🎯","Goals"],["notifications","🔔","Notifications"],["maintenance","🧹","Maintenance"]].forEach(([id,icon,label])=>{ ?><button data-action=settings-tab data-settings-tab="<?= id ?>" class="<?= tab===id?'active':'' ?>"<?= tab===id?' aria-current=page':'' ?>><?= icon ?> <?= label ?></button><? }) ?></nav><p class=muted>📂 Data Directory · <code style="overflow-wrap:anywhere"><?= settings.data_directory||'' ?></code></p><div class=settings-layout><div class=settings-main><div class=card<? if(tab!=="network"){ ?> hidden<? } ?>><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card<? if(tab!=="security"){ ?> hidden<? } ?>><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card<? if(tab!=="notifications"){ ?> hidden<? } ?>><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card<? if(tab!=="process"){ ?> hidden<? } ?>><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><label><input id=gitPreserveLineEndings type=checkbox<?= settings.git_preserve_line_endings?" checked":"" ?>> Disable automatic Git CRLF conversion</label><p class=muted>When enabled, managed processes use <code>core.autocrlf=false</code>. An existing CRLF checkout made with <code>core.autocrlf=true</code> may then appear modified without a file edit. Turn this off to use the repository and machine Git policy. Repository <code>.gitattributes</code> and explicit <code>git -c</code> options still apply.</p><div class=row><label class=grow>Environment variables for all spawned processes · one <code>NAME=value</code> per line</label><? if(settings.field_warnings?.exec_environment){ ?><span class=field-warning>⚠ <?= settings.field_warnings.exec_environment ?></span><? } ?></div><textarea id=execEnvironment rows=8 placeholder="CACHE_DIR=\${MRMCP_DIR}&#10;TOOLS=\${MRMCP_BIN}&#10;PROJECT=\${WORKSPACE}&#10;RUN_FROM=\${CWD}"><?= settings.exec_environment||'' ?></textarea><p class=muted>Available placeholders: <code>\${MRMCP_DIR}</code> = MrMCP data directory, <code>\${MRMCP_BIN}</code> = managed bin directory, <code>\${WORKSPACE}</code> = current Workspace root, <code>\${CWD}</code> = effective exec directory. Precedence: system environment → these settings → per-call <code>env</code>. Off PATH inheritance leaves child <code>PATH</code> as only <code>.mrmcp/bin</code>; PATH remains governed by this toggle rather than the generic environment list.</p></div><div class=card<? if(tab!=="files"){ ?> hidden<? } ?>><h3>📄 Text Encoding</h3><div class=row><label class=grow for=textEncodingDetection>Automatic detection for reading and searching</label><? if(settings.field_warnings?.text_encoding_detection){ ?><span class=field-warning>⚠ <?= settings.field_warnings.text_encoding_detection ?></span><? } ?></div><select id=textEncodingDetection><option value=sample<?= (settings.text_encoding_detection||"sample")==="sample"?" selected":"" ?>>Initial 16 KiB · faster</option><option value=full<?= settings.text_encoding_detection==="full"?" selected":"" ?>>Complete file · more thorough</option></select><p class=muted>The initial sample reduces detection work on large files. If the result is uncertain or its encoding cannot decode the complete file, detection retries with the full content. A sample can miss later charset clues; choose Complete file when accuracy matters more than speed.</p><p class=muted>File edits and conversions always use the complete content. An explicitly requested encoding skips detection in both modes.</p></div><div class=card<? if(tab!=="goals"){ ?> hidden<? } ?>><h3>🎯 Chat Goals</h3><h3>ChatGPT login profile</h3><p><b><?= settings.chat_goal_login_verified_at ? 'Login verified' : settings.chat_goal_login_active ? 'Login setup · goals paused' : 'Login required · goals paused' ?></b></p><p class=muted>Initialize the separate Chrome profile here before using goals. Select Login ChatGPT and sign in or complete any challenge in the dedicated window. Login is detected automatically. An existing login may reload once to observe fresh recent-chat data; drafts are preserved.</p><div class=row><button data-action=open-chat-goal-login<?= settings.chat_goal_login_busy?' disabled':'' ?>>Login ChatGPT</button></div><? if(settings.chat_goal_login_detail){ ?><p class=muted><?= settings.chat_goal_login_detail ?></p><? } ?><p class=muted>Login setup pauses automatic goals and works even when goal management is disabled. It uses a visible window with images; a running headless/image-blocked browser may need to restart with the same profile. Close the login window after verification to apply the saved monitoring launch options. Login readiness is independent of the enable switch. Losing login during a match or send pauses goals until you use this button again. Failed matches require a new chat_set_goal after login.</p><label><input id=chatGoalsEnabled type=checkbox<?= settings.chat_goals_enabled?" checked":"" ?>> Enable chat goal management</label><p class=muted>Off stops background monitoring and browser opening. The tool remains available and returns disabled. Saved goals and the login profile are retained; enabling resumes eligible goals.</p><label><input id=chatGoalMatchOnStartup type=checkbox<?= settings.chat_goal_match_on_startup?" checked":"" ?>> Retry missing chat matches at startup</label><p class=muted>Off by default: restarting does not resume matching, even if it was queued. When enabled, each startup schedules one attempt per active goal without an associated chat. Requires goal management to be enabled and a verified login profile. Saving this option does not start a match now.</p><div class=row><label class=grow for=chatGoalTimeoutMinutes>Default inactivity timeout · minutes</label><? if(settings.field_warnings?.chat_goal_timeout_minutes){ ?><span class=field-warning>⚠ <?= settings.field_warnings.chat_goal_timeout_minutes ?></span><? } ?></div><input id=chatGoalTimeoutMinutes type=number min=1 max=1440 step=1 value="<?= settings.chat_goal_timeout_minutes??5 ?>"><p class=muted>Default: 5 minutes. Used when a new goal omits timeout_seconds; existing goals keep their own timeout.</p><label><input id=chatGoalStopBeforeSend type=checkbox<?= settings.chat_goal_stop_before_send?" checked":"" ?>> Stop the current response before sending</label><p class=muted>Off by default: send the goal even while ChatGPT is working. When enabled, press Stop first and wait briefly for it to take effect. Applies to subsequent send attempts without restarting Chrome. New Tool Calls reset the inactivity timer; an older call still running does not block the prompt.</p><h3>Browser launch</h3><label><input id=chatGoalHeadless type=checkbox<?= settings.chat_goal_headless?" checked":"" ?>> Headless · no browser window</label><label><input id=chatGoalDisableImages type=checkbox<?= settings.chat_goal_disable_images?" checked":"" ?>> Disable page images</label><p class=muted>Images load by default. Enable this option to reduce image loading during monitoring. Screenshots remain available.</p><label for=chatGoalWindowsHide>Spawned process window / console</label><select id=chatGoalWindowsHide><option value=auto<?= settings.chat_goal_windows_hide==="auto"?" selected":"" ?>>Automatic · follows headless</option><option value=hide<?= settings.chat_goal_windows_hide==="hide"?" selected":"" ?>>Always hide</option><option value=show<?= settings.chat_goal_windows_hide==="show"?" selected":"" ?>>Always show</option></select><p class=muted>Headless defaults off so you can sign in or complete a challenge. Automatic sets windowsHide equal to headless: hide when headless, show otherwise. You may override it independently. Launch changes apply after the dedicated browser is closed and started again. Its login profile is preserved.</p></div><div class=card<? if(tab!=="maintenance"){ ?> hidden<? } ?>><h3>🧹 Tool Call History</h3><label>History storage</label><select id=toolCallStorage><option value=disk<?= settings.tool_call_storage==='disk'?' selected':'' ?>>Disk · survives restart</option><option value=memory<?= settings.tool_call_storage==='memory'?' selected':'' ?>>Memory · SQLite TEMP, volatile</option></select><p class=muted>Storage and payload retention are independent. Disk writes Tool Call history to the main SQLite database. Memory uses SQLite TEMP tables in RAM with the same Tool Call ids, GUI and tools_log behavior; rows disappear on restart.</p><label>Payload retention</label><select id=toolCallPayloadMode><option value=payload<?= settings.tool_call_payload_mode==='payload'?' selected':'' ?>>Payload · canonical MCP request and response packets</option><option value=metadata<?= settings.tool_call_payload_mode==='metadata'?' selected':'' ?>>Metadata · no Tool Call request/response payload copies</option></select><p class=muted>Payload retention affects only diagnostic copies in Tool Call history. Functional state required by tools remains available in its owning subsystem; for example persistent-process command/output state is retained independently so exec_attach and exec_status keep working.</p><div class=row><label class=grow>Disk retention hours · 0 keeps indefinitely</label><? if(settings.field_warnings?.tool_call_retention_hours){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_retention_hours ?></span><? } ?></div><input id=toolCallRetentionHours type=number min=0 step=1 value="<?= settings.tool_call_retention_hours??0 ?>"><div class=row><label class=grow>Memory retention minutes · 0 keeps until restart</label><? if(settings.field_warnings?.tool_call_memory_retention_minutes){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_memory_retention_minutes ?></span><? } ?></div><input id=toolCallMemoryRetentionMinutes type=number min=0 step=1 value="<?= settings.tool_call_memory_retention_minutes??60 ?>"><p class=muted>Retention removes completed Tool Call history from its own storage tier. Process, CDP and other functional state are unaffected. Changing the current storage or payload setting affects new Tool Calls only; existing rows retain their own storage and payload capabilities.</p><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, Memory, CDP browser state, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
+<? } else if(section==="help"){ ?><section id=help class=page><h2>❓ Help</h2><div class=card><h3>Connect ChatGPT Web</h3><ol><li>Make sure the Dashboard shows a trusted HTTPS certificate. ChatGPT needs a remote HTTPS MCP endpoint; use <code><?= settings.external_base_url ? settings.external_base_url + "/mcp" : "https://your-host/mcp" ?></code>.</li><li>In ChatGPT Web, enable Developer mode. In managed workspaces the current path is <b>Workspace settings → Permissions &amp; Roles → Connected Data Developer mode / Create custom MCP connectors</b>. Authorized users may also find the toggle under <b>Settings → Apps → Advanced Settings</b>.</li><li>Create a custom app from <b>Workspace settings → Apps → Create</b> or <b>Settings → Apps → Create</b>, enter the MrMCP endpoint, choose the offered authentication method, then select <b>Scan Tools</b>.</li><li>If OAuth is enabled in MrMCP, complete the authorization prompt. After the tool scan completes, create the app and select it from a new ChatGPT conversation.</li></ol></div><div class=card><h3>Authentication</h3><p>For ChatGPT, OAuth is the preferred MrMCP setup because ChatGPT can discover the authorization metadata, complete consent, and keep refresh-token connectivity. MrMCP also supports Basic authentication for MCP clients that offer it. Authentication grants access to the server; the <code>chat_session</code> selects persistent context state after authentication.</p></div><div class=card><h3>Write Access</h3><p>MrMCP does not maintain a separate read/write allowlist: every authenticated client receives every published tool. ChatGPT controls whether write/modify actions are usable through the app's permissions and action controls. As of this build, OpenAI documents full MCP write/modify support for Business, Enterprise and Edu; Pro custom MCP access is limited to read/fetch, and availability may change. Test write tools in Developer mode first. Where available, use <b>Workspace settings → Apps → Configure Actions / Action control</b> to enable the required actions. ChatGPT may still ask for confirmation before a write.</p></div><div class=card><h3>Using MrMCP in a Chat</h3><ol><li>Start a new chat and select the MrMCP app from the tools/apps menu.</li><li>Call <code>init_chat_session</code> once to create a chat Session, then pass its returned <code>chat_session</code> on every subsequent tool call. Initialization selects no Workspace. Use <code>list_workspaces</code> to discover names, then <code>open_workspace</code> with the same <code>chat_session</code> and the desired <code>name</code> before working on files or starting processes.</li><li>The result already includes <code>workspace_name</code>, absolute <code>cwd</code> and <code>agent_guidance_path</code>. Read that file when non-null. Workspace changes preserve the same <code>chat_session</code>. The Workspaces page can also move Sessions manually.</li><li>If you change ChatGPT model or thinking level, the MCP context may be recreated even inside the same conversation. Check the Sessions page if continuity matters.</li></ol><p class=muted>ChatGPT UI labels and plan availability can change. Current OpenAI references: <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt" target=_blank rel=noopener>Developer mode and MCP apps in ChatGPT</a> · <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt" target=_blank rel=noopener>Apps in ChatGPT</a>.</p></div></section><? } ?>`,
     dialogs: `<? const dialog=it.data?.state?.dialog; ?><? if(dialog){ ?><div id=dialogOverlay class=dialog-overlay><? if(dialog.kind==="root"){ const r=dialog.data||{}; ?><dialog id=rootDialog open data-managed-dialog=root><form id=rootForm><input id=rid type=hidden value="<?= r.id||'' ?>"><h2>📁 Workspace</h2><div class=row><label class=grow>Workspace name</label><? if(r.name_warning){ ?><span class=field-warning>⚠ <?= r.name_warning ?></span><? } ?></div><input id=rname value="<?= r.name||'' ?>"><div class=row><label class=grow>Directory path</label><? if(r.path_warning){ ?><span class=field-warning>⚠ <?= r.path_warning ?></span><? } else if(!r.path_checked){ ?><span class=muted>Leave the field to validate the directory.</span><? } ?></div><input id=rpath placeholder="C:\\projects\\my-workspace, /srv/my-workspace or ./project" value="<?= r.path||'' ?>"><div class=muted>Relative to the program folder.</div><label><input id=renabled type=checkbox<?= r.enabled!==false?' checked':'' ?>> Enabled</label><? if(r.form_warning){ ?><div class=field-warning>⚠ <?= r.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (r.name_warning||r.path_warning||!r.path_checked||r.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="command"){ const c=dialog.data||{}; ?><dialog id=commandDialog open data-managed-dialog=command><form id=commandForm><input id=coldName type=hidden value="<?= c.registered?c.name:'' ?>"><h2>🧰 Command Catalog Entry</h2><div class=row><label class=grow>Logical name</label><? if(c.name_warning){ ?><span class=field-warning>⚠ <?= c.name_warning ?></span><? } ?></div><input id=cname value="<?= c.name||'' ?>"><div class=row><label class=grow>Path below .mrmcp/bin</label><? if(c.path_warning){ ?><span class="<?= c.path_error?'field-warning':'muted' ?>"><?= c.path_error?'⚠ ':'' ?><?= c.path_warning ?></span><? } else if(!c.path_checked){ ?><span class=muted>Leave the field to validate the path.</span><? } ?></div><input id=cpath placeholder="Optional; defaults to logical name; Windows suffix optional" value="<?= c.path||'' ?>"><label>Description for the agent</label><textarea id=cdescription placeholder="Optional: what it does and when the agent should use it."><?= c.description||'' ?></textarea><div class=row><label class=grow>Download URL</label><? if(c.download_warning){ ?><span class=field-warning>⚠ <?= c.download_warning ?></span><? } ?></div><input id=cdownloadUrl placeholder="https://example.com/tool" value="<?= c.download_url||'' ?>"><div class=row><label class=grow>Documentation URL</label><? if(c.documentation_warning){ ?><span class=field-warning>⚠ <?= c.documentation_warning ?></span><? } ?></div><input id=cdocumentationUrl placeholder="https://example.com/docs" value="<?= c.documentation_url||'' ?>"><? if(c.form_warning){ ?><div class=field-warning>⚠ <?= c.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (c.name_warning||c.path_error||!c.path_checked||c.download_warning||c.documentation_warning||c.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="prompt"){ const p=dialog.data||{}; ?><dialog id=promptDialog open data-managed-dialog=prompt><form id=promptForm><input id=poldName type=hidden value="<?= p.old_name||'' ?>"><h2>🧭 Guided Prompt</h2><div class=row><label class=grow>Name</label><? if(p.name_warning){ ?><span class=field-warning>⚠ <?= p.name_warning ?></span><? } ?></div><input id=pname value="<?= p.name||'' ?>"><label>Title</label><input id=ptitle value="<?= p.title||'' ?>" placeholder="Human-readable title shown by MCP clients"><label>Description</label><textarea id=pdescription placeholder="What this guided prompt does."><?= p.description||'' ?></textarea><div class=row><label class=grow>Arguments · YAML list</label><? if(p.args_warning){ ?><span class=field-warning>⚠ <?= p.args_warning ?></span><? } ?></div><textarea id=parguments rows=8 placeholder="- name: focus&#10;  description: Area to focus on.&#10;  required: false"><?= p.arguments_text||'' ?></textarea><div class=row><label class=grow>Eta template</label><? if(p.template_warning){ ?><span class=field-warning>⚠ <?= p.template_warning ?></span><? } ?></div><textarea id=ptemplate rows=14 placeholder="Review the project. &lt;%= it.args.focus %&gt;"><?= p.template||'' ?></textarea><div class=muted>Standard Eta tags. Model documentation is available from Guided Prompts → Template Help.</div><? if(p.form_warning){ ?><div class=field-warning>⚠ <?= p.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (p.name_warning||p.args_warning||p.template_warning||p.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="memory"){ const m=dialog.data||{},creating=!m.id; ?><dialog id=memoryDialog open data-managed-dialog=memory><form id=memoryForm><input id=mid type=hidden value="<?= m.id||'' ?>"><h2><?= creating?'➕ New Memory':'🧠 Memory' ?></h2><? if(creating){ ?><label>Scope</label><select id=mscope><option value=global<?= m.scope==='global'?' selected':'' ?>>Global</option><option value=session<?= m.scope==='session'?' selected':'' ?><?= !(m.sessions||[]).length?' disabled':'' ?>>Session</option><option value=workspace<?= m.scope==='workspace'?' selected':'' ?><?= !(m.workspaces||[]).length?' disabled':'' ?>>Workspace</option></select><? if(m.scope==='workspace'){ ?><label>Workspace</label><select id=mworkspace><? (m.workspaces||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= String(m.workspace||'')===String(name)?' selected':'' ?>><?= name ?></option><? }) ?></select><? } else if(m.scope==='session'){ ?><label>Session</label><select id=mcontext><? (m.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(m.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><? } else { ?><div class=muted>Shared across all Sessions and Workspaces on this MrMCP server.</div><? } ?><? } else { ?><div class=muted><?= m.scope==='global'?'Global':(m.scope==='workspace'?'Workspace':'Session') ?> · <?= m.owner_name||'' ?></div><? } ?><label>Key</label><input id=mkey value="<?= m.key||'' ?>"><label>Value</label><? if(m.json){ ?><textarea id=mvalue rows=14 hidden><?= m.value_text||'' ?></textarea><div id=memoryJsonEditor class="json-editor-host memory" data-json-source=mvalue data-json-edit=memory data-json-error=memoryJsonError></div><div id=memoryJsonError class=field-warning hidden></div><? } else { ?><textarea id=mvalue rows=14><?= m.value_text||'' ?></textarea><? } ?><label><input id=mjson type=checkbox<?= m.json?' checked':'' ?>> Value is JSON · validate before saving</label><div class=muted>Switching between TEXT and JSON keeps the current draft unchanged.</div><label>TTL seconds · 0 = permanent</label><input id=mttl type=number min=0 max=315360000 value="<?= m.ttl_seconds||0 ?>"><? if(m.form_warning){ ?><div class=field-warning>⚠ <?= m.form_warning ?></div><? } ?><p class=row><button class=primary type=submit>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="confirm"){ ?><dialog id=confirmDialog open data-managed-dialog=confirm><h2>⚠️ <?= dialog.title||"Confirm Action" ?></h2><p><?= dialog.message||"Continue?" ?></p><p class=row><button class="primary danger" data-action=confirm-dialog>✓ Confirm</button><button data-action=close-dialog>✕ Cancel</button></p></dialog><? } ?></div><? } ?>`,
     status: `<? const d=it.data||{},s=d.settings||{},a=d.activity||{},bad=!!s.mcp_listen_error,warn=!!s.listener_fallback,recent=a.recent_sessions||[],inFlight=a.tool_calls_in_flight||0,errors=a.tool_calls_errors||0,invalid=a.tool_calls_invalid||0; ?><span class="status-group <?= d.live!=="connected"?(d.live==="reconnecting"?"pending":"failed"):(bad?"failed":(warn?"pending":"ok")) ?>"><?= d.live!=="connected"?(d.live==="reconnecting"?"🟡 reconnecting":"🔴 offline"):(bad?"🔴 listener error":(warn?"🟡 fallback":"🟢 live")) ?></span><span class="status-group status-link" data-action=header-settings title="HTTP / HTTPS effective listener ports; GUI uses local Tauriless assets">🔌 <span class=status-ports><?= s.mcp_http_active?s.mcp_http_port:"off" ?>/<?= s.mcp_https_active?s.mcp_https_port:"off" ?></span><? if(warn){ ?> <span class=pending>⚠</span><? } ?></span><span class=status-group title="Sessions with a Tool Call in the last <?= a.active_window_minutes||10 ?> minutes">💬 <span class="status-link <?= a.active_sessions?'ok':'muted' ?>" data-action=header-sessions><?= a.active_sessions||0 ?> active</span><? if(recent.length){ ?> · <span class=status-sessions><? recent.forEach((x,i)=>{ ?><?= i?" ":"" ?><span class=status-link data-action=session-tool-calls data-id="<?= x.id ?>">#<?= x.id ?>(<?= x.tool_calls ?>)</span><? }) ?></span><? } ?></span><span class=status-group title="Tool Calls in flight / total recorded / failed / invalid">🛠️ <span class="status-link <?= inFlight?'pending':'muted' ?>" data-action=header-tool-calls data-status=running><?= inFlight ?> in flight</span> · <span class="status-link status-total" data-action=header-tool-calls data-status=""><?= a.tool_calls_total||0 ?> total</span> · <span class="status-link <?= errors?'failed':'muted' ?>" data-action=header-tool-calls data-status=failed><?= errors ?> errors</span> · <span class="status-link <?= invalid?'invalid':'muted' ?>" data-action=header-tool-calls data-status=invalid><?= invalid ?> invalid</span></span>`,
     cards: `<? const meta={sessions:["💬","Sessions"],roots:["📁","Workspaces"],tool_calls:["🛠️","Tool Calls"],tool_calls_in_flight:["🛠️","Tool Calls In Flight"],failed_calls:["⚠️","Failed Calls"],http_requests:["🌐","HTTP Requests"]}; Object.entries(it.data || {}).forEach(([key,value]) => { const item=meta[key]||["•",key]; ?><div class=card><div class=muted><?= item[0] ?> <?= item[1] ?></div><strong style="font-size:24px"><?= value ?></strong></div><? }) ?>`,
@@ -9335,15 +10125,15 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     trash: `<? const d=it.data||{},rows=d.transactions||[],m=d.maintenance||{}; ?><div class=row><div class=grow><b><?= d.item_count||0 ?></b> tracked item<?= Number(d.item_count||0)===1?'':'s' ?> in <b><?= d.transaction_count||0 ?></b> transaction<?= Number(d.transaction_count||0)===1?'':'s' ?> · <b><?= it.bytes(d.cached_bytes||0) ?></b> cached<? if(d.unknown_sizes){ ?> · <span class=pending><?= d.unknown_sizes ?> unknown size<?= Number(d.unknown_sizes)===1?'':'s' ?></span><? } ?></div><button class="danger" data-action=empty-trash<?= m.active?' disabled':'' ?>>🗑️ Empty Trash</button></div><? if(!rows.length){ ?><div class=card><p class=muted>Trash metadata is empty.</p></div><? } else { rows.forEach(t=>{ ?><article class="card trash-transaction"><div class=row><div class=grow><h3 style="margin:0"><code><?= t.trash_id ?></code></h3><div class=muted><?= t.created_at?it.logdt(t.created_at):'Unknown creation time' ?> · <?= (t.items||[]).length ?> item<?= (t.items||[]).length===1?'':'s' ?> · <?= it.bytes(t.cached_bytes||0) ?> cached<? if(t.unknown_sizes){ ?> · <?= t.unknown_sizes ?> unknown<? } ?><? if(t.missing_count){ ?> · <span class=failed><?= t.missing_count ?> missing on disk</span><? } ?></div></div><? if(t.restorable){ ?><button class=small data-action=restore-trash data-id="<?= t.trash_id ?>">↩️ Restore available</button><? } ?><button class="small danger" data-action=delete-trash data-id="<?= t.trash_id ?>">🗑️ Delete transaction</button></div><table class=trash-table><thead><tr><th>Original path</th><th>Cached metadata</th><th>Disk payload</th><th>Stored payload</th><th></th></tr></thead><tbody><? (t.items||[]).forEach(x=>{ ?><tr><td><? if(x.original){ ?><code><?= x.original ?></code><? } else { ?><span class=muted>Original path unavailable</span><? } ?></td><td class=nowrap><b><?= x.type ?></b><? if(x.size_cached!==null){ ?> · <?= it.bytes(x.size_cached) ?><? } else { ?> · <span class=pending>size unknown</span><? } ?></td><td class=nowrap><? if(x.disk_present){ ?><span class=ok>✅ Present</span><? if(x.disk_type&&x.disk_type!==x.type){ ?> <span class=pending>· now <?= x.disk_type ?></span><? } ?><? } else { ?><span class=failed>❌ Missing</span><? } ?></td><td><code><?= x.payload ?></code></td><td class=nowrap><? if(x.disk_present&&x.original){ ?><button class=small data-action=restore-trash-item data-id="<?= t.trash_id ?>" data-payload="<?= x.payload ?>">↩️ Restore</button> <? } ?><button class="small danger" data-action=delete-trash-item data-id="<?= t.trash_id ?>" data-payload="<?= x.payload ?>"><?= x.disk_present?'🗑️ Delete':'🧹 Remove metadata' ?></button></td></tr><? }) ?></tbody></table></article><? }) } ?>`,
     tls: `<? const t=it.data||{}, problem=!t.tls_active_trusted||!!t.tls_last_error||!!t.mcp_listen_error; ?><div class="card <?= problem ? "tls-alert" : "tls-good" ?>"><div class=row><h3 class=grow>🔒 TLS / Let's Encrypt</h3><b class="<?= t.tls_active_trusted ? "ok" : "failed" ?>"><?= t.tls_active_trusted ? "trusted" : (t.tls_active ? "fallback active" : "offline") ?></b></div><div class=grid><div><span class=muted>HTTPS Listener</span><br><b><?= t.mcp_https_active ? "0.0.0.0:"+t.mcp_https_port+" active" : "not listening" ?></b></div><div><span class=muted>Active Certificate</span><br><b><?= t.tls_active_kind || "none" ?> · <?= t.tls_active_valid ? "valid" : "invalid" ?></b></div><div><span class=muted>Expires</span><br><b><?= it.dt(t.tls_active_expires) || "unknown" ?></b></div><div><span class=muted>Last ACME Request</span><br><b><?= it.dt(t.tls_last_request_at) || "never recorded" ?></b></div><div><span class=muted>Last ACME Result</span><br><b class="<?= t.tls_last_request_valid ? "ok" : (t.tls_last_request_status === "error" ? "failed" : "pending") ?>"><? if (t.tls_last_request_status) { ?><?= t.tls_last_request_status ?> · certificate <?= t.tls_last_request_valid ? "valid" : "not valid" ?><? } else { ?>not recorded<? } ?></b></div><div><span class=muted>Last Valid Certificate</span><br><b><?= it.dt(t.tls_last_issued_at) || "not recorded" ?></b></div><div><span class=muted>Renewal Due</span><br><b><?= it.dt(t.tls_renewal_due_at) || "as soon as allowed" ?></b></div><div><span class=muted>Rate-Limit Reset</span><br><b><?= it.dt(t.tls_rate_limit_reset_at) || "none" ?></b></div><div><span class=muted>Next ACME Attempt</span><br><b><?= it.dt(t.tls_next_attempt_at) || "not scheduled" ?></b></div></div><? if (t.tls_last_error || t.mcp_listen_error) { ?><pre class=tls-error><?= t.tls_last_error || t.mcp_listen_error ?></pre><? } ?><? if (!t.tls_active_trusted) { ?><p class=failed><b>Public clients such as ChatGPT will reject the self-signed fallback until Let's Encrypt succeeds.</b></p><? } ?></div>`,
     urls: `<? (it.data || []).forEach(x => { if (!x?.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?><? if (x.note) { ?> <span class=muted><?= x.note ?></span><? } ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?>`,
-    roots: `<? const d=it.data||{},rows=d.roots||[],defaults=d.default_sessions||[]; ?><div class=roots-layout><div class=roots-named><h3>📁 Workspaces</h3><? if(!rows.length){ ?><div class=card><p class=muted>No Workspaces registered.</p></div><? } ?><? rows.forEach(r => { ?><div class="card root-card<?= r.enabled?'':' root-disabled' ?>"<? if(r.enabled){ ?> data-root-drop="<?= r.id ?>"<? } ?>><div class=root-card-header><div class=grow><h3>📁 <?= r.name ?></h3><code class="<?= r.path_warning?'failed':'' ?>"<? if(r.path_warning){ ?> title="<?= r.path_warning ?>"<? } ?>><?= r.path ?></code></div><div class=command-actions><button class=small data-action=edit-root data-id="<?= r.id ?>">✏️ Edit</button><button class="small danger" data-action=delete-root data-id="<?= r.id ?>">🗑️ Delete</button></div></div><div class="<?= r.enabled?'ok':'muted' ?>"><?= r.enabled ? "enabled" : "disabled" ?></div><div class=root-session-list><? if(!r.enabled){ ?><div class=muted>Enable this Workspace to assign Sessions.</div><? } else if(!(r.sessions||[]).length){ ?><div class=root-drop-empty>Drop a Session here</div><? } ?><? (r.sessions||[]).forEach(v=>{ ?><div class=session-chip draggable=true data-session-drag data-session-id="<?= v.pk ?>" title="Drag Session #<?= v.pk ?>"><div class=session-chip-main><span>💬</span><b>#<?= v.pk ?></b><span class=grow><?= v.client_name ?></span></div><div class=session-chip-meta><span><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></span><span><span class=muted>Last Activity</span> <?= it.logdt(v.last_active_at) ?></span><span><span class=muted>Status</span> <span class="<?= v.expired?'failed':'ok' ?>"><?= v.expired?'expired':'active' ?></span></span><span><span class=muted>Tool Calls:</span> <?= v.tool_calls||0 ?></span></div></div><? }) ?></div></div><? }) ?></div><div class=roots-default><div class=row><h3 class=grow>💬 Sessions</h3><span class=muted>No Workspace assigned</span></div><div class="card default-root-card" data-root-drop="0"><p class=muted>Uses the program folder until assigned to a Workspace.</p><div class=root-session-list><? if(!defaults.length){ ?><div class=root-drop-empty>Drop a Session here to remove its Workspace association.</div><? } ?><? defaults.forEach(v=>{ ?><div class=session-chip draggable=true data-session-drag data-session-id="<?= v.pk ?>" title="Drag Session #<?= v.pk ?>"><div class=session-chip-main><span>💬</span><b>#<?= v.pk ?></b><span class=grow><?= v.client_name ?></span></div><div class=session-chip-meta><span><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></span><span><span class=muted>Last Activity</span> <?= it.logdt(v.last_active_at) ?></span><span><span class=muted>Status</span> <span class="<?= v.expired?'failed':'ok' ?>"><?= v.expired?'expired':'active' ?></span></span><span><span class=muted>Tool Calls:</span> <?= v.tool_calls||0 ?></span></div></div><? }) ?></div></div></div></div>`,
-    context: `<? const d=it.data||{},values=d.values||[]; ?><? if (!values.length) { ?><p class=muted>No Sessions have been issued yet.</p><? } else { ?><table><tr><th>ID</th><th>Session Handle</th><th>Client / Auth</th><th>State / Protocol</th><th>Current Workspace</th><th>Activity</th><th>Tool Calls</th><th></th></tr><? values.forEach(v=>{ const ua=String(v.user_agent||""); ?><tr><td class=idcell>#<?= v.pk ?></td><td class=context-id><code><?= v.context_handle ?></code></td><td><b><?= v.client_name||"Unknown client" ?></b><br><span class=muted><?= v.auth_kind||"unknown auth" ?></span><? if(ua){ ?><div class=muted title="<?= ua ?>"><?= ua.slice(0,72) ?><?= ua.length>72?"…":"" ?></div><? } ?></td><td class=nowrap><b class="<?= v.expired ? 'failed' : 'ok' ?>"><?= v.expired ? "⌛ expired" : "🟢 active" ?></b><br><code><?= v.protocol_version||"unknown" ?></code></td><td><b><?= v.workspace_name ?></b><div class="<?= v.workspace_warning?'failed':'muted' ?>"<? if(v.workspace_warning){ ?> title="<?= v.workspace_warning ?>"<? } ?>><?= v.workspace_path ?></div></td><td class=context-dates><div><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></div><div><span class=muted>Updated</span> <?= it.logdt(v.updated_at) ?></div><div><span class=muted>Active</span> <?= it.logdt(v.last_active_at) ?></div><div><span class=muted>Expires</span> <?= it.logdt(v.expires_at) ?></div></td><td class=nowrap><?= v.tool_calls||0 ?> <button class=small data-action=session-tool-calls data-id="<?= v.pk ?>">🛠️ View Calls</button></td><td><button class=danger data-action=delete-context data-id="<?= v.pk ?>">🗑️ Delete</button></td></tr><? }) ?></table><? } ?>`,
+    roots: `<? const d=it.data||{},rows=d.roots||[],defaults=d.default_sessions||[]; ?><div class=roots-layout><div class=roots-named><h3>📁 Workspaces</h3><? if(!rows.length){ ?><div class=card><p class=muted>No Workspaces registered.</p></div><? } ?><? rows.forEach(r => { ?><div class="card root-card<?= r.enabled?'':' root-disabled' ?>"<? if(r.enabled){ ?> data-root-drop="<?= r.id ?>"<? } ?>><div class=root-card-header><div class=grow><h3>📁 <?= r.name ?></h3><code class="<?= r.path_warning?'failed':'' ?>"<? if(r.path_warning){ ?> title="<?= r.path_warning ?>"<? } ?>><?= r.path ?></code></div><div class=command-actions><button class=small data-action=edit-root data-id="<?= r.id ?>">✏️ Edit</button><button class="small danger" data-action=delete-root data-id="<?= r.id ?>">🗑️ Delete</button></div></div><div class="<?= r.enabled?'ok':'muted' ?>"><?= r.enabled ? "enabled" : "disabled" ?></div><div class=root-session-list><? if(!r.enabled){ ?><div class=muted>Enable this Workspace to assign Sessions.</div><? } else if(!(r.sessions||[]).length){ ?><div class=root-drop-empty>Drop a Session here</div><? } ?><? (r.sessions||[]).forEach(v=>{ ?><div class=session-chip draggable=true data-session-drag data-session-id="<?= v.pk ?>" title="Drag Session #<?= v.pk ?>"><div class=session-chip-main><span>💬</span><b>#<?= v.pk ?></b><span class=grow><?= v.client_name ?></span></div><div class=session-chip-meta><span><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></span><span><span class=muted>Last Activity</span> <?= it.logdt(v.last_active_at) ?></span><span><span class=muted>Status</span> <span class="<?= v.expired?'failed':'ok' ?>"><?= v.expired?'expired':'active' ?></span></span><span><span class=muted>Tool Calls:</span> <?= v.tool_calls||0 ?></span></div></div><? }) ?></div></div><? }) ?></div><div class=roots-default><div class=row><h3 class=grow>💬 Sessions</h3><span class=muted>No Workspace assigned</span></div><div class="card default-root-card" data-root-drop="0"><p class=muted>Open a Workspace before file operations or starting processes.</p><div class=root-session-list><? if(!defaults.length){ ?><div class=root-drop-empty>Drop a Session here to remove its Workspace association.</div><? } ?><? defaults.forEach(v=>{ ?><div class=session-chip draggable=true data-session-drag data-session-id="<?= v.pk ?>" title="Drag Session #<?= v.pk ?>"><div class=session-chip-main><span>💬</span><b>#<?= v.pk ?></b><span class=grow><?= v.client_name ?></span></div><div class=session-chip-meta><span><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></span><span><span class=muted>Last Activity</span> <?= it.logdt(v.last_active_at) ?></span><span><span class=muted>Status</span> <span class="<?= v.expired?'failed':'ok' ?>"><?= v.expired?'expired':'active' ?></span></span><span><span class=muted>Tool Calls:</span> <?= v.tool_calls||0 ?></span></div></div><? }) ?></div></div></div></div>`,
+    context: `<? const d=it.data||{},values=d.values||[]; ?><? if (!values.length) { ?><p class=muted>No Sessions have been issued yet.</p><? } else { ?><table><tr><th>ID</th><th>Session Handle</th><th>Client / Auth</th><th>State / Protocol</th><th>Current Workspace</th><th>Activity</th><th>Tool Calls</th><th></th></tr><? values.forEach(v=>{ const ua=String(v.user_agent||""); ?><tr><td class=idcell>#<?= v.pk ?></td><td class=context-id><code><?= v.chat_session ?></code><? if(v.goal_text||v.chatgpt_chat_id){ ?><div><b>Goal: <?= v.goal_status ?></b><? if(v.goal_text){ ?><div title="<?= v.goal_text ?>"><?= v.goal_text.slice(0,120) ?><?= v.goal_text.length>120?"…":"" ?></div><div class=muted>Idle: <?= v.goal_timeout_seconds ?> s<? if(v.goal_next_check_at){ ?> · Check: <?= it.logdt(v.goal_next_check_at) ?><? } ?></div><button class="small danger" data-action=stop-chat-goal data-id="<?= v.pk ?>">Stop goal</button><? } ?> <button class=small data-action=open-chat-goal data-id="<?= v.pk ?>">Login settings</button><? if(v.chatgpt_chat_id){ ?><div class=muted>Chat: <code><?= v.chatgpt_chat_id ?></code></div><? } ?><? if(v.goal_last_sent_at){ ?><div class=muted>Last sent: <?= it.logdt(v.goal_last_sent_at) ?></div><? } ?><? if(v.goal_error){ ?><div class=failed><?= v.goal_error ?></div><? } ?></div><? } ?></td><td><b><?= v.client_name||"Unknown client" ?></b><br><span class=muted><?= v.auth_kind||"unknown auth" ?></span><? if(ua){ ?><div class=muted title="<?= ua ?>"><?= ua.slice(0,72) ?><?= ua.length>72?"…":"" ?></div><? } ?></td><td class=nowrap><b class="<?= v.expired ? 'failed' : 'ok' ?>"><?= v.expired ? "⌛ expired" : "🟢 active" ?></b><br><code><?= v.protocol_version||"unknown" ?></code></td><td><b><?= v.workspace_name ?></b><div class="<?= v.workspace_warning?'failed':'muted' ?>"<? if(v.workspace_warning){ ?> title="<?= v.workspace_warning ?>"<? } ?>><?= v.workspace_path ?></div></td><td class=context-dates><div><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></div><div><span class=muted>Updated</span> <?= it.logdt(v.updated_at) ?></div><div><span class=muted>Active</span> <?= it.logdt(v.last_active_at) ?></div><div><span class=muted>Expires</span> <?= it.logdt(v.expires_at) ?></div></td><td class=nowrap><?= v.tool_calls||0 ?> <button class=small data-action=session-tool-calls data-id="<?= v.pk ?>">🛠️ View Calls</button></td><td><button class=danger data-action=delete-context data-id="<?= v.pk ?>">🗑️ Delete</button></td></tr><? }) ?></table><? } ?>`,
     commands: `<? const d=it.data || {}, rows=d.commands || []; ?><div class=muted><?= d.total || 0 ?> command<?= d.total === 1 ? "" : "s" ?> · page <?= d.page || 1 ?>/<?= d.pages || 1 ?> · config <code><?= d.config_file || "" ?></code></div><table class=commands-table><tr><th>Name</th><th>Relative path</th><th class=command-description>Description</th><th>Links</th><th>Source</th><th>State</th><th class=command-action-cell></th></tr><? rows.forEach(c => { ?><tr><td><code><?= c.name ?></code></td><td><code><?= c.path ?></code></td><td class=command-description><?= c.description || "—" ?></td><td><? if (c.documentation_url) { ?><a href="<?= c.documentation_url ?>" target=_blank rel=noopener>📖 Docs</a><? } else { ?>—<? } ?></td><td><?= c.source ?></td><td class="<?= c.present && c.executable ? "ok" : "failed" ?>"><?= c.present ? (c.executable ? "✅ available" : "⚠️ not executable") : "❌ missing" ?></td><td class=command-action-cell><div class=command-actions><button data-action=edit-command data-name="<?= c.name ?>" data-path="<?= c.path ?>">✏️ Edit</button><? if (c.registered && c.download_url) { ?><button data-action=download-command data-name="<?= c.name ?>">⬇️ Download</button><? } ?><? if (c.registered) { ?><button class=danger data-action=delete-command data-name="<?= c.name ?>">🗑️ Delete</button><? } ?></div></td></tr><? }) ?></table><div class=row><button data-action=commands-prev<?= d.page <= 1 ? " disabled" : "" ?>>Previous</button><button data-action=commands-next<?= d.has_more ? "" : " disabled" ?>>Next</button></div>`,
     prompts: `<? const d=it.data||{},rows=d.prompts||[]; ?><div class=muted><?= d.total||0 ?> prompt<?= d.total===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?> · config <code><?= d.config_file||'' ?></code></div><? if(!rows.length){ ?><div class=card><p class=muted>No guided prompts match the current search.</p></div><? } else { ?><table class=commands-table><tr><th>Name</th><th>Title</th><th class=command-description>Description</th><th>Arguments</th><th class=command-action-cell></th></tr><? rows.forEach(p=>{ ?><tr><td><code><?= p.name ?></code></td><td><?= p.title||'—' ?></td><td class=command-description><?= p.description||'—' ?></td><td><? if(p.arguments?.length){ p.arguments.forEach(a=>{ ?><div><code><?= a.name ?></code><? if(a.required){ ?> <b>required</b><? } ?></div><? }) } else { ?>—<? } ?></td><td class=command-action-cell><div class=command-actions><button data-action=edit-prompt data-name="<?= p.name ?>">✏️ Edit</button><button class=danger data-action=delete-prompt data-name="<?= p.name ?>">🗑️ Delete</button></div></td></tr><? }) ?></table><? } ?><div class=row><button data-action=prompts-prev<?= d.page<=1?' disabled':'' ?>>Previous</button><button data-action=prompts-next<?= d.has_more?'':' disabled' ?>>Next</button></div>`,
     oauth: `<table class=oauth-table><tr><th>Client</th><th>Sessions</th><th>Tokens</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td class=oauth-client><b><?= c.name ?></b><div class=oauth-client-id title="<?= c.client_id ?>"><code><?= c.client_id ?></code></div><div class=oauth-meta><span class=muted>Created</span> <?= it.logdt(c.created_at) ?></div></td><td class=oauth-meta><div class=oauth-count><b><?= c.session_count||0 ?></b> total</div><div><span class=muted>First</span> <?= c.first_session_at ? it.logdt(c.first_session_at) : "—" ?></div><div><span class=muted>Last</span> <?= c.last_session_at ? it.logdt(c.last_session_at) : "—" ?></div></td><td><div class=oauth-tokens><div class=oauth-token><b><?= c.token_count||0 ?></b> <span>Access</span><div class=oauth-meta><span class=muted>Issued</span> <?= c.last_token_at ? it.logdt(c.last_token_at) : "—" ?></div></div><div class=oauth-token><b><?= c.refresh_token_count||0 ?></b> <span>Refresh</span><div class=oauth-meta><span class=muted>Used</span> <?= c.last_refresh_at ? it.logdt(c.last_refresh_at) : "—" ?></div></div></div></td><td class=oauth-actions><button class=small data-action=oauth-sessions data-id="<?= c.client_id ?>">💬 View Sessions</button><button class="small danger" data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> Available Tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,
-    processes: `<? const d=it.data||{},rows=d.rows||[]; ?><? if(!rows.length){ ?><div class=card><p class=muted>No active processes.</p></div><? } else { rows.forEach(p=>{ ?><article class=card><div class=row><div class=grow><b><? if(p.persistent){ ?>exec #<?= p.exec_id ?><? } else { ?>foreground exec<? } ?></b><? if(p.pid!=null){ ?> <span class=muted>· PID <?= p.pid ?></span><? } ?><? if(p.attached){ ?> <span class=progress-requested>· attached</span><? } ?></div><span class="<?= p.status ?>"><?= p.status ?></span><button class=small data-action=terminate-process data-id="<?= p.process_id ?>">⏹️ Terminate</button><button class="small danger" data-action=kill-process data-id="<?= p.process_id ?>">⚠️ Kill</button></div><div class=terminal-command><span class=prompt>&gt;</span><span><?= p.command ?></span></div><div class=terminal-cwd>cwd <code><?= p.cwd ?></code><? if(p.context_handle){ ?> · Session <code><?= p.context_handle ?></code><? } ?></div><div class=row><span class=muted>Started <?= it.logdt(Date.parse(p.started_at)) ?></span><span class=muted>· stdin <?= p.stdin_open?"open":"closed" ?></span><? if(p.progress_requested){ ?><span class=progress-requested>· progress requested</span><? } ?></div><div class=terminal-stream-label>Live output tail</div><pre><?= p.output||"(no output yet)" ?></pre></article><? }) } ?>`,
+    processes: `<? const d=it.data||{},rows=d.rows||[]; ?><? if(!rows.length){ ?><div class=card><p class=muted>No active processes.</p></div><? } else { rows.forEach(p=>{ ?><article class=card><div class=row><div class=grow><b><? if(p.persistent){ ?>exec #<?= p.exec_id ?><? } else { ?>foreground exec<? } ?></b><? if(p.pid!=null){ ?> <span class=muted>· PID <?= p.pid ?></span><? } ?><? if(p.attached){ ?> <span class=progress-requested>· attached</span><? } ?></div><span class="<?= p.status ?>"><?= p.status ?></span><button class=small data-action=terminate-process data-id="<?= p.process_id ?>">⏹️ Terminate</button><button class="small danger" data-action=kill-process data-id="<?= p.process_id ?>">⚠️ Kill</button></div><div class=terminal-command><span class=prompt>&gt;</span><span><?= p.command ?></span></div><div class=terminal-cwd>cwd <code><?= p.cwd ?></code><? if(p.chat_session){ ?> · Session <code><?= p.chat_session ?></code><? } ?></div><div class=row><span class=muted>Started <?= it.logdt(Date.parse(p.started_at)) ?></span><span class=muted>· stdin <?= p.stdin_open?"open":"closed" ?></span><? if(p.progress_requested){ ?><span class=progress-requested>· progress requested</span><? } ?></div><div class=terminal-stream-label>Live output tail</div><pre><?= p.output||"(no output yet)" ?></pre></article><? }) } ?>`,
     logs: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1),statusIcons={completed:"✅",failed:"❌",invalid:"◆",running:"⏳",received:"📥"}; ?><div id=tool-call-pagination class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> call<?= d.total===1?"":"s" ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Tool Call Pages"><button class=page-button data-action=logs-page data-log-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?" disabled":"" ?> aria-label="Previous page">‹</button><? items.forEach(item=>{ if(item==="…"){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?" active":"" ?>" data-action=logs-page data-log-page="<?= item ?>"<?= item===(d.page||1)?" aria-current=page":"" ?>><?= item ?></button><? } }) ?><button class=page-button data-action=logs-page data-log-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?" disabled":"" ?> aria-label="Next page">›</button></nav></div><table id=tool-call-table><thead><tr><th>ID</th><th>Time</th><th>Session</th><th>Tool</th><th>Status</th><th>Duration</th><th>Actions</th></tr></thead><tbody><? rows.forEach(l => { ?><tr id="tool-call-row-<?= l.id ?>" data-action=select-log data-id="<?= l.id ?>" title="Open Tool Call details"><td class=idcell>#<?= l.id ?></td><td class=nowrap><?= it.logdt(l.started_at) ?></td><td class=http-session><? if(l.context_id){ ?><div class=idcell>#<?= l.context_id ?></div><? if(l.root_id&&l.root_name){ ?><div class=workspace-label>📁 <?= l.root_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><code><?= l.tool ?></code><? if(l.payload_mode&&l.payload_mode!=='payload'){ ?> <span class="descriptor-status <?= l.payload_mode==='metadata'?'outdated':'current' ?>"><?= String(l.payload_mode).toUpperCase() ?></span><? } ?><? if(l.call_preview){ ?><div class=tool-command-preview>↳ <?= l.call_preview ?></div><? } ?><? if(l.progress_requested){ ?><div class=progress-requested>📡 Progress requested</div><? } ?></td><td class="<?= l.status ?>"><?= statusIcons[l.status]||"•" ?> <?= l.status ?></td><td><?= l.duration_ms ?? "" ?><? if (l.duration_ms != null) { ?>ms<? } ?></td><td class=nowrap><? if(l.killable){ ?><button class=small data-action=terminate-log data-id="<?= l.id ?>">⏹️ Terminate</button> <button class="small danger" data-action=kill-log data-id="<?= l.id ?>">⚠️ Kill</button><? } else { ?>—<? } ?></td></tr><? }) ?></tbody></table><? if(d.openDetail&&d.openRowId){ const x=d.openDetail,l=rows.find(row=>String(row.id)===String(d.openRowId))||{id:d.openRowId},terminal=it.terminal(x); ?><div id="tool-call-detail-<?= l.id ?>" class=tool-detail-overlay data-detail-kind=tool data-detail-id="<?= l.id ?>"><div class="detail-panel tool-detail-screen"><div class="row tool-detail-screen-head"><b class=grow>Tool Call #<?= l.id ?></b><span class="descriptor-status <?= x.payload_mode==='metadata'?'outdated':'current' ?>"><?= String(x.payload_mode||'payload').toUpperCase() ?></span><? if(x.progress_requested){ ?><span class=progress-requested>📡 Progress requested</span><? } ?><? if(x.payload_mode==='payload'&&x.tool==='desktop_auto'){ ?><button class=small data-action=replay-automation data-id="<?= l.id ?>">▶ Replay</button><? } else if(x.payload_mode==='payload'&&x.tool==='cdp_call'){ ?><button class=small data-action=replay-cdp data-id="<?= l.id ?>">▶ Replay batch</button><? } ?><button class=small data-action=copy-detail data-target="tool-full-<?= l.id ?>">📋 Copy Full Row</button><button class=small data-action=close-row-detail data-kind=tool>✕ Close</button></div><pre id="tool-full-<?= l.id ?>" hidden><?= it.pretty(x) ?></pre><div class=tool-detail-grid><div class=tool-detail-main><? if(terminal){ ?><section id="tool-terminal-<?= l.id ?>" class=terminal-detail><div class="row terminal-title"><b class=grow>🖥️ Terminal</b><span class=muted><?= terminal.status ?><? if(terminal.termination_source){ ?> · <?= terminal.termination_source ?><? } ?><? if(terminal.requested_signal||terminal.signal){ ?> · <?= terminal.requested_signal&&terminal.signal&&terminal.requested_signal!==terminal.signal ? terminal.requested_signal+"→"+terminal.signal : (terminal.signal||terminal.requested_signal) ?><? } ?><? if(terminal.exit_code!==null){ ?> · exit <?= terminal.exit_code ?><? } ?></span></div><? if(terminal.command){ ?><div class=terminal-command><span class=prompt>&gt;</span><span><?= terminal.command ?></span></div><? } ?><? if(terminal.cwd){ ?><div class=terminal-cwd>cwd <code><?= terminal.cwd ?></code></div><? } ?><? if(terminal.stdin!==null){ ?><div class=terminal-stream-label>Stdin<?= terminal.stdin_encoding==="base64" ? " · base64" : "" ?></div><pre class=terminal-stdin><?= terminal.stdin ?></pre><? } ?><div class=terminal-stream-label>Output</div><pre><?= terminal.output || "(empty)" ?></pre></section><? } ?><? if(x.payload_mode==='metadata'){ ?><section class=json-detail><b>Payload</b><p class=muted>MCP request/response packets were not retained for this Tool Call. Metadata and the historical tool descriptor remain available.</p></section><? } else { ?><section class="json-detail debug-packet"><div class=row><b class=grow>→ MCP Request</b><span class=muted>canonical stored packet · decoded only for this view</span><button class=small data-action=copy-detail data-target="tool-request-<?= l.id ?>">📋 Copy Raw JSON</button></div><pre id="tool-request-<?= l.id ?>" hidden><?= x.mcp_request_json||'' ?></pre><?~ it.debugPayload(x.mcp_request_json) ?></section><section class="json-detail debug-packet"><div class=row><b class=grow>← MCP Response</b><span class=muted>canonical stored packet · decoded only for this view</span><button class=small data-action=copy-detail data-target="tool-response-<?= l.id ?>">📋 Copy Raw JSON</button></div><pre id="tool-response-<?= l.id ?>" hidden><?= x.mcp_response_json||'' ?></pre><?~ it.debugPayload(x.mcp_response_json) ?></section><? } ?><? if(x.error){ ?><section class=json-detail><b>Error metadata</b><pre><?= x.error ?></pre></section><? } ?></div><aside class=tool-descriptor><div class=row><b class=grow>Agent Tool Definition</b><? if(x.tool_descriptor){ ?><span class="descriptor-status <?= x.tool_descriptor_matches_current?'current':'outdated' ?>"><?= x.tool_descriptor_matches_current?'CURRENT':'OUTDATED' ?></span><button class=small data-action=copy-detail data-target="tool-descriptor-<?= l.id ?>">📋 Copy JSON</button><? } ?></div><? if(x.tool_descriptor){ ?><pre id="tool-descriptor-<?= l.id ?>" hidden><?= it.pretty(x.tool_descriptor) ?></pre><? if(x.tool_descriptor.title){ ?><div class=muted>Title</div><div><?= x.tool_descriptor.title ?></div><? } ?><div class=muted>Description</div><p><?= x.tool_descriptor.description||"—" ?></p><div class=muted>Input Schema</div><pre id="tool-descriptor-input-<?= l.id ?>" class=json-editor-source hidden><?= it.pretty(x.tool_descriptor.inputSchema||{}) ?></pre><div class="json-editor-host compact" data-json-source="tool-descriptor-input-<?= l.id ?>"></div><div class=muted>Output Schema</div><pre id="tool-descriptor-output-<?= l.id ?>" class=json-editor-source hidden><?= it.pretty(x.tool_descriptor.outputSchema||{}) ?></pre><div class="json-editor-host compact" data-json-source="tool-descriptor-output-<?= l.id ?>"></div><? } else { ?><p class=muted>No descriptor snapshot was recorded for this call.</p><? } ?></aside></div></div></div><? } ?>`,
-    browser: `<? const d=it.data||{},ops=d.operations||[],ring=d.ring||[],cards=d.browsers||[],clicks=ops.filter(x=>x.method==='_mrmcp.click').length,finds=ops.filter(x=>x.method==='_mrmcp.find').length; ?><div class=row><select id=browserName><option value="">All browsers</option><? (d.browser_values||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= d.browser===name?' selected':'' ?>><?= name ?></option><? }) ?></select><select id=browserTarget><option value="">All targets</option><? (d.target_values||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= d.target===name?' selected':'' ?>><?= name ?></option><? }) ?></select><select id=browserContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=browserActive><option value="">Any connection state</option><option value=active<?= d.active==='active'?' selected':'' ?>>Active / connected</option><option value=inactive<?= d.active==='inactive'?' selected':'' ?>>Inactive / disconnected</option></select><button data-action=clear-browser-filters>🧹 Clear Filters</button></div><div class=grid><div class=card><div class=muted>Browser profiles</div><strong style="font-size:24px"><?= cards.length ?><?= Number(d.browser_total||0)>cards.length?'/'+d.browser_total:'' ?></strong></div><div class=card><div class=muted>Payload-retained cdp_call Tool Calls</div><strong style="font-size:24px"><?= d.tool_calls_total||0 ?></strong></div><div class=card><div class=muted>Visible operations</div><strong style="font-size:24px"><?= ops.length ?><?= d.operation_has_more?'+':'' ?></strong><div class=muted><?= clicks ?> click · <?= finds ?> find</div></div><div class=card><div class=muted>Retained CDP messages</div><strong style="font-size:24px"><?= ring.length ?></strong><div class=muted>after current filters</div></div></div><? if(!cards.length){ ?><div class=card><p class=muted>No browser profiles match the current filters.</p></div><? } else { ?><div class=grid><? cards.forEach(b=>{ ?><article class=card><div class=row><h3 class=grow style="margin:0"><code><?= b.browser ?></code></h3><b class="<?= b.active?'ok':'muted' ?>"><?= b.active?'🟢 connected':'⚪ disconnected' ?></b></div><div class=grid><div><span class=muted>Port</span><br><b><?= b.port||'—' ?></b></div><div><span class=muted>Logical targets</span><br><b><?= b.logical_target_count ?></b></div><div><span class=muted>Live CDP targets</span><br><b><?= b.live_target_count ?></b></div><div><span class=muted>Subscriptions</span><br><b><?= b.subscription_count ?></b></div><div><span class=muted>Ring</span><br><b><?= b.ring_count ?></b> · <?= it.bytes(b.ring_bytes) ?></div><div><span class=muted>Recorded sequence</span><br><b><?= b.recorded_sequence ?></b></div><div><span class=muted>Retained seq range</span><br><b><?= b.oldest_seq==null?'—':b.oldest_seq+'–'+b.newest_seq ?></b></div><div><span class=muted>Notifications / responses</span><br><b><?= b.notifications ?> / <?= b.responses ?></b></div><div><span class=muted>Stream resets</span><br><b class="<?= b.stream_resets?'pending':'muted' ?>"><?= b.stream_resets ?></b></div><div><span class=muted>Dropped</span><br><b class="<?= b.dropped?'failed':'muted' ?>"><?= b.dropped ?></b></div></div><div class=muted style="margin-top:8px">Profile <code><?= b.user_data_dir ?></code><? if(b.connection_id){ ?> · connection <code><?= b.connection_id ?></code><? } ?><? if(b.pending){ ?> · <?= b.pending ?> pending<? } ?></div><? if((b.session_ids||[]).length){ ?><div class=muted>Recorded origins: <? b.session_ids.forEach((id,i)=>{ ?><?= i?', ':'' ?><span class=idcell>#<?= id ?></span><? }) ?></div><? } ?><? if((b.targets||[]).length){ ?><details><summary>Logical targets (<?= b.targets.length ?>)</summary><table><tr><th>Label</th><th>Target ID</th><th>Updated</th></tr><? b.targets.forEach(t=>{ ?><tr><td><code><?= t.target ?></code></td><td><code><?= t.target_id ?></code></td><td><?= it.logdt(t.updated_at) ?></td></tr><? }) ?></table></details><? } ?><? if((b.live_targets||[]).length){ ?><details><summary>Live CDP targets (<?= b.live_targets.length ?>)</summary><table><tr><th>Label</th><th>Type</th><th>Title / URL</th><th>Target / Session</th></tr><? b.live_targets.forEach(t=>{ ?><tr><td><? if(t.label){ ?><code><?= t.label ?></code><? } else { ?>—<? } ?></td><td><code><?= t.type||'—' ?></code></td><td><? if(t.title){ ?><div><?= t.title ?></div><? } ?><code><?= t.url||'—' ?></code></td><td><code><?= t.target_id||'—' ?></code><? if(t.session_id){ ?><div class=muted>session <code><?= t.session_id ?></code></div><? } ?></td></tr><? }) ?></table></details><? } ?><? if((b.subscriptions||[]).length){ const sid='browser-subs-'+b.browser.replace(/[^A-Za-z0-9_-]/g,'_'); ?><details><summary>Subscriptions (<?= b.subscriptions.length ?>)</summary><pre id="<?= sid ?>" class=json-editor-source hidden><?= it.pretty(b.subscriptions) ?></pre><div class="json-editor-host compact" data-json-source="<?= sid ?>"></div></details><? } ?></article><? }) ?></div><? } ?><div class=row><h3 class=grow>→ Recorded CDP sends</h3><span class=muted>scanned <?= d.operation_scan_calls||0 ?> of up to <?= d.operation_scan_limit||500 ?> recent Payload-retained cdp_call Tool Calls · stops after 200 matching operations</span></div><? if(!ops.length){ ?><div class=card><p class=muted>No recorded operations match the current filters.</p></div><? } else { ?><table><thead><tr><th>Time</th><th>Session</th><th>Browser / Target</th><th>Operation</th><th>State</th><th></th></tr></thead><tbody><? ops.forEach(o=>{ const jid='browser-call-'+o.log_id+'-'+o.call_index,rid=jid+'-response'; ?><tr><td class=nowrap><?= it.logdt(o.started_at) ?></td><td><? if(o.context_id){ ?><span class=idcell>#<?= o.context_id ?></span><? if(o.root_name){ ?><div class=workspace-label>📁 <?= o.root_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><code><?= o.browser ?></code><div class=muted><?= o.target?('target '+o.target):'browser-level' ?></div></td><td><b><?= o.method||'unknown' ?></b><div class=muted>Tool Call #<?= o.log_id ?> · item <?= o.call_index+1 ?> · wait <?= o.wait?'true':'false' ?><? if(o.duration_ms!=null){ ?> · <?= o.duration_ms ?>ms<? } ?></div><? if((o.images||[]).length){ ?><div class=tool-content-grid><? o.images.forEach(c=>{ ?><img class=tool-content-preview src="<?= c.data_url ?>" alt="CDP screenshot preview"><? }) ?></div><? } ?><details><summary>Request JSON</summary><pre id="<?= jid ?>" class=json-editor-source hidden><?= it.pretty(o.call) ?></pre><div class="json-editor-host compact" data-json-source="<?= jid ?>"></div></details><? if(o.response){ ?><details><summary>Response JSON</summary><pre id="<?= rid ?>" class=json-editor-source hidden><?= it.pretty(o.response) ?></pre><div class="json-editor-host compact" data-json-source="<?= rid ?>"></div></details><? } ?></td><td><? if(o.success===true){ ?><div class=ok>success</div><? } else if(o.success===false){ ?><div class=failed>failed</div><? } else { ?><div class="<?= o.status ?>"><?= o.status ?></div><? } ?><div class=muted>Tool Call <?= o.status ?></div><div class="<?= o.active?'ok':'muted' ?>"><?= o.active?'browser connected':'browser disconnected' ?></div></td><td><button class=small data-action=replay-cdp data-id="<?= o.log_id ?>" data-index="<?= o.call_index ?>">▶ Replay</button></td></tr><? }) ?></tbody></table><? } ?><div class=row><h3 class=grow>← Retained CDP traffic</h3><span class=muted>existing bounded ring only; notifications appear only when retained by a live subscription · Session filter narrows relevant browsers, because ring events themselves are global</span></div><? if(!ring.length){ ?><div class=card><p class=muted>No retained CDP messages match the current browser/target filters.</p></div><? } else { ?><table><thead><tr><th>Seq</th><th>Browser / Target</th><th>Type</th><th>Method</th><th>Bytes</th><th>Payload</th></tr></thead><tbody><? ring.forEach((m,i)=>{ const jid='browser-ring-'+i; ?><tr><td class=idcell>#<?= m.seq ?></td><td><code><?= m.browser ?></code><div class=muted><?= m.target||'browser-level' ?></div></td><td><?= m.type ?></td><td><code><?= m.method||'—' ?></code></td><td><?= it.bytes(m.bytes) ?></td><td><details><summary>JSON</summary><pre id="<?= jid ?>" class=json-editor-source hidden><?= it.pretty(m) ?></pre><div class="json-editor-host compact" data-json-source="<?= jid ?>"></div></details></td></tr><? }) ?></tbody></table><? } ?>`,
+    browser: `<? const d=it.data||{},ops=d.operations||[],ring=d.ring||[],cards=d.browsers||[],clicks=ops.filter(x=>x.method==='_.click').length,finds=ops.filter(x=>x.method==='_.find').length; ?><div class=row><select id=browserName><option value="">All browsers</option><? (d.browser_values||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= d.browser===name?' selected':'' ?>><?= name ?></option><? }) ?></select><select id=browserTarget><option value="">All targets</option><? (d.target_values||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= d.target===name?' selected':'' ?>><?= name ?></option><? }) ?></select><select id=browserContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=browserActive><option value="">Any connection state</option><option value=active<?= d.active==='active'?' selected':'' ?>>Active / connected</option><option value=inactive<?= d.active==='inactive'?' selected':'' ?>>Inactive / disconnected</option></select><button data-action=clear-browser-filters>🧹 Clear Filters</button></div><div class=grid><div class=card><div class=muted>Browser profiles</div><strong style="font-size:24px"><?= cards.length ?><?= Number(d.browser_total||0)>cards.length?'/'+d.browser_total:'' ?></strong></div><div class=card><div class=muted>Payload-retained cdp_call Tool Calls</div><strong style="font-size:24px"><?= d.tool_calls_total||0 ?></strong></div><div class=card><div class=muted>Visible operations</div><strong style="font-size:24px"><?= ops.length ?><?= d.operation_has_more?'+':'' ?></strong><div class=muted><?= clicks ?> click · <?= finds ?> find</div></div><div class=card><div class=muted>Retained CDP messages</div><strong style="font-size:24px"><?= ring.length ?></strong><div class=muted>after current filters</div></div></div><? if(!cards.length){ ?><div class=card><p class=muted>No browser profiles match the current filters.</p></div><? } else { ?><div class=grid><? cards.forEach(b=>{ ?><article class=card><div class=row><h3 class=grow style="margin:0"><code><?= b.browser ?></code></h3><b class="<?= b.active?'ok':'muted' ?>"><?= b.active?'🟢 connected':'⚪ disconnected' ?></b></div><div class=grid><div><span class=muted>Port</span><br><b><?= b.port||'—' ?></b></div><div><span class=muted>Logical targets</span><br><b><?= b.logical_target_count ?></b></div><div><span class=muted>Live CDP targets</span><br><b><?= b.live_target_count ?></b></div><div><span class=muted>Subscriptions</span><br><b><?= b.subscription_count ?></b></div><div><span class=muted>Ring</span><br><b><?= b.ring_count ?></b> · <?= it.bytes(b.ring_bytes) ?></div><div><span class=muted>Recorded sequence</span><br><b><?= b.recorded_sequence ?></b></div><div><span class=muted>Retained seq range</span><br><b><?= b.oldest_seq==null?'—':b.oldest_seq+'–'+b.newest_seq ?></b></div><div><span class=muted>Notifications / responses</span><br><b><?= b.notifications ?> / <?= b.responses ?></b></div><div><span class=muted>Stream resets</span><br><b class="<?= b.stream_resets?'pending':'muted' ?>"><?= b.stream_resets ?></b></div><div><span class=muted>Dropped</span><br><b class="<?= b.dropped?'failed':'muted' ?>"><?= b.dropped ?></b></div></div><div class=muted style="margin-top:8px"><? if(b.connection_mode==="websocket"){ ?>Direct WebSocket<? } else if(b.connection_mode==="http"){ ?>HTTP discovery<? } else if(b.connection_mode==="port"){ ?>Debugging port · <code><?= b.host ?>:<?= b.port ?></code><? } else { ?><?= b.headless?"Headless":"Visible" ?> · Profile <code><?= b.user_data_dir ?></code><? } ?><? if(b.connection_id){ ?> · connection <code><?= b.connection_id ?></code><? } ?><? if(b.pending){ ?> · <?= b.pending ?> pending<? } ?></div><? if((b.session_ids||[]).length){ ?><div class=muted>Recorded origins: <? b.session_ids.forEach((id,i)=>{ ?><?= i?', ':'' ?><span class=idcell>#<?= id ?></span><? }) ?></div><? } ?><? if((b.targets||[]).length){ ?><details><summary>Logical targets (<?= b.targets.length ?>)</summary><table><tr><th>Label</th><th>Target ID</th><th>Updated</th></tr><? b.targets.forEach(t=>{ ?><tr><td><code><?= t.target ?></code></td><td><code><?= t.target_id ?></code></td><td><?= it.logdt(t.updated_at) ?></td></tr><? }) ?></table></details><? } ?><? if((b.live_targets||[]).length){ ?><details><summary>Live CDP targets (<?= b.live_targets.length ?>)</summary><table><tr><th>Label</th><th>Type</th><th>Title / URL</th><th>Target / Session</th></tr><? b.live_targets.forEach(t=>{ ?><tr><td><? if(t.label){ ?><code><?= t.label ?></code><? } else { ?>—<? } ?></td><td><code><?= t.type||'—' ?></code></td><td><? if(t.title){ ?><div><?= t.title ?></div><? } ?><code><?= t.url||'—' ?></code></td><td><code><?= t.target_id||'—' ?></code><? if(t.session_id){ ?><div class=muted>session <code><?= t.session_id ?></code></div><? } ?></td></tr><? }) ?></table></details><? } ?><? if((b.subscriptions||[]).length){ const sid='browser-subs-'+b.browser.replace(/[^A-Za-z0-9_-]/g,'_'); ?><details><summary>Subscriptions (<?= b.subscriptions.length ?>)</summary><pre id="<?= sid ?>" class=json-editor-source hidden><?= it.pretty(b.subscriptions) ?></pre><div class="json-editor-host compact" data-json-source="<?= sid ?>"></div></details><? } ?></article><? }) ?></div><? } ?><div class=row><h3 class=grow>→ Recorded CDP sends</h3><span class=muted>scanned <?= d.operation_scan_calls||0 ?> of up to <?= d.operation_scan_limit||500 ?> recent Payload-retained cdp_call Tool Calls · stops after 200 matching operations</span></div><? if(!ops.length){ ?><div class=card><p class=muted>No recorded operations match the current filters.</p></div><? } else { ?><table><thead><tr><th>Time</th><th>Session</th><th>Browser / Target</th><th>Operation</th><th>State</th><th></th></tr></thead><tbody><? ops.forEach(o=>{ const jid='browser-call-'+o.log_id+'-'+o.call_index,rid=jid+'-response'; ?><tr><td class=nowrap><?= it.logdt(o.started_at) ?></td><td><? if(o.context_id){ ?><span class=idcell>#<?= o.context_id ?></span><? if(o.root_name){ ?><div class=workspace-label>📁 <?= o.root_name ?></div><? } ?><? } else { ?>—<? } ?></td><td><code><?= o.browser ?></code><div class=muted><?= o.target?('target '+o.target):'browser-level' ?></div></td><td><b><?= o.method||'unknown' ?></b><div class=muted>Tool Call #<?= o.log_id ?> · item <?= o.call_index+1 ?> · wait <?= o.wait?'true':'false' ?><? if(o.duration_ms!=null){ ?> · <?= o.duration_ms ?>ms<? } ?></div><? if((o.images||[]).length){ ?><div class=tool-content-grid><? o.images.forEach(c=>{ ?><img class=tool-content-preview src="<?= c.data_url ?>" alt="CDP screenshot preview"><? }) ?></div><? } ?><details><summary>Request JSON</summary><pre id="<?= jid ?>" class=json-editor-source hidden><?= it.pretty(o.call) ?></pre><div class="json-editor-host compact" data-json-source="<?= jid ?>"></div></details><? if(o.response){ ?><details><summary>Response JSON</summary><pre id="<?= rid ?>" class=json-editor-source hidden><?= it.pretty(o.response) ?></pre><div class="json-editor-host compact" data-json-source="<?= rid ?>"></div></details><? } ?></td><td><? if(o.success===true){ ?><div class=ok>success</div><? } else if(o.success===false){ ?><div class=failed>failed</div><? } else { ?><div class="<?= o.status ?>"><?= o.status ?></div><? } ?><div class=muted>Tool Call <?= o.status ?></div><div class="<?= o.active?'ok':'muted' ?>"><?= o.active?'browser connected':'browser disconnected' ?></div></td><td><button class=small data-action=replay-cdp data-id="<?= o.log_id ?>" data-index="<?= o.call_index ?>">▶ Replay</button></td></tr><? }) ?></tbody></table><? } ?><div class=row><h3 class=grow>← Retained CDP traffic</h3><span class=muted>existing bounded ring only; notifications appear only when retained by a live subscription · Session filter narrows relevant browsers, because ring events themselves are global</span></div><? if(!ring.length){ ?><div class=card><p class=muted>No retained CDP messages match the current browser/target filters.</p></div><? } else { ?><table><thead><tr><th>Seq</th><th>Browser / Target</th><th>Type</th><th>Method</th><th>Bytes</th><th>Payload</th></tr></thead><tbody><? ring.forEach((m,i)=>{ const jid='browser-ring-'+i; ?><tr><td class=idcell>#<?= m.seq ?></td><td><code><?= m.browser ?></code><div class=muted><?= m.target||'browser-level' ?></div></td><td><?= m.type ?></td><td><code><?= m.method||'—' ?></code></td><td><?= it.bytes(m.bytes) ?></td><td><details><summary>JSON</summary><pre id="<?= jid ?>" class=json-editor-source hidden><?= it.pretty(m) ?></pre><div class="json-editor-host compact" data-json-source="<?= jid ?>"></div></details></td></tr><? }) ?></tbody></table><? } ?>`,
     automation: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class=row><select id=automationContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><button data-action=clear-automation-filters>🧹 Clear Filters</button><span class="muted grow"><?= d.total||0 ?> Payload-retained desktop_auto Tool Call<?= Number(d.total||0)===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Automation Pages"><button class=page-button data-action=automation-page data-automation-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=automation-page data-automation-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=automation-page data-automation-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No automation runs match the current Session filter.</p></div><? } else { rows.forEach(r=>{ const scenarioId='automation-scenario-'+r.id,resultId='automation-result-'+r.id; ?><article class=card><div class=row><div class=grow><h3 style="margin:0">🖱️ Automation #<?= r.id ?></h3><div class=muted><?= it.logdt(r.started_at) ?> · <? if(r.context_id){ ?>Session #<?= r.context_id ?><? } else { ?>No Session<? } ?><? if(r.root_name){ ?> · 📁 <?= r.root_name ?><? } ?> · <?= r.duration_ms==null?'in flight':r.duration_ms+'ms' ?></div></div><b class="<?= r.status ?>"><?= r.status ?></b><button class=small data-action=replay-automation data-id="<?= r.id ?>">▶ Replay scenario</button></div><div class=grid><div><span class=muted>Engine results</span><br><b><?= r.results_count ?></b></div><div><span class=muted>Retained images</span><br><b><?= (r.images||[]).length ?></b></div><div><span class=muted>Retained binary items</span><br><b><?= (r.contents||[]).length ?></b></div></div><? if((r.actions||[]).length){ ?><details><summary>Scenario actions (<?= r.actions.length ?>)</summary><table><thead><tr><th>#</th><th>Action</th><th>Parameters</th></tr></thead><tbody><? r.actions.forEach(a=>{ ?><tr><td class=idcell>#<?= a.index ?></td><td><code><?= a.action ?></code></td><td><pre style="margin:0;white-space:pre-wrap"><?= it.pretty(a.params) ?></pre></td></tr><? }) ?></tbody></table></details><? } ?><? if((r.images||[]).length){ ?><div class=tool-content-grid><? r.images.forEach(c=>{ ?><article class=tool-content-card><div class=row><b class=grow><?= c.direction==='input'?'→ Input':'← Output' ?></b><span class=muted><?= it.bytes(c.bytes) ?></span></div><div class=tool-content-path><?= c.json_path ?></div><img class=tool-content-preview src="<?= c.data_url ?>" alt="Automation screenshot"></article><? }) ?></div><? } ?><details><summary>YAML scenario</summary><pre><?= r.yaml||'(empty)' ?></pre></details><? if(r.scenario!==null){ ?><details><summary>Parsed scenario</summary><pre id="<?= scenarioId ?>" class=json-editor-source hidden><?= it.pretty(r.scenario) ?></pre><div class=json-editor-host data-json-source="<?= scenarioId ?>"></div></details><? } else if(r.scenario_error){ ?><div class=failed><?= r.scenario_error ?></div><? } ?><details><summary>Returned state / results</summary><pre id="<?= resultId ?>" class=json-editor-source hidden><?= it.pretty(r.result||{}) ?></pre><div class=json-editor-host data-json-source="<?= resultId ?>"></div></details><? if((r.contents||[]).some(c=>!c.data_url)){ ?><details><summary>Other retained binary content</summary><? r.contents.filter(c=>!c.data_url).forEach(c=>{ ?><div><code><?= c.mime_type ?></code> · <?= it.bytes(c.bytes) ?> · <?= c.direction ?> · <code><?= c.json_path ?></code></div><? }) ?></details><? } ?><? if(r.error){ ?><pre class=failed><?= r.error ?></pre><? } ?></article><? }) } ?>`,
     published: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class=row><select id=publishedContext><option value="">All sessions</option><? (d.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(d.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=publishedSize><option value="">All sizes</option><option value=small<?= d.size==='small'?' selected':'' ?>>&lt; 1 MB</option><option value=medium<?= d.size==='medium'?' selected':'' ?>>1–10 MB</option><option value=large<?= d.size==='large'?' selected':'' ?>>10–100 MB</option><option value=huge<?= d.size==='huge'?' selected':'' ?>>≥ 100 MB</option></select><button data-action=clear-published-filters>🧹 Clear Filters</button></div><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> publication<?= d.total===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Published Pages"><button class=page-button data-action=published-page data-published-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=published-page data-published-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=published-page data-published-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No published items match the current filters.</p></div><? } else { ?><table class=published-table><thead><tr><th>Created</th><th>Resource</th><th>Published By</th><th>Published File</th><th>Activity</th><th>Source</th><th></th></tr></thead><tbody><? rows.forEach(r=>{ ?><tr><td class=nowrap><?= it.logdt(r.created_at) ?></td><td class=published-id><div class=nowrap>📦 <?= r.mime_type||'content' ?></div><code title="<?= r.id ?>"><?= r.id ?></code><? if(r.content_key){ ?><div class=published-file-meta title="<?= r.content_key ?>">key <?= r.content_key ?></div><? } ?></td><td class=http-session><? const refs=r.references||[]; if(refs.length){ refs.forEach(u=>{ ?><div class=published-reference><span class=idcell>#<?= u.context_id ?></span><? if(u.root_name){ ?> <span class=workspace-label title="<?= u.root_name ?>">📁 <?= u.root_name ?></span><? } ?></div><? }); } else { ?>—<? } ?></td><td><button class=published-open data-action=open-published data-id="<?= r.id ?>" title="<?= r.published_name ?> · Open public URL in browser"><code><?= r.published_name ?></code></button><? if(r.title){ ?><div class=published-file-meta><?= r.title ?></div><? } ?><? if(r.filename&&r.filename!==r.source_filename){ ?><div class=published-file-meta>Presented as: <?= r.filename ?></div><? } ?><? if(r.presentation&&r.presentation!=='auto'){ ?><div class=published-file-meta><?= r.presentation ?></div><? } ?></td><td class=published-activity><b><?= r.request_count||0 ?> req</b><div class=published-file-meta><?= it.bytes(r.size) ?></div><? if(r.last_request_at){ ?><div class=published-file-meta>last <?= it.logdt(r.last_request_at) ?></div><? } ?></td><td class=published-source><? const latest=(r.references||[])[0]; if(latest?.source_path){ ?><code title="<?= latest.source_path ?>"><?= latest.source_path ?></code><? } else if(r.source_path){ ?><code title="<?= r.source_path ?>"><?= r.source_path ?></code><? } else { ?><span class=muted>Direct content</span><? } ?><? if((r.reference_count||0)>1){ ?><div class=published-file-meta><?= r.reference_count ?> references</div><? } ?></td><td class=nowrap><button class="small danger" data-action=delete-published data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></tbody></table><? } ?>`,
     memory: `<? const d=it.data||{},rows=d.rows||[],items=it.pages(d.page||1,d.pages||1); ?><div class="row log-pagination"><span class="muted grow"><?= d.total||0 ?> memor<?= d.total===1?'y':'ies' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?></span><nav class=pagination aria-label="Memory Pages"><button class=page-button data-action=memory-page data-memory-page="<?= Math.max(1,(d.page||1)-1) ?>"<?= (d.page||1)<=1?' disabled':'' ?>>‹</button><? items.forEach(item=>{ if(item==='…'){ ?><span class=page-ellipsis>…</span><? } else { ?><button class="page-button<?= item===(d.page||1)?' active':'' ?>" data-action=memory-page data-memory-page="<?= item ?>"<?= item===(d.page||1)?' aria-current=page':'' ?>><?= item ?></button><? } }) ?><button class=page-button data-action=memory-page data-memory-page="<?= Math.min(d.pages||1,(d.page||1)+1) ?>"<?= (d.page||1)>=(d.pages||1)?' disabled':'' ?>>›</button></nav></div><? if(!rows.length){ ?><div class=card><p class=muted>No memories match the current filters.</p></div><? } else { ?><table><thead><tr><th>Set</th><th>Scope</th><th>Key</th><th>Value</th><th>TTL</th><th></th></tr></thead><tbody><? rows.forEach(r=>{ ?><tr><td class=nowrap><?= it.logdt(r.set_at) ?></td><td><? if(r.scope==='global'){ ?><span class=workspace-label>🌐 Global</span><? } else if(r.scope==='session'){ ?><span class=idcell>💬 #<?= r.owner_id ?></span><? } else { ?><span class=workspace-label>📁 <?= r.owner_name ?></span><? } ?></td><td><code><?= r.key ?></code></td><td><span class="descriptor-status <?= Number(r.is_json)?'current':'outdated' ?>"><?= Number(r.is_json)?'JSON':'TEXT' ?></span> <code title="Open View / Edit to inspect the complete value"><?= r.value_preview ?><?= String(r.value_json||'').length>320?'…':'' ?></code></td><td class=nowrap><? if(r.expires_at){ ?><?= r.ttl_seconds ?>s<div class=muted>until <?= it.logdt(r.expires_at) ?></div><? } else { ?><span class=muted>permanent</span><? } ?></td><td class=nowrap><button class=small data-action=edit-memory data-id="<?= r.id ?>">✏️ View / Edit</button> <button class="small danger" data-action=delete-memory data-id="<?= r.id ?>">🗑️ Delete</button></td></tr><? }) ?></tbody></table><? } ?>`,
@@ -9541,6 +10331,13 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   }
   function settingsFieldWarnings(settings = {}) {
     const warnings = {};
+    const goalMinutes = String(settings.chat_goal_timeout_minutes ?? "5").trim();
+    if (!/^\d+$/.test(goalMinutes) || Number(goalMinutes) < 1 || Number(goalMinutes) > 1440)
+      warnings.chat_goal_timeout_minutes = "Goal timeout must be whole minutes from 1 to 1440.";
+    for (const key of ["chat_goals_enabled", "chat_goal_headless", "chat_goal_disable_images", "chat_goal_stop_before_send", "chat_goal_match_on_startup"])
+      if (settings[key] != null && typeof settings[key] !== "boolean") warnings[key] = "Goal switches must be enabled or disabled.";
+    if (!["auto", "hide", "show"].includes(String(settings.chat_goal_windows_hide ?? "auto")))
+      warnings.chat_goal_windows_hide = "Process visibility must follow headless, hide or show.";
     const external = String(settings.external_url || "").trim();
     if (external) {
       try {
@@ -9633,7 +10430,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       const warnings = await currentUiRender(Promise.all(roots.map(async root => [Number(root.id), await rootPathWarning(root.path)])), generation);
       const byId = new Map(warnings);
       for (const context of projection.context_values || [])
-        context.workspace_warning = context.fallback_workspace ? "" : (byId.get(Number(context.workspace_id)) || "");
+        context.workspace_warning = !context.workspace_selected ? "" : (byId.get(Number(context.workspace_id)) || "");
     }
     if (section === "commands") {
       const current = uiState.commands;
@@ -9845,13 +10642,16 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       notifySession: "desktop_notifications_session", notifyWorkspace: "desktop_notifications_workspace",
       notifyToolCall: "desktop_notifications_tool_call", inheritSystemPath: "inherit_system_path",
       gitPreserveLineEndings: "git_preserve_line_endings", execEnvironment: "exec_environment",
+      chatGoalsEnabled: "chat_goals_enabled", chatGoalTimeoutMinutes: "chat_goal_timeout_minutes",
+      chatGoalHeadless: "chat_goal_headless", chatGoalWindowsHide: "chat_goal_windows_hide",
+      chatGoalDisableImages: "chat_goal_disable_images", chatGoalStopBeforeSend: "chat_goal_stop_before_send", chatGoalMatchOnStartup: "chat_goal_match_on_startup",
       textEncodingDetection: "text_encoding_detection",
       toolCallStorage: "tool_call_storage", toolCallPayloadMode: "tool_call_payload_mode",
       toolCallRetentionHours: "tool_call_retention_hours", toolCallMemoryRetentionMinutes: "tool_call_memory_retention_minutes",
     };
     if (settingsMap[id]) {
       uiState.settingsDraft ||= {};
-      uiState.settingsDraft[settingsMap[id]] = ["notifySession", "notifyWorkspace", "notifyToolCall", "inheritSystemPath", "gitPreserveLineEndings"].includes(id) ? !!checked : text;
+      uiState.settingsDraft[settingsMap[id]] = ["notifySession", "notifyWorkspace", "notifyToolCall", "inheritSystemPath", "gitPreserveLineEndings", "chatGoalsEnabled", "chatGoalHeadless", "chatGoalDisableImages", "chatGoalStopBeforeSend", "chatGoalMatchOnStartup"].includes(id) ? !!checked : text;
     }
     if (id === "telegramBotToken") uiState.telegramDraft = text;
   }
@@ -9990,8 +10790,22 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       case "delete-root":
         uiConfirm("Delete Workspace", "Delete this registered Workspace? Existing files are not removed.", "delete-root", { id: data.id });
         return;
+      case "stop-chat-goal": {
+        const context = contextById(serverConfig(), Number(data.id));
+        if (!context) throw new Error("Session not found");
+        setChatGoal(context, "", context.goal_timeout_seconds);
+        break;
+      }
+      case "open-chat-goal":
+        uiState.currentSection = "settings";
+        uiState.settingsTab = "goals";
+        break;
+      case "open-chat-goal-login": {
+        uiNotice(await chatGoalLogin(), "ok");
+        break;
+      }
       case "delete-context":
-        uiConfirm("Delete Session", "Delete this persistent MCP context? Running processes are not terminated.", "delete-context", { id: data.id });
+        uiConfirm("Delete Session", "Delete this persistent Session and stop its chat goal? Running processes are not terminated.", "delete-context", { id: data.id });
         return;
       case "assign-session-root":
         await uiInternalApi("/api/context/select", { method: "POST", body: {
@@ -10323,7 +11137,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       }
       case "settings-tab": {
         const tab = String(data.settingsTab || "");
-        if (["network", "security", "process", "files", "notifications", "maintenance"].includes(tab)) uiState.settingsTab = tab;
+        if (["network", "security", "process", "files", "goals", "notifications", "maintenance"].includes(tab)) uiState.settingsTab = tab;
         break;
       }
       case "save-settings": {
@@ -10339,6 +11153,13 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           inherit_system_path: !!values.inheritSystemPath,
           git_preserve_line_endings: !!values.gitPreserveLineEndings,
           exec_environment: String(values.execEnvironment || ""),
+          chat_goals_enabled: values.chatGoalsEnabled == null ? chatGoalsEnabled() : !!values.chatGoalsEnabled,
+          chat_goal_timeout_minutes: String(values.chatGoalTimeoutMinutes ?? chatGoalDefaultTimeout() / 60),
+          chat_goal_headless: values.chatGoalHeadless == null ? getCfg("chat_goal_headless", "0") === "1" : !!values.chatGoalHeadless,
+          chat_goal_disable_images: values.chatGoalDisableImages == null ? getCfg("chat_goal_disable_images", "0") === "1" : !!values.chatGoalDisableImages,
+          chat_goal_stop_before_send: values.chatGoalStopBeforeSend == null ? getCfg("chat_goal_stop_before_send", "0") === "1" : !!values.chatGoalStopBeforeSend,
+          chat_goal_match_on_startup: values.chatGoalMatchOnStartup == null ? getCfg("chat_goal_match_on_startup", "0") === "1" : !!values.chatGoalMatchOnStartup,
+          chat_goal_windows_hide: String(values.chatGoalWindowsHide ?? getCfg("chat_goal_windows_hide", "auto")),
           text_encoding_detection: String(values.textEncodingDetection ?? "sample"),
           tool_call_storage: String(values.toolCallStorage || "disk"),
           tool_call_payload_mode: String(values.toolCallPayloadMode || "payload"),
@@ -10728,6 +11549,16 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         if (x[key] != null) saveSetting(key, x[key]);
       for (const key of ["desktop_notifications_session", "desktop_notifications_workspace", "desktop_notifications_tool_call"])
         if (x[key] != null) saveSetting(key, x[key] ? "1" : "0");
+      if (x.chat_goals_enabled != null && saveSetting("chat_goals_enabled", x.chat_goals_enabled ? "1" : "0")) {
+        run("UPDATE contexts SET goal_revision=goal_revision+1,goal_error=CASE WHEN goal_status='matching' THEN 'Matching was interrupted. Call chat_set_goal again to retry matching.' ELSE goal_error END,goal_status=CASE WHEN goal_status='sending' THEN 'delivery_uncertain' WHEN goal_status='matching' THEN 'error' ELSE goal_status END WHERE goal_text<>''");
+      }
+      if (x.chat_goal_timeout_minutes != null) saveSetting("chat_goal_timeout_minutes", String(Number(x.chat_goal_timeout_minutes)));
+      if (x.chat_goal_headless != null) saveSetting("chat_goal_headless", x.chat_goal_headless ? "1" : "0");
+      if (x.chat_goal_disable_images != null) saveSetting("chat_goal_disable_images", x.chat_goal_disable_images ? "1" : "0");
+      if (x.chat_goal_stop_before_send != null) saveSetting("chat_goal_stop_before_send", x.chat_goal_stop_before_send ? "1" : "0");
+      if (x.chat_goal_match_on_startup != null) saveSetting("chat_goal_match_on_startup", x.chat_goal_match_on_startup ? "1" : "0");
+      if (x.chat_goal_windows_hide != null) saveSetting("chat_goal_windows_hide", String(x.chat_goal_windows_hide));
+      if (changedSettings.has("chat_goals_enabled") || changedSettings.has("chat_goal_timeout_minutes")) chatGoalConfigure();
       if (x.inherit_system_path != null) saveSetting("inherit_system_path", x.inherit_system_path ? "1" : "0");
       if (x.git_preserve_line_endings != null) saveSetting("git_preserve_line_endings", x.git_preserve_line_endings ? "1" : "0");
       if (x.text_encoding_detection != null) saveSetting("text_encoding_detection", String(x.text_encoding_detection));
@@ -11010,8 +11841,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       const like = `%${q}%`;
       return json(all(`WITH enriched AS (
         SELECT d.*, COALESCE(
-          CASE WHEN json_valid(d.request_body) THEN json_extract(d.request_body,'$.params.arguments.context_handle') END,
-          CASE WHEN json_valid(d.response_body) THEN json_extract(d.response_body,'$.result.structuredContent.context_handle') END,
+          CASE WHEN json_valid(d.request_body) THEN json_extract(d.request_body,'$.params.arguments.chat_session') END,
+          CASE WHEN json_valid(d.response_body) THEN json_extract(d.response_body,'$.result.structuredContent.chat_session') END,
           ''
         ) context_handle
         FROM debug_logs d
@@ -11031,8 +11862,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     let dm = u.pathname.match(/^\/api\/debug\/(\d+)$/);
     if (dm && req.method === "GET") return json(one(`WITH enriched AS (
       SELECT d.*, COALESCE(
-        CASE WHEN json_valid(d.request_body) THEN json_extract(d.request_body,'$.params.arguments.context_handle') END,
-        CASE WHEN json_valid(d.response_body) THEN json_extract(d.response_body,'$.result.structuredContent.context_handle') END,
+        CASE WHEN json_valid(d.request_body) THEN json_extract(d.request_body,'$.params.arguments.chat_session') END,
+        CASE WHEN json_valid(d.response_body) THEN json_extract(d.response_body,'$.result.structuredContent.chat_session') END,
         ''
       ) context_handle
       FROM debug_logs d WHERE d.id=?
@@ -11484,6 +12315,8 @@ listen(UI_RENDER_EVENT, event => {
   renewalTimer = setInterval(automaticRenewal, 60 * 60 * 1000);
   processCleanupTimer = setInterval(maintenance, 60 * 60 * 1000);
   await cleanupPublishedOrphans();
+  recoverChatGoals();
+  chatGoalConfigure();
   const readyPayload = {
     type: "ready",
     gui: IS_BACKEND_WORKER ? "index.html" : null,
@@ -11495,6 +12328,9 @@ listen(UI_RENDER_EVENT, event => {
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    if (chatGoalTimer) clearInterval(chatGoalTimer);
+    chatGoalLoginStop();
+    for (const monitor of [...chatGoalMonitors]) monitor.stop();
     for (const control of activeCallControls.values()) try { await control.cancel?.("SIGTERM", "server"); } catch {}
     activeCallControls.clear();
     if (renewalTimer) clearInterval(renewalTimer);
@@ -11509,7 +12345,7 @@ listen(UI_RENDER_EVENT, event => {
       try { record.ws.close(1000, "MrMCP shutdown"); } catch {}
       cdpDisconnect(record, "MrMCP shutdown");
     }
-    cdpBrowsers.clear(); cdpConnectPromises.clear(); cdpSubscriptions.clear();
+    cdpBrowsers.clear(); cdpBrowserOptions.clear(); cdpTargetOptions.clear(); cdpTargetReservations.clear(); cdpConnectPromises.clear(); cdpSubscriptions.clear();
     await Promise.allSettled(
       [...processes.values()]
         .filter(rec => ["starting", "running"].includes(rec.status))
