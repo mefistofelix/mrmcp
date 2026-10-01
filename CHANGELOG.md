@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.10.146
+
+- Fixed login recognition on ChatGPT’s current rich editor by supporting its composer machine attributes and separating authenticated recent-chat evidence from editor readiness. Opening Chrome no longer blocks GUI input; Goals shows explicit opening/checking/signed-in/sign-in-required/failure states and an independent monitoring status.
+- Added chat_goal_debug for current-Session association/status inspection, one immediate match/recheck, and a manual saved-goal send with an optional per-attempt Stop override. It shares normal delivery, cancellation and uncertain-send handling; confirmed submission resets the timer. SQLite schema remains 4.
+
 ## 0.10.145
 
 - Goals now load page images by default. Disable page images remains available in Settings → Goals and starts off for new configurations. Existing saved choices are preserved; changes apply on the next dedicated browser launch. SQLite schema remains 4.
