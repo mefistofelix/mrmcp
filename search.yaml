@@ -1,0 +1,9 @@
+# Search configuration; edited in Settings → Search or directly in this file.
+# No model is downloaded automatically. Fulltext works without embeddings.
+default_path: "" # Empty: OS Desktop/_default. Otherwise absolute or relative to the MrMCP directory.
+embedding:
+  provider: ollama # ollama | openai
+  endpoint: http://127.0.0.1:11434
+  model: ""
+  api_key: ""
+ocr: native # native | disabled; no Tesseract fallback

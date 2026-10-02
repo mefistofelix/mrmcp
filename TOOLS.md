@@ -16,7 +16,79 @@ Filesystem paths are relative to the Session's current Workspace unless the spec
 
 `structuredContent` remains the complete structured result. Filesystem tools, `tools_log`, `memory_find`, Workspace discovery, command discovery and `tools_schema` also return a short text summary of counts, failures and applicable continuation fields. Summaries are derived only from current result metadata; they never duplicate file contents, match snippets, fingerprints, nested payloads or complete JSON. Batch mutation summaries report both succeeded and failed entries, including all-failed batches; the per-entry statuses remain authoritative and the existing call-level completion semantics are unchanged.
 
-Choose `fs_glob` for paths, `fs_grep` for textual occurrences (including comments, strings and configuration), `fs_navigate` for next/previous matches in known files, and `fs_read` for known ranges. Batch independent reads. Request a few context lines when nearby source can avoid another read; the default remains zero. For symbol/caller/impact exploration, prefer a suitable available command from `discover_commands`, following its catalog description; the versioned catalog already includes Cymbal.
+Choose `fs_glob` for paths, `fs_grep` for textual occurrences (including comments, strings and configuration), `fs_navigate` for next/previous matches in known files, and `fs_read` for known ranges. Use `source_code_search` for Lucerna BM25 relevance search and AST symbols. Batch independent reads. Request a few context lines when nearby source can avoid another read; the default remains zero. For additional caller/impact exploration, prefer a suitable available command from `discover_commands`, following its catalog description; the versioned catalog already includes Cymbal.
+
+### `document_grep`
+
+Requires `chat_session`. Uses its selected Workspace, or Search `default_path` when none is selected. Empty/omitted `default_path` means OS Desktop/`_default`, created on the first search. This does not create or attach a Workspace; other file/process/kernel tools still require one. Xberg 1.3.2 extracts local documents; LanceDB 0.27.2 stores passages and performs fulltext/BM25 and vector search. The separate Lucerna tool provides lexical/AST source retrieval. On macOS Intel, extraction uses Xberg's public npm WASM initializer. Deno manages the package and its WASM/license; standalone builds embed that dependency and work without downloading it at runtime. Other supported platforms use native Xberg. There is no separate WASM asset under assets.
+
+| Argument | Behavior |
+|---|---|
+| `query` | Required nonempty text, up to 4,096 characters. |
+| `mode` | `auto` (default), `fulltext`, `vector` or `hybrid`. Auto uses hybrid when an embedding model is configured, otherwise fulltext. |
+| `path/include/exclude/gitignore/hidden` | Source-directory selection with globstar `**`, parent/nested ignore rules and negations. Gitignore defaults true; hidden defaults false. Symlinks are skipped. |
+| `mime[]` | Exact types or `type/*`; inferred from local filename extensions. |
+| `limit` | Default 10, maximum 100 hits. |
+| `max_files`, `max_file_bytes` | Defaults 1,000 files and 20 MiB per file; maxima 5,000 and 50 MiB. |
+
+Every call hashes current selected files. A changed hash or extraction version replaces only that file's passages; unchanged extraction and embeddings survive restart. Completed traversal prunes vanished/newly ignored paths only inside the requested path/glob/MIME selection. Incomplete traversal never prunes unseen paths. Other selections remain stored but cannot appear in results: both fulltext and vector queries filter current eligible files/chunks. Failed/oversized files are excluded even if an older snapshot exists. No background Workspace crawl runs.
+
+Functional indices and a hash/MIME manifest live under `.mrmcp/search/<hash-of-real-Workspace-path>/`; unassigned Sessions use `.mrmcp/search/_default/<hash-of-real-source-path>/`. These survive restart and Tool Call cleanup. Changing the default source directory gets a different hash and cannot expose an earlier directory’s stored results. Index mutation serializes only within the same Workspace. Vector tables are separated by provider/endpoint/model; changed/deleted selected files lose obsolete vectors. Fulltext requires no embedding provider. Ollama `/api/embed` and OpenAI-compatible `/embeddings` receive bounded batches; no model is downloaded automatically. Hybrid uses reciprocal-rank fusion (`k=60`).
+
+Calls read at most 64 MiB of selected source bytes, bound extracted text to 8 MiB per file and changed/vector-selected passages to 20,000, and bound returned traversal entries to 100,000. Passages contain at most 2,400 UTF-16 characters without splitting surrogate pairs. Output includes effective mode/gitignore, indexing/reuse/removal/scanning counts, truncation, total error count with at most 100 details, returned count and hits with id, Workspace-relative path, MIME, chunk number, text, extracted line bounds and score. PDF lines refer to extracted text rather than original page/source coordinates.
+
+Settings → **Search** shows the resolved fallback source folder and edits root `search.yaml`, containing `default_path` (empty for OS Desktop/`_default`, otherwise absolute or relative to the MrMCP directory), `embedding` (provider, endpoint, model, api_key) and `ocr` (native or disabled). Native OCR uses Auto.js public image/OCR APIs and the OS's installed recognition support, with no custom FFI wrapper or external OCR fallback. Standalone builds preserve existing YAML edits and use Application Support on macOS.
+
+Download subtitles with the catalog `yt-dlp` command and index the resulting Workspace files. This tool has no URL, transcript-download, proxy or audio-download integration. For example, execute `yt-dlp --skip-download --write-subs --write-auto-subs --sub-format vtt --sub-langs en.* --paths . URL`, then call `document_grep` with an appropriate file selection.
+
+### `proxy_get`
+
+Requires `chat_session`, with no selected Workspace. The configured global pool comes from **Settings → Proxies** / root `proxies.yaml`. The tool exposes three actions:
+
+- `action=pick` (default): select distinct eligible entries, default `limit=1`, maximum 50. `mode=round_robin` selects the least recently selected eligible proxy globally, using health to resolve ties; selection advances a persistent monotonic cursor. `mode=random` samples without replacement, weighted by `(successes+1)/(successes+failures+2)/(consecutive_failures+1)`. Both skip active cooldowns.
+- `action=list`: paginate configured/resolved order with `offset` (default 0, maximum 10,000), `limit` (default 20, maximum 50) and `next_offset`. Listing includes unavailable/cooled-down entries and never advances selection.
+- `action=report`: require a previously picked `proxy_id` and boolean `success`. Success increments successes and clears consecutive failures/cooldown. Failure increments failures/consecutive failures and applies `failure_cooldown_seconds * 2^previous_consecutive_failures`, capped at 24 hours. Optional `retry_after_seconds` (0–86,400) overrides that delay. Report does not fetch list sources. Report arguments on other actions and nonzero pick offsets are rejected.
+
+`include_direct` defaults true; false excludes the special `direct` entry representing a direct HTTP request. Explicit proxy entries accept HTTP(S), SOCKS5/SOCKS5H, bare host:port and optional URL credentials. Returned URLs include those credentials when configured. Proxy ids are SHA-256 of normalized entries; only ids, successes, failures, consecutive failures, selection/report timestamps and cooldowns are stored in the main SQLite `proxy_stats` table. Statistics are shared across Sessions, survive restart and Clear Operational Data, and never appear in the YAML pool file. No automatic network probe or outcome inference runs: callers must report the actual request outcome.
+
+`proxies.yaml` contains `proxies[]`, newline-list `proxy_lists[]`, `list_ttl_minutes` (default 60), `request_timeout_seconds` (15), `max_entries` (200) and `failure_cooldown_seconds` (30). It seeds direct access and two public list URLs. At most 20 sources and 2,000 configured entries/source URLs are allowed. Sources are fetched only during explicit pick/list calls, with a shared per-source fetch across concurrent callers, a 1 MiB response cap and memory TTL. Invalid/comment lines are skipped, normalized duplicates removed, configured order preserved and the final pool bounded. Source failures are reported without discarding other usable entries. Saving configuration clears source caches; no background fetch/probe runs.
+
+Output contains action/mode, total configured/resolved count, offset, returned count, next_offset, next_retry_at, proxies and source errors. Each proxy has proxy_id, proxy, available and stats. Report returns proxy=null because it updates by id without fetching the pool. If every entry is cooling down, pick returns an empty array plus the earliest next_retry_at; it does not wait. Pool membership/page offsets may change when remote lists refresh.
+
+Examples:
+
+`{"chat_session":"ctx_...","mode":"random","include_direct":false}`
+
+`{"chat_session":"ctx_...","action":"report","proxy_id":"<returned id>","success":false,"retry_after_seconds":120}`
+
+### `source_code_search`
+
+Requires `chat_session`. Uses its selected Workspace, or Search `default_path` when none is selected. Empty/omitted `default_path` means OS Desktop/`_default`, created on the first search. This does not create or attach a Workspace; other file/process/kernel tools still require one. Uses the public Lucerna 0.2.9 `TreeSitterChunker` and `Searcher` APIs. This build supports local **lexical BM25 and AST**, without semantic embeddings, remote providers, reranking or call-graph analysis. Code-aware tokenization keeps identifiers and splits camelCase/underscores. Queries are ordinary words/identifiers, not FTS query syntax or regular expressions.
+
+| Argument | Meaning |
+| --- | --- |
+| `action` | `search` (default), `map`, `files`, `chunks`, `stats`. |
+| `query` | Required for search. Results appear in relevance order with `matchType: lexical`. |
+| `path`, `include[]`, `exclude[]`, `hidden` | Same path-selection rules as filesystem tools, relative to `source_directory`. Include/exclude are relative to `path`; hidden defaults false. |
+| `file_path` | File relative to `source_directory`, required for chunks; a path/glob filter for search. |
+| `language`, `types[]` | Search filters by one/many languages and Lucerna chunk types. Language aliases include `c++` → `cpp`, `c#` → `csharp`, `js`/`jsx`, `ts`/`tsx`, `py`, `yml`, `sh`/`shell`, `ps1`, `md` and `objective-c`. Results use canonical names. Map accepts types. |
+| `include_content` | Default true; false omits source `content` and enriched `contextContent` from returned chunks. |
+| `limit`, `offset` | Stateless result pagination; defaults 10/0, limit up to 100. Reuse the selection/query and pass `next_offset` as offset. |
+| `max_files`, `max_file_bytes` | Indexing bounds: defaults 5,000 files and 1 MiB per file, maxima 10,000 and 2 MiB. Also capped at 32 MiB total selected source and 100,000 traversal entries. |
+
+`.gitignore` is **always enabled** and cannot be overridden. Uses the existing Workspace selector, including applicable parent rules, nested rules and negations. Symlinks are skipped. Every call reselects and hashes live eligible files. File hashes, AST chunks and a contentless SQLite FTS5/BM25 index persist in `lucerna.sqlite` under `.mrmcp/search/<hash-of-real-Workspace-path>/`, or `.mrmcp/search/_default/<hash-of-real-source-path>/` without a Workspace. Unchanged AST chunks are reused after restart; only changed selected files are parsed again. Completed traversal prunes missing/newly ignored files only inside that requested selection. Other scopes remain stored; incomplete traversal never prunes unseen paths. Failed, oversized, ignored and out-of-scope files cannot appear because results join the current eligible selection. No `.lucerna`, index database or configuration file is created in the source folder. Indices survive operational-history cleanup. Workspace `lucerna.config.ts` is never evaluated. Supported canonical languages: `javascript`, `typescript`, `json`, `markdown`, `go`, `c`, `cpp`, `zig`, `html`, `python`, `yaml`, `php`, `java`, `rust`, `csharp`, `kotlin`, `swift`, `ruby`, `bash`, `powershell`, `sql`, `css`, `scss`, `vue`, `svelte`, `toml`, `lua`, `r`, `scala`, `dart`, `perl`, `haskell`, `elixir`, `clojure`, `matlab`, `groovy`, `solidity`, `julia`, `ocaml`, `erlang`, `objc`. Common extensions include Go, C headers, C++ `.cpp/.cc/.cxx/.c++/.hpp/.hh/.hxx/.h++` (uppercase `.C` is C++), Zig, HTML/HTM, Python/PYI/PYW, YAML/YML and PHP/PHTML/PHPS/PHP3/PHP4/PHP5/PHP7/PHP8. Extension matching is case-insensitive except the conventional uppercase `.C` distinction. Languages detected by the pack without a Lucerna extractor are counted as unsupported. Grammar libraries are not embedded in the executable. The parser's public API initializes JavaScript, TypeScript and JSON on first use and downloads additional supported grammars when selected files need them; Markdown uses its grammar-free extractor. These libraries use the package's normal OS cache, independently of the MrMCP index. Standalone builds retain only their target's native parser binding.
+
+Both retrieval tools return absolute `source_directory` and `index_directory`, plus `workspace_selected`; false means the Session stayed unassigned and used the default source folder. Search-index storage cannot be used as input files. Source results also report `reindexed_files`, `unchanged_files`, `removed_files` and `scanned_files`.
+
+The result includes `mode: lexical`, `gitignore: true`, scope `path`, indexed file/chunk counts, skipped oversized/unsupported counts, total `error_count` plus at most 100 error details, indexing `truncation_reason`, result `returned` and `next_offset`. `truncated` means an indexing bound was reached or another result page exists; skipped files and errors also indicate incomplete coverage. `data.results` contains search hits (`chunk`, `matchType`), chunks, symbol-map entries or file paths according to action. `data.stats` contains counts and language breakdown. Chunk IDs remain stable for unchanged content. Distinct symbols sharing Lucerna's file/start-line ID receive deterministic distinct IDs; their original ID is retained in `metadata.lucerna_id`. Native Lucerna chunk fields retain `id`, source-directory-relative `filePath`, `language`, `type`, optional `name`, and one-based `startLine`/`endLine`; use filesystem tools to obtain edit fingerprints.
+
+```json
+{"chat_session":"ctx_...","query":"authentication middleware","types":["function","method"],"limit":10}
+{"chat_session":"ctx_...","action":"map","include_content":false,"limit":50}
+{"chat_session":"ctx_...","action":"chunks","file_path":"src/auth.ts"}
+```
+
+The compatible parser is pinned to 1.6.2; current newer npm native packages are not usable on the tested Deno/Windows runtime. The Intel macOS companion is provided as a normal npm dependency. Do not infer caller/semantic capabilities from lexical hits. Refresh the connector and test this new tool from a new chat/branch after updating the executable.
 
 ### Stateless filesystem navigation
 
@@ -246,7 +318,7 @@ Creates one new persistent chat Session without opening or creating a Workspace.
 
 Arguments: none. Returns `chat_session`; call once per chat and reuse a valid existing value instead of initializing again. Sessions expire after 30 days without activity. Initialization and its Tool Call history are associated with the new Session.
 
-Workspace-dependent file operations, `workspace_dev_preferences_write`, new `exec`/`exec_start` or custom commands and JavaScript kernels require `open_workspace` first. Existing process follow-ups remain scoped to the same Session and work after Workspace removal. Desktop/CDP, discovery, diagnostics, memory, Telegram and `publish(text|base64)` require only the Session; `publish(path)` requires a Workspace.
+`document_grep` and `source_code_search` use the configured fallback source folder when no Workspace is selected. Workspace-dependent file operations, `workspace_dev_preferences_write`, new `exec`/`exec_start` or custom commands and JavaScript kernels require `open_workspace` first. Existing process follow-ups remain scoped to the same Session and work after Workspace removal. Desktop/CDP, discovery, diagnostics, memory, Telegram and `publish(text|base64)` require only the Session; `publish(path)` requires a Workspace.
 
 ### `list_workspaces`
 
@@ -743,6 +815,16 @@ Storage and payload are orthogonal: `Memory + Payload`, `Disk + Metadata`, etc. 
 ---
 
 ## Command discovery and diagnostics
+
+### Platform-aware command catalog
+
+The authoritative file is root `commands.yaml`. Each entry has `logical_name`, description, optional documentation_url and shared optional path/download_url/archive_path. `platforms` maps `windows-x86_64`, `linux-x86_64`, `darwin-x86_64`, `darwin-aarch64` (also aarch64 Windows/Linux) or OS-only keys to path/download_url/archive_path overrides. Exact OS/CPU wins over an OS-only fallback. Omitted fields inherit shared values; explicit empty download_url disables download. An empty/absent platform mapping uses shared values; a nonempty mapping with no matching key marks that command unsupported. Missing download URLs permit manually installed executables; no source build/package-manager install is inferred.
+
+Discovery, logical exec resolution, GUI availability and Download/Download All use the selected current-platform variant. YAML order and every platform definition survive edits to another command. The command dialog exposes shared fields plus the complete platform YAML with inline validation. Download supports direct binaries, ZIP and TAR/TAR.GZ/TGZ; it installs only the selected regular-file payload below `.mrmcp/bin`, never an archive tree or TAR symlink. `archive_path` selects an exact archive member; otherwise an unambiguous executable basename is required. Unix installs are chmod 0755. Existing files require the existing overwrite confirmation. Unsupported platform variants are never downloaded or executed.
+
+The default catalog includes native `yt-dlp` variants for Windows x64, Linux x64 and both macOS CPUs. `libgen-cli` is metadata for a manually supplied Go-built binary: upstream has no published releases. Its descriptor documents the upstream Go install command; MrMCP does not install Go or compile source automatically.
+
+`camoufox` is a manual full-bundle entry: extract the upstream browser ZIP under `.mrmcp/bin/camoufox`, preserving its libraries/resources and macOS `Camoufox.app` structure. Its variants resolve `camoufox.exe` on Windows x64, `camoufox-bin` on Linux x64/arm64 and `Camoufox.app/Contents/MacOS/camoufox` on macOS x64/arm64. The release page is linked as documentation; no single-executable download is offered for this multi-file browser. Registration never downloads or launches it and does not alter the Chromium CDP integration.
 
 ### `discover_commands`
 

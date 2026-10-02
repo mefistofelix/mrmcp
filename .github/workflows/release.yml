@@ -42,25 +42,124 @@ jobs:
       - name: Check source
         run: deno check --minimum-dependency-age=0 mrmcp.js
 
-      - name: Prepare output directory
-        run: mkdir -p dist
+      - name: Verify native Lucerna AST parser
+        run: |
+          deno eval --minimum-dependency-age=0 '
+          import pin from "npm:@kreuzberg/tree-sitter-language-pack@1.6.2/package.json" with { type: "json" };
+          import mac from "npm:@kreuzberg/tree-sitter-language-pack-darwin-x64@1.10.9/package.json" with { type: "json" };
+          const { TreeSitterChunker } = await import("npm:@upstart.gg/lucerna@0.2.9");
+          const parser = new TreeSitterChunker();
+          try {
+            await parser.initialize();
+            const chunks = await parser.chunkSource("export function lucernaSmoke(x) { return x; }", "smoke.js", "smoke", "javascript");
+            if (!chunks.some(chunk => chunk.name === "lucernaSmoke")) throw new Error("Native Lucerna AST extraction failed");
+          } finally { await parser.close(); }
+          '
+
+      - name: Verify document extraction and LanceDB
+        run: |
+          deno eval --minimum-dependency-age=0 '
+          const bytes = new TextEncoder().encode("Searchable document smoke");
+          let content;
+          if (Deno.build.os === "darwin" && Deno.build.arch === "x86_64") {
+            const x = await import("npm:@xberg-io/xberg-wasm@1.3.2");
+            await x.default();
+            const c = x.WasmExtractionConfig.default(); c.disableOcr = true;
+            const r = await x.extract(x.WasmExtractInput.fromBytes(bytes, "text/plain"), c);
+            const documents = r.results; content = documents[0]?.content;
+            documents.forEach(v => v.free()); r.free();
+          } else {
+            const x = await import("npm:@xberg-io/xberg@1.3.2");
+            content = (await x.extract({kind: "bytes", bytes, mimeType: "text/plain"}, {disableOcr: true})).results[0]?.content;
+          }
+          if (content !== "Searchable document smoke") throw new Error("Xberg extraction failed");
+          const l = await import("npm:@lancedb/lancedb@0.27.2");
+          const directory = await Deno.makeTempDir();
+          try {
+            const db = await l.connect(directory);
+            const table = await db.createTable("smoke", [{id: "a", text: content, vector: [1, 0]}, {id: "b", text: "other", vector: [0, 1]}]);
+            await table.createIndex("text", {config: l.Index.fts()});
+            if ((await table.search("Searchable").limit(1).toArray())[0]?.id !== "a") throw new Error("Fulltext query failed");
+            if ((await table.search([1, 0]).limit(1).toArray())[0]?.id !== "a") throw new Error("Vector query failed");
+          } finally { await Deno.remove(directory, {recursive: true}); }
+          '
+
+      - name: Prepare target-specific embedded files
+        shell: bash
+        run: |
+          set -euo pipefail
+          deno eval --minimum-dependency-age=0 '
+          const info = await new Deno.Command(Deno.execPath(), {
+            args: ["info", "--json", "--minimum-dependency-age=0", "mrmcp.js"], stdout: "piped", stderr: "inherit",
+          }).output();
+          if (!info.success) throw new Error("Cannot inspect build dependencies");
+          const packages = Object.values(JSON.parse(new TextDecoder().decode(info.stdout)).npmPackages);
+          const packagePath = name => {
+            const directory = packages.find(entry => entry.name === name)?.localPath;
+            if (!directory) throw new Error(`Cannot locate ${name}`);
+            return directory;
+          };
+          const shell = packagePath("@mefistofelix/tauriless");
+          const parser = packagePath("@kreuzberg/tree-sitter-language-pack");
+          const companion = packagePath("@kreuzberg/tree-sitter-language-pack-darwin-x64");
+          const wasm = packagePath("@xberg-io/xberg-wasm");
+          const targets = {
+            "x86_64-pc-windows-msvc": ["win32-x64", "ts-pack-node.win32-x64-msvc.node"],
+            "x86_64-unknown-linux-gnu": ["linux-x64", "ts-pack-node.linux-x64-gnu.node"],
+            "x86_64-apple-darwin": ["darwin-x64", null],
+            "aarch64-apple-darwin": ["darwin-arm64", "ts-pack-node.darwin-arm64.node"],
+          };
+          const exclusions = {};
+          for (const [target, [native, binding]] of Object.entries(targets)) {
+            const paths = [];
+            if (!(await Deno.stat(`${shell}/native/${native}`)).isDirectory) throw new Error(`Missing Tauriless target ${native}`);
+            const parserFile = binding ? `${parser}/${binding}` : `${companion}/ts-pack-core-node.darwin-x64.node`;
+            if (!(await Deno.stat(parserFile)).isFile) throw new Error(`Missing parser target ${target}`);
+            for await (const entry of Deno.readDir(`${shell}/native`)) {
+              if (entry.isDirectory && entry.name !== native) paths.push(`${shell}/native/${entry.name}`);
+            }
+            for await (const entry of Deno.readDir(parser)) {
+              if (entry.isFile && entry.name.endsWith(".node") && entry.name !== binding) paths.push(`${parser}/${entry.name}`);
+            }
+            if (target !== "x86_64-apple-darwin") {
+              for await (const entry of Deno.readDir(companion)) {
+                if (entry.isFile && entry.name.endsWith(".node")) paths.push(`${companion}/${entry.name}`);
+              }
+              paths.push(`${wasm}/pkg/web/xberg_wasm_bg.wasm`);
+            }
+            exclusions[target] = paths;
+          }
+          await Deno.mkdir("dist", {recursive: true});
+          await Deno.writeTextFile("dist/compile-exclusions.json", JSON.stringify(exclusions));
+          for (const [target, paths] of Object.entries(exclusions)) {
+            await Deno.writeTextFile(`dist/exclude-${target}.txt`, paths.join("\n") + "\n");
+          }
+          '
 
       - name: Build Linux x64
-        run: >-
-          deno compile --minimum-dependency-age=0 -A --unstable-ffi
-          --target x86_64-unknown-linux-gnu
-          --include assets --include commands.yaml --include guided_prompts.yaml
-          --output dist/mrmcp-linux-x64
-          mrmcp.js
+        shell: bash
+        run: |
+          set -euo pipefail
+          exclude_args=()
+          while IFS= read -r path; do exclude_args+=(--exclude "$path"); done < "dist/exclude-x86_64-unknown-linux-gnu.txt"
+          deno compile --minimum-dependency-age=0 -A --unstable-ffi \
+            --target x86_64-unknown-linux-gnu \
+            --include LICENSE --include assets --include commands.yaml --include guided_prompts.yaml --include search.yaml --include proxies.yaml \
+            "${exclude_args[@]}" \
+            --output dist/mrmcp-linux-x64 mrmcp.js
 
       - name: Build Windows x64
-        run: >-
-          deno compile --minimum-dependency-age=0 -A --unstable-ffi
-          --target x86_64-pc-windows-msvc
-          --no-terminal --icon assets/mrmcp.ico
-          --include assets --include commands.yaml --include guided_prompts.yaml
-          --output dist/mrmcp-windows-x64.exe
-          mrmcp.js
+        shell: bash
+        run: |
+          set -euo pipefail
+          exclude_args=()
+          while IFS= read -r path; do exclude_args+=(--exclude "$path"); done < "dist/exclude-x86_64-pc-windows-msvc.txt"
+          deno compile --minimum-dependency-age=0 -A --unstable-ffi \
+            --target x86_64-pc-windows-msvc \
+            --no-terminal --icon assets/mrmcp.ico \
+            --include LICENSE --include assets --include commands.yaml --include guided_prompts.yaml --include search.yaml --include proxies.yaml \
+            "${exclude_args[@]}" \
+            --output dist/mrmcp-windows-x64.exe mrmcp.js
 
       - name: Stage Windows and Linux assets
         uses: actions/upload-artifact@v4
@@ -109,6 +208,101 @@ jobs:
           test -n "$version"
           test "$version" = "$RELEASE_TAG"
 
+      - name: Verify native Lucerna AST parser
+        run: |
+          deno eval --minimum-dependency-age=0 '
+          import pin from "npm:@kreuzberg/tree-sitter-language-pack@1.6.2/package.json" with { type: "json" };
+          import mac from "npm:@kreuzberg/tree-sitter-language-pack-darwin-x64@1.10.9/package.json" with { type: "json" };
+          const { TreeSitterChunker } = await import("npm:@upstart.gg/lucerna@0.2.9");
+          const parser = new TreeSitterChunker();
+          try {
+            await parser.initialize();
+            const chunks = await parser.chunkSource("export function lucernaSmoke(x) { return x; }", "smoke.js", "smoke", "javascript");
+            if (!chunks.some(chunk => chunk.name === "lucernaSmoke")) throw new Error("Native Lucerna AST extraction failed");
+          } finally { await parser.close(); }
+          '
+
+      - name: Verify document extraction and LanceDB
+        run: |
+          deno eval --minimum-dependency-age=0 '
+          const bytes = new TextEncoder().encode("Searchable document smoke");
+          let content;
+          if (Deno.build.os === "darwin" && Deno.build.arch === "x86_64") {
+            const x = await import("npm:@xberg-io/xberg-wasm@1.3.2");
+            await x.default();
+            const c = x.WasmExtractionConfig.default(); c.disableOcr = true;
+            const r = await x.extract(x.WasmExtractInput.fromBytes(bytes, "text/plain"), c);
+            const documents = r.results; content = documents[0]?.content;
+            documents.forEach(v => v.free()); r.free();
+          } else {
+            const x = await import("npm:@xberg-io/xberg@1.3.2");
+            content = (await x.extract({kind: "bytes", bytes, mimeType: "text/plain"}, {disableOcr: true})).results[0]?.content;
+          }
+          if (content !== "Searchable document smoke") throw new Error("Xberg extraction failed");
+          const l = await import("npm:@lancedb/lancedb@0.27.2");
+          const directory = await Deno.makeTempDir();
+          try {
+            const db = await l.connect(directory);
+            const table = await db.createTable("smoke", [{id: "a", text: content, vector: [1, 0]}, {id: "b", text: "other", vector: [0, 1]}]);
+            await table.createIndex("text", {config: l.Index.fts()});
+            if ((await table.search("Searchable").limit(1).toArray())[0]?.id !== "a") throw new Error("Fulltext query failed");
+            if ((await table.search([1, 0]).limit(1).toArray())[0]?.id !== "a") throw new Error("Vector query failed");
+          } finally { await Deno.remove(directory, {recursive: true}); }
+          '
+
+
+      - name: Prepare target-specific embedded files
+        shell: bash
+        run: |
+          set -euo pipefail
+          deno eval --minimum-dependency-age=0 '
+          const info = await new Deno.Command(Deno.execPath(), {
+            args: ["info", "--json", "--minimum-dependency-age=0", "mrmcp.js"], stdout: "piped", stderr: "inherit",
+          }).output();
+          if (!info.success) throw new Error("Cannot inspect build dependencies");
+          const packages = Object.values(JSON.parse(new TextDecoder().decode(info.stdout)).npmPackages);
+          const packagePath = name => {
+            const directory = packages.find(entry => entry.name === name)?.localPath;
+            if (!directory) throw new Error(`Cannot locate ${name}`);
+            return directory;
+          };
+          const shell = packagePath("@mefistofelix/tauriless");
+          const parser = packagePath("@kreuzberg/tree-sitter-language-pack");
+          const companion = packagePath("@kreuzberg/tree-sitter-language-pack-darwin-x64");
+          const wasm = packagePath("@xberg-io/xberg-wasm");
+          const targets = {
+            "x86_64-pc-windows-msvc": ["win32-x64", "ts-pack-node.win32-x64-msvc.node"],
+            "x86_64-unknown-linux-gnu": ["linux-x64", "ts-pack-node.linux-x64-gnu.node"],
+            "x86_64-apple-darwin": ["darwin-x64", null],
+            "aarch64-apple-darwin": ["darwin-arm64", "ts-pack-node.darwin-arm64.node"],
+          };
+          const exclusions = {};
+          for (const [target, [native, binding]] of Object.entries(targets)) {
+            const paths = [];
+            if (!(await Deno.stat(`${shell}/native/${native}`)).isDirectory) throw new Error(`Missing Tauriless target ${native}`);
+            const parserFile = binding ? `${parser}/${binding}` : `${companion}/ts-pack-core-node.darwin-x64.node`;
+            if (!(await Deno.stat(parserFile)).isFile) throw new Error(`Missing parser target ${target}`);
+            for await (const entry of Deno.readDir(`${shell}/native`)) {
+              if (entry.isDirectory && entry.name !== native) paths.push(`${shell}/native/${entry.name}`);
+            }
+            for await (const entry of Deno.readDir(parser)) {
+              if (entry.isFile && entry.name.endsWith(".node") && entry.name !== binding) paths.push(`${parser}/${entry.name}`);
+            }
+            if (target !== "x86_64-apple-darwin") {
+              for await (const entry of Deno.readDir(companion)) {
+                if (entry.isFile && entry.name.endsWith(".node")) paths.push(`${companion}/${entry.name}`);
+              }
+              paths.push(`${wasm}/pkg/web/xberg_wasm_bg.wasm`);
+            }
+            exclusions[target] = paths;
+          }
+          await Deno.mkdir("dist", {recursive: true});
+          await Deno.writeTextFile("dist/compile-exclusions.json", JSON.stringify(exclusions));
+          for (const [target, paths] of Object.entries(exclusions)) {
+            await Deno.writeTextFile(`dist/exclude-${target}.txt`, paths.join("\n") + "\n");
+          }
+          '
+
       - name: Build MrMCP.app
         shell: bash
         run: |
@@ -116,9 +310,12 @@ jobs:
           app="dist/MrMCP.app"
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 
+          exclude_args=()
+          while IFS= read -r path; do exclude_args+=(--exclude "$path"); done < "dist/exclude-${TARGET}.txt"
           deno compile --minimum-dependency-age=0 -A --unstable-ffi \
             --target "$TARGET" \
-            --include assets --include commands.yaml --include guided_prompts.yaml \
+            "${exclude_args[@]}" \
+            --include LICENSE --include assets --include commands.yaml --include guided_prompts.yaml --include search.yaml --include proxies.yaml \
             --output "$app/Contents/MacOS/MrMCP" \
             mrmcp.js
           chmod 755 "$app/Contents/MacOS/MrMCP"

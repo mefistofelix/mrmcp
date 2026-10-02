@@ -14,3 +14,7 @@
 !/.github/workflows/release.yml
 !/assets/
 !/assets/**
+
+!/search.yaml
+
+!proxies.yaml

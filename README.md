@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.146
+# MrMCP 0.10.149
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated `/mcp` endpoint, Workspace-scoped Sessions, filesystem and process tools, OAuth/Basic authentication, TLS automation, and a local Tauriless administration UI.
 
@@ -15,9 +15,12 @@ MrMCP is a stateless Model Context Protocol server implemented in Deno. It expos
 - Low-level Chrome DevTools Protocol control through [`@mefistofelix/cdp.js`](https://github.com/mefistofelix/cdp.js) using always-batched `cdp_call`, with persistent browser/profile and logical page labels plus subscription/poll access to CDP notifications; the local Browser page summarizes existing profile/target/ring/subscription state; recorded request/response inspection and Replay are available for **Payload-retained** Tool Calls only.
 - Explicit persistent Global/Session/Workspace key-value memory through `memory_find` and `memory_set`, with explicitly typed JSON/text values, TTL and a local Memory manager.
 - Filesystem, text search/editing, reversible trash and generated-file publishing.
+- Persistent local Lucerna BM25 source-code search and AST navigation through `source_code_search`, covering 41 languages including Go, C/C++, Zig, HTML, Python, YAML and PHP, with `.gitignore` always enabled, symbol maps, file/chunk inspection and stateless result pagination. Grammars download lazily into the OS cache. Embeddings and call-graph analysis are not enabled in this build.
+- Incremental document retrieval through `document_grep`: Xberg extraction, LanceDB fulltext/vector/hybrid search, globstar/MIME/`.gitignore` scopes, native OS OCR. Settings → Search edits `search.yaml`; fulltext works immediately, while vector/hybrid require an embedding model.
 - Foreground and persistent processes with progress streaming when requested.
 - Persistent JavaScript kernels scoped to Session + Workspace.
-- Extra command catalog through `commands.yaml`.
+- Extra command catalog through `commands.yaml`, with OS/CPU variants, native yt-dlp downloads and libgen-cli metadata.
+- `proxy_get` provides paginated proxy discovery, weighted random/round robin selection and persistent reported outcome statistics. Settings → Proxies edits `proxies.yaml`.
 - User-managed MCP guided prompts through `guided_prompts.yaml`, with Eta templates, two editable starter examples (one argument-free and one parameterized), and a built-in template/model help view.
 - OAuth and Basic authentication.
 - Automatic TLS/certificate handling.
@@ -52,6 +55,8 @@ deno run -A mrmcp.js --add-workspace "Workspace name" "/path/to/workspace"
 ```
 
 The desktop UI is local-only and opens no GUI TCP listener. Public MCP/OAuth traffic uses HTTP/HTTPS listeners; occupied base ports fall back in `+50` steps without rewriting configuration.
+
+Document and source search also work without an open Workspace: Search `default_path` defaults to Desktop/`_default`, created on the first search. Both indices persist under `.mrmcp/search`, with a separate `_default` namespace and one hash per real source path. This leaves the Session unassigned; ordinary file/process tools still need a Workspace. Settings → Search shows the effective default source path.
 
 Settings shows the absolute **Data Directory** path in every tab. Portable builds keep `.mrmcp` beside the executable; source mode keeps it beside `mrmcp.js`; the macOS app uses `~/Library/Application Support/MrMCP/.mrmcp`.
 
@@ -162,14 +167,18 @@ The macOS app is currently ad-hoc signed; warning-free first launch of an Intern
 - `mrmcp.js` — server, tools, SQLite, local UI and desktop launcher.
 - `commands.yaml` — editable extra-command catalog.
 - `guided_prompts.yaml` — editable MCP guided-prompt catalog and Eta templates.
+- `proxies.yaml` — proxy entries, public list sources and cooldown configuration, editable in Settings → Proxies.
+- `search.yaml` — document search, embeddings and native OCR configuration, editable in Settings → Search.
 - `README.md` — current user/operator overview.
 - `CHANGELOG.md` — release history.
 - `AGENTS.md` — implementation invariants, server-authoritative Web GUI/Morphlex/state/channel rules and release checks.
-- `LICENSE` — MIT license.
+- `LICENSE` — MIT license for MrMCP and JSONEditor third-party license notice/text.
 - `.github/workflows/` — release and native macOS GUI test workflows.
 - `assets/` — Morphlex, branding, icons and screenshots.
 
-Runtime data lives under `.mrmcp`. Packaged macOS builds keep mutable state, `commands.yaml` and `guided_prompts.yaml` under `~/Library/Application Support/MrMCP/` rather than inside the application bundle.
+Runtime data lives under `.mrmcp`. Packaged macOS builds keep mutable state, `commands.yaml`, `guided_prompts.yaml`, `search.yaml` and `proxies.yaml` under `~/Library/Application Support/MrMCP/` rather than inside the application bundle. Document indices live under `.mrmcp/search/` and survive operational history cleanup. Fulltext works without an embedding provider; configure the endpoint/model in Settings → Search for vector/hybrid search. Use the catalog yt-dlp command to download subtitles, then index the saved Workspace files. Proxy outcomes must be reported explicitly through proxy_get. Native OCR depends on the OS's installed recognition support.
+
+Proxy statistics use SQLite schema 5. Older databases require the normal Start Fresh recovery, which archives the previous data directory. Existing editable YAML catalogs are preserved; update their platform definitions manually when keeping an older catalog.
 
 ## Changelog
 
@@ -177,4 +186,4 @@ See [CHANGELOG.md](./CHANGELOG.md).
 
 ## License
 
-MrMCP is licensed under the [MIT License](./LICENSE). Third-party components retain their respective licenses.
+MrMCP is licensed under the [MIT License](./LICENSE). The same file retains JSONEditor's Apache-2.0 notice and full license text; dependencies retain their respective licenses.

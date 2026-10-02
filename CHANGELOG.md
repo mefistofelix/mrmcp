@@ -1,5 +1,36 @@
 # Changelog
 
+## 0.10.151
+
+- Make the 41 public Lucerna source extractors explicit in the tool contract, including Go, C/C++, Zig, HTML, Python, YAML and PHP. Add common extension aliases and case-insensitive detection, preserving uppercase .C as C++. Accept canonical language/filter aliases and skip detected languages without an extractor. Grammar loading remains lazy; persistent selected files refresh once for the new recognition signature. Disambiguate colliding Lucerna chunk IDs for distinct symbols on the same source line without changing the database schema.
+
+## 0.10.150
+
+- Consolidate the JSONEditor third-party notice and complete Apache-2.0 text into root LICENSE alongside MrMCP MIT, remove the separate asset license file and include root LICENSE in every standalone build.
+- Persist Lucerna AST chunks, file hashes and SQLite FTS5/BM25 indices under `.mrmcp/search`, reusing unchanged parsing after restart. Refresh and completed-traversal pruning remain confined to the requested selection; queries exclude stale, failed and out-of-scope files. Indices survive operational-history cleanup.
+- Allow document_grep and source_code_search without a selected Workspace through Search default_path, initially OS Desktop/`_default`. The folder is created lazily, default indices have their own `_default` namespace, effective paths are returned and shown in Settings, and the Session stays unassigned. Main SQLite schema remains 5.
+
+## 0.10.149
+
+- Load macOS Intel Xberg WASM through the npm package's public initializer and Deno-managed package filesystem, removing the duplicate WASM asset and license copy from the repository. The upstream license remains included in the dependency; standalone use needs no runtime download.
+- Reduced standalone builds by excluding Tauriless and Tree-sitter native bindings for other platforms, and Xberg WASM outside macOS Intel. Dependencies and public runtime APIs remain unchanged.
+- Registered Camoufox with platform-specific full-bundle executable paths and upstream release documentation. Installation remains manual because the command downloader installs individual executable payloads; no browser download or launch is triggered by catalog registration.
+- Removed YouTube transcript/caption/audio acquisition from document_grep and Xberg integration. Search configuration now covers extraction/OCR/embeddings; download subtitles through the catalog yt-dlp command before indexing local files.
+- Added platform variants to commands.yaml and all catalog resolution/GUI/save/download paths, with direct binary, ZIP and TAR/TAR.GZ/TGZ support. Populated verified OS/CPU download variants and added yt-dlp plus libgen-cli metadata (upstream has no release binaries).
+- Added proxy_get for paginated pool discovery, stats-weighted random and persistent round robin picks, and explicit success/failure reports with cooldowns. Settings → Proxies edits root proxies.yaml with public list seeds; stats live only in proxy_stats, survive cleanup/restart and require schema 5. Older data uses the existing archive/Start Fresh gate.
+
+
+## 0.10.148
+
+- Added `document_grep` with Xberg document extraction and persistent LanceDB fulltext/vector/hybrid retrieval. Incremental refresh and pruning are confined to each call's globstar/MIME/gitignore selection; results exclude other cached scopes. Embeddings support Ollama and OpenAI-compatible endpoints.
+- Added a public native-OS OCR adapter through Auto.js, without external OCR dependencies or vendor modifications, plus the unchanged Xberg WASM asset for macOS Intel.
+- Added YouTube transcript/caption download with bounded client/proxy fallback, exponential backoff, route cooldowns and optional offline audio transcription. Settings → Search edits root `search.yaml`, seeded with direct access and two public proxy-list URLs; standalone templates preserve user edits. SQLite schema remains 4.
+
+## 0.10.147
+
+- Added source_code_search using Lucerna 0.2.9 public AST and Searcher APIs with local SQLite FTS5/BM25 storage. Exposes ranked lexical search, symbol maps, file/chunk inspection and statistics; embeddings and call-graph analysis are not enabled. Applies the existing Workspace selector with parent/nested .gitignore and negations always enabled, reselects/hashes live files on each call, bounds indexing and caches only parsed files in memory. Creates no persistent source index or Workspace files. Schema remains 4.
+- Pinned the parser to the compatible 1.6.2 npm package through a lazy JSON dependency root, with the published Intel macOS native companion supplied through npm. Newer parser packages have incomplete optional-dependency publication and their Windows bindings fail to load; this build does not expose unavailable call-graph results as working analysis.
+
 ## 0.10.146
 
 - Fixed login recognition on ChatGPT’s current rich editor by supporting its composer machine attributes and separating authenticated recent-chat evidence from editor readiness. Opening Chrome no longer blocks GUI input; Goals shows explicit opening/checking/signed-in/sign-in-required/failure states and an independent monitoring status.

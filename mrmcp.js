@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.146 — Clear ChatGPT login detection and goal diagnostics.
+MrMCP 0.10.151 — Common source languages and extension aliases.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -14,8 +14,14 @@ import chardet from "npm:chardet@2.1.1";
 import iconv from "npm:iconv-lite@0.7.0";
 import * as auto from "npm:@mefistofelix/auto.js";
 import * as cdp from "npm:@mefistofelix/cdp.js";
+// Pin the parser through a JSON import: newer releases reference unpublished
+// optional packages. JSON keeps native code lazy, including in the desktop isolate.
+import lucernaParserPackage from "npm:@kreuzberg/tree-sitter-language-pack@1.6.2/package.json" with { type: "json" };
+// The parser's public loader resolves this companion on Intel macOS, whose
+// binding is absent from the older parser tarball. No native wrapper is owned here.
+import lucernaMacPackage from "npm:@kreuzberg/tree-sitter-language-pack-darwin-x64@1.10.9/package.json" with { type: "json" };
 const loadAutoVips = async () => auto.vips;
-import { inflateRawSync, inflateSync } from "node:zlib";
+import { inflateRawSync, inflateSync, gunzipSync } from "node:zlib";
 import { Readable, Writable } from "node:stream";
 import { spawn as nodeSpawn } from "node:child_process";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -81,26 +87,28 @@ const COMMANDS_TEMPLATE_PATH = join(MODULE_DIR, "commands.yaml");
 const COMMANDS_PATH = join(APP_DIR, "commands.yaml");
 const GUIDED_PROMPTS_TEMPLATE_PATH = join(MODULE_DIR, "guided_prompts.yaml");
 const GUIDED_PROMPTS_PATH = join(APP_DIR, "guided_prompts.yaml");
+const PROXIES_TEMPLATE_PATH = join(MODULE_DIR, "proxies.yaml"), PROXIES_PATH = join(APP_DIR, "proxies.yaml");
+const SEARCH_TEMPLATE_PATH = join(MODULE_DIR, "search.yaml"), SEARCH_PATH = join(APP_DIR, "search.yaml");
 const DEV_PREF_FILENAME = "DEV_PREF.md";
 const DEV_PREF_SOURCE_PATH = join(Deno.build.standalone ? STANDALONE_DIR : MODULE_DIR, DEV_PREF_FILENAME);
 const PORT_FALLBACK_STEP = 50;
 const UI_INPUT_EVENT = "tauriless://webview-message", UI_RENDER_EVENT = "mrmcp://ui-render";
-const BASE_TOOLS = [
+const BASE_TOOLS = ["proxy_get",
   "init_chat_session", "chat_set_goal", "chat_goal_debug", "list_workspaces", "open_workspace", "workspace_dev_preferences_write",
-  "fs_glob", "fs_grep", "fs_read", "fs_navigate", "fs_stat",
+  "fs_glob", "fs_grep", "fs_read", "fs_navigate", "fs_stat", "source_code_search", "document_grep",
   "fs_write", "fs_edit", "fs_text_convert_encoding_eol", "fs_mkdir", "fs_copy", "fs_move", "fs_trash", "fs_untrash",
   "desktop_auto", "publish", "cdp_call", "cdp_subs", "cdp_poll", "memory_find", "memory_set", "telegram_req", "discover_commands", "tools_schema", "tools_log", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
   "js", "js_add_node_module_dir", "js_reset",
 ];
 const READ_TOOLS = new Set([
-  "list_workspaces", "fs_glob", "fs_grep", "fs_read", "fs_navigate", "fs_stat",
+  "list_workspaces", "fs_glob", "fs_grep", "fs_read", "fs_navigate", "fs_stat", "source_code_search", "document_grep",
   "discover_commands", "tools_schema", "tools_log", "exec_attach", "exec_list", "exec_status",
 ]);
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.146";
-const DB_SCHEMA_VERSION = 4;
+const VERSION = "0.10.151";
+const DB_SCHEMA_VERSION = 5;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const SESSION_ACTIVE_MS = 10 * 60 * 1000, ACTIVE_TOOL_CALL_TTL_MS = 5000;
@@ -531,7 +539,7 @@ async function runBackend(options = {}) {
 async function backend({ addWorkspace = null } = {}) {
   if (Deno.build.standalone && !addWorkspace) {
     await Deno.mkdir(APP_DIR, { recursive: true });
-    for (const [target, template] of [[COMMANDS_PATH, COMMANDS_TEMPLATE_PATH], [GUIDED_PROMPTS_PATH, GUIDED_PROMPTS_TEMPLATE_PATH]]) {
+    for (const [target, template] of [[COMMANDS_PATH, COMMANDS_TEMPLATE_PATH], [GUIDED_PROMPTS_PATH, GUIDED_PROMPTS_TEMPLATE_PATH], [SEARCH_PATH, SEARCH_TEMPLATE_PATH], [PROXIES_PATH, PROXIES_TEMPLATE_PATH]]) {
       try { await Deno.lstat(target); }
       catch (error) {
         if (!(error instanceof Deno.errors.NotFound)) throw error;
@@ -725,6 +733,12 @@ async function backend({ addWorkspace = null } = {}) {
       version INTEGER NOT NULL
     );
     INSERT OR IGNORE INTO schema_meta(id,version) VALUES(1,${DB_SCHEMA_VERSION});
+    CREATE TABLE IF NOT EXISTS proxy_stats(
+      proxy_id TEXT PRIMARY KEY, successes INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0,
+      consecutive_failures INTEGER NOT NULL DEFAULT 0, last_selected_at INTEGER NOT NULL DEFAULT 0,
+      last_reported_at INTEGER NOT NULL DEFAULT 0, cooldown_until INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS proxy_stats_last_selected ON proxy_stats(last_selected_at);
     CREATE TABLE IF NOT EXISTS config(
       key TEXT PRIMARY KEY, value TEXT NOT NULL
     );
@@ -4978,6 +4992,458 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       },
     };
   }
+  // Functional document indices are independent of Tool Call history policies.
+  const documentSearchTasks = new Map();
+  let extractionLibraryPromise;
+  function searchConfig(text = Deno.readTextFileSync(SEARCH_PATH)) {
+    if (text.length > 262144) throw new Error("Search configuration exceeds 256 KiB");
+    const c = parseYaml(text);
+    if (!c || typeof c !== "object" || Array.isArray(c)) throw new Error("Search configuration must be a YAML mapping");
+    const e = c.embedding;
+    if (!e || !["ollama", "openai"].includes(e.provider)) throw new Error("embedding.provider must be ollama or openai");
+    const httpUrl = value => { const u = new URL(String(value)); if (!["http:", "https:"].includes(u.protocol) || u.username || u.password) throw new Error("Expected HTTP(S) URL without credentials"); return u; };
+    httpUrl(e.endpoint);
+    if (typeof e.model !== "string" || typeof e.api_key !== "string") throw new Error("Embedding model and api_key must be strings");
+    if (!["native", "disabled"].includes(c.ocr)) throw new Error("ocr must be native or disabled");
+    if (c.default_path !== undefined && (typeof c.default_path !== "string" || c.default_path.length > 32768 || c.default_path.includes("\0"))) throw new Error("default_path must be a path string or empty for Desktop/_default");
+    return c;
+  }
+  const searchDefaultDirectory = async c => String(c.default_path || "").trim()
+    ? configuredWorkspacePath(c.default_path) : join(await desktopDirectory(), "_default");
+  async function searchSelection(selection) {
+    if (selection.root?.id) return { ...selection, search_default: false };
+    const config = searchConfig(), path = await searchDefaultDirectory(config);
+    if (!String(config.default_path || "").trim()) {
+      try { await Deno.mkdir(path); }
+      catch (error) { if (!(error instanceof Deno.errors.AlreadyExists)) throw error; }
+    }
+    const real = await Deno.realPath(path);
+    if (!(await Deno.stat(real)).isDirectory) throw new Error("Search default_path must be a directory");
+    return { ...selection, search_default: true, search_config: config, root: { ...selection.root, path: real } };
+  }
+  const searchScopeKey = (selection, root) => `${selection.search_default ? "_default" : "workspace"}:${cdpPathKey(root)}`;
+  const searchIndexDirectory = (selection, root) => join(DATA_DIR, "search", ...(selection.search_default ? ["_default"] : []), createHash("sha256").update(cdpPathKey(root)).digest("hex"));
+  async function searchFileSelection(root, scope, args) {
+    const storage = join(DATA_DIR, "search"); await Deno.mkdir(storage, { recursive: true });
+    const realStorage = await Deno.realPath(storage);
+    if (within(realStorage, scope.path)) throw new Error("Search index storage cannot be searched as source files");
+    const exclude = [...(args.exclude || [])];
+    if (within(scope.path, realStorage)) {
+      const path = slashPath(relative(scope.path, realStorage));
+      exclude.push(path, `${path}/**`);
+    }
+    return { ...args, exclude, root_real: root };
+  }
+  const searchScopeOutput = (selection, root, dir) => ({ source_directory: root, index_directory: dir, workspace_selected: !!selection.root.id });
+  async function searchReadResponse(response, maxBytes) {
+    if (!response.ok) { await response.body?.cancel(); const e = new Error(`HTTP ${response.status}`); e.status = response.status; e.retryAfter = response.headers.get("retry-after"); throw e; }
+    if (Number(response.headers.get("content-length")) > maxBytes) { await response.body?.cancel(); throw new Error("Download exceeds byte limit"); }
+    const reader = response.body?.getReader(); if (!reader) return new Uint8Array();
+    const parts = []; let size = 0;
+    try { while (true) { const {done,value} = await reader.read(); if (done) break; size += value.length; if (size > maxBytes) throw new Error("Download exceeds byte limit"); parts.push(value); } }
+    catch (e) { await reader.cancel().catch(()=>{}); throw e; }
+    finally { reader.releaseLock(); }
+    const data = new Uint8Array(size); let offset=0; for (const part of parts) {data.set(part,offset);offset+=part.length;} return data;
+  }
+  const proxySourceCache = new Map(), proxySourceTasks = new Map();
+  function normalizeProxy(value) {
+    if (value === "direct") return value;
+    if (typeof value !== "string") throw new Error("Proxy entries must be strings");
+    const u = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `http://${value}`);
+    if (!["http:", "https:", "socks5:", "socks5h:"].includes(u.protocol) || !u.hostname || !u.port || !["/", ""].includes(u.pathname) || u.search || u.hash) throw new Error("Expected direct or HTTP(S)/SOCKS5 proxy URL with a port");
+    return u.href;
+  }
+  function proxyConfig(text = Deno.readTextFileSync(PROXIES_PATH)) {
+    if (text.length > 262144) throw new Error("Proxy configuration exceeds 256 KiB");
+    const c = parseYaml(text);
+    if (!c || typeof c !== "object" || Array.isArray(c)) throw new Error("Proxy configuration must be a YAML mapping");
+    if (!Array.isArray(c.proxies) || !Array.isArray(c.proxy_lists) || c.proxies.length + c.proxy_lists.length > 2000) throw new Error("Expected bounded proxies and proxy_lists arrays");
+    if (c.proxy_lists.length > 20) throw new Error("Configure at most 20 proxy list sources");
+    c.proxies = c.proxies.map(normalizeProxy);
+    for (const source of c.proxy_lists) {
+      const u = new URL(source); if (typeof source !== "string" || !["http:", "https:"].includes(u.protocol) || u.username || u.password) throw new Error("Proxy list sources must be HTTP(S) URLs without credentials");
+    }
+    for (const [key, min, max] of [["list_ttl_minutes",1,1440],["request_timeout_seconds",1,60],["max_entries",1,10000],["failure_cooldown_seconds",1,86400]])
+      if (!Number.isInteger(c[key]) || c[key] < min || c[key] > max) throw new Error(`${key} must be an integer from ${min} to ${max}`);
+    if (!c.proxies.length && !c.proxy_lists.length) throw new Error("Configure proxy entries or list sources");
+    return c;
+  }
+  async function proxyPool(c) {
+    const errors = [], entries = [...c.proxies];
+    // Source requests share one bounded deadline and execute only on explicit tool calls.
+    await Promise.all(c.proxy_lists.map(async (source, index) => {
+      let cached = proxySourceCache.get(source);
+      if (!cached || cached.expires <= Date.now()) {
+        let task = proxySourceTasks.get(source);
+        if (!task) {
+          task = (async () => {
+            const response = await fetch(source, { signal: AbortSignal.timeout(c.request_timeout_seconds * 1000) });
+            const lines = dec.decode(await searchReadResponse(response, 1048576)).split(/\r?\n/), parsed = [];
+            for (const line of lines) { const value = line.trim(); if (!value || value.startsWith("#")) continue;
+              try { parsed.push(normalizeProxy(value)); } catch { continue; }
+              if (parsed.length >= c.max_entries) break;
+            }
+            const item = { entries: [...new Set(parsed)], expires: Date.now() + c.list_ttl_minutes * 60000 };
+            proxySourceCache.set(source, item); return item;
+          })().finally(() => { if (proxySourceTasks.get(source) === task) proxySourceTasks.delete(source); });
+          proxySourceTasks.set(source, task);
+        }
+        try { cached = await task; } catch { errors.push({ source: index + 1, error: "Proxy list download failed or exceeded its timeout/byte limit" }); }
+      }
+      // Entries are appended later in configured order, independent of fetch completion.
+    }));
+    for (const source of c.proxy_lists) {
+      const cached = proxySourceCache.get(source); if (cached?.expires > Date.now()) entries.push(...cached.entries);
+    }
+    const configuredSources = new Set(c.proxy_lists); for (const key of proxySourceCache.keys()) if (!configuredSources.has(key)) proxySourceCache.delete(key);
+    return { entries: [...new Set(entries)].slice(0, c.max_entries), errors: errors.sort((a,b) => a.source - b.source) };
+  }
+  const proxyIdentity = proxy => createHash("sha256").update(proxy).digest("hex");
+  function proxyStats(id) {
+    const row = one("SELECT successes,failures,consecutive_failures,last_selected_at,last_reported_at,cooldown_until FROM proxy_stats WHERE proxy_id=?", id);
+    return row || { successes: 0, failures: 0, consecutive_failures: 0, last_selected_at: 0, last_reported_at: 0, cooldown_until: 0 };
+  }
+  async function proxyGet(args) {
+    const c = proxyConfig(), action = args.action || "pick", mode = args.mode || "round_robin", now = Date.now();
+    if (action === "report") {
+      if (!args.proxy_id || typeof args.success !== "boolean") throw new Error("report requires proxy_id and success");
+      if (!one("SELECT 1 AS found FROM proxy_stats WHERE proxy_id=?", args.proxy_id)) throw new Error("Report only proxy_id values previously selected by proxy_get");
+      const previous = proxyStats(args.proxy_id), cooldown = args.success ? 0 : now + Math.min(86400000, (args.retry_after_seconds ?? Math.min(86400, c.failure_cooldown_seconds * 2 ** Math.min(10, previous.consecutive_failures))) * 1000);
+      run("UPDATE proxy_stats SET successes=successes+?,failures=failures+?,consecutive_failures=?,last_reported_at=?,cooldown_until=? WHERE proxy_id=?", +args.success, +!args.success, args.success ? 0 : previous.consecutive_failures + 1, now, cooldown, args.proxy_id);
+      return { action, mode, total: 1, offset: 0, returned: 1, next_offset: null, next_retry_at: null,
+        proxies: [{ proxy_id: args.proxy_id, proxy: null, available: args.success || cooldown <= now, stats: proxyStats(args.proxy_id) }], errors: [] };
+    }
+    if (args.proxy_id != null || args.success != null || args.retry_after_seconds != null) throw new Error("Report arguments require action=report");
+    if (action === "pick" && (args.offset ?? 0) !== 0) throw new Error("offset applies only to action=list");
+    const pool = await proxyPool(c), clock = Date.now();
+    const rows = pool.entries.filter(v => args.include_direct !== false || v !== "direct").map(proxy => {
+      const proxy_id = proxyIdentity(proxy), stats = proxyStats(proxy_id);
+      return { proxy_id, proxy, stats, available: stats.cooldown_until <= clock };
+    });
+    let selected, nextOffset = null; const limit = args.limit ?? (action === "list" ? 20 : 1), offset = action === "list" ? args.offset ?? 0 : 0;
+    if (action === "list") { selected = rows.slice(offset, offset + limit); if (offset + limit < rows.length) nextOffset = offset + limit; }
+    else {
+      const eligible = rows.filter(row => row.available); selected = [];
+      const weight = row => (row.stats.successes + 1) / (row.stats.successes + row.stats.failures + 2) / (row.stats.consecutive_failures + 1);
+      while (eligible.length && selected.length < limit) {
+        let index;
+        if (mode === "random") {
+          let sample = Math.random() * eligible.reduce((sum,row) => sum + weight(row), 0); index = eligible.length - 1;
+          for (let i = 0; i < eligible.length; i++) { sample -= weight(eligible[i]); if (sample <= 0) { index = i; break; } }
+        } else {
+          index = 0;
+          for (let i = 1; i < eligible.length; i++) if (eligible[i].stats.last_selected_at < eligible[index].stats.last_selected_at ||
+            eligible[i].stats.last_selected_at === eligible[index].stats.last_selected_at && weight(eligible[i]) > weight(eligible[index])) index = i;
+        }
+        const row = eligible.splice(index, 1)[0];
+        // No await between selection and reservation: concurrent calls cannot race the cursor.
+        const cursor = Math.max(clock, Number(one("SELECT COALESCE(MAX(last_selected_at),0) AS last FROM proxy_stats").last) + 1);
+        run("INSERT INTO proxy_stats(proxy_id,last_selected_at) VALUES(?,?) ON CONFLICT(proxy_id) DO UPDATE SET last_selected_at=excluded.last_selected_at", row.proxy_id, cursor);
+        row.stats = proxyStats(row.proxy_id); selected.push(row);
+      }
+    }
+    const paused = rows.filter(row => !row.available).map(row => row.stats.cooldown_until);
+    return { action, mode, total: rows.length, offset, returned: selected.length, next_offset: nextOffset,
+      next_retry_at: action === "pick" && !selected.length && paused.length ? Math.min(...paused) : null, proxies: selected, errors: pool.errors };
+  }
+
+  async function documentExtractionLibrary() {
+    return extractionLibraryPromise ||= (async()=>{
+      let x, wasmBackend=false;
+      if(Deno.build.os==="darwin" && Deno.build.arch==="x86_64") {
+        const wasm=await import("npm:@xberg-io/xberg-wasm@1.3.2");wasmBackend=true;
+        await wasm.default();
+        x={...wasm,extract:async(input,options={})=>{
+          const wi=wasm.WasmExtractInput.fromBytes(input.bytes,input.mimeType,input.filename),wc=wasm.WasmExtractionConfig.default();
+          wc.disableOcr=!!options.disableOcr;wc.useCache=false;
+          if(options.ocr){const oc=wasm.WasmOcrConfig.default();oc.backend=options.ocr.backend;wc.ocr=oc;oc.free();}
+          // extract takes ownership of input/config; getters return owned result copies.
+          const result=await wasm.extract(wi,wc),docs=result.results,errors=result.errors;
+          try{return {results:docs.map(v=>({content:v.content,mimeType:v.mimeType})),errors:errors.map(v=>({message:v.message}))};}
+          finally{docs.forEach(v=>v.free());errors.forEach(v=>v.free());result.free();}
+        }};
+      } else x=await import("npm:@xberg-io/xberg@1.3.2");
+      const processImage=async argument=>{
+        // NAPI 1.3.2 sends callback arguments in one tuple despite its TS signature.
+        const raw=Array.isArray(argument)&&(Array.isArray(argument[0])||argument[0] instanceof Uint8Array)?argument[0]:argument;
+        const bytes=raw instanceof Uint8Array?raw:Uint8Array.from(raw);
+        const image=await auto.vips.decodeImage(bytes), result=await auto.ocr({provider:"native",image});
+        if(!result)throw new Error("Native OS OCR is unavailable for this image/platform or no installed OCR language is available");
+        const document={content:result.text||"",mimeType:"text/plain",metadata:{additional:{ocr_provider:"native-os"}},tables:[]};
+        // WASM's public trait bridge consumes serialized Rust document fields.
+        return wasmBackend?JSON.stringify({content:document.content,mime_type:document.mimeType,metadata:document.metadata,tables:[],counts:{pages:0,tables:0,images:0},processing_warnings:[],formulas:[],form_fields:[]}):document;
+      };
+      // Public Xberg plugin hooks; never patch package internals or load an OCR engine.
+      x.registerOcrBackend({name:()=>"mrmcp-native-os",version:()=>"1",initialize:()=>{},shutdown:()=>{},processImage,processImageFile:async path=>processImage(await Deno.readFile(Array.isArray(path)?path[0]:path)),processDocument:async()=>{throw new Error("Document-level OCR unsupported; use Xberg page rasterization");},supportsLanguage:()=>true,supportedLanguages:()=>[],supportedLanguagesFor:()=>[],supportsLanguageFor:()=>true,backendType:()=>"custom",supportsTableDetection:()=>false,supportsDocumentProcessing:()=>false,emitsStructuredMarkdown:()=>false,confidenceSemantics:()=>"uncalibrated",pageOrientationHandling:()=>"requires_upright"});
+      return x;
+    })().catch(e=>{extractionLibraryPromise=null;throw e;});
+  }
+  async function searchEmbedding(texts,c,signal) {
+    const e=c.embedding;if(!e.model.trim())throw new Error("Vector/hybrid search requires embedding.model in Settings → Search");
+    const base=e.endpoint.replace(/\/$/,""), ollama=e.provider==="ollama";
+    const response=await fetch(`${base}${ollama?"/api/embed":"/embeddings"}`,{method:"POST",headers:{"content-type":"application/json",...(e.api_key?{authorization:`Bearer ${e.api_key}`}:{})},body:JSON.stringify({model:e.model,input:texts,...(ollama?{truncate:false}:{})}),signal:AbortSignal.any([signal,AbortSignal.timeout(60000)])});
+    const packet=JSON.parse(new TextDecoder().decode(await searchReadResponse(response,8388608)));
+    const vectors=ollama?packet.embeddings:packet.data?.slice().sort((a,b)=>a.index-b.index).map(v=>v.embedding);
+    if(!Array.isArray(vectors)||vectors.length!==texts.length||!vectors.every(v=>Array.isArray(v)&&v.length>0&&v.length<=16384&&v.every(Number.isFinite)&&v.length===vectors[0].length))throw new Error("Invalid or inconsistent embedding response");
+    return vectors;
+  }
+  const searchSql = value => `'${String(value).replaceAll("'","''")}'`;
+  function searchChunks(text,source,hash,mime) {
+    const lines=String(text).split(/\r?\n/), out=[];let buffer=[],size=0,start=1,end=1;
+    const flush=()=>{if(!buffer.length)return;const content=buffer.join("\n");out.push({id:createHash("sha256").update(`${source}\0${hash}\0${out.length}`).digest("hex"),path:source,mime,hash,chunk:out.length,text:content,start_line:start,end_line:end});buffer=[];size=0;};
+    for(let i=0;i<lines.length;i++){
+      let line=lines[i];
+      do{let cut=Math.min(2400,line.length);if(cut<line.length&&/[\uD800-\uDBFF]/.test(line[cut-1]))cut--;const part=line.slice(0,cut);line=line.slice(cut);
+        if(size+part.length+1>2400&&buffer.length)flush();if(!buffer.length)start=i+1;end=i+1;buffer.push(part);size+=part.length+1;if(line.length)flush();
+      }while(line.length);
+    }flush();return out;
+  }
+  async function documentGrep(selection,args) {
+    if(!String(args.query||"").trim())throw new Error("query must contain non-whitespace text");
+    const c=selection.search_config||searchConfig(), mode=args.mode||"auto", effective=mode==="auto"?(c.embedding.model.trim()?"hybrid":"fulltext"):mode;
+    if(effective!=="fulltext"&&!c.embedding.model.trim())throw new Error("Configure embedding.model in Settings → Search for vector/hybrid mode, or use fulltext/auto");
+    const root=await Deno.realPath(selection.root.path), scope=await resolveWorkspacePath(selection,args.path||".",root), base=scope.path, key=searchScopeKey(selection,root), walkOptions=await searchFileSelection(root,scope,args);
+    while(documentSearchTasks.has(key))await documentSearchTasks.get(key);
+    let release;documentSearchTasks.set(key,new Promise(r=>{release=r;}));
+    try {
+      const lance=await import("npm:@lancedb/lancedb@0.27.2"), x=await documentExtractionLibrary();
+      const dir=searchIndexDirectory(selection,root);await Deno.mkdir(dir,{recursive:true});
+      const connection=await lance.connect(dir), manifestPath=join(dir,"manifest.json");
+      let manifest;try {manifest=JSON.parse(await Deno.readTextFile(manifestPath));}catch(e){if(!(e instanceof Deno.errors.NotFound))throw e;manifest={};}
+      const names=await connection.tableNames(), table=names.includes("chunks")?await connection.openTable("chunks"):null;
+      let chunksTable=table, changed=0, unchanged=0, removed=0, scanned=0,totalBytes=0,truncated=false;const errors=[], eligible=new Set(), discovered=new Set(), replacements=[], deletions=[];
+      const mimeMatches=mime=>!args.mime?.length||args.mime.some(v=>v.endsWith("/*")?mime.startsWith(v.slice(0,-1)):mime===v);
+      const baseStat=await Deno.lstat(base), include=compileGlobs(args.include?.length?args.include:["**/*"]),exclude=compileGlobs(walkOptions.exclude,[]);
+      const selectedPath=path=>{
+        if(/^https:\/\//.test(path))return false;
+        const absolute=resolve(root,path), local=baseStat.isFile?basename(absolute):slashPath(relative(base,absolute));
+        return (baseStat.isFile?absolute===base:!local.startsWith("../")&&!isAbsolute(local))&&(args.hidden||!local.split("/").some(v=>v.startsWith(".")))&&matchesGlobs(local,include)&&!excludedByGlobs(local,exclude);
+      };
+      const extractionSignature=`xberg1.3.2:${c.ocr}:chunks1`;
+      const indexSource=async (source,mime,bytes,input)=>{
+        const hash=createHash("sha256").update(bytes).update(extractionSignature).digest("hex");
+        if(manifest[source]?.hash===hash){unchanged++;eligible.add(source);return;}
+        const result=await x.extract(input,c.ocr==="native"?{ocr:{backend:"mrmcp-native-os"},useCache:false}:{disableOcr:true,useCache:false});
+        if(result.errors?.length)throw new Error(result.errors.map(v=>v.message||v.error||"Extraction failed").join("; "));
+        const text=result.results.map(v=>v.content).filter(Boolean).join("\n\n");
+        if(text.length>8388608)throw new Error("Extracted document exceeds 8 MiB");
+        if(!text.trim())throw new Error("Extraction returned no searchable text");
+        const chunks=searchChunks(text,source,hash,mime);if(replacements.length+chunks.length>20000)throw new Error("Selected extraction exceeds 20,000 chunks");
+        replacements.push(...chunks);deletions.push(source);manifest[source]={hash,mime,chunks:chunks.length};eligible.add(source);changed++;
+      };
+      try {
+        let walked=0;
+        for await(const entry of fsWalkEntries(root,scope.display,{...walkOptions,gitignore:args.gitignore!==false,hidden:!!args.hidden,hard_limit:100000})) {
+          if(++walked>=100000){truncated=true;break;}
+          if(entry.type!=="file")continue;
+          const mime=(mediaContentType(extname(entry.path))||"application/octet-stream").split(";")[0];if(!mimeMatches(mime))continue;
+          if(scanned>=(args.max_files??1000)){truncated=true;break;}scanned++;
+          discovered.add(entry.path);
+          if(entry.size>(args.max_file_bytes??20971520)){errors.push({path:entry.path,error:"File exceeds max_file_bytes"});continue;}
+          try {
+            const path=await safePath(root,entry.path,root);if(cdpPathKey(path).startsWith(cdpPathKey(dir)+sep))continue;
+            const bytes=await Deno.readFile(path);if(bytes.length>(args.max_file_bytes??20971520))throw new Error("File grew beyond max_file_bytes");totalBytes+=bytes.length;if(totalBytes>67108864){truncated=true;break;}
+            await indexSource(entry.path,mime,bytes,{kind:"bytes",bytes,mimeType:mime,filename:basename(path)});
+          }catch(e){errors.push({path:entry.path,error:String(e.message||e).slice(0,1000)});}
+        }
+      }catch(e){truncated=true;errors.push({path:args.path||".",error:String(e.message||e).slice(0,1000)});}
+      // Only prune paths proven inside this complete requested glob/MIME selection.
+      if(!truncated)for(const [path,v] of Object.entries(manifest))if(selectedPath(path)&&mimeMatches(v.mime)&&!discovered.has(path)){deletions.push(path);delete manifest[path];removed++;}
+      if(chunksTable && deletions.length)await chunksTable.delete(`path IN (${[...new Set(deletions)].map(searchSql).join(",")})`);
+      for(const name of names.filter(v=>v.startsWith("vectors_")))if(deletions.length){const vt=await connection.openTable(name);await vt.delete(`path IN (${[...new Set(deletions)].map(searchSql).join(",")})`);}
+      if(replacements.length){
+        if(!chunksTable){chunksTable=await connection.createTable("chunks",replacements);await chunksTable.createIndex("text",{config:lance.Index.fts({stem:false})});}
+        else await chunksTable.add(replacements);
+      }
+      const temporary=manifestPath+".tmp";await Deno.writeTextFile(temporary,JSON.stringify(manifest));await Deno.rename(temporary,manifestPath);
+      const paths=[...eligible], filter=paths.length?`path IN (${paths.map(searchSql).join(",")})`:"false", limit=args.limit??10;
+      let hits=[],indexedChunks=0;
+      if(chunksTable && paths.length){
+        indexedChunks=await chunksTable.countRows(filter);
+        const lexical=effective!=="vector"?await chunksTable.search(args.query).where(filter).limit(effective==="hybrid"?Math.min(100,limit*4):limit).toArray():[];
+        let vectors=[];
+        if(effective!=="fulltext"){
+          const signature=createHash("sha256").update(JSON.stringify([c.embedding.provider,c.embedding.endpoint,c.embedding.model])).digest("hex").slice(0,24),name=`vectors_${signature}`;
+          let vt=names.includes(name)?await connection.openTable(name):null;
+          const rows=await chunksTable.query().where(filter).limit(20001).toArray();if(rows.length>20000)throw new Error("Vector selection exceeds 20,000 chunks; narrow globs");
+          const validIds=rows.map(v=>v.id), vf=`id IN (${validIds.map(searchSql).join(",")})`;
+          const existing=vt?new Set((await vt.query().where(vf).select(["id"]).limit(20001).toArray()).map(v=>v.id)):new Set();
+          const missing=rows.filter(v=>!existing.has(v.id)), signal=AbortSignal.timeout(300000);
+          for(let offset=0;offset<missing.length;offset+=32){const batch=missing.slice(offset,offset+32),embedded=await searchEmbedding(batch.map(v=>v.text),c,signal),data=batch.map((v,i)=>({...v,vector:embedded[i]}));if(vt)await vt.add(data);else vt=await connection.createTable(name,data);}
+          const [vector]=await searchEmbedding([args.query],c,signal);vectors=await vt.search(vector).where(vf).limit(effective==="hybrid"?Math.min(100,limit*4):limit).toArray();
+        }
+        if(effective==="hybrid"){
+          const ranked=new Map();for(const group of [lexical,vectors])group.forEach((v,i)=>{const old=ranked.get(v.id);ranked.set(v.id,{...v,rrf:(old?.rrf||0)+1/(60+i+1)});});hits=[...ranked.values()].sort((a,b)=>b.rrf-a.rrf||a.id.localeCompare(b.id)).slice(0,limit);
+        }else hits=effective==="vector"?vectors:lexical;
+      }
+      return {...searchScopeOutput(selection,root,dir),mode:effective,gitignore:args.gitignore!==false,indexed_files:eligible.size,indexed_chunks:indexedChunks,reindexed_files:changed,unchanged_files:unchanged,removed_files:removed,scanned_files:scanned,truncated,error_count:errors.length,errors:errors.slice(0,100),returned:hits.length,results:hits.map(v=>({id:v.id,path:v.path,mime:v.mime,chunk:v.chunk,text:v.text,start_line:v.start_line,end_line:v.end_line,score:Number(v.rrf??v._score??-v._distance)}))};
+    }finally{documentSearchTasks.delete(key);release();}
+  }
+
+  const SOURCE_CODE_ACTIONS = ["search", "map", "files", "chunks", "stats"];
+  // Languages with actual extractors in the pinned public Lucerna version.
+  const SOURCE_CODE_LANGUAGES = ["javascript","typescript","json","markdown","go","c","cpp","zig","html","python","yaml","php","java","rust","csharp","kotlin","swift","ruby","bash","powershell","sql","css","scss","vue","svelte","toml","lua","r","scala","dart","perl","haskell","elixir","clojure","matlab","groovy","solidity","julia","ocaml","erlang","objc"];
+  const SOURCE_CODE_LANGUAGE_ALIASES = { "c++": "cpp", "c#": "csharp", js: "javascript", jsx: "javascript", ts: "typescript", tsx: "typescript", py: "python", yml: "yaml", sh: "bash", shell: "bash", shellscript: "bash", ps1: "powershell", md: "markdown", "objective-c": "objc", ocaml_interface: "ocaml" };
+  const sourceCodeLanguageName = value => {
+    const name = String(value).trim().toLowerCase();
+    return SOURCE_CODE_LANGUAGE_ALIASES[name] || name;
+  };
+  const sourceCodeLanguage = (lib, path) => {
+    const extension = extname(path);
+    const override = extension === ".C" ? "cpp" : ({ ".c++": "cpp", ".h++": "cpp", ".hh": "cpp", ".phtml": "php", ".phps": "php", ".php3": "php", ".php4": "php", ".php5": "php", ".php7": "php", ".php8": "php" })[extension.toLowerCase()];
+    const detected = override || lib.TreeSitterChunker.detectLanguage(path.toLowerCase());
+    const language = detected && sourceCodeLanguageName(detected);
+    return SOURCE_CODE_LANGUAGES.includes(language) ? language : null;
+  };
+  const sourceCodeTasks = new Map();
+  let lucernaPromise;
+  const sourceCodeLibrary = () => lucernaPromise ||= import("npm:@upstart.gg/lucerna@0.2.9").catch(error => {
+    lucernaPromise = null;
+    throw new Error(`Lucerna parser could not load (${lucernaParserPackage.version}; macOS companion ${lucernaMacPackage.version}): ${error.message}`);
+  });
+  const sourceCodeWords = text => (String(text).match(/[\p{L}\p{N}_]+/gu) || []).flatMap(word => [...new Set([
+    word, ...word.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/([A-Z])([A-Z][a-z])/g, "$1 $2").split(/[\s_]+/).filter(Boolean),
+  ])]);
+  async function sourceCodeSearch(selection, args) {
+    const action = args.action || "search", limit = args.limit ?? 10, offset = args.offset ?? 0;
+    if (action === "search" && !String(args.query || "").trim()) throw new Error("search requires a nonempty query");
+    if (action === "chunks" && !args.file_path) throw new Error("chunks requires file_path");
+    const root = await Deno.realPath(selection.root.path), scope = await resolveWorkspacePath(selection, args.path || ".", root);
+    if (args.file_path && !/[?*]/.test(args.file_path)) await safePath(root, args.file_path, root);
+    const walkOptions = await searchFileSelection(root, scope, args), key = searchScopeKey(selection, root), dir = searchIndexDirectory(selection, root);
+    // Only this source index is serialized; unrelated Tool Calls stay concurrent.
+    while (sourceCodeTasks.has(key)) await sourceCodeTasks.get(key);
+    let release; sourceCodeTasks.set(key, new Promise(resolveTask => { release = resolveTask; }));
+    let index;
+    try {
+      await Deno.mkdir(dir, { recursive: true });
+      index = new DatabaseSync(join(dir, "lucerna.sqlite"));
+      index.exec(`PRAGMA busy_timeout=3000; PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL;
+        CREATE TABLE IF NOT EXISTS indexed_files(path TEXT PRIMARY KEY, hash TEXT NOT NULL, signature TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS indexed_chunks(row_id INTEGER PRIMARY KEY, chunk_id TEXT NOT NULL UNIQUE,
+          path TEXT NOT NULL REFERENCES indexed_files(path) ON DELETE CASCADE, chunk_json TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS indexed_chunks_path ON indexed_chunks(path);
+        CREATE VIRTUAL TABLE IF NOT EXISTS source_fts USING fts5(content,content='',contentless_delete=1,tokenize='unicode61');
+        CREATE TEMP TABLE search_scope(path TEXT PRIMARY KEY);`);
+      const readFile = index.prepare("SELECT hash,signature FROM indexed_files WHERE path=?");
+      const deleteText = index.prepare("DELETE FROM source_fts WHERE rowid IN (SELECT row_id FROM indexed_chunks WHERE path=?)");
+      const deleteFile = index.prepare("DELETE FROM indexed_files WHERE path=?");
+      const writeFile = index.prepare("INSERT INTO indexed_files(path,hash,signature) VALUES(?,?,?)");
+      const writeChunk = index.prepare("INSERT INTO indexed_chunks(chunk_id,path,chunk_json) VALUES(?,?,?)");
+      const writeText = index.prepare("INSERT INTO source_fts(rowid,content) VALUES(?,?)");
+      const selectFile = index.prepare("INSERT INTO search_scope(path) VALUES(?)");
+      const transaction = operation => {
+        index.exec("BEGIN IMMEDIATE");
+        try { operation(); index.exec("COMMIT"); }
+        catch (error) { index.exec("ROLLBACK"); throw error; }
+      };
+      const removeFile = path => { deleteText.run(path); deleteFile.run(path); };
+      const lib = await sourceCodeLibrary(), parser = new lib.TreeSitterChunker();
+      const signature = `lucerna0.2.9:${lucernaParserPackage.version}:${lucernaMacPackage.version}:${Deno.build.os}:${Deno.build.arch}:words1:languages3`;
+      const projectId = createHash("sha256").update(cdpPathKey(root)).digest("hex").slice(0, 16);
+      const files = [], discovered = new Set(), errors = [];
+      const maxFiles = args.max_files ?? 5000, maxFileBytes = args.max_file_bytes ?? 1048576;
+      let parserReady = false, scanned = 0, bytes = 0, changed = 0, unchanged = 0, removed = 0;
+      let skippedLarge = 0, skippedUnsupported = 0, errorCount = 0, truncationReason = null;
+      const addError = (path, error) => { errorCount++; if (errors.length < 100) errors.push({ path, error: String(error?.message || error).slice(0, 500) }); };
+      try {
+        for await (const entry of fsWalkEntries(root, scope.display, { ...walkOptions, hidden: args.hidden === true, gitignore: true, hard_limit: 100001 })) {
+          if (++scanned > 100000) { truncationReason = "walk_limit"; break; }
+          if (entry.type !== "file") continue;
+          discovered.add(entry.path);
+          const language = sourceCodeLanguage(lib, entry.path);
+          if (!language) { skippedUnsupported++; continue; }
+          if (entry.size > maxFileBytes) { skippedLarge++; continue; }
+          if (files.length >= maxFiles) { truncationReason = "max_files"; break; }
+          try {
+            const absolute = await safePath(root, entry.path, root), source = await Deno.readFile(absolute);
+            if (source.byteLength > maxFileBytes) { skippedLarge++; continue; }
+            if (bytes + source.byteLength > 33554432) { truncationReason = "total_bytes"; break; }
+            bytes += source.byteLength;
+            const hash = createHash("sha256").update(source).digest("hex"), previous = readFile.get(entry.path);
+            if (previous?.hash === hash && previous.signature === signature) unchanged++;
+            else {
+              if (!parserReady) { await parser.initialize(); parserReady = true; }
+              const text = decodeTextDocument(source, "auto", "full").text;
+              const parsed = await parser.chunkSource(text, entry.path, projectId, language);
+              // Lucerna ids use file/start-line: distinct symbols on one line can collide.
+              const reservedIds = new Set(parsed.map(chunk => chunk.id)), writtenIds = new Set();
+              for (let i = 0; i < parsed.length; i++) {
+                const chunk = parsed[i];
+                if (writtenIds.has(chunk.id)) {
+                  let id, salt = 0;
+                  do { id = createHash("sha256").update(JSON.stringify([chunk.id, chunk.type, chunk.name, chunk.startLine, chunk.endLine, chunk.content, i, salt++])).digest("hex"); }
+                  while (reservedIds.has(id) || writtenIds.has(id));
+                  parsed[i] = { ...chunk, id, metadata: { ...chunk.metadata, lucerna_id: chunk.id } };
+                }
+                writtenIds.add(parsed[i].id);
+              }
+              transaction(() => {
+                removeFile(entry.path); writeFile.run(entry.path, hash, signature);
+                for (const chunk of parsed) {
+                  const inserted = writeChunk.run(chunk.id, entry.path, JSON.stringify(chunk));
+                  writeText.run(inserted.lastInsertRowid, sourceCodeWords(`${chunk.name || ""} ${chunk.content}`).join(" "));
+                }
+              });
+              changed++;
+            }
+            files.push(entry.path); selectFile.run(entry.path);
+          } catch (error) { addError(entry.path, error); }
+        }
+      } catch (error) { addError(scope.display, error); truncationReason ||= "walk_error"; }
+      finally { await parser.close(); }
+      // Unseen paths are pruned only inside a completely traversed path/glob scope.
+      if (!truncationReason) {
+        const stat = await Deno.lstat(scope.path), include = compileGlobs(args.include?.length ? args.include : ["**/*"]), exclude = compileGlobs(walkOptions.exclude, []);
+        const selected = path => {
+          const absolute = resolve(root, path), local = stat.isFile ? basename(absolute) : slashPath(relative(scope.path, absolute));
+          return (stat.isFile ? absolute === scope.path : within(scope.path, absolute)) && (args.hidden || !local.split("/").some(v => v.startsWith("."))) && matchesGlobs(local, include) && !excludedByGlobs(local, exclude);
+        };
+        const absent = index.prepare("SELECT path FROM indexed_files").all().filter(row => selected(row.path) && !discovered.has(row.path));
+        if (absent.length) transaction(() => { for (const row of absent) { removeFile(row.path); removed++; } });
+      }
+      const rows = index.prepare("SELECT row_id,chunk_json FROM indexed_chunks JOIN search_scope USING(path) ORDER BY row_id").all();
+      const chunks = rows.map(row => JSON.parse(row.chunk_json));
+      const byId = new Map(chunks.map(chunk => [chunk.id, chunk])), byRow = new Map(rows.map((row, i) => [Number(row.row_id), chunks[i]]));
+      const store = {
+        getChunksByIds: async ids => ids.map(id => byId.get(id)).filter(Boolean),
+        getChunksByFile: async path => chunks.filter(chunk => chunk.filePath === path),
+        searchText: async (query, options) => {
+          const words = [...new Set(sourceCodeWords(query).map(word => word.toLowerCase()))];
+          if (!words.length) return [];
+          const languages = options.language == null ? null : (Array.isArray(options.language) ? options.language : [options.language]).map(sourceCodeLanguageName);
+          const paths = options.filePath ? compileGlobs([options.filePath]) : null;
+          const found = index.prepare(`SELECT indexed_chunks.row_id FROM source_fts JOIN indexed_chunks ON indexed_chunks.row_id=source_fts.rowid
+            JOIN search_scope ON search_scope.path=indexed_chunks.path WHERE source_fts MATCH ? ORDER BY bm25(source_fts),indexed_chunks.row_id`).all(words.map(word => `"${word}"`).join(" OR "));
+          return found.map(row => byRow.get(Number(row.row_id))).filter(chunk =>
+            (!languages || languages.includes(chunk.language)) && (!options.types?.length || options.types.includes(chunk.type)) && (!paths || matchesGlobs(chunk.filePath, paths))
+          ).slice(0, options.limit ?? 10).map(chunk => ({ chunk, matchType: "lexical" }));
+        },
+      };
+      const options = { limit: offset + limit + 1, language: args.language, types: args.types, filePath: args.file_path };
+      let data, results, nextOffset = null;
+      if (action === "search") results = await new lib.Searcher(store, false, false).searchLexical(args.query, options);
+      else if (action === "chunks") results = await store.getChunksByFile(slashPath(args.file_path));
+      else if (action === "files") results = files;
+      else if (action === "map") results = chunks.filter(chunk => chunk.name && (!args.types?.length || args.types.includes(chunk.type))).map(({ id, filePath, type, name, startLine, endLine }) => ({ id, filePath, type, name, startLine, endLine }));
+      else data = { stats: { files: files.length, chunks: chunks.length, by_language: Object.fromEntries([...new Set(chunks.map(chunk => chunk.language))].map(language => [language, chunks.filter(chunk => chunk.language === language).length])) } };
+      let returned = 0;
+      if (results) {
+        if (results.length > offset + limit) nextOffset = offset + limit;
+        results = results.slice(offset, offset + limit); returned = results.length; data = { results };
+      }
+      if (args.include_content === false) {
+        const strip = value => Array.isArray(value) ? value.map(strip) : !value || typeof value !== "object" ? value
+          : Object.fromEntries(Object.entries(value).filter(([key]) => key !== "content" && key !== "contextContent").map(([key, item]) => [key, strip(item)]));
+        data = strip(data);
+      }
+      return { ...searchScopeOutput(selection, root, dir), action, mode: "lexical", gitignore: true, path: scope.display, indexed_files: files.length, indexed_chunks: chunks.length,
+        reindexed_files: changed, unchanged_files: unchanged, removed_files: removed, scanned_files: scanned,
+        skipped_large_files: skippedLarge, skipped_unsupported_files: skippedUnsupported, error_count: errorCount, errors, truncation_reason: truncationReason,
+        truncated: !!truncationReason || nextOffset != null, returned, next_offset: nextOffset, data };
+    } finally { try { index?.close(); } finally { sourceCodeTasks.delete(key); release(); } }
+  }
+
   const WINDOWS_EXECUTABLE_SUFFIXES = [".exe", ".com", ".cmd", ".bat"];
   const windowsExecutableSuffix = name => Deno.build.os === "windows"
     ? WINDOWS_EXECUTABLE_SUFFIXES.find(suffix => String(name).toLowerCase().endsWith(suffix)) || ""
@@ -5087,25 +5553,51 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   }
   function selectZipCommandEntry(bytes, row) {
     const files = zipEntries(bytes).filter(entry => entry.name && !entry.name.endsWith("/"));
-    const bases = [...new Set([basename(String(row.path || row.name)), basename(row.name)].map(value => value.toLowerCase()))];
-    const wanted = [];
-    for (const base of bases) {
-      wanted.push(base);
-      if (!WINDOWS_EXECUTABLE_SUFFIXES.some(suffix => base.endsWith(suffix))) {
-        for (const suffix of WINDOWS_EXECUTABLE_SUFFIXES) wanted.push(base + suffix);
-      }
-    }
-    for (const name of wanted) {
-      const matches = files.filter(entry => basename(entry.name.replaceAll("\\", "/")).toLowerCase() === name)
-        .sort((a, b) => a.name.length - b.name.length);
-      if (matches.length) return matches[0];
-    }
-    const executables = files.filter(entry => WINDOWS_EXECUTABLE_SUFFIXES.some(
-      suffix => basename(entry.name.replaceAll("\\", "/")).toLowerCase().endsWith(suffix),
-    ));
-    if (executables.length === 1) return executables[0];
-    throw new Error(`ZIP archive does not contain an unambiguous executable for ${row.name}`);
+    return selectCommandArchiveEntry(files, row);
   }
+  function selectCommandArchiveEntry(files, row) {
+    if (row.archive_path) {
+      const found = files.find(entry => entry.name.replaceAll("\\", "/").replace(/^\.\//, "") === row.archive_path);
+      if (!found) throw new Error(`Archive entry not found: ${row.archive_path}`);
+      return found;
+    }
+    const bases = [...new Set([basename(String(row.path || row.name)), basename(row.name)].map(v => v.toLowerCase()))];
+    for (const base of bases) for (const wanted of [base, ...WINDOWS_EXECUTABLE_SUFFIXES.map(suffix => base + suffix)]) {
+      const found = files.filter(entry => basename(entry.name.replaceAll("\\", "/")).toLowerCase() === wanted);
+      if (found.length === 1) return found[0];
+      if (found.length > 1) throw new Error(`Ambiguous archive entry ${wanted}; configure archive_path`);
+    }
+    throw new Error(`Archive does not contain an unambiguous executable for ${row.name}`);
+  }
+  function tarCommandEntries(bytes) {
+    const entries = []; let offset = 0, extended = {}, longName = "";
+    const text = (start, length) => dec.decode(bytes.subarray(start, start + length)).split("\0")[0];
+    while (offset + 512 <= bytes.length) {
+      if (bytes.subarray(offset, offset + 512).every(v => v === 0)) break;
+      let checksum = 0; for (let i = 0; i < 512; i++) checksum += i >= 148 && i < 156 ? 32 : bytes[offset + i];
+      if (parseInt(text(offset + 148, 8).trim(), 8) !== checksum) throw new Error("Invalid TAR header checksum");
+      const sizeText = text(offset + 124, 12).trim();
+      if (!/^[0-7]+$/.test(sizeText)) throw new Error("Unsupported TAR size encoding");
+      const size = parseInt(sizeText, 8), data = offset + 512, type = text(offset + 156, 1);
+      if (!Number.isSafeInteger(size) || size < 0 || data + size > bytes.length) throw new Error("Truncated TAR entry");
+      const prefix = text(offset + 345, 155), name = longName || extended.path || [prefix, text(offset, 100)].filter(Boolean).join("/");
+      if (type === "x" || type === "g") {
+        if (size > 1048576) throw new Error("TAR metadata exceeds limit");
+        let p = data; const fields = {};
+        while (p < data + size) {
+          const space = bytes.indexOf(32, p); if (space < 0 || space >= data + size) throw new Error("Invalid TAR PAX record");
+          const length = Number(text(p, space - p)); if (!Number.isSafeInteger(length) || length <= space - p + 1 || p + length > data + size) throw new Error("Invalid TAR PAX length");
+          const record = dec.decode(bytes.subarray(space + 1, p + length - 1)), equal = record.indexOf("=");
+          if (equal > 0) fields[record.slice(0, equal)] = record.slice(equal + 1); p += length;
+        }
+        if (type === "x") extended = fields;
+      } else if (type === "L") { if (size > 1048576) throw new Error("TAR name exceeds limit"); longName = text(data, size); }
+      else { if (type === "" || type === "0") entries.push({ name, offset: data, size }); extended = {}; longName = ""; }
+      offset = data + Math.ceil(size / 512) * 512;
+    }
+    return entries;
+  }
+
   function extractZipEntry(bytes, entry) {
     if (entry.flags & 1) throw new Error("Encrypted ZIP entries are unsupported");
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -5122,58 +5614,71 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     if (entry.uncompressedSize !== 0xffffffff && output.byteLength !== entry.uncompressedSize) throw new Error("Invalid ZIP archive: extracted size mismatch");
     return output;
   }
+  function normalizeCommandPlatforms(value = {}) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("platforms must be a YAML mapping");
+    const result = {};
+    for (const [key, variant] of Object.entries(value)) {
+      if (!/^(windows|linux|darwin)(-(x86_64|aarch64))?$/.test(key)) throw new Error(`Unsupported platform key: ${key}`);
+      if (!variant || typeof variant !== "object" || Array.isArray(variant)) throw new Error(`Platform ${key} must be a mapping`);
+      if (Object.keys(variant).some(field => !["path", "download_url", "archive_path"].includes(field))) throw new Error(`Unknown field in platform ${key}`);
+      result[key] = {};
+      for (const field of ["path", "download_url", "archive_path"]) if (variant[field] != null) {
+        if (typeof variant[field] !== "string") throw new Error(`${key}.${field} must be a string`);
+        result[key][field] = variant[field].trim();
+      }
+    }
+    return result;
+  }
   function normalizeCommandEntry(entry) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new Error("Each commands.yaml entry must be an object");
     const name = String(entry.logical_name || "").trim();
     if (!/^[A-Za-z0-9_.+-]{1,128}$/.test(name)) throw new Error(`Invalid logical_name in commands.yaml: ${name || "(empty)"}`);
-    return {
-      name,
-      logical_name: name,
-      path: String(entry.path || "").trim() || name,
-      description: String(entry.description || "").trim(),
-      download_url: String(entry.download_url || "").trim(),
-      documentation_url: String(entry.documentation_url || "").trim(),
-    };
+    return { name, logical_name: name, path: String(entry.path || "").trim() || name,
+      description: String(entry.description || "").trim(), download_url: String(entry.download_url || "").trim(),
+      archive_path: String(entry.archive_path || "").trim(), documentation_url: String(entry.documentation_url || "").trim(),
+      platforms: normalizeCommandPlatforms(entry.platforms) };
+  }
+  function commandPlatform(row, os = Deno.build.os, arch = Deno.build.arch) {
+    const variants = row.platforms || {}, key = `${os}-${arch}`, variant = variants[key] ?? variants[os];
+    return { path: variant?.path || row.path, download_url: variant?.download_url ?? row.download_url,
+      archive_path: variant?.archive_path ?? row.archive_path, supported: !Object.keys(variants).length || variant !== undefined };
+  }
+  async function validateCommandEntry(row) {
+    for (const entry of [row, ...Object.values(row.platforms)]) {
+      if (entry.path) await binPath(entry.path);
+      if (entry.archive_path && (entry.archive_path.startsWith("/") || entry.archive_path.split(/[\\/]/).includes(".."))) throw new Error("archive_path must be a relative archive entry");
+      const warning = httpUrlWarning(entry.download_url, "Download URL"); if (warning) throw new Error(warning);
+    }
+    const warning = httpUrlWarning(row.documentation_url, "Documentation URL"); if (warning) throw new Error(warning);
+  }
+  async function commandPlatformsWarning(text) {
+    try { await validateCommandEntry(normalizeCommandEntry({ logical_name: "probe", platforms: parseYaml(text || "{}") })); return ""; }
+    catch (e) { return e.message; }
   }
   async function readCommandConfig() {
     let source;
     try { source = await Deno.readTextFile(COMMANDS_PATH); }
-    catch (e) {
-      if (!(e instanceof Deno.errors.NotFound)) throw e;
-      return [];
-    }
+    catch (e) { if (!(e instanceof Deno.errors.NotFound)) throw e; return []; }
     const document = parseYaml(source || "commands: []", { schema: "core" });
-    if (!document || typeof document !== "object" || Array.isArray(document)) throw new Error("commands.yaml must contain a mapping");
-    if (!Array.isArray(document.commands)) throw new Error("commands.yaml must contain a commands array");
-    const rows = document.commands.map(normalizeCommandEntry);
-    const names = new Set();
+    if (!document || typeof document !== "object" || Array.isArray(document) || !Array.isArray(document.commands)) throw new Error("commands.yaml must contain a commands array");
+    const rows = document.commands.map(normalizeCommandEntry), names = new Set();
     for (const row of rows) {
-      const key = row.name.toLowerCase();
-      if (names.has(key)) throw new Error(`Duplicate logical_name in commands.yaml: ${row.name}`);
-      names.add(key);
-      await binPath(row.path);
-      for (const [field, value] of [["download_url", row.download_url], ["documentation_url", row.documentation_url]]) {
-        if (!value) continue;
-        let url;
-        try { url = new URL(value); } catch { throw new Error(`Invalid ${field} for ${row.name}`); }
-        if (!/^https?:$/.test(url.protocol)) throw new Error(`${field} for ${row.name} must use HTTP or HTTPS`);
-      }
+      const key = row.name.toLowerCase(); if (names.has(key)) throw new Error(`Duplicate logical_name in commands.yaml: ${row.name}`);
+      names.add(key); await validateCommandEntry(row);
     }
     return rows;
   }
   async function writeCommandConfig(rows) {
-    const commands = rows.map(row => ({
-      logical_name: row.name,
-      ...(row.path !== row.name ? { path: row.path } : {}),
-      description: row.description || "",
-      download_url: row.download_url || "",
-      documentation_url: row.documentation_url || "",
-    }));
+    const commands = rows.map(row => ({ logical_name: row.name, ...(row.path !== row.name ? { path: row.path } : {}),
+      description: row.description || "", ...(row.download_url ? { download_url: row.download_url } : {}),
+      ...(row.archive_path ? { archive_path: row.archive_path } : {}), documentation_url: row.documentation_url || "",
+      ...(Object.keys(row.platforms || {}).length ? { platforms: row.platforms } : {}) }));
     const temporary = `${COMMANDS_PATH}.${crypto.randomUUID()}.tmp`;
     await Deno.writeTextFile(temporary, stringifyYaml({ commands }, { lineWidth: -1 }));
     if (Deno.build.os === "windows") await Deno.remove(COMMANDS_PATH).catch(e => { if (!(e instanceof Deno.errors.NotFound)) throw e; });
     await Deno.rename(temporary, COMMANDS_PATH);
   }
+
   function normalizeGuidedPromptArgument(argument, promptName) {
     if (!argument || typeof argument !== "object" || Array.isArray(argument))
       throw new Error(`Each argument for ${promptName} must be an object`);
@@ -5303,16 +5808,18 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     runtime: { os: Deno.build.os, arch: Deno.build.arch, standalone: Deno.build.standalone, app_dir: APP_DIR, now: "ISO timestamp", now_ms: 0 },
   }, null, 2);
   async function commandRow(row) {
-    const configured = await binPath(row.path), target = await commandTarget(row.path);
+    const effective = commandPlatform(row), configured = await binPath(effective.path), target = await commandTarget(effective.path);
     const stat = await Deno.stat(target.path).catch(() => null);
     return {
-      ...row,
+      ...row, ...effective,
+      catalog_path: row.path, catalog_download_url: row.download_url, catalog_archive_path: row.archive_path,
+      platform: `${Deno.build.os}-${Deno.build.arch}`,
       source: "catalog",
       registered: true,
       path: configured.relative,
       resolved_path: target.relative,
-      present: !!stat?.isFile,
-      executable: !!stat?.isFile && executableFile(target.relative, stat),
+      present: effective.supported && !!stat?.isFile,
+      executable: effective.supported && !!stat?.isFile && executableFile(target.relative, stat),
       size: stat?.size ?? null,
       modified_at: stat?.mtime?.toISOString() || null,
     };
@@ -5392,6 +5899,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     const registered = (await readCommandConfig()).find(row => row.name.toLowerCase() === String(name).toLowerCase());
     if (registered) {
       const target = await commandRow(registered);
+      if (!target.supported) throw new Error(`Catalog command "${registered.name}" is not supported on ${target.platform}`);
       if (!target.present) throw new Error(`Catalog command "${registered.name}" is missing: ${registered.path}`);
       if (!target.executable) throw new Error(`Catalog command "${registered.name}" is not executable: ${registered.path}`);
       return { name: registered.name, path: target.resolved_path, absolute: (await binPath(target.resolved_path)).path };
@@ -5544,8 +6052,39 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           ...contextInput,
         } },
       ],
+      proxy_get: [
+        "Get configured proxies without probing them. Requires chat_session, no Workspace. action=pick (default) selects distinct eligible entries with stats-aware round_robin (default) or weighted random; picks persist the global cursor in SQLite. action=list paginates the configured/resolved order with limit/offset and includes cooled-down entries and stats. action=report requires a previously picked proxy_id and success boolean; failures apply exponential cooldown or retry_after_seconds, successes clear consecutive failures. Report actual outcomes explicitly: MrMCP cannot observe requests made by external commands. direct is a placeholder for a direct request; include_direct=false excludes it. Explicit entries and lazily downloaded list sources come from Settings → Proxies / proxies.yaml; lists are bounded/cached, failed sources are reported. Empty picks return next_retry_at when all entries are cooling down. The tool returns proxy URLs including configured credentials; use them only for the intended request.",
+        { properties: { action: { type: "string", enum: ["pick", "list", "report"], default: "pick" }, mode: { type: "string", enum: ["random", "round_robin"], default: "round_robin" },
+          limit: { type: "integer", minimum: 1, maximum: 50 }, offset: { type: "integer", minimum: 0, maximum: 10000, default: 0 }, include_direct: { type: "boolean", default: true },
+          proxy_id: { type: "string", pattern: "^[a-f0-9]{64}$" }, success: { type: "boolean" }, retry_after_seconds: { type: "integer", minimum: 0, maximum: 86400 } } },
+      ],
+      document_grep: [
+        "Rank document passages with Xberg extraction and persistent LanceDB retrieval. Uses the current Workspace, or Settings → Search default_path (Desktop/_default when empty) without assigning a Workspace. mode=auto chooses hybrid when an embedding model is configured, otherwise fulltext; vector and hybrid require Settings → Search embeddings. Each call incrementally refreshes ONLY the requested path/include/exclude/MIME selection and restricts results to its currently eligible files. Globstar ** and parent/nested .gitignore are supported (gitignore defaults true); symlinks are skipped. Local files are hashed every call; unchanged extraction is reused across restarts. Use the catalog yt-dlp command to download subtitles to Workspace files before indexing them. Failed, ignored or oversized inputs are not searched. Native OS OCR uses Auto.js's native provider with no external OCR engine; unavailable OS support is reported. Returned line numbers refer to extracted text, not original PDF pages. Use fs_grep for exact literal/regex source occurrences. The selected index survives Tool Call history cleanup.",
+        {properties:{
+          query:{type:"string",minLength:1,maxLength:4096},mode:{type:"string",enum:["auto","fulltext","vector","hybrid"],default:"auto"},...pathSelection,path:{...pathSelection.path,description:"File or directory relative to the current Workspace or configured default search directory."},
+          mime:{type:"array",minItems:1,maxItems:100,uniqueItems:true,items:{type:"string",pattern:"^[a-zA-Z0-9.+_-]+/([a-zA-Z0-9.+_-]+|\\*)$"},description:"Exact MIME types or type/*; inferred from filename extension for local files. "},
+          limit:{type:"integer",minimum:1,maximum:100,default:10},max_files:{type:"integer",minimum:1,maximum:5000,default:1000},max_file_bytes:{type:"integer",minimum:1,maximum:52428800,default:20971520},
+        },required:["query"]},
+      ],
+      source_code_search: [
+        "Search source code by relevance and explore AST functions, classes, methods, interfaces and imports using Lucerna. Uses the current Workspace, or Settings → Search default_path (Desktop/_default when empty) without assigning a Workspace. This deployment uses local BM25 lexical retrieval plus AST, without semantic embeddings or remote providers. Every call refreshes the selected live files; unchanged AST chunks and the SQLite BM25 index persist under the server data directory and are reused after restart. Only a completely traversed selection prunes absent/ignored files; other scopes remain stored and cannot appear in results. Applicable parent and nested .gitignore rules are always enforced, including negations, and cannot be disabled. Symlinks are not indexed. Default action=search; use fs_grep for literal/regex occurrences and fs_read for exact ranges. Results retain Lucerna chunk ids, source-directory-relative filePath and one-based startLine/endLine. Reuse the same scope for stateless offset pagination. Errors, skipped files and truncation indicate incomplete coverage.",
+        { properties: {
+          action: { type: "string", enum: SOURCE_CODE_ACTIONS, default: "search" },
+          query: { type: "string", minLength: 1, description: "Natural-language or identifier query; required for search. Retrieval is lexical BM25 in this deployment." },
+          path: { type: "string", default: ".", description: "File/directory relative to the current Workspace or configured default search directory." },
+          include: { type: "array", items: { type: "string" }, description: "Glob patterns relative to path; default **/*. Gitignore always applies." },
+          exclude: { type: "array", items: { type: "string" } }, hidden: { type: "boolean", default: false },
+          language: { anyOf: [{ type: "string" }, { type: "array", items: { type: "string" }, uniqueItems: true, minItems: 1 }], description: `Search language filter. Supported: ${SOURCE_CODE_LANGUAGES.join(", ")}. Aliases include c++, c#, js, ts, py, yml and sh; results use canonical names. Grammars download on first use into the OS parser cache.` },
+          types: { type: "array", items: { type: "string" }, uniqueItems: true, description: "Lucerna chunk types, e.g. function, class, method, import, interface." },
+          file_path: { type: "string", description: "Path relative to the current Workspace or configured default search directory; required for chunks. Search also accepts a glob filter." },
+          include_content: { type: "boolean", default: true, description: "false removes source content and contextContent from all returned chunks." },
+          limit: { type: "integer", minimum: 1, maximum: 100, default: 10 }, offset: { type: "integer", minimum: 0, maximum: 10000, default: 0 },
+          max_files: { type: "integer", minimum: 1, maximum: 10000, default: 5000 },
+          max_file_bytes: { type: "integer", minimum: 1, maximum: 2097152, default: 1048576 },
+        } },
+      ],
       fs_grep: [
-        "Search textual occurrences across files, including comments, strings and configuration. For symbol/caller exploration, prefer a suitable discover_commands entry. Narrow path/include when scope is known. Use mode=files for paths only, matches for source lines, count for per-file matching-line counts (grep -c, not substring occurrences). With regex=false, pattern is one literal substring including spaces and punctuation. Request a few context lines, e.g. 2 before/after, when nearby code can avoid another read; default 0. Matched files include edit fingerprints. Counters are page-local; skipped_large_files and per-file errors indicate incomplete coverage. When truncated=true, pass next_resume_after as resume_after with unchanged search arguments; remaining paths may yield no matches.",
+        "Search textual occurrences across files, including comments, strings and configuration. Use source_code_search for ranked lexical retrieval and AST symbols; prefer a suitable discover_commands entry for additional caller/impact exploration. Narrow path/include when scope is known. Use mode=files for paths only, matches for source lines, count for per-file matching-line counts (grep -c, not substring occurrences). With regex=false, pattern is one literal substring including spaces and punctuation. Request a few context lines, e.g. 2 before/after, when nearby code can avoid another read; default 0. Matched files include edit fingerprints. Counters are page-local; skipped_large_files and per-file errors indicate incomplete coverage. When truncated=true, pass next_resume_after as resume_after with unchanged search arguments; remaining paths may yield no matches.",
         { properties: {
           pattern: { type: "string", minLength: 1, description: "Literal substring when regex=false, including any spaces exactly as supplied; regular expression source only when regex=true." }, ...pathSelection,
           regex: { type: "boolean", default: false }, case_sensitive: { type: "boolean", default: false },
@@ -6055,6 +6594,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       stderr: { type: "string", description: "Complete normalized standard error, returned only when separate_streams=true. Some successful CLIs legitimately write progress or diagnostics here." },
       stdin_open: { type: "boolean" }, success: { type: "boolean" },
     };
+    const searchScopeOutputSchema = {source_directory:{type:"string",description:"Absolute directory containing the searched files."},index_directory:{type:"string",description:"Absolute persistent search index directory."},workspace_selected:{type:"boolean",description:"false means the configured default search directory was used; the Session still has no Workspace."}};
     const outputSchemas = {
       init_chat_session: outputSchema(),
       chat_set_goal: outputSchema({
@@ -6079,6 +6619,9 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       fs_grep: strictOutputSchema({ mode: { type: "string", enum: ["matches", "files", "count"] }, scanned_files: { type: "integer", minimum: 0, description: "Candidate files examined on this page after path resolution, including oversized files and later read/decode failures. Not a count of successfully searched files." }, matched_files: { type: "integer", minimum: 0 }, skipped_large_files: { type: "integer", minimum: 0, description: "Candidates omitted on this page because their observed source size exceeds max_file_bytes. Excludes filtered paths and candidates not yet visited." }, max_file_bytes: { type: "integer", minimum: 1, maximum: 52428800 }, returned: { type: "integer", minimum: 0 }, limit: { type: "integer", minimum: 1 }, truncation_reason: { anyOf: [{ type: "string", enum: ["limit", "walk_limit"] }, { type: "null" }] }, files: fsArray(fsGrepEntry), next_resume_after: { anyOf: [fsResumePoint, { type: "null" }] }, truncated: { type: "boolean" } }),
       fs_read: strictOutputSchema({ files: fsArray(fsReadEntry) }),
       fs_navigate: strictOutputSchema({ files: fsArray(fsNavigateEntry) }),
+      document_grep: strictOutputSchema({...searchScopeOutputSchema,mode:{type:"string",enum:["fulltext","vector","hybrid"]},gitignore:{type:"boolean"},indexed_files:{type:"integer",minimum:0},indexed_chunks:{type:"integer",minimum:0},reindexed_files:{type:"integer",minimum:0},unchanged_files:{type:"integer",minimum:0},removed_files:{type:"integer",minimum:0},scanned_files:{type:"integer",minimum:0},truncated:{type:"boolean"},error_count:{type:"integer",minimum:0},errors:{type:"array",items:{type:"object",additionalProperties:false,properties:{path:{type:"string"},error:{type:"string"}},required:["path","error"]}},returned:{type:"integer",minimum:0},results:{type:"array",items:{type:"object",additionalProperties:false,properties:{id:{type:"string"},path:{type:"string"},mime:{type:"string"},chunk:{type:"integer",minimum:0},text:{type:"string"},start_line:{type:"integer",minimum:1},end_line:{type:"integer",minimum:1},score:{type:"number"}},required:["id","path","mime","chunk","text","start_line","end_line","score"]}}}),
+      proxy_get: strictOutputSchema({ action: { type: "string", enum: ["pick", "list", "report"] }, mode: { type: "string", enum: ["random", "round_robin"] }, total: { type: "integer", minimum: 0 }, offset: { type: "integer", minimum: 0 }, returned: { type: "integer", minimum: 0 }, next_offset: { anyOf: [{ type: "integer" }, { type: "null" }] }, next_retry_at: { anyOf: [{ type: "integer" }, { type: "null" }] }, proxies: { type: "array", items: { type: "object", additionalProperties: false, properties: { proxy_id: { type: "string" }, proxy: { anyOf: [{ type: "string" }, { type: "null" }] }, available: { type: "boolean" }, stats: { type: "object", additionalProperties: false, properties: Object.fromEntries(["successes","failures","consecutive_failures","last_selected_at","last_reported_at","cooldown_until"].map(key => [key, { type: "integer", minimum: 0 }])), required: ["successes","failures","consecutive_failures","last_selected_at","last_reported_at","cooldown_until"] } }, required: ["proxy_id","proxy","available","stats"] } }, errors: { type: "array", items: { type: "object", additionalProperties: false, properties: { source: { type: "integer" }, error: { type: "string" } }, required: ["source","error"] } } }),
+      source_code_search: strictOutputSchema({ ...searchScopeOutputSchema, reindexed_files: {type:"integer",minimum:0}, unchanged_files: {type:"integer",minimum:0}, removed_files: {type:"integer",minimum:0}, scanned_files: {type:"integer",minimum:0}, action: { type: "string", enum: SOURCE_CODE_ACTIONS }, mode: { type: "string", const: "lexical" }, gitignore: { type: "boolean", const: true }, path: { type: "string" }, indexed_files: { type: "integer", minimum: 0 }, indexed_chunks: { type: "integer", minimum: 0 }, skipped_large_files: { type: "integer", minimum: 0 }, skipped_unsupported_files: { type: "integer", minimum: 0 }, error_count: { type: "integer", minimum: 0 }, errors: { type: "array", items: { type: "object", properties: { path: { type: "string" }, error: { type: "string" } }, required: ["path", "error"], additionalProperties: false } }, truncation_reason: { anyOf: [{ type: "string", enum: ["walk_limit", "walk_error", "max_files", "total_bytes"] }, { type: "null" }] }, truncated: { type: "boolean" }, returned: { type: "integer", minimum: 0 }, next_offset: { anyOf: [{ type: "integer", minimum: 0 }, { type: "null" }] }, data: { type: "object", additionalProperties: true } }),
       fs_stat: strictOutputSchema({ entries: fsArray(fsStatEntry) }),
       fs_write: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, files: fsArray(fsWriteEntry) }),
       fs_edit: strictOutputSchema({ succeeded: { type: "integer" }, failed: { type: "integer" }, total_replacements: { type: "integer" }, files: fsArray(fsEditEntry) }),
@@ -6184,7 +6727,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     });
     const titles = {
       init_chat_session: "Initialize Chat Session", chat_set_goal: "Set Chat Goal", chat_goal_debug: "Debug Chat Goal", list_workspaces: "List Workspaces", open_workspace: "Open Workspace",
-      fs_glob: "FS Glob", fs_grep: "FS Grep", fs_read: "FS Read", fs_navigate: "FS Navigate", fs_stat: "FS Stat",
+      fs_glob: "FS Glob", fs_grep: "FS Grep", fs_read: "FS Read", fs_navigate: "FS Navigate", fs_stat: "FS Stat", source_code_search: "Source Code Search", document_grep: "Document Grep", proxy_get: "Get Proxy",
       fs_write: "FS Write", fs_edit: "FS Edit", fs_mkdir: "FS Mkdir", fs_copy: "FS Copy", fs_move: "FS Move", fs_trash: "FS Trash", fs_untrash: "FS Untrash",
       desktop_auto: "Desktop Auto", publish: "Publish to User", cdp_call: "CDP Call", cdp_subs: "CDP Subscriptions", cdp_poll: "CDP Poll", memory_find: "Memory Find", memory_set: "Memory Set", telegram_req: "Telegram Request", discover_commands: "Discover Commands", tools_schema: "Tools Schema", tools_log: "Tools Log",
       exec: "Run Command", exec_start: "Start Persistent Command", exec_attach: "Attach Process Output", exec_write: "Write Stdin",
@@ -6196,7 +6739,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       readOnlyHint: READ_TOOLS.has(name) || name === "publish" || name === "cdp_poll" || name === "memory_find",
       destructiveHint: ["desktop_auto", "cdp_call", "memory_set", "telegram_req", "fs_write", "fs_edit", "fs_text_convert_encoding_eol", "fs_move", "exec", "exec_start", "exec_write", "exec_kill", "js", "js_add_node_module_dir", "js_reset"].includes(name),
       idempotentHint: (READ_TOOLS.has(name) && name !== "publish") || ["fs_write", "fs_mkdir", "fs_text_convert_encoding_eol", "js_reset", "workspace_dev_preferences_write"].includes(name),
-      openWorldHint: name === "desktop_auto" || name === "chat_goal_debug" || name.startsWith("cdp_") || name.startsWith("exec") || name === "js" || name === "publish" || name === "telegram_req",
+      openWorldHint: name === "proxy_get" || name === "document_grep" || name === "desktop_auto" || name === "chat_goal_debug" || name.startsWith("cdp_") || name.startsWith("exec") || name === "js" || name === "publish" || name === "telegram_req",
     });
     const schema = value => ({
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -6284,7 +6827,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         memory_find: ["memories", "next_before_id"], memory_set: ["memory", "deleted"], telegram_req: ["method", "response", "migrated_chat_id"],
         fs_glob: ["metadata", "returned", "limit", "entries", "next_after_path", "truncated"],
         fs_grep: ["scanned_files", "matched_files", "skipped_large_files", "max_file_bytes", "returned", "limit", "truncation_reason", "files", "next_resume_after", "truncated"],
-        fs_read: ["files"], fs_navigate: ["files"], fs_stat: ["entries"],
+        fs_read: ["files"], fs_navigate: ["files"], fs_stat: ["entries"], source_code_search: ["action", "mode", "gitignore", "indexed_files", "indexed_chunks", "data", "errors", "truncated", "next_offset"], document_grep: ["mode", "gitignore", "indexed_files", "indexed_chunks", "reindexed_files", "unchanged_files", "removed_files", "errors", "results", "truncated"],
         fs_write: ["succeeded", "failed", "files"], fs_edit: ["succeeded", "failed", "total_replacements", "files"],
         fs_text_convert_encoding_eol: ["succeeded", "failed", "files"],
         fs_mkdir: ["succeeded", "failed", "entries"], fs_copy: ["succeeded", "failed", "entries"], fs_move: ["succeeded", "failed", "entries"],
@@ -6319,7 +6862,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       open_workspace: ["name", "create", "chat_session"],
       fs_glob: ["path", "include", "exclude", "gitignore", "hidden", "metadata", "limit", "after_path"],
       fs_grep: ["pattern", "path", "include", "exclude", "gitignore", "hidden", "regex", "case_sensitive", "encoding", "context_lines_before", "context_lines_after", "mode", "max_file_bytes", "limit", "resume_after"],
-      fs_read: ["files", "max_output_bytes_per_file"], fs_navigate: ["pattern", "files", "regex", "case_sensitive", "context_lines_before", "context_lines_after"], fs_stat: ["paths", "fingerprint"],
+      fs_read: ["files", "max_output_bytes_per_file"], fs_navigate: ["pattern", "files", "regex", "case_sensitive", "context_lines_before", "context_lines_after"], fs_stat: ["paths", "fingerprint"], source_code_search: ["action", "query", "path", "include", "exclude", "file_path", "include_content", "limit", "offset"], document_grep: ["query", "mode", "path", "include", "exclude", "mime", "gitignore", "limit"],
       fs_write: ["files", "create_parents"], fs_edit: ["files"], fs_text_convert_encoding_eol: ["files", "encoding", "line_endings", "bom"], fs_mkdir: ["paths", "parents"],
       fs_copy: ["entries", "create_parents"], fs_move: ["entries", "create_parents"], fs_trash: ["paths", "selection"], fs_untrash: ["trash_id"],
       desktop_auto: ["yaml"], publish: ["path", "text", "base64", "mime_type", "filename", "presentation", "title", "description", "height"],
@@ -7733,6 +8276,9 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     let workspaceRootRealPromise = null;
     const workspaceRootReal = () => workspaceRootRealPromise ||= Deno.realPath(selection.root.path);
     const resolvePath = async path => resolveWorkspacePath(selection, path, await workspaceRootReal());
+    if (name === "document_grep") return await documentGrep(await searchSelection(selection), args);
+    if (name === "proxy_get") return await proxyGet(args);
+    if (name === "source_code_search") return await sourceCodeSearch(await searchSelection(selection), args);
     const pathKey = path => Deno.build.os === "windows" ? resolve(path).toLowerCase() : resolve(path);
     const exists = async path => {
       try { return await Deno.lstat(path); }
@@ -8591,6 +9137,12 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     // Summaries inspect only result metadata, never source text, transcripts or nested payloads.
     const continuation = field => `; continuation available via ${field}`;
     switch (name) {
+      case "document_grep":
+        return `${result.returned} passages; ${result.reindexed_files} files refreshed, ${result.unchanged_files} reused; ${result.mode}; ${result.error_count} errors${result.truncated ? "; incomplete selection" : ""}`;
+      case "proxy_get":
+        return `Proxies: ${result.returned ?? 0} · ${result.action || "pick"} · ${result.mode || "round_robin"}`;
+      case "source_code_search":
+        return `${result.returned} results; ${result.indexed_files} files / ${result.indexed_chunks} chunks indexed; ${result.error_count} errors; ${result.mode}` + (result.next_offset != null ? "; continue with next_offset" : "") + (result.truncation_reason ? `; incomplete: ${result.truncation_reason}` : "");
       case "fs_glob":
         return `${result.returned} entries returned on this page${result.truncated ? continuation("next_after_path") : ""}`;
       case "fs_grep": {
@@ -9358,7 +9910,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const serverInfoMeta = { "io.modelcontextprotocol/serverInfo": mcpServerInfo() };
     const instructions = fullAccess
       ? "Start a chat by calling init_chat_session with no arguments, unless you already have its valid chat_session. Reuse the exact returned chat_session on every subsequent tool call, including list_workspaces and tools_schema. Initialization creates no Workspace and selects no working directory. Use list_workspaces to discover enabled Workspace names, then open_workspace(chat_session,name) to attach or move this same Session. Only pass create=true when you explicitly want a missing Workspace created as a new empty Desktop folder. Filesystem tools, new processes, configured commands and JavaScript kernels require an open Workspace; desktop/CDP, discovery, diagnostics, memory, Telegram and text/base64 publication work without one. Existing process follow-ups remain available by chat_session after its Workspace is removed. The result includes workspace_name, absolute cwd, agent_guidance_path, whether this call created the Workspace, and a compact count/latest-key Memory summary for Global, Workspace and Session scopes. When guidance is non-null, read and follow it before repository work. Workspace changes preserve chat_session; only init_chat_session creates a Session. Invalid or expired values never create replacement Sessions implicitly. " +
-        "Use fs_glob, fs_grep, fs_read, fs_navigate, fs_stat, fs_write and fs_edit directly for filesystem discovery, inspection, textual search and changes; do not spawn shell commands, uv or Python for operations those tools cover. For symbol/caller/impact exploration, prefer a suitable discovered catalog command. Batch independent reads and request small optional context when nearby text avoids another call. Check per-entry failures, skipped_large_files and continuation fields before claiming complete coverage or successful batch changes. Use fs_text_convert_encoding_eol only for explicit encoding/EOL/BOM representation conversion of named files when requested or specifically required by the task; never use it proactively to normalize a repository. Use desktop_auto for desktop observation and interaction through AAF YAML; when the model needs to see a screenshot, retain its image handle anywhere in the scenario's final state so the tool returns that image directly as MCP image content. Multiple retained screenshots and ordinary OCR/text/geometry/state values may coexist in one result. " +
+        "Use fs_glob, fs_grep, fs_read, fs_navigate, fs_stat, fs_write and fs_edit directly for filesystem discovery, inspection, textual search and changes; do not spawn shell commands, uv or Python for operations those tools cover. Use document_grep for Xberg document extraction, scoped incremental fulltext/vector/hybrid retrieval over files. document_grep and source_code_search also work without a Workspace using Search default_path (initially Desktop/_default); they keep persistent indices across restarts and report effective source/index paths without assigning a Workspace. Use source_code_search for Lucerna BM25 retrieval, AST symbols and source maps with gitignore always enabled. This installation uses local lexical/AST search without semantic embeddings or call-graph analysis. For additional caller/impact exploration, prefer a suitable discovered catalog command. Batch independent reads and request small optional context when nearby text avoids another call. Check per-entry failures, skipped_large_files and continuation fields before claiming complete coverage or successful batch changes. Use fs_text_convert_encoding_eol only for explicit encoding/EOL/BOM representation conversion of named files when requested or specifically required by the task; never use it proactively to normalize a repository. Use desktop_auto for desktop observation and interaction through AAF YAML; when the model needs to see a screenshot, retain its image handle anywhere in the scenario's final state so the tool returns that image directly as MCP image content. Multiple retained screenshots and ordinary OCR/text/geometry/state values may coexist in one result. " +
         "workspace_dev_preferences_write is strictly opt-in: call it only when the user explicitly asks to copy/save/materialize their development preferences into the current Workspace. Never call it proactively, for preference discovery, or merely because DEV_PREF.md might exist; the tool returns no preference content and calling it does not imply that DEV_PREF.md should then be read or applied. " +
         "When work may benefit from command-line capability beyond the structured tools, call discover_commands proactively before inventing workarounds or assuming a utility is unavailable. It returns the complete user-chosen available command catalog in one call; prefer a listed command when it fits, remember the catalog for the Session, and invoke its logical_name directly through exec.program without PATH probes. Use chat_set_goal only for user-requested automatic ChatGPT follow-ups; goal empty stops them. It opens a dedicated Chrome login profile, tries to match the chat once per explicit set, and uses the configured default Tool Call inactivity timeout (initially 5 minutes). When globally disabled it returns disabled and performs no monitoring. After a failed/login/interrupted match, call chat_set_goal again only when a new attempt is wanted; background ticks and login completion do not retry it. Startup matching is an optional global setting, off by default. Check status before claiming the association is ready. Use tools_schema when exact live tool descriptor data is needed instead of relying on a connector-synthesized schema view. " +
         "Command output is normalized before buffering or streaming: ANSI/OSC/control sequences are removed and standalone carriage-return progress updates become separate lines. exec retains its complete foreground transcript and, when _meta.progressToken is supplied, also emits incremental progress before returning the same complete transcript at exit; observed cancellation/disconnect terminates exec's child, while the hard timeout covers transports that cannot report a disconnect before a response exists. Foreground exec and configured foreground commands default to 45 seconds but may be raised to 1 hour; high request timeouts can cross client/proxy retry or replay windows, so for long, expensive or non-idempotent work use exec_start, which immediately returns exec_id and leaves the persistent child independent of request lifetime. Pass that exec_id together with the same chat_session to exec_attach, exec_write, exec_kill or exec_status; ids from other Sessions are inaccessible. exec_list shows only currently running persistent executions in this Session. exec_status is the non-consuming way to inspect running or recently completed/killed executions and optionally retrieve all output or a tail. exec_attach is also request-bounded: timeout_ms defaults to 45 seconds and may be raised to 1 hour; high values can overlap client/proxy retries, so shorter repeated attaches or exec_status are safer, returns wait_timed_out=true when only the attachment wait expires while the child remains running, and can then be called again. With progressToken it streams unread backlog/live output only until exit/disconnect/that bounded wait; without progressToken it returns at most 16 KiB of unread output per call. An observed disconnect or the bounded attachment timeout detaches and never kills the persistent process; the timeout is also the fallback when a transport cannot report disconnect. " +
@@ -9573,6 +10125,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       chat_goal_stop_before_send: getCfg("chat_goal_stop_before_send", "0") === "1",
       chat_goal_match_on_startup: getCfg("chat_goal_match_on_startup", "0") === "1",
       chat_goal_windows_hide: getCfg("chat_goal_windows_hide", "auto"),
+      search_configuration: Deno.readTextFileSync(SEARCH_PATH),
+      search_configuration_path: SEARCH_PATH,
+      proxy_configuration: Deno.readTextFileSync(PROXIES_PATH), proxy_configuration_path: PROXIES_PATH,
       text_encoding_detection: textEncodingDetection(),
       exec_environment: getCfg("exec_environment", ""),
       tool_call_storage: toolCallStorage(),
@@ -10195,7 +10750,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 <? } else if(section==="sessions"){ ?><section id=sessions class=page><div class=row><h2 class=grow>💬 Sessions</h2><span class=muted>Live updates</span><button class=danger data-action=clear-sessions<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Persistent MCP Sessions. Each Session is attached to a <b>📁 Workspace</b>.</p><? if(s.sessions?.oauthClientId){ ?><div class=row><span class=muted>OAuth filter</span><code><?= s.sessions.oauthClientId ?></code><button class=small data-action=clear-session-oauth>✕ Clear</button></div><? } ?><div class=card><b>Client Continuity</b><p class=muted>ChatGPT may create a new Session after model or thinking changes. Client/auth/User-Agent metadata is best effort.</p></div><div id=contextList></div></section>
 <? } else if(section==="processes"){ ?><section id=processes class=page><div class=row><h2 class=grow>🖥️ Processes</h2><span class=muted>Live runtime state · independent of Tool Call payload retention</span></div><div class=row><h3 class=grow>🛠️ Active Tool Calls</h3><span class=muted>Live · finished calls remain for 5s</span></div><div id=activeToolCalls></div><div class=row><h3 class=grow>🖥️ Active Processes</h3><span class=muted>Foreground exec + persistent exec_start</span></div><p class=muted>Processes currently running in this MrMCP instance. Output below is an 8 KiB live tail; process control does not depend on Tool Call history.</p><div id=processList></div></section>
 <? } else if(section==="roots"){ ?><section id=roots class=page><div class=row><h2 class=grow>📁 Workspaces</h2><button class=primary data-action=new-root>➕ Add Workspace</button><button class=danger data-action=clear-workspaces<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Workspace names are unique. Drag Sessions to change where future Tool Calls run; running processes stay in their original folder.</p><div id=rootList></div></section>
-<? } else if(section==="commands"){ const c=s.commands||{}, discoveryEnabled=c.discoveryEnabled!==false; ?><section id=commands class=page><div class=row><h2 class=grow>🧰 Extra Commands</h2><button class="<?= discoveryEnabled?'ok':'failed' ?>" data-action=toggle-command-discovery><?= discoveryEnabled?'🟢 Agent Discovery Enabled':'🔴 Agent Discovery Disabled' ?></button><button data-action=download-all-commands>⬇️ Download All</button><button class=primary data-action=new-command>➕ Register Command</button></div><p class=muted><code>commands.yaml</code> defines catalog entries. Executables in <code>.mrmcp/bin</code> appear automatically.</p><div class=row><input id=commandQuery class=grow placeholder="Search name, path or description…" value="<?= c.query||'' ?>"><select id=commandFilter><option value=""<?= !c.filter?' selected':'' ?>>All Commands</option><option value=available<?= c.filter==='available'?' selected':'' ?>>Available</option><option value=unavailable<?= c.filter==='unavailable'?' selected':'' ?>>Unavailable</option><option value=yaml<?= c.filter==='yaml'?' selected':'' ?>>YAML Metadata</option><option value=disk<?= c.filter==='disk'?' selected':'' ?>>Disk Only</option></select><select id=commandPageSize><? [5,10,25,50].forEach(n=>{ ?><option<?= Number(c.pageSize||5)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-commands>🔎 Search</button></div><div id=commandList></div></section>
+<? } else if(section==="commands"){ const c=s.commands||{}, discoveryEnabled=c.discoveryEnabled!==false; ?><section id=commands class=page><div class=row><h2 class=grow>🧰 Extra Commands</h2><button class="<?= discoveryEnabled?'ok':'failed' ?>" data-action=toggle-command-discovery><?= discoveryEnabled?'🟢 Agent Discovery Enabled':'🔴 Agent Discovery Disabled' ?></button><button data-action=download-all-commands>⬇️ Download All</button><button class=primary data-action=new-command>➕ Register Command</button></div><p class=muted><code>commands.yaml</code> defines catalog entries and platform variants. Downloads select the current OS/architecture. Executables in <code>.mrmcp/bin</code> appear automatically.</p><div class=row><input id=commandQuery class=grow placeholder="Search name, path or description…" value="<?= c.query||'' ?>"><select id=commandFilter><option value=""<?= !c.filter?' selected':'' ?>>All Commands</option><option value=available<?= c.filter==='available'?' selected':'' ?>>Available</option><option value=unavailable<?= c.filter==='unavailable'?' selected':'' ?>>Unavailable</option><option value=yaml<?= c.filter==='yaml'?' selected':'' ?>>YAML Metadata</option><option value=disk<?= c.filter==='disk'?' selected':'' ?>>Disk Only</option></select><select id=commandPageSize><? [5,10,25,50].forEach(n=>{ ?><option<?= Number(c.pageSize||5)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-commands>🔎 Search</button></div><div id=commandList></div></section>
 <? } else if(section==="prompts"){ const p=s.prompts||{}; ?><section id=prompts class=page><div class=row><h2 class=grow>🧭 Guided Prompts</h2><button data-action=prompt-help>❓ Template Help</button><button class=primary data-action=new-prompt>➕ Add Prompt</button></div><p class=muted><code>guided_prompts.yaml</code> is authoritative. Entries are exposed through MCP <code>prompts/list</code> and rendered on demand through <code>prompts/get</code>.</p><div class=row><input id=promptQuery class=grow placeholder="Search name, title, description or arguments…" value="<?= p.query||'' ?>"><select id=promptPageSize><? [5,10,25,50].forEach(n=>{ ?><option<?= Number(p.pageSize||5)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=load-prompts>🔎 Search</button></div><div id=promptList></div></section>
 <? } else if(section==="prompt_help"){ const h=s.promptHelp||{}; ?><section id=prompt_help class=page><div class=row><h2 class=grow>🧭 Guided Prompt Templates</h2><button data-action=prompts-back>← Guided Prompts</button></div><div class=card><h3>YAML shape</h3><p><code>guided_prompts.yaml</code> contains a top-level <code>prompts</code> array. Prompt arguments are MCP string arguments with <code>name</code> plus optional <code>title</code>, <code>description</code> and <code>required</code>; <code>required</code> controls whether the client must supply them.</p><pre><?= h.yaml||'' ?></pre></div><div class=card><h3>Eta</h3><p>The <code>template</code> is rendered with Eta using standard tags and no HTML escaping. Read values with <code>&lt;%= it.args.focus %&gt;</code>, use normal JavaScript in <code>&lt;% ... %&gt;</code>, and branch on any model field. Templates are trusted local configuration and are not sandboxed.</p><pre><?= h.model||'' ?></pre></div><div class=card><h3>Session / Workspace context</h3><p><code>it.session</code> and <code>it.workspace</code> are populated only when the prompt declares a <code>chat_session</code> argument and the client supplies a valid active MrMCP Session handle. For a Session with no selected Workspace, <code>it.workspace</code> remains null. <code>it.workspaces</code> is always available and includes the fallback Workspace plus enabled named Workspaces.</p></div></section>
 <? } else if(section==="logs"){ const l=s.logs||{}; ?><section id=logs class=page><div class=row><h2 class=grow>🛠️ Tool Calls</h2><button class=danger data-action=clear-tool-calls<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Click a row for details. Terminate active work from Actions.</p><div class=row><input id=logTool placeholder="Tool / command…" value="<?= l.toolQuery||'' ?>"><input id=logQuery class=grow placeholder="Search input, output, errors…" value="<?= l.query||'' ?>"><select id=logContext><option value="">All sessions</option><? (s.contextValues||[]).forEach(v=>{ ?><option value="<?= v.pk ?>"<?= String(l.context||"")===String(v.pk)?" selected":"" ?>>#<?= v.pk ?></option><? }) ?></select><select id=logStatus class="<?= l.status||'' ?>"><option value="">All states</option><? ['completed','failed','invalid','running'].forEach(v=>{ ?><option class="<?= v ?>" value="<?= v ?>"<?= l.status===v?' selected':'' ?>><?= v ?></option><? }) ?></select><select id=logPageSize><? [10,25,50,100].forEach(n=>{ ?><option<?= Number(l.pageSize||25)===n?' selected':'' ?>><?= n ?></option><? }) ?></select><button data-action=clear-log-filters>🧹 Clear Filters</button></div><? if(l.selfTest){ ?><div id=logSelfTest class=card><div class=row><h3 class=grow>🧪 MCP Self-Test</h3><button class=small data-action=copy-detail data-target=logDetail>📋 Copy JSON</button><button class=small data-action=close-self-test>✕ Close</button></div><pre id=logDetail><?= it.pretty(l.selfTest) ?></pre></div><? } ?><div id=logList></div></section>
@@ -10207,9 +10762,9 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 <? } else if(section==="debug"){ const d=s.debug||{},enabled=!!s.debug?.enabled; ?><section id=debug class=page><div class=row><h2 class=grow>🐞 HTTP Debug Log</h2><button class="debug-toggle <?= enabled?'enabled':'disabled' ?>" data-action=toggle-debug-settings aria-pressed="<?= enabled?'true':'false' ?>"><?= enabled?"🟢 Logging ON · Disable":"🔴 Logging OFF · Enable" ?></button><button class=danger data-action=clear-debug>🗑️ Clear</button></div><p class=muted>Off by default. Secrets are redacted. Disabling stops new records but keeps stored data visible. Click a row for request JSON.</p><div class=row><input id=debugQuery class=grow placeholder="Search URL, headers, body or errors…" value="<?= d.query||'' ?>"><select id=debugMethod><option value="">All methods</option><? ['GET','POST','OPTIONS'].forEach(v=>{ ?><option<?= d.method===v?' selected':'' ?>><?= v ?></option><? }) ?></select><input id=debugStatus type=number placeholder="Status" value="<?= d.status||'' ?>"><button data-action=load-debug>🔎 Search</button></div><div id=debugList></div></section>
 <? } else if(section==="oauth"){ ?><section id=oauth class=page><div class=row><h2 class=grow>🔐 OAuth Clients</h2><button class=danger data-action=clear-clients<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><div id=oauthList></div></section>
 <? } else if(section==="telegram"){ const t=s.telegram||{}; ?><section id=telegram class=page><div class=row><h2 class=grow>✈️ Telegram</h2><button class=primary data-action=save-telegram<?= t.save_disabled?' disabled':'' ?>>💾 Save Telegram</button></div><div class=card><h3>🤖 Telegram Bot</h3><div class=row><label class=grow>Bot token</label><? if(t.field_warning){ ?><span class=field-warning>⚠ <?= t.field_warning ?></span><? } ?></div><input id=telegramBotToken type=password autocomplete=off value="<?= t.telegram_bot_token||'' ?>" placeholder="123456789:AA…"><p class=muted>Used only by <code>telegram_req</code> to authenticate Bot API requests. Chat IDs, channels and application state are intentionally left to the agent/Memory.</p></div></section>
-<? } else if(section==="settings"){ const tab=s.settingsTab||"network"; ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><nav class=settings-tabs aria-label="Settings sections"><? [["network","🌐","Network"],["security","🔒","Security"],["process","🖥️","Process"],["files","📄","Files"],["goals","🎯","Goals"],["notifications","🔔","Notifications"],["maintenance","🧹","Maintenance"]].forEach(([id,icon,label])=>{ ?><button data-action=settings-tab data-settings-tab="<?= id ?>" class="<?= tab===id?'active':'' ?>"<?= tab===id?' aria-current=page':'' ?>><?= icon ?> <?= label ?></button><? }) ?></nav><p class=muted>📂 Data Directory · <code style="overflow-wrap:anywhere"><?= settings.data_directory||'' ?></code></p><div class=settings-layout><div class=settings-main><div class=card<? if(tab!=="network"){ ?> hidden<? } ?>><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card<? if(tab!=="security"){ ?> hidden<? } ?>><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card<? if(tab!=="notifications"){ ?> hidden<? } ?>><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card<? if(tab!=="process"){ ?> hidden<? } ?>><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><label><input id=gitPreserveLineEndings type=checkbox<?= settings.git_preserve_line_endings?" checked":"" ?>> Disable automatic Git CRLF conversion</label><p class=muted>When enabled, managed processes use <code>core.autocrlf=false</code>. An existing CRLF checkout made with <code>core.autocrlf=true</code> may then appear modified without a file edit. Turn this off to use the repository and machine Git policy. Repository <code>.gitattributes</code> and explicit <code>git -c</code> options still apply.</p><div class=row><label class=grow>Environment variables for all spawned processes · one <code>NAME=value</code> per line</label><? if(settings.field_warnings?.exec_environment){ ?><span class=field-warning>⚠ <?= settings.field_warnings.exec_environment ?></span><? } ?></div><textarea id=execEnvironment rows=8 placeholder="CACHE_DIR=\${MRMCP_DIR}&#10;TOOLS=\${MRMCP_BIN}&#10;PROJECT=\${WORKSPACE}&#10;RUN_FROM=\${CWD}"><?= settings.exec_environment||'' ?></textarea><p class=muted>Available placeholders: <code>\${MRMCP_DIR}</code> = MrMCP data directory, <code>\${MRMCP_BIN}</code> = managed bin directory, <code>\${WORKSPACE}</code> = current Workspace root, <code>\${CWD}</code> = effective exec directory. Precedence: system environment → these settings → per-call <code>env</code>. Off PATH inheritance leaves child <code>PATH</code> as only <code>.mrmcp/bin</code>; PATH remains governed by this toggle rather than the generic environment list.</p></div><div class=card<? if(tab!=="files"){ ?> hidden<? } ?>><h3>📄 Text Encoding</h3><div class=row><label class=grow for=textEncodingDetection>Automatic detection for reading and searching</label><? if(settings.field_warnings?.text_encoding_detection){ ?><span class=field-warning>⚠ <?= settings.field_warnings.text_encoding_detection ?></span><? } ?></div><select id=textEncodingDetection><option value=sample<?= (settings.text_encoding_detection||"sample")==="sample"?" selected":"" ?>>Initial 16 KiB · faster</option><option value=full<?= settings.text_encoding_detection==="full"?" selected":"" ?>>Complete file · more thorough</option></select><p class=muted>The initial sample reduces detection work on large files. If the result is uncertain or its encoding cannot decode the complete file, detection retries with the full content. A sample can miss later charset clues; choose Complete file when accuracy matters more than speed.</p><p class=muted>File edits and conversions always use the complete content. An explicitly requested encoding skips detection in both modes.</p></div><div class=card<? if(tab!=="goals"){ ?> hidden<? } ?>><h3>🎯 Chat Goals</h3><h3>ChatGPT login profile</h3><? const loginLabels={unknown:'Not initialized',opening:'Opening Chrome…',checking:'Checking login…',authenticated:'Signed in',signed_out:'Sign-in required',page_not_ready:'Waiting for page or challenge',closed:'Login window closed',error:'Login check failed'},loginStatus=settings.chat_goal_login_status||'unknown'; ?><p><b class="<?= loginStatus==='authenticated'?'ok':['signed_out','closed','error'].includes(loginStatus)?'failed':'pending' ?>"><? if(settings.chat_goal_login_busy||settings.chat_goal_login_active){ ?><span class=spinner>↻</span> <? } ?><?= loginLabels[loginStatus]||loginStatus ?></b></p><p>Goal monitoring: <b><?= !settings.chat_goals_enabled?'Disabled by your setting':settings.chat_goal_login_active?'Paused during login check':settings.chat_goal_login_verified_at?'Enabled':'Paused · login required' ?></b></p><? if(settings.chat_goal_login_verified_at){ ?><p class=muted>Login confirmed: <?= it.logdt(settings.chat_goal_login_verified_at) ?></p><? } ?><? if(settings.chat_goal_login_composer){ ?><p class=muted>Chat editor: <?= settings.chat_goal_login_composer==='ready'?'Ready':settings.chat_goal_login_composer==='response_busy'?'Response in progress':'Not ready yet' ?></p><? } ?><p class=muted>Initialize the separate Chrome profile here before using goals. Select Login ChatGPT and sign in or complete any challenge in the dedicated window. Login is detected automatically. An existing login may reload once to observe fresh recent-chat data; drafts are preserved.</p><div class=row><button data-action=open-chat-goal-login<?= settings.chat_goal_login_busy?' disabled':'' ?>><? if(settings.chat_goal_login_busy){ ?><span class=spinner>↻</span> Opening Chrome…<? } else { ?>Login ChatGPT<? } ?></button></div><? if(settings.chat_goal_login_detail){ ?><p class=muted><?= settings.chat_goal_login_detail ?></p><? } ?><p class=muted>Login setup pauses automatic goals and works even when goal management is disabled. It uses a visible window with images; a running headless/image-blocked browser may need to restart with the same profile. Close the login window after verification to apply the saved monitoring launch options. Login readiness is independent of the enable switch. Losing login during a match or send pauses goals until you use this button again. Failed matches require a new chat_set_goal after login.</p><label><input id=chatGoalsEnabled type=checkbox<?= settings.chat_goals_enabled?" checked":"" ?>> Enable chat goal management</label><p class=muted>Off stops background monitoring and browser opening. The tool remains available and returns disabled. Saved goals and the login profile are retained; enabling resumes eligible goals.</p><label><input id=chatGoalMatchOnStartup type=checkbox<?= settings.chat_goal_match_on_startup?" checked":"" ?>> Retry missing chat matches at startup</label><p class=muted>Off by default: restarting does not resume matching, even if it was queued. When enabled, each startup schedules one attempt per active goal without an associated chat. Requires goal management to be enabled and a verified login profile. Saving this option does not start a match now.</p><div class=row><label class=grow for=chatGoalTimeoutMinutes>Default inactivity timeout · minutes</label><? if(settings.field_warnings?.chat_goal_timeout_minutes){ ?><span class=field-warning>⚠ <?= settings.field_warnings.chat_goal_timeout_minutes ?></span><? } ?></div><input id=chatGoalTimeoutMinutes type=number min=1 max=1440 step=1 value="<?= settings.chat_goal_timeout_minutes??5 ?>"><p class=muted>Default: 5 minutes. Used when a new goal omits timeout_seconds; existing goals keep their own timeout.</p><label><input id=chatGoalStopBeforeSend type=checkbox<?= settings.chat_goal_stop_before_send?" checked":"" ?>> Stop the current response before sending</label><p class=muted>Off by default: send the goal even while ChatGPT is working. When enabled, press Stop first and wait briefly for it to take effect. Applies to subsequent send attempts without restarting Chrome. New Tool Calls reset the inactivity timer; an older call still running does not block the prompt.</p><h3>Browser launch</h3><label><input id=chatGoalHeadless type=checkbox<?= settings.chat_goal_headless?" checked":"" ?>> Headless · no browser window</label><label><input id=chatGoalDisableImages type=checkbox<?= settings.chat_goal_disable_images?" checked":"" ?>> Disable page images</label><p class=muted>Images load by default. Enable this option to reduce image loading during monitoring. Screenshots remain available.</p><label for=chatGoalWindowsHide>Spawned process window / console</label><select id=chatGoalWindowsHide><option value=auto<?= settings.chat_goal_windows_hide==="auto"?" selected":"" ?>>Automatic · follows headless</option><option value=hide<?= settings.chat_goal_windows_hide==="hide"?" selected":"" ?>>Always hide</option><option value=show<?= settings.chat_goal_windows_hide==="show"?" selected":"" ?>>Always show</option></select><p class=muted>Headless defaults off so you can sign in or complete a challenge. Automatic sets windowsHide equal to headless: hide when headless, show otherwise. You may override it independently. Launch changes apply after the dedicated browser is closed and started again. Its login profile is preserved.</p></div><div class=card<? if(tab!=="maintenance"){ ?> hidden<? } ?>><h3>🧹 Tool Call History</h3><label>History storage</label><select id=toolCallStorage><option value=disk<?= settings.tool_call_storage==='disk'?' selected':'' ?>>Disk · survives restart</option><option value=memory<?= settings.tool_call_storage==='memory'?' selected':'' ?>>Memory · SQLite TEMP, volatile</option></select><p class=muted>Storage and payload retention are independent. Disk writes Tool Call history to the main SQLite database. Memory uses SQLite TEMP tables in RAM with the same Tool Call ids, GUI and tools_log behavior; rows disappear on restart.</p><label>Payload retention</label><select id=toolCallPayloadMode><option value=payload<?= settings.tool_call_payload_mode==='payload'?' selected':'' ?>>Payload · canonical MCP request and response packets</option><option value=metadata<?= settings.tool_call_payload_mode==='metadata'?' selected':'' ?>>Metadata · no Tool Call request/response payload copies</option></select><p class=muted>Payload retention affects only diagnostic copies in Tool Call history. Functional state required by tools remains available in its owning subsystem; for example persistent-process command/output state is retained independently so exec_attach and exec_status keep working.</p><div class=row><label class=grow>Disk retention hours · 0 keeps indefinitely</label><? if(settings.field_warnings?.tool_call_retention_hours){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_retention_hours ?></span><? } ?></div><input id=toolCallRetentionHours type=number min=0 step=1 value="<?= settings.tool_call_retention_hours??0 ?>"><div class=row><label class=grow>Memory retention minutes · 0 keeps until restart</label><? if(settings.field_warnings?.tool_call_memory_retention_minutes){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_memory_retention_minutes ?></span><? } ?></div><input id=toolCallMemoryRetentionMinutes type=number min=0 step=1 value="<?= settings.tool_call_memory_retention_minutes??60 ?>"><p class=muted>Retention removes completed Tool Call history from its own storage tier. Process, CDP and other functional state are unaffected. Changing the current storage or payload setting affects new Tool Calls only; existing rows retain their own storage and payload capabilities.</p><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, Memory, CDP browser state, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
+<? } else if(section==="settings"){ const tab=s.settingsTab||"network"; ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><nav class=settings-tabs aria-label="Settings sections"><? [["network","🌐","Network"],["security","🔒","Security"],["process","🖥️","Process"],["files","📄","Files"],["goals","🎯","Goals"],["search","🔎","Search"],["proxies","🌐","Proxies"],["notifications","🔔","Notifications"],["maintenance","🧹","Maintenance"]].forEach(([id,icon,label])=>{ ?><button data-action=settings-tab data-settings-tab="<?= id ?>" class="<?= tab===id?'active':'' ?>"<?= tab===id?' aria-current=page':'' ?>><?= icon ?> <?= label ?></button><? }) ?></nav><p class=muted>📂 Data Directory · <code style="overflow-wrap:anywhere"><?= settings.data_directory||'' ?></code></p><div class=settings-layout><div class=settings-main><div class=card<? if(tab!=="network"){ ?> hidden<? } ?>><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card<? if(tab!=="security"){ ?> hidden<? } ?>><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card<?= tab==="proxies"?'':' hidden' ?>><h3>🌐 Proxies</h3><p class=muted>Configure proxy entries, public list sources and cooldowns. proxy_get selects entries and records reported successes/failures in SQLite.</p><p class=muted><code><?= settings.proxy_configuration_path ?></code></p><? if(settings.field_warnings?.proxy_configuration){ ?><div class=field-warning>⚠ <?= settings.field_warnings.proxy_configuration ?></div><? } ?><textarea id=proxyConfiguration rows=20><?= settings.proxy_configuration||'' ?></textarea><p class=muted>direct means a direct request. Lists refresh on tool use; no background checks run.</p></div><div class=card<?= tab==="search"?'':' hidden' ?>><h3>🔎 Search</h3><p class=muted>Configuration file: <?= settings.search_configuration_path ?>. Fulltext is ready without an embedding model. Configure Ollama or an OpenAI-compatible embedding endpoint for vector/hybrid search.</p><p>Without a Workspace: <code><?= settings.default_search_path||'Desktop/_default' ?></code></p><p class=muted>default_path in this YAML selects the source folder. Empty uses Desktop/_default, created on the first search. Both document and source indices persist under the data directory; source files stay in their own folder.</p><label>Search and native OCR configuration<textarea id=searchConfiguration rows=20 spellcheck=false><?= settings.search_configuration ?></textarea></label><? if(settings.field_warnings.search_configuration){ ?><small class=field-warning>⚠ <?= settings.field_warnings.search_configuration ?></small><? } ?><p class=muted>Native OCR uses the OS installed recognition support. Download subtitles with the catalog yt-dlp command, then search those Workspace files.</p></div><div class=card<? if(tab!=="notifications"){ ?> hidden<? } ?>><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card<? if(tab!=="process"){ ?> hidden<? } ?>><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><label><input id=gitPreserveLineEndings type=checkbox<?= settings.git_preserve_line_endings?" checked":"" ?>> Disable automatic Git CRLF conversion</label><p class=muted>When enabled, managed processes use <code>core.autocrlf=false</code>. An existing CRLF checkout made with <code>core.autocrlf=true</code> may then appear modified without a file edit. Turn this off to use the repository and machine Git policy. Repository <code>.gitattributes</code> and explicit <code>git -c</code> options still apply.</p><div class=row><label class=grow>Environment variables for all spawned processes · one <code>NAME=value</code> per line</label><? if(settings.field_warnings?.exec_environment){ ?><span class=field-warning>⚠ <?= settings.field_warnings.exec_environment ?></span><? } ?></div><textarea id=execEnvironment rows=8 placeholder="CACHE_DIR=\${MRMCP_DIR}&#10;TOOLS=\${MRMCP_BIN}&#10;PROJECT=\${WORKSPACE}&#10;RUN_FROM=\${CWD}"><?= settings.exec_environment||'' ?></textarea><p class=muted>Available placeholders: <code>\${MRMCP_DIR}</code> = MrMCP data directory, <code>\${MRMCP_BIN}</code> = managed bin directory, <code>\${WORKSPACE}</code> = current Workspace root, <code>\${CWD}</code> = effective exec directory. Precedence: system environment → these settings → per-call <code>env</code>. Off PATH inheritance leaves child <code>PATH</code> as only <code>.mrmcp/bin</code>; PATH remains governed by this toggle rather than the generic environment list.</p></div><div class=card<? if(tab!=="files"){ ?> hidden<? } ?>><h3>📄 Text Encoding</h3><div class=row><label class=grow for=textEncodingDetection>Automatic detection for reading and searching</label><? if(settings.field_warnings?.text_encoding_detection){ ?><span class=field-warning>⚠ <?= settings.field_warnings.text_encoding_detection ?></span><? } ?></div><select id=textEncodingDetection><option value=sample<?= (settings.text_encoding_detection||"sample")==="sample"?" selected":"" ?>>Initial 16 KiB · faster</option><option value=full<?= settings.text_encoding_detection==="full"?" selected":"" ?>>Complete file · more thorough</option></select><p class=muted>The initial sample reduces detection work on large files. If the result is uncertain or its encoding cannot decode the complete file, detection retries with the full content. A sample can miss later charset clues; choose Complete file when accuracy matters more than speed.</p><p class=muted>File edits and conversions always use the complete content. An explicitly requested encoding skips detection in both modes.</p></div><div class=card<? if(tab!=="goals"){ ?> hidden<? } ?>><h3>🎯 Chat Goals</h3><h3>ChatGPT login profile</h3><? const loginLabels={unknown:'Not initialized',opening:'Opening Chrome…',checking:'Checking login…',authenticated:'Signed in',signed_out:'Sign-in required',page_not_ready:'Waiting for page or challenge',closed:'Login window closed',error:'Login check failed'},loginStatus=settings.chat_goal_login_status||'unknown'; ?><p><b class="<?= loginStatus==='authenticated'?'ok':['signed_out','closed','error'].includes(loginStatus)?'failed':'pending' ?>"><? if(settings.chat_goal_login_busy||settings.chat_goal_login_active){ ?><span class=spinner>↻</span> <? } ?><?= loginLabels[loginStatus]||loginStatus ?></b></p><p>Goal monitoring: <b><?= !settings.chat_goals_enabled?'Disabled by your setting':settings.chat_goal_login_active?'Paused during login check':settings.chat_goal_login_verified_at?'Enabled':'Paused · login required' ?></b></p><? if(settings.chat_goal_login_verified_at){ ?><p class=muted>Login confirmed: <?= it.logdt(settings.chat_goal_login_verified_at) ?></p><? } ?><? if(settings.chat_goal_login_composer){ ?><p class=muted>Chat editor: <?= settings.chat_goal_login_composer==='ready'?'Ready':settings.chat_goal_login_composer==='response_busy'?'Response in progress':'Not ready yet' ?></p><? } ?><p class=muted>Initialize the separate Chrome profile here before using goals. Select Login ChatGPT and sign in or complete any challenge in the dedicated window. Login is detected automatically. An existing login may reload once to observe fresh recent-chat data; drafts are preserved.</p><div class=row><button data-action=open-chat-goal-login<?= settings.chat_goal_login_busy?' disabled':'' ?>><? if(settings.chat_goal_login_busy){ ?><span class=spinner>↻</span> Opening Chrome…<? } else { ?>Login ChatGPT<? } ?></button></div><? if(settings.chat_goal_login_detail){ ?><p class=muted><?= settings.chat_goal_login_detail ?></p><? } ?><p class=muted>Login setup pauses automatic goals and works even when goal management is disabled. It uses a visible window with images; a running headless/image-blocked browser may need to restart with the same profile. Close the login window after verification to apply the saved monitoring launch options. Login readiness is independent of the enable switch. Losing login during a match or send pauses goals until you use this button again. Failed matches require a new chat_set_goal after login.</p><label><input id=chatGoalsEnabled type=checkbox<?= settings.chat_goals_enabled?" checked":"" ?>> Enable chat goal management</label><p class=muted>Off stops background monitoring and browser opening. The tool remains available and returns disabled. Saved goals and the login profile are retained; enabling resumes eligible goals.</p><label><input id=chatGoalMatchOnStartup type=checkbox<?= settings.chat_goal_match_on_startup?" checked":"" ?>> Retry missing chat matches at startup</label><p class=muted>Off by default: restarting does not resume matching, even if it was queued. When enabled, each startup schedules one attempt per active goal without an associated chat. Requires goal management to be enabled and a verified login profile. Saving this option does not start a match now.</p><div class=row><label class=grow for=chatGoalTimeoutMinutes>Default inactivity timeout · minutes</label><? if(settings.field_warnings?.chat_goal_timeout_minutes){ ?><span class=field-warning>⚠ <?= settings.field_warnings.chat_goal_timeout_minutes ?></span><? } ?></div><input id=chatGoalTimeoutMinutes type=number min=1 max=1440 step=1 value="<?= settings.chat_goal_timeout_minutes??5 ?>"><p class=muted>Default: 5 minutes. Used when a new goal omits timeout_seconds; existing goals keep their own timeout.</p><label><input id=chatGoalStopBeforeSend type=checkbox<?= settings.chat_goal_stop_before_send?" checked":"" ?>> Stop the current response before sending</label><p class=muted>Off by default: send the goal even while ChatGPT is working. When enabled, press Stop first and wait briefly for it to take effect. Applies to subsequent send attempts without restarting Chrome. New Tool Calls reset the inactivity timer; an older call still running does not block the prompt.</p><h3>Browser launch</h3><label><input id=chatGoalHeadless type=checkbox<?= settings.chat_goal_headless?" checked":"" ?>> Headless · no browser window</label><label><input id=chatGoalDisableImages type=checkbox<?= settings.chat_goal_disable_images?" checked":"" ?>> Disable page images</label><p class=muted>Images load by default. Enable this option to reduce image loading during monitoring. Screenshots remain available.</p><label for=chatGoalWindowsHide>Spawned process window / console</label><select id=chatGoalWindowsHide><option value=auto<?= settings.chat_goal_windows_hide==="auto"?" selected":"" ?>>Automatic · follows headless</option><option value=hide<?= settings.chat_goal_windows_hide==="hide"?" selected":"" ?>>Always hide</option><option value=show<?= settings.chat_goal_windows_hide==="show"?" selected":"" ?>>Always show</option></select><p class=muted>Headless defaults off so you can sign in or complete a challenge. Automatic sets windowsHide equal to headless: hide when headless, show otherwise. You may override it independently. Launch changes apply after the dedicated browser is closed and started again. Its login profile is preserved.</p></div><div class=card<? if(tab!=="maintenance"){ ?> hidden<? } ?>><h3>🧹 Tool Call History</h3><label>History storage</label><select id=toolCallStorage><option value=disk<?= settings.tool_call_storage==='disk'?' selected':'' ?>>Disk · survives restart</option><option value=memory<?= settings.tool_call_storage==='memory'?' selected':'' ?>>Memory · SQLite TEMP, volatile</option></select><p class=muted>Storage and payload retention are independent. Disk writes Tool Call history to the main SQLite database. Memory uses SQLite TEMP tables in RAM with the same Tool Call ids, GUI and tools_log behavior; rows disappear on restart.</p><label>Payload retention</label><select id=toolCallPayloadMode><option value=payload<?= settings.tool_call_payload_mode==='payload'?' selected':'' ?>>Payload · canonical MCP request and response packets</option><option value=metadata<?= settings.tool_call_payload_mode==='metadata'?' selected':'' ?>>Metadata · no Tool Call request/response payload copies</option></select><p class=muted>Payload retention affects only diagnostic copies in Tool Call history. Functional state required by tools remains available in its owning subsystem; for example persistent-process command/output state is retained independently so exec_attach and exec_status keep working.</p><div class=row><label class=grow>Disk retention hours · 0 keeps indefinitely</label><? if(settings.field_warnings?.tool_call_retention_hours){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_retention_hours ?></span><? } ?></div><input id=toolCallRetentionHours type=number min=0 step=1 value="<?= settings.tool_call_retention_hours??0 ?>"><div class=row><label class=grow>Memory retention minutes · 0 keeps until restart</label><? if(settings.field_warnings?.tool_call_memory_retention_minutes){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_memory_retention_minutes ?></span><? } ?></div><input id=toolCallMemoryRetentionMinutes type=number min=0 step=1 value="<?= settings.tool_call_memory_retention_minutes??60 ?>"><p class=muted>Retention removes completed Tool Call history from its own storage tier. Process, CDP and other functional state are unaffected. Changing the current storage or payload setting affects new Tool Calls only; existing rows retain their own storage and payload capabilities.</p><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, Memory, CDP browser state, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
 <? } else if(section==="help"){ ?><section id=help class=page><h2>❓ Help</h2><div class=card><h3>Connect ChatGPT Web</h3><ol><li>Make sure the Dashboard shows a trusted HTTPS certificate. ChatGPT needs a remote HTTPS MCP endpoint; use <code><?= settings.external_base_url ? settings.external_base_url + "/mcp" : "https://your-host/mcp" ?></code>.</li><li>In ChatGPT Web, enable Developer mode. In managed workspaces the current path is <b>Workspace settings → Permissions &amp; Roles → Connected Data Developer mode / Create custom MCP connectors</b>. Authorized users may also find the toggle under <b>Settings → Apps → Advanced Settings</b>.</li><li>Create a custom app from <b>Workspace settings → Apps → Create</b> or <b>Settings → Apps → Create</b>, enter the MrMCP endpoint, choose the offered authentication method, then select <b>Scan Tools</b>.</li><li>If OAuth is enabled in MrMCP, complete the authorization prompt. After the tool scan completes, create the app and select it from a new ChatGPT conversation.</li></ol></div><div class=card><h3>Authentication</h3><p>For ChatGPT, OAuth is the preferred MrMCP setup because ChatGPT can discover the authorization metadata, complete consent, and keep refresh-token connectivity. MrMCP also supports Basic authentication for MCP clients that offer it. Authentication grants access to the server; the <code>chat_session</code> selects persistent context state after authentication.</p></div><div class=card><h3>Write Access</h3><p>MrMCP does not maintain a separate read/write allowlist: every authenticated client receives every published tool. ChatGPT controls whether write/modify actions are usable through the app's permissions and action controls. As of this build, OpenAI documents full MCP write/modify support for Business, Enterprise and Edu; Pro custom MCP access is limited to read/fetch, and availability may change. Test write tools in Developer mode first. Where available, use <b>Workspace settings → Apps → Configure Actions / Action control</b> to enable the required actions. ChatGPT may still ask for confirmation before a write.</p></div><div class=card><h3>Using MrMCP in a Chat</h3><ol><li>Start a new chat and select the MrMCP app from the tools/apps menu.</li><li>Call <code>init_chat_session</code> once to create a chat Session, then pass its returned <code>chat_session</code> on every subsequent tool call. Initialization selects no Workspace. Use <code>list_workspaces</code> to discover names, then <code>open_workspace</code> with the same <code>chat_session</code> and the desired <code>name</code> before working on files or starting processes.</li><li>The result already includes <code>workspace_name</code>, absolute <code>cwd</code> and <code>agent_guidance_path</code>. Read that file when non-null. Workspace changes preserve the same <code>chat_session</code>. The Workspaces page can also move Sessions manually.</li><li>If you change ChatGPT model or thinking level, the MCP context may be recreated even inside the same conversation. Check the Sessions page if continuity matters.</li></ol><p class=muted>ChatGPT UI labels and plan availability can change. Current OpenAI references: <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt" target=_blank rel=noopener>Developer mode and MCP apps in ChatGPT</a> · <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt" target=_blank rel=noopener>Apps in ChatGPT</a>.</p></div></section><? } ?>`,
-    dialogs: `<? const dialog=it.data?.state?.dialog; ?><? if(dialog){ ?><div id=dialogOverlay class=dialog-overlay><? if(dialog.kind==="root"){ const r=dialog.data||{}; ?><dialog id=rootDialog open data-managed-dialog=root><form id=rootForm><input id=rid type=hidden value="<?= r.id||'' ?>"><h2>📁 Workspace</h2><div class=row><label class=grow>Workspace name</label><? if(r.name_warning){ ?><span class=field-warning>⚠ <?= r.name_warning ?></span><? } ?></div><input id=rname value="<?= r.name||'' ?>"><div class=row><label class=grow>Directory path</label><? if(r.path_warning){ ?><span class=field-warning>⚠ <?= r.path_warning ?></span><? } else if(!r.path_checked){ ?><span class=muted>Leave the field to validate the directory.</span><? } ?></div><input id=rpath placeholder="C:\\projects\\my-workspace, /srv/my-workspace or ./project" value="<?= r.path||'' ?>"><div class=muted>Relative to the program folder.</div><label><input id=renabled type=checkbox<?= r.enabled!==false?' checked':'' ?>> Enabled</label><? if(r.form_warning){ ?><div class=field-warning>⚠ <?= r.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (r.name_warning||r.path_warning||!r.path_checked||r.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="command"){ const c=dialog.data||{}; ?><dialog id=commandDialog open data-managed-dialog=command><form id=commandForm><input id=coldName type=hidden value="<?= c.registered?c.name:'' ?>"><h2>🧰 Command Catalog Entry</h2><div class=row><label class=grow>Logical name</label><? if(c.name_warning){ ?><span class=field-warning>⚠ <?= c.name_warning ?></span><? } ?></div><input id=cname value="<?= c.name||'' ?>"><div class=row><label class=grow>Path below .mrmcp/bin</label><? if(c.path_warning){ ?><span class="<?= c.path_error?'field-warning':'muted' ?>"><?= c.path_error?'⚠ ':'' ?><?= c.path_warning ?></span><? } else if(!c.path_checked){ ?><span class=muted>Leave the field to validate the path.</span><? } ?></div><input id=cpath placeholder="Optional; defaults to logical name; Windows suffix optional" value="<?= c.path||'' ?>"><label>Description for the agent</label><textarea id=cdescription placeholder="Optional: what it does and when the agent should use it."><?= c.description||'' ?></textarea><div class=row><label class=grow>Download URL</label><? if(c.download_warning){ ?><span class=field-warning>⚠ <?= c.download_warning ?></span><? } ?></div><input id=cdownloadUrl placeholder="https://example.com/tool" value="<?= c.download_url||'' ?>"><div class=row><label class=grow>Documentation URL</label><? if(c.documentation_warning){ ?><span class=field-warning>⚠ <?= c.documentation_warning ?></span><? } ?></div><input id=cdocumentationUrl placeholder="https://example.com/docs" value="<?= c.documentation_url||'' ?>"><? if(c.form_warning){ ?><div class=field-warning>⚠ <?= c.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (c.name_warning||c.path_error||!c.path_checked||c.download_warning||c.documentation_warning||c.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="prompt"){ const p=dialog.data||{}; ?><dialog id=promptDialog open data-managed-dialog=prompt><form id=promptForm><input id=poldName type=hidden value="<?= p.old_name||'' ?>"><h2>🧭 Guided Prompt</h2><div class=row><label class=grow>Name</label><? if(p.name_warning){ ?><span class=field-warning>⚠ <?= p.name_warning ?></span><? } ?></div><input id=pname value="<?= p.name||'' ?>"><label>Title</label><input id=ptitle value="<?= p.title||'' ?>" placeholder="Human-readable title shown by MCP clients"><label>Description</label><textarea id=pdescription placeholder="What this guided prompt does."><?= p.description||'' ?></textarea><div class=row><label class=grow>Arguments · YAML list</label><? if(p.args_warning){ ?><span class=field-warning>⚠ <?= p.args_warning ?></span><? } ?></div><textarea id=parguments rows=8 placeholder="- name: focus&#10;  description: Area to focus on.&#10;  required: false"><?= p.arguments_text||'' ?></textarea><div class=row><label class=grow>Eta template</label><? if(p.template_warning){ ?><span class=field-warning>⚠ <?= p.template_warning ?></span><? } ?></div><textarea id=ptemplate rows=14 placeholder="Review the project. &lt;%= it.args.focus %&gt;"><?= p.template||'' ?></textarea><div class=muted>Standard Eta tags. Model documentation is available from Guided Prompts → Template Help.</div><? if(p.form_warning){ ?><div class=field-warning>⚠ <?= p.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (p.name_warning||p.args_warning||p.template_warning||p.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="memory"){ const m=dialog.data||{},creating=!m.id; ?><dialog id=memoryDialog open data-managed-dialog=memory><form id=memoryForm><input id=mid type=hidden value="<?= m.id||'' ?>"><h2><?= creating?'➕ New Memory':'🧠 Memory' ?></h2><? if(creating){ ?><label>Scope</label><select id=mscope><option value=global<?= m.scope==='global'?' selected':'' ?>>Global</option><option value=session<?= m.scope==='session'?' selected':'' ?><?= !(m.sessions||[]).length?' disabled':'' ?>>Session</option><option value=workspace<?= m.scope==='workspace'?' selected':'' ?><?= !(m.workspaces||[]).length?' disabled':'' ?>>Workspace</option></select><? if(m.scope==='workspace'){ ?><label>Workspace</label><select id=mworkspace><? (m.workspaces||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= String(m.workspace||'')===String(name)?' selected':'' ?>><?= name ?></option><? }) ?></select><? } else if(m.scope==='session'){ ?><label>Session</label><select id=mcontext><? (m.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(m.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><? } else { ?><div class=muted>Shared across all Sessions and Workspaces on this MrMCP server.</div><? } ?><? } else { ?><div class=muted><?= m.scope==='global'?'Global':(m.scope==='workspace'?'Workspace':'Session') ?> · <?= m.owner_name||'' ?></div><? } ?><label>Key</label><input id=mkey value="<?= m.key||'' ?>"><label>Value</label><? if(m.json){ ?><textarea id=mvalue rows=14 hidden><?= m.value_text||'' ?></textarea><div id=memoryJsonEditor class="json-editor-host memory" data-json-source=mvalue data-json-edit=memory data-json-error=memoryJsonError></div><div id=memoryJsonError class=field-warning hidden></div><? } else { ?><textarea id=mvalue rows=14><?= m.value_text||'' ?></textarea><? } ?><label><input id=mjson type=checkbox<?= m.json?' checked':'' ?>> Value is JSON · validate before saving</label><div class=muted>Switching between TEXT and JSON keeps the current draft unchanged.</div><label>TTL seconds · 0 = permanent</label><input id=mttl type=number min=0 max=315360000 value="<?= m.ttl_seconds||0 ?>"><? if(m.form_warning){ ?><div class=field-warning>⚠ <?= m.form_warning ?></div><? } ?><p class=row><button class=primary type=submit>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="confirm"){ ?><dialog id=confirmDialog open data-managed-dialog=confirm><h2>⚠️ <?= dialog.title||"Confirm Action" ?></h2><p><?= dialog.message||"Continue?" ?></p><p class=row><button class="primary danger" data-action=confirm-dialog>✓ Confirm</button><button data-action=close-dialog>✕ Cancel</button></p></dialog><? } ?></div><? } ?>`,
+    dialogs: `<? const dialog=it.data?.state?.dialog; ?><? if(dialog){ ?><div id=dialogOverlay class=dialog-overlay><? if(dialog.kind==="root"){ const r=dialog.data||{}; ?><dialog id=rootDialog open data-managed-dialog=root><form id=rootForm><input id=rid type=hidden value="<?= r.id||'' ?>"><h2>📁 Workspace</h2><div class=row><label class=grow>Workspace name</label><? if(r.name_warning){ ?><span class=field-warning>⚠ <?= r.name_warning ?></span><? } ?></div><input id=rname value="<?= r.name||'' ?>"><div class=row><label class=grow>Directory path</label><? if(r.path_warning){ ?><span class=field-warning>⚠ <?= r.path_warning ?></span><? } else if(!r.path_checked){ ?><span class=muted>Leave the field to validate the directory.</span><? } ?></div><input id=rpath placeholder="C:\\projects\\my-workspace, /srv/my-workspace or ./project" value="<?= r.path||'' ?>"><div class=muted>Relative to the program folder.</div><label><input id=renabled type=checkbox<?= r.enabled!==false?' checked':'' ?>> Enabled</label><? if(r.form_warning){ ?><div class=field-warning>⚠ <?= r.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (r.name_warning||r.path_warning||!r.path_checked||r.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="command"){ const c=dialog.data||{}; ?><dialog id=commandDialog open data-managed-dialog=command><form id=commandForm><input id=coldName type=hidden value="<?= c.registered?c.name:'' ?>"><h2>🧰 Command Catalog Entry</h2><div class=row><label class=grow>Logical name</label><? if(c.name_warning){ ?><span class=field-warning>⚠ <?= c.name_warning ?></span><? } ?></div><input id=cname value="<?= c.name||'' ?>"><div class=row><label class=grow>Path below .mrmcp/bin</label><? if(c.path_warning){ ?><span class="<?= c.path_error?'field-warning':'muted' ?>"><?= c.path_error?'⚠ ':'' ?><?= c.path_warning ?></span><? } else if(!c.path_checked){ ?><span class=muted>Leave the field to validate the path.</span><? } ?></div><input id=cpath placeholder="Optional; defaults to logical name; Windows suffix optional" value="<?= c.path||'' ?>"><label>Description for the agent</label><textarea id=cdescription placeholder="Optional: what it does and when the agent should use it."><?= c.description||'' ?></textarea><div class=row><label class=grow>Download URL</label><? if(c.download_warning){ ?><span class=field-warning>⚠ <?= c.download_warning ?></span><? } ?></div><input id=cdownloadUrl placeholder="https://example.com/tool" value="<?= c.download_url||'' ?>"><label>Archive entry · optional exact path inside ZIP/TAR</label><input id=carchivePath value="<?= c.archive_path||'' ?>"><div class=row><label class=grow>Platforms · YAML mapping</label><? if(c.platforms_warning){ ?><span class=field-warning>⚠ <?= c.platforms_warning ?></span><? } ?></div><textarea id=cplatforms rows=10><?= c.platforms_text||'{}' ?></textarea><p class=muted>Keys: windows-x86_64, linux-x86_64, darwin-x86_64, darwin-aarch64, or OS names. Each variant accepts path, download_url and archive_path. Missing variants are unsupported; an empty mapping uses the shared fields.</p><div class=row><label class=grow>Documentation URL</label><? if(c.documentation_warning){ ?><span class=field-warning>⚠ <?= c.documentation_warning ?></span><? } ?></div><input id=cdocumentationUrl placeholder="https://example.com/docs" value="<?= c.documentation_url||'' ?>"><? if(c.form_warning){ ?><div class=field-warning>⚠ <?= c.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (c.name_warning||c.path_error||!c.path_checked||c.download_warning||c.documentation_warning||c.platforms_warning||c.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="prompt"){ const p=dialog.data||{}; ?><dialog id=promptDialog open data-managed-dialog=prompt><form id=promptForm><input id=poldName type=hidden value="<?= p.old_name||'' ?>"><h2>🧭 Guided Prompt</h2><div class=row><label class=grow>Name</label><? if(p.name_warning){ ?><span class=field-warning>⚠ <?= p.name_warning ?></span><? } ?></div><input id=pname value="<?= p.name||'' ?>"><label>Title</label><input id=ptitle value="<?= p.title||'' ?>" placeholder="Human-readable title shown by MCP clients"><label>Description</label><textarea id=pdescription placeholder="What this guided prompt does."><?= p.description||'' ?></textarea><div class=row><label class=grow>Arguments · YAML list</label><? if(p.args_warning){ ?><span class=field-warning>⚠ <?= p.args_warning ?></span><? } ?></div><textarea id=parguments rows=8 placeholder="- name: focus&#10;  description: Area to focus on.&#10;  required: false"><?= p.arguments_text||'' ?></textarea><div class=row><label class=grow>Eta template</label><? if(p.template_warning){ ?><span class=field-warning>⚠ <?= p.template_warning ?></span><? } ?></div><textarea id=ptemplate rows=14 placeholder="Review the project. &lt;%= it.args.focus %&gt;"><?= p.template||'' ?></textarea><div class=muted>Standard Eta tags. Model documentation is available from Guided Prompts → Template Help.</div><? if(p.form_warning){ ?><div class=field-warning>⚠ <?= p.form_warning ?></div><? } ?><p class=row><button class=primary type=submit<?= (p.name_warning||p.args_warning||p.template_warning||p.form_warning)?' disabled':'' ?>>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="memory"){ const m=dialog.data||{},creating=!m.id; ?><dialog id=memoryDialog open data-managed-dialog=memory><form id=memoryForm><input id=mid type=hidden value="<?= m.id||'' ?>"><h2><?= creating?'➕ New Memory':'🧠 Memory' ?></h2><? if(creating){ ?><label>Scope</label><select id=mscope><option value=global<?= m.scope==='global'?' selected':'' ?>>Global</option><option value=session<?= m.scope==='session'?' selected':'' ?><?= !(m.sessions||[]).length?' disabled':'' ?>>Session</option><option value=workspace<?= m.scope==='workspace'?' selected':'' ?><?= !(m.workspaces||[]).length?' disabled':'' ?>>Workspace</option></select><? if(m.scope==='workspace'){ ?><label>Workspace</label><select id=mworkspace><? (m.workspaces||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= String(m.workspace||'')===String(name)?' selected':'' ?>><?= name ?></option><? }) ?></select><? } else if(m.scope==='session'){ ?><label>Session</label><select id=mcontext><? (m.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(m.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><? } else { ?><div class=muted>Shared across all Sessions and Workspaces on this MrMCP server.</div><? } ?><? } else { ?><div class=muted><?= m.scope==='global'?'Global':(m.scope==='workspace'?'Workspace':'Session') ?> · <?= m.owner_name||'' ?></div><? } ?><label>Key</label><input id=mkey value="<?= m.key||'' ?>"><label>Value</label><? if(m.json){ ?><textarea id=mvalue rows=14 hidden><?= m.value_text||'' ?></textarea><div id=memoryJsonEditor class="json-editor-host memory" data-json-source=mvalue data-json-edit=memory data-json-error=memoryJsonError></div><div id=memoryJsonError class=field-warning hidden></div><? } else { ?><textarea id=mvalue rows=14><?= m.value_text||'' ?></textarea><? } ?><label><input id=mjson type=checkbox<?= m.json?' checked':'' ?>> Value is JSON · validate before saving</label><div class=muted>Switching between TEXT and JSON keeps the current draft unchanged.</div><label>TTL seconds · 0 = permanent</label><input id=mttl type=number min=0 max=315360000 value="<?= m.ttl_seconds||0 ?>"><? if(m.form_warning){ ?><div class=field-warning>⚠ <?= m.form_warning ?></div><? } ?><p class=row><button class=primary type=submit>💾 Save</button><button type=button data-action=close-dialog>✕ Cancel</button></p></form></dialog><? } else if(dialog.kind==="confirm"){ ?><dialog id=confirmDialog open data-managed-dialog=confirm><h2>⚠️ <?= dialog.title||"Confirm Action" ?></h2><p><?= dialog.message||"Continue?" ?></p><p class=row><button class="primary danger" data-action=confirm-dialog>✓ Confirm</button><button data-action=close-dialog>✕ Cancel</button></p></dialog><? } ?></div><? } ?>`,
     status: `<? const d=it.data||{},s=d.settings||{},a=d.activity||{},bad=!!s.mcp_listen_error,warn=!!s.listener_fallback,recent=a.recent_sessions||[],inFlight=a.tool_calls_in_flight||0,errors=a.tool_calls_errors||0,invalid=a.tool_calls_invalid||0; ?><span class="status-group <?= d.live!=="connected"?(d.live==="reconnecting"?"pending":"failed"):(bad?"failed":(warn?"pending":"ok")) ?>"><?= d.live!=="connected"?(d.live==="reconnecting"?"🟡 reconnecting":"🔴 offline"):(bad?"🔴 listener error":(warn?"🟡 fallback":"🟢 live")) ?></span><span class="status-group status-link" data-action=header-settings title="HTTP / HTTPS effective listener ports; GUI uses local Tauriless assets">🔌 <span class=status-ports><?= s.mcp_http_active?s.mcp_http_port:"off" ?>/<?= s.mcp_https_active?s.mcp_https_port:"off" ?></span><? if(warn){ ?> <span class=pending>⚠</span><? } ?></span><span class=status-group title="Sessions with a Tool Call in the last <?= a.active_window_minutes||10 ?> minutes">💬 <span class="status-link <?= a.active_sessions?'ok':'muted' ?>" data-action=header-sessions><?= a.active_sessions||0 ?> active</span><? if(recent.length){ ?> · <span class=status-sessions><? recent.forEach((x,i)=>{ ?><?= i?" ":"" ?><span class=status-link data-action=session-tool-calls data-id="<?= x.id ?>">#<?= x.id ?>(<?= x.tool_calls ?>)</span><? }) ?></span><? } ?></span><span class=status-group title="Tool Calls in flight / total recorded / failed / invalid">🛠️ <span class="status-link <?= inFlight?'pending':'muted' ?>" data-action=header-tool-calls data-status=running><?= inFlight ?> in flight</span> · <span class="status-link status-total" data-action=header-tool-calls data-status=""><?= a.tool_calls_total||0 ?> total</span> · <span class="status-link <?= errors?'failed':'muted' ?>" data-action=header-tool-calls data-status=failed><?= errors ?> errors</span> · <span class="status-link <?= invalid?'invalid':'muted' ?>" data-action=header-tool-calls data-status=invalid><?= invalid ?> invalid</span></span>`,
     cards: `<? const meta={sessions:["💬","Sessions"],roots:["📁","Workspaces"],tool_calls:["🛠️","Tool Calls"],tool_calls_in_flight:["🛠️","Tool Calls In Flight"],failed_calls:["⚠️","Failed Calls"],http_requests:["🌐","HTTP Requests"]}; Object.entries(it.data || {}).forEach(([key,value]) => { const item=meta[key]||["•",key]; ?><div class=card><div class=muted><?= item[0] ?> <?= item[1] ?></div><strong style="font-size:24px"><?= value ?></strong></div><? }) ?>`,
     active_tool_calls: `<? const rows=it.data||[],icons={completed:"✅",failed:"❌",invalid:"◆",killed:"❌",timed_out:"❌",running:"⏳",received:"⏳"}; ?><div class="card active-call-card"><table class=active-call-table><thead><tr><th>State</th><th>Tool Call</th><th>Session</th><th>Time</th></tr></thead><tbody><? if(!rows.length){ ?><tr><td colspan=4 class=muted>No active Tool Calls.</td></tr><? } else { rows.forEach(l=>{ const ms=Number(l.elapsed_ms||0),elapsed=ms<1000?ms+"ms":(ms/1000).toFixed(ms<10000?1:0)+"s"; ?><tr data-action=process-tool-call title="Open Tool Call #<?= l.id ?>" data-id="<?= l.id ?>" class="<?= l.active?'':'active-call-recent' ?>"<? if(!l.active){ ?> style="--active-call-ttl:<?= Math.max(50,Number(l.ttl_ms||0)) ?>ms"<? } ?>><td class="<?= l.active?'pending':l.status ?> nowrap"><?= icons[l.status]||"•" ?> <?= l.active?"running":l.status ?></td><td class=active-call-summary><?= l.call_summary ?><? if(l.storage==='memory'){ ?> <span class=muted>· MEMORY</span><? } ?><? if(l.progress_requested){ ?> <span class=progress-requested>📡 progress</span><? } ?></td><td class=idcell><?= l.context_id?"#"+l.context_id:"—" ?></td><td class=nowrap><?= elapsed ?><? if(!l.active){ ?> <span class=muted>· done</span><? } ?></td></tr><? }) } ?></tbody></table></div>`,
@@ -10218,7 +10773,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     urls: `<? (it.data || []).forEach(x => { if (!x?.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?><? if (x.note) { ?> <span class=muted><?= x.note ?></span><? } ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?>`,
     roots: `<? const d=it.data||{},rows=d.roots||[],defaults=d.default_sessions||[]; ?><div class=roots-layout><div class=roots-named><h3>📁 Workspaces</h3><? if(!rows.length){ ?><div class=card><p class=muted>No Workspaces registered.</p></div><? } ?><? rows.forEach(r => { ?><div class="card root-card<?= r.enabled?'':' root-disabled' ?>"<? if(r.enabled){ ?> data-root-drop="<?= r.id ?>"<? } ?>><div class=root-card-header><div class=grow><h3>📁 <?= r.name ?></h3><code class="<?= r.path_warning?'failed':'' ?>"<? if(r.path_warning){ ?> title="<?= r.path_warning ?>"<? } ?>><?= r.path ?></code></div><div class=command-actions><button class=small data-action=edit-root data-id="<?= r.id ?>">✏️ Edit</button><button class="small danger" data-action=delete-root data-id="<?= r.id ?>">🗑️ Delete</button></div></div><div class="<?= r.enabled?'ok':'muted' ?>"><?= r.enabled ? "enabled" : "disabled" ?></div><div class=root-session-list><? if(!r.enabled){ ?><div class=muted>Enable this Workspace to assign Sessions.</div><? } else if(!(r.sessions||[]).length){ ?><div class=root-drop-empty>Drop a Session here</div><? } ?><? (r.sessions||[]).forEach(v=>{ ?><div class=session-chip draggable=true data-session-drag data-session-id="<?= v.pk ?>" title="Drag Session #<?= v.pk ?>"><div class=session-chip-main><span>💬</span><b>#<?= v.pk ?></b><span class=grow><?= v.client_name ?></span></div><div class=session-chip-meta><span><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></span><span><span class=muted>Last Activity</span> <?= it.logdt(v.last_active_at) ?></span><span><span class=muted>Status</span> <span class="<?= v.expired?'failed':'ok' ?>"><?= v.expired?'expired':'active' ?></span></span><span><span class=muted>Tool Calls:</span> <?= v.tool_calls||0 ?></span></div></div><? }) ?></div></div><? }) ?></div><div class=roots-default><div class=row><h3 class=grow>💬 Sessions</h3><span class=muted>No Workspace assigned</span></div><div class="card default-root-card" data-root-drop="0"><p class=muted>Open a Workspace before file operations or starting processes.</p><div class=root-session-list><? if(!defaults.length){ ?><div class=root-drop-empty>Drop a Session here to remove its Workspace association.</div><? } ?><? defaults.forEach(v=>{ ?><div class=session-chip draggable=true data-session-drag data-session-id="<?= v.pk ?>" title="Drag Session #<?= v.pk ?>"><div class=session-chip-main><span>💬</span><b>#<?= v.pk ?></b><span class=grow><?= v.client_name ?></span></div><div class=session-chip-meta><span><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></span><span><span class=muted>Last Activity</span> <?= it.logdt(v.last_active_at) ?></span><span><span class=muted>Status</span> <span class="<?= v.expired?'failed':'ok' ?>"><?= v.expired?'expired':'active' ?></span></span><span><span class=muted>Tool Calls:</span> <?= v.tool_calls||0 ?></span></div></div><? }) ?></div></div></div></div>`,
     context: `<? const d=it.data||{},values=d.values||[]; ?><? if (!values.length) { ?><p class=muted>No Sessions have been issued yet.</p><? } else { ?><table><tr><th>ID</th><th>Session Handle</th><th>Client / Auth</th><th>State / Protocol</th><th>Current Workspace</th><th>Activity</th><th>Tool Calls</th><th></th></tr><? values.forEach(v=>{ const ua=String(v.user_agent||""); ?><tr><td class=idcell>#<?= v.pk ?></td><td class=context-id><code><?= v.chat_session ?></code><? if(v.goal_text||v.chatgpt_chat_id){ ?><div><b>Goal: <?= v.goal_status ?></b><? if(v.goal_text){ ?><div title="<?= v.goal_text ?>"><?= v.goal_text.slice(0,120) ?><?= v.goal_text.length>120?"…":"" ?></div><div class=muted>Idle: <?= v.goal_timeout_seconds ?> s<? if(v.goal_next_check_at){ ?> · Check: <?= it.logdt(v.goal_next_check_at) ?><? } ?></div><button class="small danger" data-action=stop-chat-goal data-id="<?= v.pk ?>">Stop goal</button><? } ?> <button class=small data-action=open-chat-goal data-id="<?= v.pk ?>">Login settings</button><? if(v.chatgpt_chat_id){ ?><div class=muted>Chat: <code><?= v.chatgpt_chat_id ?></code></div><? } ?><? if(v.goal_last_sent_at){ ?><div class=muted>Last sent: <?= it.logdt(v.goal_last_sent_at) ?></div><? } ?><? if(v.goal_error){ ?><div class=failed><?= v.goal_error ?></div><? } ?></div><? } ?></td><td><b><?= v.client_name||"Unknown client" ?></b><br><span class=muted><?= v.auth_kind||"unknown auth" ?></span><? if(ua){ ?><div class=muted title="<?= ua ?>"><?= ua.slice(0,72) ?><?= ua.length>72?"…":"" ?></div><? } ?></td><td class=nowrap><b class="<?= v.expired ? 'failed' : 'ok' ?>"><?= v.expired ? "⌛ expired" : "🟢 active" ?></b><br><code><?= v.protocol_version||"unknown" ?></code></td><td><b><?= v.workspace_name ?></b><div class="<?= v.workspace_warning?'failed':'muted' ?>"<? if(v.workspace_warning){ ?> title="<?= v.workspace_warning ?>"<? } ?>><?= v.workspace_path ?></div></td><td class=context-dates><div><span class=muted>Created</span> <?= it.logdt(v.created_at) ?></div><div><span class=muted>Updated</span> <?= it.logdt(v.updated_at) ?></div><div><span class=muted>Active</span> <?= it.logdt(v.last_active_at) ?></div><div><span class=muted>Expires</span> <?= it.logdt(v.expires_at) ?></div></td><td class=nowrap><?= v.tool_calls||0 ?> <button class=small data-action=session-tool-calls data-id="<?= v.pk ?>">🛠️ View Calls</button></td><td><button class=danger data-action=delete-context data-id="<?= v.pk ?>">🗑️ Delete</button></td></tr><? }) ?></table><? } ?>`,
-    commands: `<? const d=it.data || {}, rows=d.commands || []; ?><div class=muted><?= d.total || 0 ?> command<?= d.total === 1 ? "" : "s" ?> · page <?= d.page || 1 ?>/<?= d.pages || 1 ?> · config <code><?= d.config_file || "" ?></code></div><table class=commands-table><tr><th>Name</th><th>Relative path</th><th class=command-description>Description</th><th>Links</th><th>Source</th><th>State</th><th class=command-action-cell></th></tr><? rows.forEach(c => { ?><tr><td><code><?= c.name ?></code></td><td><code><?= c.path ?></code></td><td class=command-description><?= c.description || "—" ?></td><td><? if (c.documentation_url) { ?><a href="<?= c.documentation_url ?>" target=_blank rel=noopener>📖 Docs</a><? } else { ?>—<? } ?></td><td><?= c.source ?></td><td class="<?= c.present && c.executable ? "ok" : "failed" ?>"><?= c.present ? (c.executable ? "✅ available" : "⚠️ not executable") : "❌ missing" ?></td><td class=command-action-cell><div class=command-actions><button data-action=edit-command data-name="<?= c.name ?>" data-path="<?= c.path ?>">✏️ Edit</button><? if (c.registered && c.download_url) { ?><button data-action=download-command data-name="<?= c.name ?>">⬇️ Download</button><? } ?><? if (c.registered) { ?><button class=danger data-action=delete-command data-name="<?= c.name ?>">🗑️ Delete</button><? } ?></div></td></tr><? }) ?></table><div class=row><button data-action=commands-prev<?= d.page <= 1 ? " disabled" : "" ?>>Previous</button><button data-action=commands-next<?= d.has_more ? "" : " disabled" ?>>Next</button></div>`,
+    commands: `<? const d=it.data || {}, rows=d.commands || []; ?><div class=muted><?= d.total || 0 ?> command<?= d.total === 1 ? "" : "s" ?> · page <?= d.page || 1 ?>/<?= d.pages || 1 ?> · config <code><?= d.config_file || "" ?></code></div><table class=commands-table><tr><th>Name</th><th>Relative path</th><th class=command-description>Description</th><th>Links</th><th>Source</th><th>State</th><th class=command-action-cell></th></tr><? rows.forEach(c => { ?><tr><td><code><?= c.name ?></code></td><td><code><?= c.path ?></code></td><td class=command-description><?= c.description || "—" ?></td><td><? if (c.documentation_url) { ?><a href="<?= c.documentation_url ?>" target=_blank rel=noopener>📖 Docs</a><? } else { ?>—<? } ?></td><td><?= c.source ?></td><td class="<?= c.present && c.executable ? "ok" : "failed" ?>"><?= c.supported===false ? "— unsupported platform" : c.present ? (c.executable ? "✅ available" : "⚠️ not executable") : "❌ missing" ?></td><td class=command-action-cell><div class=command-actions><button data-action=edit-command data-name="<?= c.name ?>" data-path="<?= c.path ?>">✏️ Edit</button><? if (c.registered && c.supported!==false && c.download_url) { ?><button data-action=download-command data-name="<?= c.name ?>">⬇️ Download</button><? } ?><? if (c.registered) { ?><button class=danger data-action=delete-command data-name="<?= c.name ?>">🗑️ Delete</button><? } ?></div></td></tr><? }) ?></table><div class=row><button data-action=commands-prev<?= d.page <= 1 ? " disabled" : "" ?>>Previous</button><button data-action=commands-next<?= d.has_more ? "" : " disabled" ?>>Next</button></div>`,
     prompts: `<? const d=it.data||{},rows=d.prompts||[]; ?><div class=muted><?= d.total||0 ?> prompt<?= d.total===1?'':'s' ?> · page <?= d.page||1 ?>/<?= d.pages||1 ?> · config <code><?= d.config_file||'' ?></code></div><? if(!rows.length){ ?><div class=card><p class=muted>No guided prompts match the current search.</p></div><? } else { ?><table class=commands-table><tr><th>Name</th><th>Title</th><th class=command-description>Description</th><th>Arguments</th><th class=command-action-cell></th></tr><? rows.forEach(p=>{ ?><tr><td><code><?= p.name ?></code></td><td><?= p.title||'—' ?></td><td class=command-description><?= p.description||'—' ?></td><td><? if(p.arguments?.length){ p.arguments.forEach(a=>{ ?><div><code><?= a.name ?></code><? if(a.required){ ?> <b>required</b><? } ?></div><? }) } else { ?>—<? } ?></td><td class=command-action-cell><div class=command-actions><button data-action=edit-prompt data-name="<?= p.name ?>">✏️ Edit</button><button class=danger data-action=delete-prompt data-name="<?= p.name ?>">🗑️ Delete</button></div></td></tr><? }) ?></table><? } ?><div class=row><button data-action=prompts-prev<?= d.page<=1?' disabled':'' ?>>Previous</button><button data-action=prompts-next<?= d.has_more?'':' disabled' ?>>Next</button></div>`,
     oauth: `<table class=oauth-table><tr><th>Client</th><th>Sessions</th><th>Tokens</th><th></th></tr><? (it.data || []).forEach(c => { ?><tr><td class=oauth-client><b><?= c.name ?></b><div class=oauth-client-id title="<?= c.client_id ?>"><code><?= c.client_id ?></code></div><div class=oauth-meta><span class=muted>Created</span> <?= it.logdt(c.created_at) ?></div></td><td class=oauth-meta><div class=oauth-count><b><?= c.session_count||0 ?></b> total</div><div><span class=muted>First</span> <?= c.first_session_at ? it.logdt(c.first_session_at) : "—" ?></div><div><span class=muted>Last</span> <?= c.last_session_at ? it.logdt(c.last_session_at) : "—" ?></div></td><td><div class=oauth-tokens><div class=oauth-token><b><?= c.token_count||0 ?></b> <span>Access</span><div class=oauth-meta><span class=muted>Issued</span> <?= c.last_token_at ? it.logdt(c.last_token_at) : "—" ?></div></div><div class=oauth-token><b><?= c.refresh_token_count||0 ?></b> <span>Refresh</span><div class=oauth-meta><span class=muted>Used</span> <?= c.last_refresh_at ? it.logdt(c.last_refresh_at) : "—" ?></div></div></div></td><td class=oauth-actions><button class=small data-action=oauth-sessions data-id="<?= c.client_id ?>">💬 View Sessions</button><button class="small danger" data-action=revoke-client data-id="<?= c.client_id ?>">🚫 Revoke</button></td></tr><? }) ?></table>`,
     endpoints: `<? const server=it.data||{}; ?><div class=card><div class=row><div class=grow><h3 style="margin:0">🌐 MrMCP <code>/mcp</code></h3><div class=muted>Protocols: <?= (server.protocol_versions||[]).join(", ") ?></div></div><button data-action=self-test>🧪 Self-test</button></div><? it.endpointRows(server).forEach(x => { if (!x.url) return; ?><div class=urlrow><span class=label><?= x.label ?></span><code><?= x.url ?></code><button class=small data-copy="<?= x.url ?>">📋 Copy</button></div><? }) ?><details><summary><?= server.tool_count||0 ?> Available Tools</summary><p class=muted><?= (server.tool_names||[]).join(", ") ?></p></details></div>`,
@@ -10464,6 +11019,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     const memoryRetentionText = String(settings.tool_call_memory_retention_minutes ?? "60").trim(), memoryRetentionMinutes = Number(memoryRetentionText);
     if (!/^\d+$/.test(memoryRetentionText) || !Number.isSafeInteger(memoryRetentionMinutes) || memoryRetentionMinutes < 0)
       warnings.tool_call_memory_retention_minutes = "Memory Tool Call retention must be whole minutes; 0 keeps rows until restart.";
+    if (settings.search_configuration != null) { try { const c=searchConfig(String(settings.search_configuration)); if(String(c.default_path||"").trim() && !Deno.statSync(configuredWorkspacePath(c.default_path)).isDirectory) throw new Error("default_path must point to a directory"); } catch (e) { warnings.search_configuration = e.message; } }
+    if (settings.proxy_configuration != null) { try { proxyConfig(String(settings.proxy_configuration)); } catch (e) { warnings.proxy_configuration = e.message; } }
     return warnings;
   }
   function telegramTokenWarning(value) {
@@ -10499,6 +11056,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       dialog: uiState.dialog,
       settingsTab: uiState.settingsTab,
     };
+    if (section === "settings") {
+      try { viewState.settings.default_search_path = await currentUiRender(searchDefaultDirectory(searchConfig(viewState.settings.search_configuration)), generation); }
+      catch (error) { requireCurrentUiRender(generation); viewState.settings.default_search_path = ""; }
+    }
     if (section === "sessions") viewState.sessions = { ...uiState.sessions };
     else if (section === "commands") viewState.commands = { ...uiState.commands };
     else if (section === "prompts") viewState.prompts = { ...uiState.prompts };
@@ -10699,7 +11260,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     } else if (uiState.dialog?.kind === "command") {
       const map = {
         coldName: "old_name", cname: "name", cpath: "path", cdescription: "description",
-        cdownloadUrl: "download_url", cdocumentationUrl: "documentation_url",
+        cdownloadUrl: "download_url", cplatforms: "platforms_text", carchivePath: "archive_path", cdocumentationUrl: "documentation_url",
       };
       if (map[id]) uiState.dialog.data[map[id]] = text;
     } else if (uiState.dialog?.kind === "prompt") {
@@ -10732,7 +11293,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       sslipSuffix: "sslip_suffix", acmeDirectoryUrl: "acme_directory_url",
       notifySession: "desktop_notifications_session", notifyWorkspace: "desktop_notifications_workspace",
       notifyToolCall: "desktop_notifications_tool_call", inheritSystemPath: "inherit_system_path",
-      gitPreserveLineEndings: "git_preserve_line_endings", execEnvironment: "exec_environment",
+      gitPreserveLineEndings: "git_preserve_line_endings", execEnvironment: "exec_environment", searchConfiguration: "search_configuration", proxyConfiguration: "proxy_configuration",
       chatGoalsEnabled: "chat_goals_enabled", chatGoalTimeoutMinutes: "chat_goal_timeout_minutes",
       chatGoalHeadless: "chat_goal_headless", chatGoalWindowsHide: "chat_goal_windows_hide",
       chatGoalDisableImages: "chat_goal_disable_images", chatGoalStopBeforeSend: "chat_goal_stop_before_send", chatGoalMatchOnStartup: "chat_goal_match_on_startup",
@@ -10957,7 +11518,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         break;
       case "new-command":
         uiState.dialog = { kind: "command", data: {
-          name: "", path: "", description: "", download_url: "", documentation_url: "", registered: false,
+          name: "", path: "", description: "", download_url: "", archive_path: "", platforms_text: "{}", documentation_url: "", registered: false,
           name_warning: "Command name is required.", path_warning: "", path_error: false, path_checked: true,
           download_warning: "", documentation_warning: "", form_warning: "",
         } };
@@ -10967,7 +11528,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         if (!row) throw new Error("Command not found");
         const pathWarning = await commandPathWarning(row.path);
         uiState.dialog = { kind: "command", data: {
-          ...row, old_name: row.name,
+          ...row, old_name: row.name, path: row.catalog_path ?? row.path, download_url: row.catalog_download_url ?? row.download_url, archive_path: row.catalog_archive_path ?? row.archive_path,
+          platforms_text: stringifyYaml(row.platforms || {}, { lineWidth: -1 }),
           name_warning: await commandNameWarning(row.name, row.name),
           path_warning: pathWarning, path_error: commandPathBlocksSave(pathWarning), path_checked: true,
           download_warning: httpUrlWarning(row.download_url, "Download URL"),
@@ -11228,7 +11790,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       }
       case "settings-tab": {
         const tab = String(data.settingsTab || "");
-        if (["network", "security", "process", "files", "goals", "notifications", "maintenance"].includes(tab)) uiState.settingsTab = tab;
+        if (["network", "security", "process", "files", "goals", "search", "proxies", "notifications", "maintenance"].includes(tab)) uiState.settingsTab = tab;
         break;
       }
       case "save-settings": {
@@ -11251,6 +11813,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           chat_goal_stop_before_send: values.chatGoalStopBeforeSend == null ? getCfg("chat_goal_stop_before_send", "0") === "1" : !!values.chatGoalStopBeforeSend,
           chat_goal_match_on_startup: values.chatGoalMatchOnStartup == null ? getCfg("chat_goal_match_on_startup", "0") === "1" : !!values.chatGoalMatchOnStartup,
           chat_goal_windows_hide: String(values.chatGoalWindowsHide ?? getCfg("chat_goal_windows_hide", "auto")),
+          search_configuration: String(values.searchConfiguration ?? Deno.readTextFileSync(SEARCH_PATH)),
+          proxy_configuration: String(values.proxyConfiguration ?? Deno.readTextFileSync(PROXIES_PATH)),
           text_encoding_detection: String(values.textEncodingDetection ?? "sample"),
           tool_call_storage: String(values.toolCallStorage || "disk"),
           tool_call_payload_mode: String(values.toolCallPayloadMode || "payload"),
@@ -11372,13 +11936,14 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
               if (id === "rpath") { d.path_warning = ""; d.path_checked = false; }
               renderDraft = true;
             }
-            if (uiState.dialog?.kind === "command" && ["cname", "cpath", "cdescription", "cdownloadUrl", "cdocumentationUrl"].includes(id)) {
+            if (uiState.dialog?.kind === "command" && ["cname", "cpath", "cdescription", "cdownloadUrl", "carchivePath", "cplatforms", "cdocumentationUrl"].includes(id)) {
               const d = uiState.dialog.data;
               d.form_warning = "";
               if (id === "cname") d.name_warning = await commandNameWarning(item.value, d.old_name);
               if (id === "cpath") {
                 d.path_warning = ""; d.path_error = false; d.path_checked = !String(item.value || "").trim();
               }
+              if (id === "cplatforms") d.platforms_warning = await commandPlatformsWarning(item.value);
               if (id === "cdownloadUrl") d.download_warning = httpUrlWarning(item.value, "Download URL");
               if (id === "cdocumentationUrl") d.documentation_warning = httpUrlWarning(item.value, "Documentation URL");
               renderDraft = true;
@@ -11483,7 +12048,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
             const pathWarning = await commandPathWarning(values.cpath);
             d.path_warning = pathWarning; d.path_error = commandPathBlocksSave(pathWarning); d.path_checked = true;
             d.form_warning = "";
-            if (d.name_warning || d.path_error || d.download_warning || d.documentation_warning) {
+            d.platforms_warning = await commandPlatformsWarning(values.cplatforms);
+            if (d.name_warning || d.path_error || d.download_warning || d.documentation_warning || d.platforms_warning) {
               queueUiRender("submit:commandForm-invalid", 0);
               return;
             }
@@ -11491,6 +12057,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
               await uiInternalApi("/api/commands/save", { method: "POST", body: {
                 old_name: values.coldName, name: values.cname, path: values.cpath,
                 description: values.cdescription, download_url: values.cdownloadUrl,
+                archive_path: values.carchivePath, platforms: parseYaml(values.cplatforms || "{}"),
                 documentation_url: values.cdocumentationUrl,
               } });
               uiState.dialog = null;
@@ -11628,6 +12195,12 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         catch { return json({ error: "Public base URL must be a valid HTTPS URL" }, 400); }
         if (external.protocol !== "https:" || (external.port && external.port !== "443"))
           return json({ error: "Public base URL must use HTTPS on port 443" }, 400);
+      }
+      if (x.proxy_configuration != null && String(x.proxy_configuration) !== Deno.readTextFileSync(PROXIES_PATH)) {
+        const tmp = PROXIES_PATH + ".tmp"; await Deno.writeTextFile(tmp, String(x.proxy_configuration)); await Deno.rename(tmp, PROXIES_PATH); proxySourceCache.clear();
+      }
+      if (x.search_configuration != null && String(x.search_configuration) !== Deno.readTextFileSync(SEARCH_PATH)) {
+        const tmp = SEARCH_PATH + ".tmp"; await Deno.writeTextFile(tmp, String(x.search_configuration)); await Deno.rename(tmp, SEARCH_PATH);
       }
       const changedSettings = new Set();
       const saveSetting = (key, value) => {
@@ -11810,13 +12383,15 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       if (documentationWarning) return json({ error: documentationWarning, field: "documentation_url" }, 400);
       let target;
       try { target = await binPath(String(x.path || "").trim() || name); } catch (e) { return json({ error: String(e.message || e) }, 400); }
-      const row = normalizeCommandEntry({
+      let row;
+      try { row = normalizeCommandEntry({
         logical_name: name,
         path: target.relative,
         description: x.description,
         download_url: x.download_url,
+        archive_path: x.archive_path, platforms: x.platforms,
         documentation_url: x.documentation_url,
-      });
+      }); await validateCommandEntry(row); } catch (e) { return json({ error: e.message }, 400); }
       const rows = await readCommandConfig(), oldKey = old.toLowerCase(), key = name.toLowerCase();
       if (rows.some(existing => existing.name.toLowerCase() === key && existing.name.toLowerCase() !== oldKey)) return json({ error: "Command name already exists" }, 409);
       const index = rows.findIndex(existing => existing.name.toLowerCase() === oldKey || (!old && existing.name.toLowerCase() === key));
@@ -11859,8 +12434,10 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     }
     if (u.pathname === "/api/commands/download" && req.method === "POST") {
       const x = await bodyJson(req), key = String(x.name || "").toLowerCase();
-      const row = (await readCommandConfig()).find(entry => entry.name.toLowerCase() === key);
+      const configured = (await readCommandConfig()).find(entry => entry.name.toLowerCase() === key);
+      const row = configured ? { ...configured, ...commandPlatform(configured) } : null;
       if (!row) return json({ error: "Command not found" }, 404);
+      if (!row.supported) return json({ error: `Command does not support ${Deno.build.os}-${Deno.build.arch}` }, 400);
       if (!row.download_url) return json({ error: "No download URL configured" }, 400);
       let target, temporary;
       try {
@@ -11869,14 +12446,19 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         if (!/^https?:$/.test(new URL(response.url).protocol)) throw new Error("Download redirected to an unsupported URL scheme");
         const filename = responseFilename(response);
         const zipped = filename.toLowerCase().endsWith(".zip") || /(?:^|\b)(?:application|binary)\/(?:x-)?zip(?:\b|$)/i.test(response.headers.get("content-type") || "");
+        const tarred = /\.(?:tar\.gz|tgz|tar)$/i.test(filename);
         let archiveEntry = null, content = null;
-        if (zipped) {
+        if (zipped || tarred) {
           const declared = Number(response.headers.get("content-length") || 0);
-          if (declared > 512 * 1024 * 1024) throw new Error("ZIP download is too large");
-          const archive = new Uint8Array(await response.arrayBuffer());
-          if (archive.byteLength > 512 * 1024 * 1024) throw new Error("ZIP download is too large");
-          archiveEntry = selectZipCommandEntry(archive, row);
-          content = extractZipEntry(archive, archiveEntry);
+          if (declared > 512 * 1024 * 1024) throw new Error("Archive download is too large");
+          const archive = await searchReadResponse(response, 512 * 1024 * 1024);
+          if (archive.byteLength > 512 * 1024 * 1024) throw new Error("Archive download is too large");
+          if (zipped) { archiveEntry = selectZipCommandEntry(archive, row); content = extractZipEntry(archive, archiveEntry); }
+          else {
+            const tar = /\.(?:tar\.gz|tgz)$/i.test(filename) ? new Uint8Array(gunzipSync(archive, { maxOutputLength: 536870912 })) : archive;
+            archiveEntry = selectCommandArchiveEntry(tarCommandEntries(tar), row);
+            content = tar.subarray(archiveEntry.offset, archiveEntry.offset + archiveEntry.size);
+          }
           target = await archiveCommandTarget(row.path, basename(archiveEntry.name.replaceAll("\\", "/")));
         } else target = await downloadCommandTarget(row.path, response);
         const current = await Deno.stat(target.path).catch(e => {

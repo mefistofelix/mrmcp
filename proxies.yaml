@@ -1,0 +1,10 @@
+# Edited in Settings → Proxies. Statistics live in SQLite, never in this file.
+proxies:
+  - direct # Placeholder for a direct HTTP request, not a proxy address.
+proxy_lists:
+  - https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt
+  - https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt
+list_ttl_minutes: 60
+request_timeout_seconds: 15
+max_entries: 200
+failure_cooldown_seconds: 30
