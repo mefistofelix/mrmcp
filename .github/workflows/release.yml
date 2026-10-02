@@ -125,6 +125,23 @@ jobs:
             if (!directory) throw new Error(`Cannot locate ${name}`);
             return directory;
           };
+          // Compile can resolve new optional packages for a cross target after deno info.
+          // Cache each supported native variant before constructing the exclusion paths.
+          for (const [native, versions] of Object.entries({
+            "win32-x64-msvc": ["0.22.3", "0.27.2"],
+            "linux-x64-gnu": ["0.22.3", "0.27.2"],
+            "darwin-arm64": ["0.22.3", "0.27.2"],
+            "darwin-x64": ["0.22.3"],
+          })) {
+            for (const version of versions) {
+              const name = "@lancedb/lancedb-" + native;
+              const specifier = "npm:" + name + "@" + version + "/package.json";
+              await import(specifier, { with: { type: "json" } });
+              const { fileURLToPath } = await import("node:url");
+              const { dirname } = await import("node:path");
+              if (!packages.some(p => p.name === name && p.version === version)) packages.push({ name, version, localPath: dirname(fileURLToPath(import.meta.resolve(specifier))) });
+            }
+          }
           const shell = packagePath("@mefistofelix/tauriless");
           const parser = packagePath("@kreuzberg/tree-sitter-language-pack");
           const companion = packagePath("@kreuzberg/tree-sitter-language-pack-darwin-x64");
@@ -163,8 +180,9 @@ jobs:
                 }
               } catch(error) { if (!(error instanceof Deno.errors.NotFound)) throw error; }
             }
+            const lanceTarget = native === "linux-x64" ? "linux-x64-gnu" : native === "win32-x64" ? "win32-x64-msvc" : native;
             for (const entry of packages) {
-              if (entry.name.startsWith("@lancedb/lancedb") && entry.version !== lanceVersion) await excludeNativeFiles(entry.localPath);
+              if (entry.name.startsWith("@lancedb/lancedb-") && (entry.version !== lanceVersion || entry.name !== "@lancedb/lancedb-" + lanceTarget)) await excludeNativeFiles(entry.localPath);
             }
             exclusions[target] = paths;
           }
@@ -330,6 +348,23 @@ jobs:
             if (!directory) throw new Error(`Cannot locate ${name}`);
             return directory;
           };
+          // Compile can resolve new optional packages for a cross target after deno info.
+          // Cache each supported native variant before constructing the exclusion paths.
+          for (const [native, versions] of Object.entries({
+            "win32-x64-msvc": ["0.22.3", "0.27.2"],
+            "linux-x64-gnu": ["0.22.3", "0.27.2"],
+            "darwin-arm64": ["0.22.3", "0.27.2"],
+            "darwin-x64": ["0.22.3"],
+          })) {
+            for (const version of versions) {
+              const name = "@lancedb/lancedb-" + native;
+              const specifier = "npm:" + name + "@" + version + "/package.json";
+              await import(specifier, { with: { type: "json" } });
+              const { fileURLToPath } = await import("node:url");
+              const { dirname } = await import("node:path");
+              if (!packages.some(p => p.name === name && p.version === version)) packages.push({ name, version, localPath: dirname(fileURLToPath(import.meta.resolve(specifier))) });
+            }
+          }
           const shell = packagePath("@mefistofelix/tauriless");
           const parser = packagePath("@kreuzberg/tree-sitter-language-pack");
           const companion = packagePath("@kreuzberg/tree-sitter-language-pack-darwin-x64");
@@ -368,8 +403,9 @@ jobs:
                 }
               } catch(error) { if (!(error instanceof Deno.errors.NotFound)) throw error; }
             }
+            const lanceTarget = native === "linux-x64" ? "linux-x64-gnu" : native === "win32-x64" ? "win32-x64-msvc" : native;
             for (const entry of packages) {
-              if (entry.name.startsWith("@lancedb/lancedb") && entry.version !== lanceVersion) await excludeNativeFiles(entry.localPath);
+              if (entry.name.startsWith("@lancedb/lancedb-") && (entry.version !== lanceVersion || entry.name !== "@lancedb/lancedb-" + lanceTarget)) await excludeNativeFiles(entry.localPath);
             }
             exclusions[target] = paths;
           }

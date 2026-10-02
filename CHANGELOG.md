@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.154
+
+- Fix portable cross-target packaging: cache LanceDB native variants for every release target before generating exclusions, then retain only the target/version in use. This removes the unused 0.22.3 Windows binding that Deno resolved after Linux-host dependency inspection, restoring the reduced executable size. Runtime search behavior and schema 5 remain unchanged.
+
 ## 0.10.153
 
 - Use LanceDB 0.22.3 for Intel macOS document search, the latest stable release publishing that native target, and retain 0.27.2 elsewhere. Exclude unused-version native binaries from standalone builds. Preserve fulltext/vector/hybrid APIs and the Intel Lucerna fix from 0.10.152. The 0.10.152 attempt passed source parsing but failed Intel LanceDB loading and published no release assets.
