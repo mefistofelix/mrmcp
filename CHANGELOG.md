@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.152
+
+- Fix Intel macOS Lucerna loading through the main parser's public native-path loader option and the installed Darwin x64 companion. Restore the previous environment immediately after synchronous loading; keep vendor packages unchanged, native initialization lazy and all search features from 0.10.151. The 0.10.151 release attempt failed its Intel macOS parser check and published no release assets.
+
 ## 0.10.151
 
 - Make the 41 public Lucerna source extractors explicit in the tool contract, including Go, C/C++, Zig, HTML, Python, YAML and PHP. Add common extension aliases and case-insensitive detection, preserving uppercase .C as C++. Accept canonical language/filter aliases and skip detected languages without an extractor. Grammar loading remains lazy; persistent selected files refresh once for the new recognition signature. Disambiguate colliding Lucerna chunk IDs for distinct symbols on the same source line without changing the database schema.

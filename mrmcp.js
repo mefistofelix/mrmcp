@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.151 — Common source languages and extension aliases.
+MrMCP 0.10.152 — Load the Lucerna Intel macOS companion through its public loader.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -8,6 +8,7 @@ GUI library: Tauriless, imported directly from npm by Deno.
 */
 
 import { DatabaseSync } from "node:sqlite";
+import { createRequire } from "node:module";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { Buffer } from "node:buffer";
 import chardet from "npm:chardet@2.1.1";
@@ -17,8 +18,8 @@ import * as cdp from "npm:@mefistofelix/cdp.js";
 // Pin the parser through a JSON import: newer releases reference unpublished
 // optional packages. JSON keeps native code lazy, including in the desktop isolate.
 import lucernaParserPackage from "npm:@kreuzberg/tree-sitter-language-pack@1.6.2/package.json" with { type: "json" };
-// The parser's public loader resolves this companion on Intel macOS, whose
-// binding is absent from the older parser tarball. No native wrapper is owned here.
+// Intel macOS uses this companion through the parser loader's native-path
+// option. Both package loaders remain unmodified; native code stays lazy.
 import lucernaMacPackage from "npm:@kreuzberg/tree-sitter-language-pack-darwin-x64@1.10.9/package.json" with { type: "json" };
 const loadAutoVips = async () => auto.vips;
 import { inflateRawSync, inflateSync, gunzipSync } from "node:zlib";
@@ -107,7 +108,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.151";
+const VERSION = "0.10.152";
 const DB_SCHEMA_VERSION = 5;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -5297,7 +5298,21 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   };
   const sourceCodeTasks = new Map();
   let lucernaPromise;
-  const sourceCodeLibrary = () => lucernaPromise ||= import("npm:@upstart.gg/lucerna@0.2.9").catch(error => {
+  function loadLucernaIntelParser(requireModule = createRequire(SELF.href), bindingPath = fileURLToPath(import.meta.resolve("npm:@kreuzberg/tree-sitter-language-pack-darwin-x64@1.10.9")), parserPath = fileURLToPath(import.meta.resolve("npm:@kreuzberg/tree-sitter-language-pack@1.6.2"))) {
+    // Public NAPI loader option. Synchronous loading prevents Tool Call interleaving.
+    const previous = Deno.env.get("NAPI_RS_NATIVE_LIBRARY_PATH");
+    try {
+      Deno.env.set("NAPI_RS_NATIVE_LIBRARY_PATH", bindingPath);
+      requireModule(parserPath);
+    } finally {
+      if (previous === undefined) Deno.env.delete("NAPI_RS_NATIVE_LIBRARY_PATH");
+      else Deno.env.set("NAPI_RS_NATIVE_LIBRARY_PATH", previous);
+    }
+  }
+  const sourceCodeLibrary = () => lucernaPromise ||= Promise.resolve().then(() => {
+    if (Deno.build.os === "darwin" && Deno.build.arch === "x86_64") loadLucernaIntelParser();
+    return import("npm:@upstart.gg/lucerna@0.2.9");
+  }).catch(error => {
     lucernaPromise = null;
     throw new Error(`Lucerna parser could not load (${lucernaParserPackage.version}; macOS companion ${lucernaMacPackage.version}): ${error.message}`);
   });

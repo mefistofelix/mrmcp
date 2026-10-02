@@ -47,12 +47,38 @@ jobs:
           deno eval --minimum-dependency-age=0 '
           import pin from "npm:@kreuzberg/tree-sitter-language-pack@1.6.2/package.json" with { type: "json" };
           import mac from "npm:@kreuzberg/tree-sitter-language-pack-darwin-x64@1.10.9/package.json" with { type: "json" };
+          if (Deno.build.os === "darwin" && Deno.build.arch === "x86_64") {
+            const { createRequire } = await import("node:module");
+            const { fileURLToPath } = await import("node:url");
+            const requireModule = createRequire(import.meta.url);
+            const previous = Deno.env.get("NAPI_RS_NATIVE_LIBRARY_PATH");
+            try {
+              Deno.env.set("NAPI_RS_NATIVE_LIBRARY_PATH", fileURLToPath(import.meta.resolve("npm:@kreuzberg/tree-sitter-language-pack-darwin-x64@1.10.9")));
+              requireModule(fileURLToPath(import.meta.resolve("npm:@kreuzberg/tree-sitter-language-pack@1.6.2")));
+            } finally {
+              if (previous === undefined) Deno.env.delete("NAPI_RS_NATIVE_LIBRARY_PATH");
+              else Deno.env.set("NAPI_RS_NATIVE_LIBRARY_PATH", previous);
+            }
+          }
           const { TreeSitterChunker } = await import("npm:@upstart.gg/lucerna@0.2.9");
           const parser = new TreeSitterChunker();
           try {
             await parser.initialize();
             const chunks = await parser.chunkSource("export function lucernaSmoke(x) { return x; }", "smoke.js", "smoke", "javascript");
             if (!chunks.some(chunk => chunk.name === "lucernaSmoke")) throw new Error("Native Lucerna AST extraction failed");
+            for (const [language, extension, source] of [
+              ["go", "go", "package main\nfunc smoke() int { return 7 }"],
+              ["c", "c", "int smoke(void) { return 7; }"],
+              ["cpp", "cpp", "int smoke() { return 7; }"],
+              ["zig", "zig", "pub fn smoke() u32 { return 7; }"],
+              ["html", "html", "<section id=smoke>smoke</section>"],
+              ["python", "py", "def smoke():\n    return 7\n"],
+              ["yaml", "yaml", "smoke:\n  enabled: true\n"],
+              ["php", "php", "<?php function smoke() { return 7; }"],
+            ]) {
+              const parsed = await parser.chunkSource(source, "smoke." + extension, "smoke", language);
+              if (!parsed.length || parsed.some(chunk => !Number.isInteger(chunk.startLine) || chunk.startLine < 1 || !Number.isInteger(chunk.endLine) || chunk.endLine < chunk.startLine)) throw new Error("Native Lucerna parser/line mapping failed for " + language);
+            }
           } finally { await parser.close(); }
           '
 
@@ -213,12 +239,37 @@ jobs:
           deno eval --minimum-dependency-age=0 '
           import pin from "npm:@kreuzberg/tree-sitter-language-pack@1.6.2/package.json" with { type: "json" };
           import mac from "npm:@kreuzberg/tree-sitter-language-pack-darwin-x64@1.10.9/package.json" with { type: "json" };
+          if (Deno.build.os === "darwin" && Deno.build.arch === "x86_64") {
+            const { createRequire } = await import("node:module");
+            const requireModule = createRequire(import.meta.url);
+            const previous = Deno.env.get("NAPI_RS_NATIVE_LIBRARY_PATH");
+            try {
+              Deno.env.set("NAPI_RS_NATIVE_LIBRARY_PATH", requireModule.resolve("@kreuzberg/tree-sitter-language-pack-darwin-x64"));
+              requireModule("@kreuzberg/tree-sitter-language-pack");
+            } finally {
+              if (previous === undefined) Deno.env.delete("NAPI_RS_NATIVE_LIBRARY_PATH");
+              else Deno.env.set("NAPI_RS_NATIVE_LIBRARY_PATH", previous);
+            }
+          }
           const { TreeSitterChunker } = await import("npm:@upstart.gg/lucerna@0.2.9");
           const parser = new TreeSitterChunker();
           try {
             await parser.initialize();
             const chunks = await parser.chunkSource("export function lucernaSmoke(x) { return x; }", "smoke.js", "smoke", "javascript");
             if (!chunks.some(chunk => chunk.name === "lucernaSmoke")) throw new Error("Native Lucerna AST extraction failed");
+            for (const [language, extension, source] of [
+              ["go", "go", "package main\nfunc smoke() int { return 7 }"],
+              ["c", "c", "int smoke(void) { return 7; }"],
+              ["cpp", "cpp", "int smoke() { return 7; }"],
+              ["zig", "zig", "pub fn smoke() u32 { return 7; }"],
+              ["html", "html", "<section id=smoke>smoke</section>"],
+              ["python", "py", "def smoke():\n    return 7\n"],
+              ["yaml", "yaml", "smoke:\n  enabled: true\n"],
+              ["php", "php", "<?php function smoke() { return 7; }"],
+            ]) {
+              const parsed = await parser.chunkSource(source, "smoke." + extension, "smoke", language);
+              if (!parsed.length || parsed.some(chunk => !Number.isInteger(chunk.startLine) || chunk.startLine < 1 || !Number.isInteger(chunk.endLine) || chunk.endLine < chunk.startLine)) throw new Error("Native Lucerna parser/line mapping failed for " + language);
+            }
           } finally { await parser.close(); }
           '
 
