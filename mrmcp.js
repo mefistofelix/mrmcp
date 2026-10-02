@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.152 — Load the Lucerna Intel macOS companion through its public loader.
+MrMCP 0.10.153 — Support Intel macOS document and source search.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -108,7 +108,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.152";
+const VERSION = "0.10.153";
 const DB_SCHEMA_VERSION = 5;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -4995,6 +4995,8 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
   }
   // Functional document indices are independent of Tool Call history policies.
   const documentSearchTasks = new Map();
+  const documentLanceLibrary = () => Deno.build.os === "darwin" && Deno.build.arch === "x86_64"
+    ? import("npm:@lancedb/lancedb@0.22.3") : import("npm:@lancedb/lancedb@0.27.2");
   let extractionLibraryPromise;
   function searchConfig(text = Deno.readTextFileSync(SEARCH_PATH)) {
     if (text.length > 262144) throw new Error("Search configuration exceeds 256 KiB");
@@ -5207,7 +5209,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     while(documentSearchTasks.has(key))await documentSearchTasks.get(key);
     let release;documentSearchTasks.set(key,new Promise(r=>{release=r;}));
     try {
-      const lance=await import("npm:@lancedb/lancedb@0.27.2"), x=await documentExtractionLibrary();
+      const lance=await documentLanceLibrary(), x=await documentExtractionLibrary();
       const dir=searchIndexDirectory(selection,root);await Deno.mkdir(dir,{recursive:true});
       const connection=await lance.connect(dir), manifestPath=join(dir,"manifest.json");
       let manifest;try {manifest=JSON.parse(await Deno.readTextFile(manifestPath));}catch(e){if(!(e instanceof Deno.errors.NotFound))throw e;manifest={};}

@@ -99,7 +99,7 @@ jobs:
             content = (await x.extract({kind: "bytes", bytes, mimeType: "text/plain"}, {disableOcr: true})).results[0]?.content;
           }
           if (content !== "Searchable document smoke") throw new Error("Xberg extraction failed");
-          const l = await import("npm:@lancedb/lancedb@0.27.2");
+          const l = Deno.build.os === "darwin" && Deno.build.arch === "x86_64" ? await import("npm:@lancedb/lancedb@0.22.3") : await import("npm:@lancedb/lancedb@0.27.2");
           const directory = await Deno.makeTempDir();
           try {
             const db = await l.connect(directory);
@@ -152,6 +152,19 @@ jobs:
                 if (entry.isFile && entry.name.endsWith(".node")) paths.push(`${companion}/${entry.name}`);
               }
               paths.push(`${wasm}/pkg/web/xberg_wasm_bg.wasm`);
+            }
+            const lanceVersion = target === "x86_64-apple-darwin" ? "0.22.3" : "0.27.2";
+            async function excludeNativeFiles(directory) {
+              try {
+                for await (const entry of Deno.readDir(directory)) {
+                  const path = directory + "/" + entry.name;
+                  if (entry.isDirectory) await excludeNativeFiles(path);
+                  else if (entry.isFile && entry.name.endsWith(".node")) paths.push(path);
+                }
+              } catch(error) { if (!(error instanceof Deno.errors.NotFound)) throw error; }
+            }
+            for (const entry of packages) {
+              if (entry.name.startsWith("@lancedb/lancedb") && entry.version !== lanceVersion) await excludeNativeFiles(entry.localPath);
             }
             exclusions[target] = paths;
           }
@@ -290,7 +303,7 @@ jobs:
             content = (await x.extract({kind: "bytes", bytes, mimeType: "text/plain"}, {disableOcr: true})).results[0]?.content;
           }
           if (content !== "Searchable document smoke") throw new Error("Xberg extraction failed");
-          const l = await import("npm:@lancedb/lancedb@0.27.2");
+          const l = Deno.build.os === "darwin" && Deno.build.arch === "x86_64" ? await import("npm:@lancedb/lancedb@0.22.3") : await import("npm:@lancedb/lancedb@0.27.2");
           const directory = await Deno.makeTempDir();
           try {
             const db = await l.connect(directory);
@@ -344,6 +357,19 @@ jobs:
                 if (entry.isFile && entry.name.endsWith(".node")) paths.push(`${companion}/${entry.name}`);
               }
               paths.push(`${wasm}/pkg/web/xberg_wasm_bg.wasm`);
+            }
+            const lanceVersion = target === "x86_64-apple-darwin" ? "0.22.3" : "0.27.2";
+            async function excludeNativeFiles(directory) {
+              try {
+                for await (const entry of Deno.readDir(directory)) {
+                  const path = directory + "/" + entry.name;
+                  if (entry.isDirectory) await excludeNativeFiles(path);
+                  else if (entry.isFile && entry.name.endsWith(".node")) paths.push(path);
+                }
+              } catch(error) { if (!(error instanceof Deno.errors.NotFound)) throw error; }
+            }
+            for (const entry of packages) {
+              if (entry.name.startsWith("@lancedb/lancedb") && entry.version !== lanceVersion) await excludeNativeFiles(entry.localPath);
             }
             exclusions[target] = paths;
           }

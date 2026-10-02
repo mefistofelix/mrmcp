@@ -20,7 +20,7 @@ Choose `fs_glob` for paths, `fs_grep` for textual occurrences (including comment
 
 ### `document_grep`
 
-Requires `chat_session`. Uses its selected Workspace, or Search `default_path` when none is selected. Empty/omitted `default_path` means OS Desktop/`_default`, created on the first search. This does not create or attach a Workspace; other file/process/kernel tools still require one. Xberg 1.3.2 extracts local documents; LanceDB 0.27.2 stores passages and performs fulltext/BM25 and vector search. The separate Lucerna tool provides lexical/AST source retrieval. On macOS Intel, extraction uses Xberg's public npm WASM initializer. Deno manages the package and its WASM/license; standalone builds embed that dependency and work without downloading it at runtime. Other supported platforms use native Xberg. There is no separate WASM asset under assets.
+Requires `chat_session`. Uses its selected Workspace, or Search `default_path` when none is selected. Empty/omitted `default_path` means OS Desktop/`_default`, created on the first search. This does not create or attach a Workspace; other file/process/kernel tools still require one. Xberg 1.3.2 extracts local documents; LanceDB 0.27.2 (0.22.3 on Intel macOS, the last stable Intel binding) stores passages and performs fulltext/BM25 and vector search. The separate Lucerna tool provides lexical/AST source retrieval. On macOS Intel, extraction uses Xberg's public npm WASM initializer. Deno manages the package and its WASM/license; standalone builds embed that dependency and work without downloading it at runtime. Other supported platforms use native Xberg. There is no separate WASM asset under assets.
 
 | Argument | Behavior |
 |---|---|

@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.153
+
+- Use LanceDB 0.22.3 for Intel macOS document search, the latest stable release publishing that native target, and retain 0.27.2 elsewhere. Exclude unused-version native binaries from standalone builds. Preserve fulltext/vector/hybrid APIs and the Intel Lucerna fix from 0.10.152. The 0.10.152 attempt passed source parsing but failed Intel LanceDB loading and published no release assets.
+
 ## 0.10.152
 
 - Fix Intel macOS Lucerna loading through the main parser's public native-path loader option and the installed Darwin x64 companion. Restore the previous environment immediately after synchronous loading; keep vendor packages unchanged, native initialization lazy and all search features from 0.10.151. The 0.10.151 release attempt failed its Intel macOS parser check and published no release assets.
