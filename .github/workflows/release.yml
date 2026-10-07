@@ -517,6 +517,11 @@ jobs:
     env:
       RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
     steps:
+      - name: Check out release documentation
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+
       - name: Download Windows and Linux assets
         uses: actions/download-artifact@v4
         with:
@@ -546,6 +551,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          awk -v version="$RELEASE_TAG" '
+            { sub(/\r$/, "") }
+            $0 == "## " version { found = 1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          test -s release-notes.md
+          printf '\n[Complete release history](https://github.com/%s/blob/%s/CHANGELOG.md)\n' "$GH_REPO" "$RELEASE_TAG" >> release-notes.md
           files=(
             dist/mrmcp-windows-x64.exe
             dist/mrmcp-linux-x64
@@ -556,9 +569,10 @@ jobs:
             gh release delete-asset "$RELEASE_TAG" mrmcp-macos-x64 --yes >/dev/null 2>&1 || true
             gh release delete-asset "$RELEASE_TAG" mrmcp-macos-arm64 --yes >/dev/null 2>&1 || true
             gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
+            gh release edit "$RELEASE_TAG" --notes-file release-notes.md
           else
             gh release create "$RELEASE_TAG" "${files[@]}" \
               --verify-tag \
               --title "MrMCP $RELEASE_TAG" \
-              --generate-notes
+              --notes-file release-notes.md
           fi

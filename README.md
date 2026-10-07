@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.149
+# MrMCP 0.10.155
 
 MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated `/mcp` endpoint, Workspace-scoped Sessions, filesystem and process tools, OAuth/Basic authentication, TLS automation, and a local Tauriless administration UI.
 
@@ -19,9 +19,10 @@ MrMCP is a stateless Model Context Protocol server implemented in Deno. It expos
 - Incremental document retrieval through `document_grep`: Xberg extraction, LanceDB fulltext/vector/hybrid search, globstar/MIME/`.gitignore` scopes, native OS OCR. Settings → Search edits `search.yaml`; fulltext works immediately, while vector/hybrid require an embedding model.
 - Foreground and persistent processes with progress streaming when requested.
 - Persistent JavaScript kernels scoped to Session + Workspace.
-- Extra command catalog through `commands.yaml`, with OS/CPU variants, native yt-dlp downloads and libgen-cli metadata.
+- Extra command catalog through `commands.yaml`, with OS/CPU variants, native yt-dlp, Anna's Archive CLI and Google Workspace `gws` downloads (including Drive/Gmail), and libgen-cli metadata.
 - `proxy_get` provides paginated proxy discovery, weighted random/round robin selection and persistent reported outcome statistics. Settings → Proxies edits `proxies.yaml`.
 - User-managed MCP guided prompts through `guided_prompts.yaml`, with Eta templates, two editable starter examples (one argument-free and one parameterized), and a built-in template/model help view.
+- OpenRouter JSON API through `openrouter_req`, with the API key configured on the dedicated OpenRouter GUI page; model discovery and non-streaming requests work without a Workspace.
 - OAuth and Basic authentication.
 - Automatic TLS/certificate handling.
 - Tool Call and optional HTTP diagnostic logs. Tool Call history has independent **Disk / Memory** storage and **Payload / Metadata** retention policies. Disk history survives restart; Memory history uses volatile SQLite TEMP storage. Payload stores exactly the canonical MCP JSON-RPC request and response packets once; Metadata stores neither packet. The fullscreen Tool Call debugger interprets nested JSON/YAML, multiline text, readable Base64 and images only while viewing a row, without persisting decoded copies. Disk retention is configured in hours and Memory retention in minutes. Functional process/CDP/Memory/Published/Trash state, authentication, Sessions, Workspaces and configuration are never disabled or made volatile by the Tool Call logging policy.
@@ -123,6 +124,7 @@ Commands and execution:
 - `js`, `js_add_node_module_dir`, `js_reset`
 - `tools_schema` — inspect canonical live MCP descriptors; `tools_log` — query Tool Calls that reached the current Session across both Disk and Memory history, using `detail=summary` by default or `detail=full` to retrieve the retained canonical `mcp_request` / `mcp_response` packets.
 - `telegram_req` — make one generic pre-authenticated Telegram Bot API JSON request using the Bot token configured by the user on the dedicated **✈️ Telegram** sidebar page.
+- `openrouter_req` — make an authenticated OpenRouter JSON API request using the key saved on the OpenRouter page; model discovery, chat, responses and embeddings require only a Session. Returns provider JSON, status, usage and errors; streaming is unsupported.
 
 Filesystem removal is reversible: `fs_trash`/`fs_untrash` use explicit `trash_id` transactions instead of a permanent delete tool. All Workspaces share the single MrMCP-managed `APP_DIR/.mrmcp/trash/` payload store; MrMCP never creates `.mrmcp` metadata directories inside named Workspaces. Trash transaction/item metadata lives in SQLite (`trash_transactions` / `trash_items`) with original path, cached type and cached byte size for non-directory payloads; directory size is deliberately left unknown to avoid recursively scanning a tree before a rename; no JSON manifest copy is written. The desktop **Trash** page uses the DB for inventory/sidebar counts and checks each tracked payload live on disk, making missing payloads explicit while preserving their cached metadata until deleted. Restore/delete and Empty Trash remain independent of Tool Call logging.
 

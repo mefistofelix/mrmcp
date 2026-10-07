@@ -318,7 +318,7 @@ Creates one new persistent chat Session without opening or creating a Workspace.
 
 Arguments: none. Returns `chat_session`; call once per chat and reuse a valid existing value instead of initializing again. Sessions expire after 30 days without activity. Initialization and its Tool Call history are associated with the new Session.
 
-`document_grep` and `source_code_search` use the configured fallback source folder when no Workspace is selected. Workspace-dependent file operations, `workspace_dev_preferences_write`, new `exec`/`exec_start` or custom commands and JavaScript kernels require `open_workspace` first. Existing process follow-ups remain scoped to the same Session and work after Workspace removal. Desktop/CDP, discovery, diagnostics, memory, Telegram and `publish(text|base64)` require only the Session; `publish(path)` requires a Workspace.
+`document_grep` and `source_code_search` use the configured fallback source folder when no Workspace is selected. Workspace-dependent file operations, `workspace_dev_preferences_write`, new `exec`/`exec_start` or custom commands and JavaScript kernels require `open_workspace` first. Existing process follow-ups remain scoped to the same Session and work after Workspace removal. Desktop/CDP, discovery, diagnostics, memory, Telegram, OpenRouter and `publish(text|base64)` require only the Session; `publish(path)` requires a Workspace.
 
 ### `list_workspaces`
 
@@ -820,7 +820,7 @@ Storage and payload are orthogonal: `Memory + Payload`, `Disk + Metadata`, etc. 
 
 The authoritative file is root `commands.yaml`. Each entry has `logical_name`, description, optional documentation_url and shared optional path/download_url/archive_path. `platforms` maps `windows-x86_64`, `linux-x86_64`, `darwin-x86_64`, `darwin-aarch64` (also aarch64 Windows/Linux) or OS-only keys to path/download_url/archive_path overrides. Exact OS/CPU wins over an OS-only fallback. Omitted fields inherit shared values; explicit empty download_url disables download. An empty/absent platform mapping uses shared values; a nonempty mapping with no matching key marks that command unsupported. Missing download URLs permit manually installed executables; no source build/package-manager install is inferred.
 
-Discovery, logical exec resolution, GUI availability and Download/Download All use the selected current-platform variant. YAML order and every platform definition survive edits to another command. The command dialog exposes shared fields plus the complete platform YAML with inline validation. Download supports direct binaries, ZIP and TAR/TAR.GZ/TGZ; it installs only the selected regular-file payload below `.mrmcp/bin`, never an archive tree or TAR symlink. `archive_path` selects an exact archive member; otherwise an unambiguous executable basename is required. Unix installs are chmod 0755. Existing files require the existing overwrite confirmation. Unsupported platform variants are never downloaded or executed.
+Discovery, logical exec resolution, GUI availability and Download/Download All use the selected current-platform variant. YAML order and every platform definition survive edits to another command. The command dialog exposes shared fields plus the complete platform YAML with inline validation. Download supports direct binaries, ZIP and TAR/TAR.GZ/TGZ/TAR.XZ; it installs only the selected regular-file payload below `.mrmcp/bin`, never an archive tree or TAR symlink. XZ decompression uses a lazy portable WASM dependency, with the same 512 MiB archive/output limit as gzip. `archive_path` selects an exact archive member; otherwise an unambiguous executable basename is required. Unix installs are chmod 0755. Existing files require the existing overwrite confirmation. Unsupported platform variants are never downloaded or executed.
 
 The default catalog includes native `yt-dlp` variants for Windows x64, Linux x64 and both macOS CPUs. `libgen-cli` is metadata for a manually supplied Go-built binary: upstream has no published releases. Its descriptor documents the upstream Go install command; MrMCP does not install Go or compile source automatically.
 
@@ -884,6 +884,37 @@ Arguments:
 - `chat_session`.
 
 MrMCP uses native `fetch()` only: no TDLib and no Telegram client library. Numeric-string `chat_id` is normalized to a number when safely representable. If Telegram returns `parameters.migrate_to_chat_id`, MrMCP remembers that redirect for the running process, rewrites the request and retries once. The result contains the method, Telegram's JSON response body, and nullable migration metadata. Telegram method semantics remain the Bot API's own contract.
+
+---
+
+## OpenRouter API
+
+### `openrouter_req`
+
+Sends one JSON request to `https://openrouter.ai/api/v1`. The local user saves the API key on the **🔀 OpenRouter** sidebar page; a password field, inline validation and Save work like Telegram. An empty saved key removes authentication configuration. Opening or saving this page performs no API request. The key persists in the local database and is never a tool argument or returned value. No Workspace is required.
+
+Arguments:
+
+- `chat_session` — required current Session.
+- `request.path` — required API-relative endpoint, such as `/models`, `/chat/completions`, `/responses` or `/embeddings`.
+- `request.method` — `GET`, `POST` (default), `PUT`, `PATCH` or `DELETE`.
+- `request.query` — optional mapping of URL parameters to strings, numbers or booleans.
+- `request.body` — optional ordinary API JSON object; disallowed for GET. Model/provider parameters, messages, multimodal content, structured-output schemas and tool definitions pass through unchanged.
+- `timeout_ms` — optional 1,000–3,600,000 ms, default 60,000.
+
+Only non-streaming JSON is supported: omit `stream` or set it to `false`. Responses are bounded to 16 MiB. External URLs, traversal paths and redirects are rejected; authentication headers cannot be overridden. Requests use native `fetch()` without an SDK, automatic retries or execution of model-returned tool calls. Cancellation aborts the HTTP request. Results contain `method`, `path`, HTTP `status`, `success` and the complete JSON `response`; HTTP/provider errors set `success=false` and retain their JSON details. Non-JSON, network, timeout and configuration failures return ordinary tool errors. The configured key is redacted from API results and errors.
+
+Examples:
+
+```json
+{"chat_session":"<current Session>","request":{"method":"GET","path":"/models"}}
+```
+
+```json
+{"chat_session":"<current Session>","request":{"path":"/chat/completions","body":{"model":"<model id from /models>","messages":[{"role":"user","content":"Summarize this text."}],"max_tokens":200}}}
+```
+
+Endpoint fields and model capabilities follow the [official OpenRouter API contract](https://openrouter.ai/docs/api_reference/overview).
 
 ---
 

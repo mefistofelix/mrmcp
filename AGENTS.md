@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.10.154 consists of ten root project files, one GitHub Actions workflow and one versioned asset directory:
+MrMCP 0.10.155 consists of ten root project files, one GitHub Actions workflow and one versioned asset directory:
 
 - `mrmcp.js` — Deno backend, MCP `2026-07-28`, OAuth/Basic authentication, SQLite, local Tauriless UI and desktop launcher.
 - `commands.yaml` — versioned editable extra-command catalog; keep it in the repository root, never under `assets/`.
@@ -88,7 +88,7 @@ Application state uses an explicit Session bearer capability:
 - valid handles execute and are repeated byte-for-byte in the result;
 - Sessions expire after 30 days without activity.
 
-Authentication gates access to the server. After authentication, only `init_chat_session` may execute without a pre-existing Session. Every other tool requires a valid `chat_session`; it selects the Session independently of Workspace selection. Filesystem tools, Workspace preference writes, new processes/custom commands, JavaScript kernels and `publish(path)` require a selected Workspace. Desktop/CDP, discovery, diagnostics, memory, Telegram and text/Base64 publication may run with no Workspace. Process follow-ups still use the original process Workspace/cwd snapshot and remain available when the Session has no Workspace. Do not bind Sessions, processes or kernels to OAuth clients, Basic credentials or transport identity.
+Authentication gates access to the server. After authentication, only `init_chat_session` may execute without a pre-existing Session. Every other tool requires a valid `chat_session`; it selects the Session independently of Workspace selection. Filesystem tools, Workspace preference writes, new processes/custom commands, JavaScript kernels and `publish(path)` require a selected Workspace. Desktop/CDP, discovery, diagnostics, memory, Telegram, OpenRouter and text/Base64 publication may run with no Workspace. Process follow-ups still use the original process Workspace/cwd snapshot and remain available when the Session has no Workspace. Do not bind Sessions, processes or kernels to OAuth clients, Basic credentials or transport identity.
 
 Never describe `chat_session` as a protocol or transport session identifier. Session client metadata is best-effort observational information captured when `init_chat_session` creates the Session; do not infer a model, reasoning/thinking level or client ownership from it. A ChatGPT model or thinking-level change may result in a new Session even inside the same chat.
 
@@ -134,6 +134,7 @@ Keep these sections:
 - Guided Prompts;
 - HTTP Log;
 - Telegram;
+- OpenRouter;
 - Settings;
 - Help.
 
@@ -325,6 +326,10 @@ The public memory surface is exactly `memory_find` and `memory_set`; do not add 
 
 `telegram_req` is the only Telegram surface. Keep it as one native-`fetch()` Bot API JSON request tool: the agent supplies `request.method` plus ordinary Bot API JSON fields, while the dedicated Telegram sidebar page supplies the Bot token. Never expose the token as a tool argument/result and never import TDLib, a Telegram SDK, or anything from `doc/telegram.js`. Normalize safely numeric `chat_id`, remember `migrate_to_chat_id` redirects only at runtime, and retry one migrated request once; chat/channel ids and higher application state belong to the agent/Memory.
 
+## OpenRouter API
+
+`openrouter_req` is the only OpenRouter surface, using native `fetch()` with no SDK. The dedicated OpenRouter sidebar page manages `config.openrouter_api_key` through a password field, server-owned drafts, inline validation and Save; clearing the field removes it. Saving/opening the page makes no API call. Every request requires only `chat_session`, not a Workspace. Accept an API-relative path, HTTP method, query parameters and ordinary JSON body; inject Bearer authentication only for the fixed HTTPS `/api/v1` origin and reject redirects and path traversal. Preserve provider parameters and return HTTP status, success and the JSON response, including structured API failures. Redact the configured key from returned data/errors. Streaming, automatic retries and execution of model-returned tool calls are unsupported. Bound JSON responses to 16 MiB; default timeout is 60 seconds with explicit override up to one hour, and cancellation aborts the HTTP request. The key lives in the existing config table, is preserved by operational cleanup and requires no schema bump. Partial GUI settings saves validate against saved settings and must not reset unrelated values.
+
 ## Published content and MCP App widget
 
 `publish` is the single supported user-publication surface. Keep the contract stateless across Tool Calls and deliberately source-oriented:
@@ -383,7 +388,7 @@ When testing MrMCP through ChatGPT, treat the tool schema available to an existi
 
 README describes only current behavior. Keep it concise and do not append release history. `CHANGELOG.md` is the only release-history document; keep reverted architecture experiments clearly marked as superseded there.
 
-For a release, update `CHANGELOG.md`, the source header and the `VERSION` constant in `mrmcp.js`. Update README only when current user/operator behavior changed, and AGENTS only when implementation invariants or release checks changed. The release commit message must be descriptive, not a generic `release X.Y.Z`: include the version plus a short summary of the primary change, for example `0.10.82: color Tool Call status filter options`. Keep it concise but specific enough that `git log` explains what changed without opening the commit. Invoke Git/GitHub CLI through MrMCP `exec` with `program` + `args`; never add a `shell` boolean/field, because it is not part of the tool schema. After creating the release tag, prefer one direct combined push with `git push origin main X.Y.Z`; the pushed version tag is the publication trigger. Do not manually create/upload the normal GitHub Release afterward: `.github/workflows/release.yml` verifies the tag against `VERSION`, cross-compiles the four release executables and publishes them. Split branch/tag pushes only when Git itself returns an execution error, not when a tool invocation was rejected before reaching MrMCP.
+For a release, update `CHANGELOG.md`, the source header and the `VERSION` constant in `mrmcp.js`; always synchronize the README version heading and this guide's current-release identifier. Update the README body when current user/operator behavior changed, and implementation guidance when invariants or release checks changed. GitHub Release notes must come from the matching CHANGELOG section, with a link to the full history; never publish only a comparison link. The release commit message must be descriptive, not a generic `release X.Y.Z`: include the version plus a short summary of the primary change, for example `0.10.82: color Tool Call status filter options`. Keep it concise but specific enough that `git log` explains what changed without opening the commit. Invoke Git/GitHub CLI through MrMCP `exec` with `program` + `args`; never add a `shell` boolean/field, because it is not part of the tool schema. After creating the release tag, prefer one direct combined push with `git push origin main X.Y.Z`; the pushed version tag is the publication trigger. Do not manually create/upload the normal GitHub Release afterward: `.github/workflows/release.yml` verifies the tag against `VERSION`, cross-compiles the four release executables and publishes them. Split branch/tag pushes only when Git itself returns an execution error, not when a tool invocation was rejected before reaching MrMCP.
 
 ## Release checks
 
@@ -441,6 +446,6 @@ For ChatGPT goals, test explicit Settings login setup, no automatic browser work
 
 ## Platform commands and proxy pool
 
-commands.yaml supports shared fields and platforms mappings keyed by Deno OS/arch (exact key before OS fallback). Resolve the same variant for discovery, availability, exec and download. Preserve all mappings through GUI edits; mark unmatched nonempty mappings unsupported. Downloads support binaries/ZIP/TAR/TAR.GZ/TGZ, selecting one unambiguous regular-file payload or explicit archive_path without extracting trees or links. Never invent unavailable release URLs; libgen-cli currently has no releases and is a manual-install catalog entry. yt-dlp owns YouTube downloading.
+commands.yaml supports shared fields and platforms mappings keyed by Deno OS/arch (exact key before OS fallback). Resolve the same variant for discovery, availability, exec and download. Preserve all mappings through GUI edits; mark unmatched nonempty mappings unsupported. Downloads support binaries/ZIP/TAR/TAR.GZ/TGZ/TAR.XZ, selecting one unambiguous regular-file payload or explicit archive_path without extracting trees or links. XZ uses the public xz-decompress WASM stream API, loaded lazily, with decompressed output bounded to 512 MiB. Never invent unavailable release URLs; libgen-cli currently has no releases and is a manual-install catalog entry. yt-dlp owns YouTube downloading.
 
 proxy_get requires chat_session but no Workspace. Pick reserves a global persistent selection cursor; list is paginated and does not reserve; report updates actual caller-supplied outcomes by previously selected id. Random selection uses health weights; round robin orders least recently used eligible proxies with health tie-breaks. Both skip cooldowns. Store stats only in proxy_stats in schema 5, preserve them through operational cleanup, and store proxy entries/list URLs/options only in root proxies.yaml. Settings → Proxies uses server-owned drafts, inline validation and the shared Save; every standalone includes proxies.yaml and materializes it only after the schema gate. Never import or migrate old statistics/configuration. Public list downloads are explicit-call-only, bounded, cached and deduplicated; no background probes or inferred command outcome tracking. Verify paging, source errors/timeouts/cache, cooldown/reset, concurrent picks, persistence, cleanup preservation and standalone embedding.

@@ -1,5 +1,5 @@
 /*
-MrMCP 0.10.154 — Exclude cross-target and unused-version LanceDB binaries.
+MrMCP 0.10.155 — Add OpenRouter requests and Google Workspace/Anna's Archive commands.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: deno run -A --unstable-ffi mrmcp.js
 Run headless backend: deno run -A mrmcp.js --backend
@@ -98,7 +98,7 @@ const BASE_TOOLS = ["proxy_get",
   "init_chat_session", "chat_set_goal", "chat_goal_debug", "list_workspaces", "open_workspace", "workspace_dev_preferences_write",
   "fs_glob", "fs_grep", "fs_read", "fs_navigate", "fs_stat", "source_code_search", "document_grep",
   "fs_write", "fs_edit", "fs_text_convert_encoding_eol", "fs_mkdir", "fs_copy", "fs_move", "fs_trash", "fs_untrash",
-  "desktop_auto", "publish", "cdp_call", "cdp_subs", "cdp_poll", "memory_find", "memory_set", "telegram_req", "discover_commands", "tools_schema", "tools_log", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
+  "desktop_auto", "publish", "cdp_call", "cdp_subs", "cdp_poll", "memory_find", "memory_set", "telegram_req", "openrouter_req", "discover_commands", "tools_schema", "tools_log", "exec", "exec_start", "exec_attach", "exec_write", "exec_kill", "exec_list", "exec_status",
   "js", "js_add_node_module_dir", "js_reset",
 ];
 const READ_TOOLS = new Set([
@@ -108,7 +108,7 @@ const READ_TOOLS = new Set([
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
 const MCP_DEFAULT_PROTOCOL = MCP_MODERN_PROTOCOL;
-const VERSION = "0.10.154";
+const VERSION = "0.10.155";
 const DB_SCHEMA_VERSION = 5;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -592,7 +592,7 @@ async function backend({ addWorkspace = null } = {}) {
   const deliverUiRender = payload => {
     if (IS_BACKEND_WORKER) self.postMessage({ type: "ui-render", payload });
   };
-  const UI_SECTIONS = new Set(["dashboard", "sessions", "processes", "logs", "browser", "automation", "published", "trash", "memory", "roots", "commands", "prompts", "prompt_help", "debug", "oauth", "telegram", "settings", "help"]);
+  const UI_SECTIONS = new Set(["dashboard", "sessions", "processes", "logs", "browser", "automation", "published", "trash", "memory", "roots", "commands", "prompts", "prompt_help", "debug", "oauth", "telegram", "openrouter", "settings", "help"]);
   const uiState = {
     currentSection: "dashboard",
     scrollBySection: { dashboard: [0, 0] },
@@ -603,6 +603,7 @@ async function backend({ addWorkspace = null } = {}) {
     settingsDraft: null,
     settingsTab: "network",
     telegramDraft: null,
+    openrouterDraft: null,
     commands: { page: 1, query: "", pageSize: 5, filter: "" },
     prompts: { page: 1, query: "", pageSize: 5 },
     sessions: { oauthClientId: "" },
@@ -622,7 +623,7 @@ async function backend({ addWorkspace = null } = {}) {
   function uiScopesAffectCurrent(scopes) {
     const values = new Set(normalizedUiScopes(scopes));
     return values.has("all") || values.has("state") || values.has("view") ||
-      values.has(uiState.currentSection) || (uiState.currentSection === "telegram" && values.has("settings")) ||
+      values.has(uiState.currentSection) || (["telegram", "openrouter"].includes(uiState.currentSection) && values.has("settings")) ||
       (uiState.currentSection === "dashboard" && values.has("endpoints"));
   }
   function emitUiChange(scopes = ["state"], reason = "change") {
@@ -1301,7 +1302,7 @@ async function backend({ addWorkspace = null } = {}) {
     ["chat_goal_match_on_startup", "0"],
     ["chat_goal_login_verified_at", "0"],
     ["tool_call_retention_hours", "0"], ["tool_call_memory_retention_minutes", "60"],
-    ["command_discovery_enabled", "1"], ["telegram_bot_token", ""],
+    ["command_discovery_enabled", "1"], ["telegram_bot_token", ""], ["openrouter_api_key", ""],
   ]) if (!configCache.has(k)) setCfg(k, v);
   setCfg("tls_cert_path", CERT_PATH);
   setCfg("tls_key_path", KEY_PATH);
@@ -2908,6 +2909,38 @@ async function backend({ addWorkspace = null } = {}) {
       response = await send();
     }
     return { method, response, migrated_chat_id: migrated };
+  }
+
+  async function openrouterRequest(args, execution) {
+    const key = String(getCfg("openrouter_api_key", "") || "").trim();
+    if (!key) throw new Error("OpenRouter API key is not configured on the OpenRouter page");
+    const { path, method = "POST", query = {}, body } = args.request;
+    if (!/^\/[A-Za-z0-9_./:@+~-]+$/.test(path) || path.startsWith("//") || path.split("/").some(part => part === "." || part === ".."))
+      throw new Error("OpenRouter request.path must be an endpoint relative to /api/v1, for example /models or /chat/completions");
+    if (method === "GET" && body !== undefined) throw new Error("OpenRouter GET requests must not include a body");
+    if (body?.stream != null && body.stream !== false) throw new Error("openrouter_req supports JSON responses only; stream must be false or omitted");
+    const url = new URL(`https://openrouter.ai/api/v1${path}`);
+    for (const [name, value] of Object.entries(query)) url.searchParams.set(name, String(value));
+    const controller = new AbortController();
+    execution?.setCancel(() => { controller.abort(); return true; }, { kind: "openrouter" });
+    execution?.onDisconnect(() => controller.abort());
+    try {
+      const response = await fetch(url, {
+        method, redirect: "error", headers: { authorization: `Bearer ${key}`, "content-type": "application/json", accept: "application/json", "X-OpenRouter-Title": "MrMCP" },
+        ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(args.timeout_ms ?? 60000)]),
+      });
+      // Read API error bodies too; callers need the provider's structured details.
+      const bytes = await searchReadResponse(new Response(response.body), 16 * 1024 * 1024);
+      let result;
+      try { result = JSON.parse(dec.decode(bytes)); }
+      catch { throw new Error(`OpenRouter returned non-JSON HTTP ${response.status}`); }
+      const redact = value => typeof value === "string" ? value.replaceAll(key, "[redacted]")
+        : Array.isArray(value) ? value.map(redact)
+        : value && typeof value === "object" ? Object.fromEntries(Object.entries(value).map(([name, item]) => [redact(name), redact(item)])) : value;
+      result = redact(result);
+      return { method, path, status: response.status, success: response.ok && !result?.error, response: result };
+    } catch (error) { throw new Error(String(error?.message || error).replaceAll(key, "[redacted]")); }
   }
 
   function memoryFindRows(p, selection, args) {
@@ -5615,6 +5648,15 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     return entries;
   }
 
+  async function decompressCommandTar(archive, filename) {
+    if (/\.(?:tar\.gz|tgz)$/i.test(filename)) return new Uint8Array(gunzipSync(archive, { maxOutputLength: 536870912 }));
+    if (/\.tar\.xz$/i.test(filename)) {
+      const { default: { XzReadableStream } } = await import("npm:xz-decompress@0.2.3");
+      return await searchReadResponse(new Response(new XzReadableStream(new Blob([archive]).stream())), 536870912);
+    }
+    return archive;
+  }
+
   function extractZipEntry(bytes, entry) {
     if (entry.flags & 1) throw new Error("Encrypted ZIP entries are unsupported");
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
@@ -6355,6 +6397,19 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           ...contextInput,
         }, required: ["request"] },
       ],
+      openrouter_req: [
+        "Send one OpenRouter API JSON request using the API key configured by the local user on the OpenRouter page. Requires a chat_session but no Workspace. request.path is relative to https://openrouter.ai/api/v1, for example /models, /chat/completions, /responses or /embeddings. Use request.method=GET for discovery, otherwise POST by default; put API parameters in request.body and URL parameters in request.query. Model names, messages, multimodal content, tool definitions, provider routing and other JSON fields pass through unchanged. Authentication is injected and never supplied or returned as a tool argument. Only non-streaming JSON responses are supported: omit stream or set it false. Returns HTTP status, success and the complete JSON response including provider errors, usage and cost. No automatic retries or tool execution; inspect returned tool calls yourself. timeout_ms defaults to 60000.",
+        { properties: {
+          request: { type: "object", additionalProperties: false, properties: {
+            path: { type: "string", minLength: 2, maxLength: 512, description: "Endpoint relative to /api/v1 with a leading slash; not a URL. Example: /chat/completions or /models." },
+            method: { type: "string", enum: ["GET", "POST", "PUT", "PATCH", "DELETE"], default: "POST" },
+            query: { type: "object", additionalProperties: { anyOf: [{ type: "string" }, { type: "number" }, { type: "boolean" }] }, description: "URL query parameters, encoded by the server." },
+            body: { type: "object", additionalProperties: true, description: "Ordinary OpenRouter JSON request body. Streaming is unsupported." },
+          }, required: ["path"] },
+          timeout_ms: { type: "integer", minimum: 1000, maximum: 3600000, default: 60000 },
+          ...contextInput,
+        }, required: ["request"] },
+      ],
       discover_commands: [
         "Read the complete catalog of extra executable commands intentionally made available to the agent. Call this proactively whenever a task might benefit from capabilities beyond MrMCP's built-in tools, before inventing a workaround, assuming a utility is unavailable, or choosing a generic alternative. When a listed command fits the task, prefer it: its presence reflects an explicit user choice. The whole available catalog is returned in one call with descriptions and documentation links, so normally call it once per Session and reuse what you learned; there is no search or pagination, which also avoids failures from guessed or misspelled command names. If the operator globally disables command discovery, this tool returns an empty commands array. Every returned logical_name is directly callable as exec.program. MrMCP resolves catalog logical names before normal platform PATH lookup; do not probe PATH or search the filesystem first.",
         { properties: { ...contextInput } },
@@ -6693,6 +6748,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
           { type: "null" },
         ] },
       }),
+      openrouter_req: outputSchema({ method: { type: "string" }, path: { type: "string" }, status: { type: "integer" }, success: { type: "boolean" }, response: {} }),
       discover_commands: outputSchema({ commands: {
         type: "array", items: {
           type: "object", additionalProperties: false,
@@ -6746,7 +6802,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       init_chat_session: "Initialize Chat Session", chat_set_goal: "Set Chat Goal", chat_goal_debug: "Debug Chat Goal", list_workspaces: "List Workspaces", open_workspace: "Open Workspace",
       fs_glob: "FS Glob", fs_grep: "FS Grep", fs_read: "FS Read", fs_navigate: "FS Navigate", fs_stat: "FS Stat", source_code_search: "Source Code Search", document_grep: "Document Grep", proxy_get: "Get Proxy",
       fs_write: "FS Write", fs_edit: "FS Edit", fs_mkdir: "FS Mkdir", fs_copy: "FS Copy", fs_move: "FS Move", fs_trash: "FS Trash", fs_untrash: "FS Untrash",
-      desktop_auto: "Desktop Auto", publish: "Publish to User", cdp_call: "CDP Call", cdp_subs: "CDP Subscriptions", cdp_poll: "CDP Poll", memory_find: "Memory Find", memory_set: "Memory Set", telegram_req: "Telegram Request", discover_commands: "Discover Commands", tools_schema: "Tools Schema", tools_log: "Tools Log",
+      desktop_auto: "Desktop Auto", publish: "Publish to User", cdp_call: "CDP Call", cdp_subs: "CDP Subscriptions", cdp_poll: "CDP Poll", memory_find: "Memory Find", memory_set: "Memory Set", telegram_req: "Telegram Request", openrouter_req: "OpenRouter Request", discover_commands: "Discover Commands", tools_schema: "Tools Schema", tools_log: "Tools Log",
       exec: "Run Command", exec_start: "Start Persistent Command", exec_attach: "Attach Process Output", exec_write: "Write Stdin",
       exec_kill: "Terminate Process", exec_list: "List Processes", exec_status: "Process Status", js: "JavaScript Kernel",
       js_add_node_module_dir: "Add Module Directory", js_reset: "Reset JavaScript Kernel",
@@ -6754,9 +6810,9 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
     };
     const annotations = name => ({
       readOnlyHint: READ_TOOLS.has(name) || name === "publish" || name === "cdp_poll" || name === "memory_find",
-      destructiveHint: ["desktop_auto", "cdp_call", "memory_set", "telegram_req", "fs_write", "fs_edit", "fs_text_convert_encoding_eol", "fs_move", "exec", "exec_start", "exec_write", "exec_kill", "js", "js_add_node_module_dir", "js_reset"].includes(name),
+      destructiveHint: ["desktop_auto", "cdp_call", "memory_set", "telegram_req", "openrouter_req", "fs_write", "fs_edit", "fs_text_convert_encoding_eol", "fs_move", "exec", "exec_start", "exec_write", "exec_kill", "js", "js_add_node_module_dir", "js_reset"].includes(name),
       idempotentHint: (READ_TOOLS.has(name) && name !== "publish") || ["fs_write", "fs_mkdir", "fs_text_convert_encoding_eol", "js_reset", "workspace_dev_preferences_write"].includes(name),
-      openWorldHint: name === "proxy_get" || name === "document_grep" || name === "desktop_auto" || name === "chat_goal_debug" || name.startsWith("cdp_") || name.startsWith("exec") || name === "js" || name === "publish" || name === "telegram_req",
+      openWorldHint: name === "proxy_get" || name === "document_grep" || name === "desktop_auto" || name === "chat_goal_debug" || name.startsWith("cdp_") || name.startsWith("exec") || name === "js" || name === "publish" || name === "telegram_req" || name === "openrouter_req",
     });
     const schema = value => ({
       "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -6841,7 +6897,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
         cdp_call: ["wait", "results"],
         cdp_subs: ["browser", "added", "removed", "missing", "subscriptions"],
         cdp_poll: ["browser", "subscription", "messages", "cursor", "dropped", "stream_resets", "oldest_seq", "newest_seq"],
-        memory_find: ["memories", "next_before_id"], memory_set: ["memory", "deleted"], telegram_req: ["method", "response", "migrated_chat_id"],
+        memory_find: ["memories", "next_before_id"], memory_set: ["memory", "deleted"], telegram_req: ["method", "response", "migrated_chat_id"], openrouter_req: ["method", "path", "status", "success", "response"],
         fs_glob: ["metadata", "returned", "limit", "entries", "next_after_path", "truncated"],
         fs_grep: ["scanned_files", "matched_files", "skipped_large_files", "max_file_bytes", "returned", "limit", "truncation_reason", "files", "next_resume_after", "truncated"],
         fs_read: ["files"], fs_navigate: ["files"], fs_stat: ["entries"], source_code_search: ["action", "mode", "gitignore", "indexed_files", "indexed_chunks", "data", "errors", "truncated", "next_offset"], document_grep: ["mode", "gitignore", "indexed_files", "indexed_chunks", "reindexed_files", "unchanged_files", "removed_files", "errors", "results", "truncated"],
@@ -6888,7 +6944,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       cdp_poll: ["subscription", "browser", "target", "type", "id", "methods", "method_prefixes", "limit", "advance"],
       memory_find: ["scope", "workspace", "key", "key_prefix", "query", "regex", "case_sensitive", "set_after", "set_before", "limit", "before_id"],
       memory_set: ["scope", "workspace", "key", "value", "json", "delete", "ttl_seconds"],
-      telegram_req: ["request"],
+      telegram_req: ["request"], openrouter_req: ["request", "timeout_ms"],
       tools_schema: ["names"],
       tools_log: ["id", "detail", "limit", "tool", "status", "query", "before_id"],
       exec: ["operation_id"], exec_start: ["operation_id"], exec_attach: ["exec_id", "timeout_ms"], exec_write: ["exec_id"], exec_kill: ["exec_id"], exec_status: ["exec_id", "output", "tail_lines"],
@@ -8989,6 +9045,7 @@ html[data-mode="fullscreen"] #frame { height: 100% !important; min-height: 0; }
       return memorySetValue(p, selection, args);
     }
     if (name === "telegram_req") return await telegramRequest(args);
+    if (name === "openrouter_req") return await openrouterRequest(args, execution);
     if (name === "discover_commands") return await discoverCommands();
     if (name === "tools_log") {
       const requestedLimit = Math.max(1, Math.min(Number(args.limit || 10), 50));
@@ -9926,7 +9983,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 
     const serverInfoMeta = { "io.modelcontextprotocol/serverInfo": mcpServerInfo() };
     const instructions = fullAccess
-      ? "Start a chat by calling init_chat_session with no arguments, unless you already have its valid chat_session. Reuse the exact returned chat_session on every subsequent tool call, including list_workspaces and tools_schema. Initialization creates no Workspace and selects no working directory. Use list_workspaces to discover enabled Workspace names, then open_workspace(chat_session,name) to attach or move this same Session. Only pass create=true when you explicitly want a missing Workspace created as a new empty Desktop folder. Filesystem tools, new processes, configured commands and JavaScript kernels require an open Workspace; desktop/CDP, discovery, diagnostics, memory, Telegram and text/base64 publication work without one. Existing process follow-ups remain available by chat_session after its Workspace is removed. The result includes workspace_name, absolute cwd, agent_guidance_path, whether this call created the Workspace, and a compact count/latest-key Memory summary for Global, Workspace and Session scopes. When guidance is non-null, read and follow it before repository work. Workspace changes preserve chat_session; only init_chat_session creates a Session. Invalid or expired values never create replacement Sessions implicitly. " +
+      ? "Start a chat by calling init_chat_session with no arguments, unless you already have its valid chat_session. Reuse the exact returned chat_session on every subsequent tool call, including list_workspaces and tools_schema. Initialization creates no Workspace and selects no working directory. Use list_workspaces to discover enabled Workspace names, then open_workspace(chat_session,name) to attach or move this same Session. Only pass create=true when you explicitly want a missing Workspace created as a new empty Desktop folder. Filesystem tools, new processes, configured commands and JavaScript kernels require an open Workspace; desktop/CDP, discovery, diagnostics, memory, Telegram, OpenRouter and text/base64 publication work without one. Existing process follow-ups remain available by chat_session after its Workspace is removed. The result includes workspace_name, absolute cwd, agent_guidance_path, whether this call created the Workspace, and a compact count/latest-key Memory summary for Global, Workspace and Session scopes. When guidance is non-null, read and follow it before repository work. Workspace changes preserve chat_session; only init_chat_session creates a Session. Invalid or expired values never create replacement Sessions implicitly. " +
         "Use fs_glob, fs_grep, fs_read, fs_navigate, fs_stat, fs_write and fs_edit directly for filesystem discovery, inspection, textual search and changes; do not spawn shell commands, uv or Python for operations those tools cover. Use document_grep for Xberg document extraction, scoped incremental fulltext/vector/hybrid retrieval over files. document_grep and source_code_search also work without a Workspace using Search default_path (initially Desktop/_default); they keep persistent indices across restarts and report effective source/index paths without assigning a Workspace. Use source_code_search for Lucerna BM25 retrieval, AST symbols and source maps with gitignore always enabled. This installation uses local lexical/AST search without semantic embeddings or call-graph analysis. For additional caller/impact exploration, prefer a suitable discovered catalog command. Batch independent reads and request small optional context when nearby text avoids another call. Check per-entry failures, skipped_large_files and continuation fields before claiming complete coverage or successful batch changes. Use fs_text_convert_encoding_eol only for explicit encoding/EOL/BOM representation conversion of named files when requested or specifically required by the task; never use it proactively to normalize a repository. Use desktop_auto for desktop observation and interaction through AAF YAML; when the model needs to see a screenshot, retain its image handle anywhere in the scenario's final state so the tool returns that image directly as MCP image content. Multiple retained screenshots and ordinary OCR/text/geometry/state values may coexist in one result. " +
         "workspace_dev_preferences_write is strictly opt-in: call it only when the user explicitly asks to copy/save/materialize their development preferences into the current Workspace. Never call it proactively, for preference discovery, or merely because DEV_PREF.md might exist; the tool returns no preference content and calling it does not imply that DEV_PREF.md should then be read or applied. " +
         "When work may benefit from command-line capability beyond the structured tools, call discover_commands proactively before inventing workarounds or assuming a utility is unavailable. It returns the complete user-chosen available command catalog in one call; prefer a listed command when it fits, remember the catalog for the Session, and invoke its logical_name directly through exec.program without PATH probes. Use chat_set_goal only for user-requested automatic ChatGPT follow-ups; goal empty stops them. It opens a dedicated Chrome login profile, tries to match the chat once per explicit set, and uses the configured default Tool Call inactivity timeout (initially 5 minutes). When globally disabled it returns disabled and performs no monitoring. After a failed/login/interrupted match, call chat_set_goal again only when a new attempt is wanted; background ticks and login completion do not retry it. Startup matching is an optional global setting, off by default. Check status before claiming the association is ready. Use tools_schema when exact live tool descriptor data is needed instead of relying on a connector-synthesized schema view. " +
@@ -10152,6 +10209,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       tool_call_retention_hours: Number(getCfg("tool_call_retention_hours", "0")) || 0,
       tool_call_memory_retention_minutes: Number(getCfg("tool_call_memory_retention_minutes", "60")) || 0,
       telegram_bot_token: getCfg("telegram_bot_token", ""),
+      openrouter_api_key: getCfg("openrouter_api_key", ""),
       external_url: getCfg("external_url", ""), gui_transport: "Tauriless local asset protocol",
       listener_fallback: listenerFallbacks().length > 0, listener_fallbacks: listenerFallbacks(),
       public_ip: currentIp, public_ip_checked_at: Number(getCfg("public_ip_checked_at", "0")),
@@ -10417,7 +10475,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     return result;
   };
   const state = (section = "all") => {
-    const valid = new Set(["all", "dashboard", "sessions", "processes", "logs", "browser", "automation", "published", "trash", "memory", "roots", "commands", "prompts", "prompt_help", "debug", "oauth", "telegram", "settings", "help"]);
+    const valid = new Set(["all", "dashboard", "sessions", "processes", "logs", "browser", "automation", "published", "trash", "memory", "roots", "commands", "prompts", "prompt_help", "debug", "oauth", "telegram", "openrouter", "settings", "help"]);
     section = valid.has(section) ? section : "dashboard";
     const p = serverConfig();
     if (!p) throw new Error("MrMCP server configuration is missing");
@@ -10761,7 +10819,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   }
 
   const fragmentTemplates = GUI_RUNTIME ? {
-    sidebar: `<? const current=it.data?.state?.currentSection||"dashboard",items=[["dashboard","🏠","Dashboard"],["oauth","🔐","Clients"],["sessions","💬","Sessions"],["processes","🖥️","Processes",Number(it.data?.state?.processCount||0)],["roots","📁","Workspaces"],["logs","🛠️","Tool Calls"],["browser","🌐","Browser"],["automation","🖱️","Automation"],["published","📦","Published"],["trash","🗑️","Trash",Number(it.data?.state?.trashCount||0)],["memory","🧠","Memory"],["commands","🧰","Commands"],["prompts","🧭","Guided Prompts"],["debug","🐞","HTTP Log"],["telegram","✈️","Telegram"],["settings","⚙️","Settings"],["help","❓","Help"]]; items.forEach(([id,icon,label,badge])=>{ ?><button data-page="<?= id ?>" class="<?= current===id?'nav-active':'' ?>"<?= current===id?' aria-current=page':'' ?>><span class=menu-icon><?= icon ?></span><span class=menu-label><?= label ?></span><? if(Number(badge)>0){ ?><span class=menu-badge><?= badge ?></span><? } ?></button><? }) ?>`,
+    sidebar: `<? const current=it.data?.state?.currentSection||"dashboard",items=[["dashboard","🏠","Dashboard"],["oauth","🔐","Clients"],["sessions","💬","Sessions"],["processes","🖥️","Processes",Number(it.data?.state?.processCount||0)],["roots","📁","Workspaces"],["logs","🛠️","Tool Calls"],["browser","🌐","Browser"],["automation","🖱️","Automation"],["published","📦","Published"],["trash","🗑️","Trash",Number(it.data?.state?.trashCount||0)],["memory","🧠","Memory"],["commands","🧰","Commands"],["prompts","🧭","Guided Prompts"],["debug","🐞","HTTP Log"],["telegram","✈️","Telegram"],["openrouter","🔀","OpenRouter"],["settings","⚙️","Settings"],["help","❓","Help"]]; items.forEach(([id,icon,label,badge])=>{ ?><button data-page="<?= id ?>" class="<?= current===id?'nav-active':'' ?>"<?= current===id?' aria-current=page':'' ?>><span class=menu-icon><?= icon ?></span><span class=menu-label><?= label ?></span><? if(Number(badge)>0){ ?><span class=menu-badge><?= badge ?></span><? } ?></button><? }) ?>`,
     view: `<? const s=it.data?.state||{},section=s.currentSection||"dashboard",settings=s.settings||{}; ?>
 <? if(section==="dashboard"){ ?><section id=dashboard class=page><div class=row><h2 class=grow>🏠 Dashboard</h2><span class=muted>Runtime · activity · endpoints</span></div><div id=cards class=grid></div><div class=dashboard-grid><div><h3>🌐 Server</h3><div id=endpoints></div></div><div><h3>🔒 TLS and Connectivity</h3><div id=tlsStatus></div></div></div></section>
 <? } else if(section==="sessions"){ ?><section id=sessions class=page><div class=row><h2 class=grow>💬 Sessions</h2><span class=muted>Live updates</span><button class=danger data-action=clear-sessions<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><p class=muted>Persistent MCP Sessions. Each Session is attached to a <b>📁 Workspace</b>.</p><? if(s.sessions?.oauthClientId){ ?><div class=row><span class=muted>OAuth filter</span><code><?= s.sessions.oauthClientId ?></code><button class=small data-action=clear-session-oauth>✕ Clear</button></div><? } ?><div class=card><b>Client Continuity</b><p class=muted>ChatGPT may create a new Session after model or thinking changes. Client/auth/User-Agent metadata is best effort.</p></div><div id=contextList></div></section>
@@ -10778,6 +10836,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
 <? } else if(section==="memory"){ const m=s.memory||{}; ?><section id=memory class=page><div class=row><h2 class=grow>🧠 Memory</h2><button class=primary data-action=new-memory>➕ New Memory</button></div><p class=muted>Persistent explicit key-value memory. Create it here or through <code>memory_set</code>. Each value is explicitly JSON or plain text; Global memory is server-wide, Session memory belongs to one Session, and Workspace memory is shared by Workspace label. Expired TTL entries are removed automatically.</p><div class=row><input id=memoryQuery class=grow placeholder="Search keys or values…" value="<?= m.query||'' ?>"><select id=memoryScope><option value=""<?= !m.scope?' selected':'' ?>>All scopes</option><option value=global<?= m.scope==='global'?' selected':'' ?>>Global</option><option value=session<?= m.scope==='session'?' selected':'' ?>>Session</option><option value=workspace<?= m.scope==='workspace'?' selected':'' ?>>Workspace</option></select><select id=memoryContext><option value="">All sessions</option><? (m.sessions||[]).forEach(id=>{ ?><option value="<?= id ?>"<?= String(m.context||'')===String(id)?' selected':'' ?>>#<?= id ?></option><? }) ?></select><select id=memoryWorkspace><option value="">All workspaces</option><? (m.workspaces||[]).forEach(name=>{ ?><option value="<?= name ?>"<?= String(m.workspace||'')===String(name)?' selected':'' ?>><?= name ?></option><? }) ?></select><input id=memoryFrom type=date title="Set on or after" value="<?= m.from||'' ?>"><input id=memoryTo type=date title="Set on or before" value="<?= m.to||'' ?>"><button data-action=load-memory>🔎 Search</button><button data-action=clear-memory-filters>🧹 Clear Filters</button></div><div id=memoryList></div></section>
 <? } else if(section==="debug"){ const d=s.debug||{},enabled=!!s.debug?.enabled; ?><section id=debug class=page><div class=row><h2 class=grow>🐞 HTTP Debug Log</h2><button class="debug-toggle <?= enabled?'enabled':'disabled' ?>" data-action=toggle-debug-settings aria-pressed="<?= enabled?'true':'false' ?>"><?= enabled?"🟢 Logging ON · Disable":"🔴 Logging OFF · Enable" ?></button><button class=danger data-action=clear-debug>🗑️ Clear</button></div><p class=muted>Off by default. Secrets are redacted. Disabling stops new records but keeps stored data visible. Click a row for request JSON.</p><div class=row><input id=debugQuery class=grow placeholder="Search URL, headers, body or errors…" value="<?= d.query||'' ?>"><select id=debugMethod><option value="">All methods</option><? ['GET','POST','OPTIONS'].forEach(v=>{ ?><option<?= d.method===v?' selected':'' ?>><?= v ?></option><? }) ?></select><input id=debugStatus type=number placeholder="Status" value="<?= d.status||'' ?>"><button data-action=load-debug>🔎 Search</button></div><div id=debugList></div></section>
 <? } else if(section==="oauth"){ ?><section id=oauth class=page><div class=row><h2 class=grow>🔐 OAuth Clients</h2><button class=danger data-action=clear-clients<?= s.maintenance?.active?' disabled':'' ?>>🗑️ Clear</button></div><div id=oauthList></div></section>
+<? } else if(section==="openrouter"){ const o=s.openrouter||{}; ?><section id=openrouter class=page><div class=row><h2 class=grow>🔀 OpenRouter</h2><button class=primary data-action=save-openrouter<?= o.save_disabled?' disabled':'' ?>>💾 Save OpenRouter</button></div><div class=card><h3>API access</h3><p>API key: <b><?= o.configured?'Configured':'Not configured' ?></b></p><div class=row><label class=grow for=openrouterApiKey>API key</label><? if(o.field_warning){ ?><span class=field-warning>⚠ <?= o.field_warning ?></span><? } ?></div><input id=openrouterApiKey type=password autocomplete=off value="<?= o.openrouter_api_key||'' ?>" placeholder="sk-or-v1-…"><p class=muted>Used by <code>openrouter_req</code> for OpenRouter JSON API requests. The key is saved locally and injected into authentication; agents choose models and request parameters. Clear the field and Save to remove the key.</p><p class=muted>Examples: GET <code>/models</code>, POST <code>/chat/completions</code> or <code>/embeddings</code>. Streaming is not supported. No request runs when opening or saving this page.</p></div></section>
 <? } else if(section==="telegram"){ const t=s.telegram||{}; ?><section id=telegram class=page><div class=row><h2 class=grow>✈️ Telegram</h2><button class=primary data-action=save-telegram<?= t.save_disabled?' disabled':'' ?>>💾 Save Telegram</button></div><div class=card><h3>🤖 Telegram Bot</h3><div class=row><label class=grow>Bot token</label><? if(t.field_warning){ ?><span class=field-warning>⚠ <?= t.field_warning ?></span><? } ?></div><input id=telegramBotToken type=password autocomplete=off value="<?= t.telegram_bot_token||'' ?>" placeholder="123456789:AA…"><p class=muted>Used only by <code>telegram_req</code> to authenticate Bot API requests. Chat IDs, channels and application state are intentionally left to the agent/Memory.</p></div></section>
 <? } else if(section==="settings"){ const tab=s.settingsTab||"network"; ?><section id=settings class=page><div class=row><h2 class=grow>⚙️ Settings</h2><button class=primary data-action=save-settings<?= settings.save_disabled?' disabled':'' ?>>💾 Save Settings</button></div><nav class=settings-tabs aria-label="Settings sections"><? [["network","🌐","Network"],["security","🔒","Security"],["process","🖥️","Process"],["files","📄","Files"],["goals","🎯","Goals"],["search","🔎","Search"],["proxies","🌐","Proxies"],["notifications","🔔","Notifications"],["maintenance","🧹","Maintenance"]].forEach(([id,icon,label])=>{ ?><button data-action=settings-tab data-settings-tab="<?= id ?>" class="<?= tab===id?'active':'' ?>"<?= tab===id?' aria-current=page':'' ?>><?= icon ?> <?= label ?></button><? }) ?></nav><p class=muted>📂 Data Directory · <code style="overflow-wrap:anywhere"><?= settings.data_directory||'' ?></code></p><div class=settings-layout><div class=settings-main><div class=card<? if(tab!=="network"){ ?> hidden<? } ?>><h3>🌐 Listeners</h3><p><b>HTTP</b> <code>0.0.0.0:<?= settings.mcp_http_port ?></code><? if(settings.mcp_http_port!==settings.mcp_http_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_http_port_base ?></span><? } ?> · ACME HTTP-01 <?= settings.acme_http_available?"available":"unavailable" ?></p><p><b>HTTPS</b> <code>0.0.0.0:<?= settings.mcp_https_port ?></code><? if(settings.mcp_https_port!==settings.mcp_https_port_base){ ?> <span class=pending>⚠ fallback from <?= settings.mcp_https_port_base ?></span><? } ?> · MCP, OAuth and metadata</p><p><b>GUI</b> <code><?= settings.gui_transport ?></code> · local-only, no network listener</p><label>Public IPv4</label><div class=row><input id=publicIp readonly class=grow value="<?= settings.public_ip||'' ?>"><button data-action=detect-ip>🔎 Detect</button></div><div class=row><label class=grow>Public base URL override</label><? if(settings.field_warnings?.external_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.external_url ?></span><? } ?></div><input id=externalUrl class=grow placeholder="https://mcp.example.com" value="<?= settings.external_url||'' ?>"><div class=row><label class=grow>Public IPv4 lookup URLs (one per line)</label><? if(settings.field_warnings?.public_ip_urls){ ?><span class=field-warning>⚠ <?= settings.field_warnings.public_ip_urls ?></span><? } ?></div><textarea id=publicIpUrls><?= (settings.public_ip_urls||[]).join("\\n") ?></textarea><div class=row><label class=grow>Automatic DNS suffix</label><? if(settings.field_warnings?.sslip_suffix){ ?><span class=field-warning>⚠ <?= settings.field_warnings.sslip_suffix ?></span><? } ?></div><input id=sslipSuffix placeholder="sslip.io" value="<?= settings.sslip_suffix||'sslip.io' ?>"><div class=row><label class=grow>ACME directory URL</label><? if(settings.field_warnings?.acme_directory_url){ ?><span class=field-warning>⚠ <?= settings.field_warnings.acme_directory_url ?></span><? } ?></div><input id=acmeDirectoryUrl class=grow value="<?= settings.acme_directory_url||'' ?>"></div><div class=card<? if(tab!=="security"){ ?> hidden<? } ?>><h3>🔒 Certificate</h3><div class=row><label class=grow>Let's Encrypt email</label><? if(settings.field_warnings?.tls_email){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tls_email ?></span><? } ?></div><input id=tlsEmail value="<?= settings.tls_email||'' ?>"><div class=row><button data-action=issue-cert>🛡️ Check / Request Certificate</button></div><p class=muted>Valid certificates are reused. ACME HTTP-01 requires effective HTTP port 80.</p></div></div><div class=settings-side><div class=card<?= tab==="proxies"?'':' hidden' ?>><h3>🌐 Proxies</h3><p class=muted>Configure proxy entries, public list sources and cooldowns. proxy_get selects entries and records reported successes/failures in SQLite.</p><p class=muted><code><?= settings.proxy_configuration_path ?></code></p><? if(settings.field_warnings?.proxy_configuration){ ?><div class=field-warning>⚠ <?= settings.field_warnings.proxy_configuration ?></div><? } ?><textarea id=proxyConfiguration rows=20><?= settings.proxy_configuration||'' ?></textarea><p class=muted>direct means a direct request. Lists refresh on tool use; no background checks run.</p></div><div class=card<?= tab==="search"?'':' hidden' ?>><h3>🔎 Search</h3><p class=muted>Configuration file: <?= settings.search_configuration_path ?>. Fulltext is ready without an embedding model. Configure Ollama or an OpenAI-compatible embedding endpoint for vector/hybrid search.</p><p>Without a Workspace: <code><?= settings.default_search_path||'Desktop/_default' ?></code></p><p class=muted>default_path in this YAML selects the source folder. Empty uses Desktop/_default, created on the first search. Both document and source indices persist under the data directory; source files stay in their own folder.</p><label>Search and native OCR configuration<textarea id=searchConfiguration rows=20 spellcheck=false><?= settings.search_configuration ?></textarea></label><? if(settings.field_warnings.search_configuration){ ?><small class=field-warning>⚠ <?= settings.field_warnings.search_configuration ?></small><? } ?><p class=muted>Native OCR uses the OS installed recognition support. Download subtitles with the catalog yt-dlp command, then search those Workspace files.</p></div><div class=card<? if(tab!=="notifications"){ ?> hidden<? } ?>><h3>🔔 Desktop Notifications</h3><label><input id=notifySession type=checkbox<?= settings.desktop_notifications_session?" checked":"" ?>> Session notifications</label><label><input id=notifyWorkspace type=checkbox<?= settings.desktop_notifications_workspace?" checked":"" ?>> Workspace notifications</label><label><input id=notifyToolCall type=checkbox<?= settings.desktop_notifications_tool_call?" checked":"" ?>> Tool Call notifications</label><p class=muted>Notifications use the native OS integration. Session references include Workspace, creation age and Tool Call count.</p></div><div class=card<? if(tab!=="process"){ ?> hidden<? } ?>><h3>🖥️ Process Environment</h3><label><input id=inheritSystemPath type=checkbox<?= settings.inherit_system_path?" checked":"" ?>> Include the system PATH in spawned processes and commands</label><label><input id=gitPreserveLineEndings type=checkbox<?= settings.git_preserve_line_endings?" checked":"" ?>> Disable automatic Git CRLF conversion</label><p class=muted>When enabled, managed processes use <code>core.autocrlf=false</code>. An existing CRLF checkout made with <code>core.autocrlf=true</code> may then appear modified without a file edit. Turn this off to use the repository and machine Git policy. Repository <code>.gitattributes</code> and explicit <code>git -c</code> options still apply.</p><div class=row><label class=grow>Environment variables for all spawned processes · one <code>NAME=value</code> per line</label><? if(settings.field_warnings?.exec_environment){ ?><span class=field-warning>⚠ <?= settings.field_warnings.exec_environment ?></span><? } ?></div><textarea id=execEnvironment rows=8 placeholder="CACHE_DIR=\${MRMCP_DIR}&#10;TOOLS=\${MRMCP_BIN}&#10;PROJECT=\${WORKSPACE}&#10;RUN_FROM=\${CWD}"><?= settings.exec_environment||'' ?></textarea><p class=muted>Available placeholders: <code>\${MRMCP_DIR}</code> = MrMCP data directory, <code>\${MRMCP_BIN}</code> = managed bin directory, <code>\${WORKSPACE}</code> = current Workspace root, <code>\${CWD}</code> = effective exec directory. Precedence: system environment → these settings → per-call <code>env</code>. Off PATH inheritance leaves child <code>PATH</code> as only <code>.mrmcp/bin</code>; PATH remains governed by this toggle rather than the generic environment list.</p></div><div class=card<? if(tab!=="files"){ ?> hidden<? } ?>><h3>📄 Text Encoding</h3><div class=row><label class=grow for=textEncodingDetection>Automatic detection for reading and searching</label><? if(settings.field_warnings?.text_encoding_detection){ ?><span class=field-warning>⚠ <?= settings.field_warnings.text_encoding_detection ?></span><? } ?></div><select id=textEncodingDetection><option value=sample<?= (settings.text_encoding_detection||"sample")==="sample"?" selected":"" ?>>Initial 16 KiB · faster</option><option value=full<?= settings.text_encoding_detection==="full"?" selected":"" ?>>Complete file · more thorough</option></select><p class=muted>The initial sample reduces detection work on large files. If the result is uncertain or its encoding cannot decode the complete file, detection retries with the full content. A sample can miss later charset clues; choose Complete file when accuracy matters more than speed.</p><p class=muted>File edits and conversions always use the complete content. An explicitly requested encoding skips detection in both modes.</p></div><div class=card<? if(tab!=="goals"){ ?> hidden<? } ?>><h3>🎯 Chat Goals</h3><h3>ChatGPT login profile</h3><? const loginLabels={unknown:'Not initialized',opening:'Opening Chrome…',checking:'Checking login…',authenticated:'Signed in',signed_out:'Sign-in required',page_not_ready:'Waiting for page or challenge',closed:'Login window closed',error:'Login check failed'},loginStatus=settings.chat_goal_login_status||'unknown'; ?><p><b class="<?= loginStatus==='authenticated'?'ok':['signed_out','closed','error'].includes(loginStatus)?'failed':'pending' ?>"><? if(settings.chat_goal_login_busy||settings.chat_goal_login_active){ ?><span class=spinner>↻</span> <? } ?><?= loginLabels[loginStatus]||loginStatus ?></b></p><p>Goal monitoring: <b><?= !settings.chat_goals_enabled?'Disabled by your setting':settings.chat_goal_login_active?'Paused during login check':settings.chat_goal_login_verified_at?'Enabled':'Paused · login required' ?></b></p><? if(settings.chat_goal_login_verified_at){ ?><p class=muted>Login confirmed: <?= it.logdt(settings.chat_goal_login_verified_at) ?></p><? } ?><? if(settings.chat_goal_login_composer){ ?><p class=muted>Chat editor: <?= settings.chat_goal_login_composer==='ready'?'Ready':settings.chat_goal_login_composer==='response_busy'?'Response in progress':'Not ready yet' ?></p><? } ?><p class=muted>Initialize the separate Chrome profile here before using goals. Select Login ChatGPT and sign in or complete any challenge in the dedicated window. Login is detected automatically. An existing login may reload once to observe fresh recent-chat data; drafts are preserved.</p><div class=row><button data-action=open-chat-goal-login<?= settings.chat_goal_login_busy?' disabled':'' ?>><? if(settings.chat_goal_login_busy){ ?><span class=spinner>↻</span> Opening Chrome…<? } else { ?>Login ChatGPT<? } ?></button></div><? if(settings.chat_goal_login_detail){ ?><p class=muted><?= settings.chat_goal_login_detail ?></p><? } ?><p class=muted>Login setup pauses automatic goals and works even when goal management is disabled. It uses a visible window with images; a running headless/image-blocked browser may need to restart with the same profile. Close the login window after verification to apply the saved monitoring launch options. Login readiness is independent of the enable switch. Losing login during a match or send pauses goals until you use this button again. Failed matches require a new chat_set_goal after login.</p><label><input id=chatGoalsEnabled type=checkbox<?= settings.chat_goals_enabled?" checked":"" ?>> Enable chat goal management</label><p class=muted>Off stops background monitoring and browser opening. The tool remains available and returns disabled. Saved goals and the login profile are retained; enabling resumes eligible goals.</p><label><input id=chatGoalMatchOnStartup type=checkbox<?= settings.chat_goal_match_on_startup?" checked":"" ?>> Retry missing chat matches at startup</label><p class=muted>Off by default: restarting does not resume matching, even if it was queued. When enabled, each startup schedules one attempt per active goal without an associated chat. Requires goal management to be enabled and a verified login profile. Saving this option does not start a match now.</p><div class=row><label class=grow for=chatGoalTimeoutMinutes>Default inactivity timeout · minutes</label><? if(settings.field_warnings?.chat_goal_timeout_minutes){ ?><span class=field-warning>⚠ <?= settings.field_warnings.chat_goal_timeout_minutes ?></span><? } ?></div><input id=chatGoalTimeoutMinutes type=number min=1 max=1440 step=1 value="<?= settings.chat_goal_timeout_minutes??5 ?>"><p class=muted>Default: 5 minutes. Used when a new goal omits timeout_seconds; existing goals keep their own timeout.</p><label><input id=chatGoalStopBeforeSend type=checkbox<?= settings.chat_goal_stop_before_send?" checked":"" ?>> Stop the current response before sending</label><p class=muted>Off by default: send the goal even while ChatGPT is working. When enabled, press Stop first and wait briefly for it to take effect. Applies to subsequent send attempts without restarting Chrome. New Tool Calls reset the inactivity timer; an older call still running does not block the prompt.</p><h3>Browser launch</h3><label><input id=chatGoalHeadless type=checkbox<?= settings.chat_goal_headless?" checked":"" ?>> Headless · no browser window</label><label><input id=chatGoalDisableImages type=checkbox<?= settings.chat_goal_disable_images?" checked":"" ?>> Disable page images</label><p class=muted>Images load by default. Enable this option to reduce image loading during monitoring. Screenshots remain available.</p><label for=chatGoalWindowsHide>Spawned process window / console</label><select id=chatGoalWindowsHide><option value=auto<?= settings.chat_goal_windows_hide==="auto"?" selected":"" ?>>Automatic · follows headless</option><option value=hide<?= settings.chat_goal_windows_hide==="hide"?" selected":"" ?>>Always hide</option><option value=show<?= settings.chat_goal_windows_hide==="show"?" selected":"" ?>>Always show</option></select><p class=muted>Headless defaults off so you can sign in or complete a challenge. Automatic sets windowsHide equal to headless: hide when headless, show otherwise. You may override it independently. Launch changes apply after the dedicated browser is closed and started again. Its login profile is preserved.</p></div><div class=card<? if(tab!=="maintenance"){ ?> hidden<? } ?>><h3>🧹 Tool Call History</h3><label>History storage</label><select id=toolCallStorage><option value=disk<?= settings.tool_call_storage==='disk'?' selected':'' ?>>Disk · survives restart</option><option value=memory<?= settings.tool_call_storage==='memory'?' selected':'' ?>>Memory · SQLite TEMP, volatile</option></select><p class=muted>Storage and payload retention are independent. Disk writes Tool Call history to the main SQLite database. Memory uses SQLite TEMP tables in RAM with the same Tool Call ids, GUI and tools_log behavior; rows disappear on restart.</p><label>Payload retention</label><select id=toolCallPayloadMode><option value=payload<?= settings.tool_call_payload_mode==='payload'?' selected':'' ?>>Payload · canonical MCP request and response packets</option><option value=metadata<?= settings.tool_call_payload_mode==='metadata'?' selected':'' ?>>Metadata · no Tool Call request/response payload copies</option></select><p class=muted>Payload retention affects only diagnostic copies in Tool Call history. Functional state required by tools remains available in its owning subsystem; for example persistent-process command/output state is retained independently so exec_attach and exec_status keep working.</p><div class=row><label class=grow>Disk retention hours · 0 keeps indefinitely</label><? if(settings.field_warnings?.tool_call_retention_hours){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_retention_hours ?></span><? } ?></div><input id=toolCallRetentionHours type=number min=0 step=1 value="<?= settings.tool_call_retention_hours??0 ?>"><div class=row><label class=grow>Memory retention minutes · 0 keeps until restart</label><? if(settings.field_warnings?.tool_call_memory_retention_minutes){ ?><span class=field-warning>⚠ <?= settings.field_warnings.tool_call_memory_retention_minutes ?></span><? } ?></div><input id=toolCallMemoryRetentionMinutes type=number min=0 step=1 value="<?= settings.tool_call_memory_retention_minutes??60 ?>"><p class=muted>Retention removes completed Tool Call history from its own storage tier. Process, CDP and other functional state are unaffected. Changing the current storage or payload setting affects new Tool Calls only; existing rows retain their own storage and payload capabilities.</p><h3>🧹 Database</h3><p class=muted>Clears Tool Calls, process/HTTP history, published snapshots and metrics. Keeps auth, Sessions, Workspaces, Memory, CDP browser state, settings, tools and Workspace files.</p><? const m=s.maintenance||{},busy=m.active&&m.action==="database"; ?><button class=danger data-action=clear-database<?= m.active?" disabled":"" ?>><? if(busy){ ?><span class=spinner>↻</span> <?= m.phase==="waiting" ? m.in_flight+" in flight · "+m.waiting+" waiting" : "Clearing · "+m.waiting+" waiting" ?><? } else { ?>🗑️ Clear Operational Data<? } ?></button></div></div></div></section>
 <? } else if(section==="help"){ ?><section id=help class=page><h2>❓ Help</h2><div class=card><h3>Connect ChatGPT Web</h3><ol><li>Make sure the Dashboard shows a trusted HTTPS certificate. ChatGPT needs a remote HTTPS MCP endpoint; use <code><?= settings.external_base_url ? settings.external_base_url + "/mcp" : "https://your-host/mcp" ?></code>.</li><li>In ChatGPT Web, enable Developer mode. In managed workspaces the current path is <b>Workspace settings → Permissions &amp; Roles → Connected Data Developer mode / Create custom MCP connectors</b>. Authorized users may also find the toggle under <b>Settings → Apps → Advanced Settings</b>.</li><li>Create a custom app from <b>Workspace settings → Apps → Create</b> or <b>Settings → Apps → Create</b>, enter the MrMCP endpoint, choose the offered authentication method, then select <b>Scan Tools</b>.</li><li>If OAuth is enabled in MrMCP, complete the authorization prompt. After the tool scan completes, create the app and select it from a new ChatGPT conversation.</li></ol></div><div class=card><h3>Authentication</h3><p>For ChatGPT, OAuth is the preferred MrMCP setup because ChatGPT can discover the authorization metadata, complete consent, and keep refresh-token connectivity. MrMCP also supports Basic authentication for MCP clients that offer it. Authentication grants access to the server; the <code>chat_session</code> selects persistent context state after authentication.</p></div><div class=card><h3>Write Access</h3><p>MrMCP does not maintain a separate read/write allowlist: every authenticated client receives every published tool. ChatGPT controls whether write/modify actions are usable through the app's permissions and action controls. As of this build, OpenAI documents full MCP write/modify support for Business, Enterprise and Edu; Pro custom MCP access is limited to read/fetch, and availability may change. Test write tools in Developer mode first. Where available, use <b>Workspace settings → Apps → Configure Actions / Action control</b> to enable the required actions. ChatGPT may still ask for confirmation before a write.</p></div><div class=card><h3>Using MrMCP in a Chat</h3><ol><li>Start a new chat and select the MrMCP app from the tools/apps menu.</li><li>Call <code>init_chat_session</code> once to create a chat Session, then pass its returned <code>chat_session</code> on every subsequent tool call. Initialization selects no Workspace. Use <code>list_workspaces</code> to discover names, then <code>open_workspace</code> with the same <code>chat_session</code> and the desired <code>name</code> before working on files or starting processes.</li><li>The result already includes <code>workspace_name</code>, absolute <code>cwd</code> and <code>agent_guidance_path</code>. Read that file when non-null. Workspace changes preserve the same <code>chat_session</code>. The Workspaces page can also move Sessions manually.</li><li>If you change ChatGPT model or thinking level, the MCP context may be recreated even inside the same conversation. Check the Sessions page if continuity matters.</li></ol><p class=muted>ChatGPT UI labels and plan availability can change. Current OpenAI references: <a href="https://help.openai.com/en/articles/12584461-developer-mode-and-mcp-apps-in-chatgpt" target=_blank rel=noopener>Developer mode and MCP apps in ChatGPT</a> · <a href="https://help.openai.com/en/articles/11487775-connectors-in-chatgpt" target=_blank rel=noopener>Apps in ChatGPT</a>.</p></div></section><? } ?>`,
@@ -11038,6 +11097,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       warnings.tool_call_memory_retention_minutes = "Memory Tool Call retention must be whole minutes; 0 keeps rows until restart.";
     if (settings.search_configuration != null) { try { const c=searchConfig(String(settings.search_configuration)); if(String(c.default_path||"").trim() && !Deno.statSync(configuredWorkspacePath(c.default_path)).isDirectory) throw new Error("default_path must point to a directory"); } catch (e) { warnings.search_configuration = e.message; } }
     if (settings.proxy_configuration != null) { try { proxyConfig(String(settings.proxy_configuration)); } catch (e) { warnings.proxy_configuration = e.message; } }
+    if (settings.openrouter_api_key != null) warnings.openrouter_api_key = openrouterKeyWarning(settings.openrouter_api_key);
     return warnings;
   }
   function telegramTokenWarning(value) {
@@ -11050,6 +11110,17 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       ? String(settings.telegram_bot_token || "") : String(uiState.telegramDraft || "");
     const field_warning = telegramTokenWarning(telegram_bot_token);
     return { telegram_bot_token, field_warning, save_disabled: !!field_warning };
+  }
+  function openrouterKeyWarning(value) {
+    if (typeof value !== "string") return "OpenRouter API key must be a string.";
+    const key = value.trim();
+    return key && (key.length > 512 || /[^\x21-\x7e]/.test(key))
+      ? "OpenRouter API key must contain only visible ASCII characters and be at most 512 characters." : "";
+  }
+  function uiOpenrouterProjection(settings) {
+    const openrouter_api_key = uiState.openrouterDraft ?? String(settings.openrouter_api_key || "");
+    const field_warning = openrouterKeyWarning(openrouter_api_key);
+    return { openrouter_api_key, field_warning, save_disabled: !!field_warning, configured: !!String(settings.openrouter_api_key || "").trim() };
   }
   function uiSettingsProjection(settings) {
     const draft = uiState.settingsDraft || {};
@@ -11087,6 +11158,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
     else if (section === "memory") viewState.memory = { ...uiState.memory };
     else if (section === "debug") viewState.debug = { ...uiState.debug, enabled: !!projection.settings.debug_http_log };
     else if (section === "telegram") viewState.telegram = uiTelegramProjection(projection.settings);
+    else if (section === "openrouter") viewState.openrouter = uiOpenrouterProjection(projection.settings);
     const model = { section, projection, viewState, commandData: null, promptData: null, processData: null, logData: null, browserData: null, automationData: null, publishedData: null, trashData: null, memoryData: null, debugData: null };
     if (section === "prompt_help") viewState.promptHelp = { yaml: GUIDED_PROMPTS_HELP_YAML, model: GUIDED_PROMPTS_HELP_MODEL };
     if (section === "roots") {
@@ -11323,6 +11395,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
       uiState.settingsDraft[settingsMap[id]] = ["notifySession", "notifyWorkspace", "notifyToolCall", "inheritSystemPath", "gitPreserveLineEndings", "chatGoalsEnabled", "chatGoalHeadless", "chatGoalDisableImages", "chatGoalStopBeforeSend", "chatGoalMatchOnStartup"].includes(id) ? !!checked : text;
     }
     if (id === "telegramBotToken") uiState.telegramDraft = text;
+    if (id === "openrouterApiKey") uiState.openrouterDraft = text;
   }
   async function uiCommandRow(name, path = "") {
     const rows = await commandRows({ include_missing: true, admin: true });
@@ -11862,6 +11935,15 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         uiNotice("Telegram settings saved.", "ok");
         break;
       }
+      case "save-openrouter": {
+        const openrouter_api_key = String(values.openrouterApiKey ?? uiState.openrouterDraft ?? "").trim();
+        const warning = openrouterKeyWarning(openrouter_api_key);
+        if (warning) { uiState.openrouterDraft = openrouter_api_key; queueUiRender("openrouter-invalid", 0); return; }
+        await uiInternalApi("/api/settings", { method: "POST", body: { openrouter_api_key } });
+        uiState.openrouterDraft = null;
+        uiNotice("OpenRouter settings saved.", "ok");
+        break;
+      }
       case "close-dialog":
         uiState.dialog = null;
         break;
@@ -11910,6 +11992,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
               uiState.settingsDraft = { ...settingsProjection() };
             if (section === "telegram" && uiState.telegramDraft == null)
               uiState.telegramDraft = String(settingsProjection().telegram_bot_token || "");
+            if (section === "openrouter" && uiState.openrouterDraft == null)
+              uiState.openrouterDraft = String(settingsProjection().openrouter_api_key || "");
           }
           queueUiRender("navigate", 0);
           return;
@@ -11973,7 +12057,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
               if (id === "ptemplate") d.template_warning = String(item.value || "").trim() ? "" : "Template is required.";
               renderDraft = true;
             }
-            if (["externalUrl", "tlsEmail", "publicIpUrls", "sslipSuffix", "acmeDirectoryUrl", "textEncodingDetection", "toolCallStorage", "toolCallPayloadMode", "toolCallRetentionHours", "toolCallMemoryRetentionMinutes"].includes(id)) renderDraft = true;
+            if (["externalUrl", "tlsEmail", "publicIpUrls", "sslipSuffix", "acmeDirectoryUrl", "textEncodingDetection", "toolCallStorage", "toolCallPayloadMode", "toolCallRetentionHours", "toolCallMemoryRetentionMinutes", "telegramBotToken", "openrouterApiKey"].includes(id)) renderDraft = true;
             if (["logTool", "logQuery"].includes(id)) { uiState.logs.page = 1; filterLogs = true; }
           }
           if (renderDraft) queueUiRender("input:draft", 40);
@@ -12204,7 +12288,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
   async function guiApi(req, u) {
     if (u.pathname === "/api/settings" && req.method === "POST") {
       const x = await bodyJson(req);
-      const warnings = settingsFieldWarnings(x), firstWarning = Object.values(warnings).find(Boolean);
+      const warnings = settingsFieldWarnings({ ...settingsProjection(), ...x }), firstWarning = Object.values(warnings).find(Boolean);
       if (firstWarning) return json({ error: firstWarning }, 400);
       if (x.external_url) {
         let external;
@@ -12226,8 +12310,8 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         changedSettings.add(key);
         return true;
       };
-      for (const key of ["external_url", "tls_email", "sslip_suffix", "acme_directory_url", "telegram_bot_token"])
-        if (x[key] != null) saveSetting(key, x[key]);
+      for (const key of ["external_url", "tls_email", "sslip_suffix", "acme_directory_url", "telegram_bot_token", "openrouter_api_key"])
+        if (x[key] != null) saveSetting(key, key === "openrouter_api_key" ? String(x[key]).trim() : x[key]);
       for (const key of ["desktop_notifications_session", "desktop_notifications_workspace", "desktop_notifications_tool_call"])
         if (x[key] != null) saveSetting(key, x[key] ? "1" : "0");
       if (x.chat_goals_enabled != null && saveSetting("chat_goals_enabled", x.chat_goals_enabled ? "1" : "0")) {
@@ -12463,7 +12547,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
         if (!/^https?:$/.test(new URL(response.url).protocol)) throw new Error("Download redirected to an unsupported URL scheme");
         const filename = responseFilename(response);
         const zipped = filename.toLowerCase().endsWith(".zip") || /(?:^|\b)(?:application|binary)\/(?:x-)?zip(?:\b|$)/i.test(response.headers.get("content-type") || "");
-        const tarred = /\.(?:tar\.gz|tgz|tar)$/i.test(filename);
+        const tarred = /\.(?:tar\.gz|tar\.xz|tgz|tar)$/i.test(filename);
         let archiveEntry = null, content = null;
         if (zipped || tarred) {
           const declared = Number(response.headers.get("content-length") || 0);
@@ -12472,7 +12556,7 @@ main{width:100vw;height:100vh;height:100dvh;display:grid;place-items:center;padd
           if (archive.byteLength > 512 * 1024 * 1024) throw new Error("Archive download is too large");
           if (zipped) { archiveEntry = selectZipCommandEntry(archive, row); content = extractZipEntry(archive, archiveEntry); }
           else {
-            const tar = /\.(?:tar\.gz|tgz)$/i.test(filename) ? new Uint8Array(gunzipSync(archive, { maxOutputLength: 536870912 })) : archive;
+            const tar = await decompressCommandTar(archive, filename);
             archiveEntry = selectCommandArchiveEntry(tarCommandEntries(tar), row);
             content = tar.subarray(archiveEntry.offset, archiveEntry.offset + archiveEntry.size);
           }

@@ -220,6 +220,22 @@ commands:
   - logical_name: libgen-cli
     description: 'Library Genesis CLI for title/author/ISBN search, filtering, link resolution and mirror status. Use libgen-cli --help, search QUERY, link MD5 or status. Upstream currently publishes no release binaries: build with Go (go install github.com/anilpdv/libgen-cli@latest) and place libgen-cli.exe on Windows or libgen-cli on Unix in .mrmcp/bin. This catalog entry does not install Go or build source automatically.'
     documentation_url: 'https://github.com/anilpdv/libgen-cli'
+  - logical_name: annas-mcp
+    description: "Anna's Archive CLI for book/article search and downloads. Invoke annas-mcp --help, book-search QUERY, article-search DOI_OR_QUERY, book-download MD5 FILENAME or article-download DOI. Search requires no API key; downloads require ANNAS_SECRET_KEY and ANNAS_DOWNLOAD_PATH. Optional ANNAS_BASE_URL selects a mirror and ANNAS_AUTO_BASE_URL=true enables automatic mirror discovery; --timeout overrides the request timeout. Use CLI subcommands through exec; the mcp subcommand starts a separate MCP server."
+    documentation_url: 'https://github.com/iosifache/annas-mcp#available-operations'
+    platforms:
+      windows-x86_64:
+        download_url: 'https://github.com/iosifache/annas-mcp/releases/download/v0.1/annas-mcp_0.1_windows_amd64.zip'
+      windows-aarch64:
+        download_url: 'https://github.com/iosifache/annas-mcp/releases/download/v0.1/annas-mcp_0.1_windows_arm64.zip'
+      linux-x86_64:
+        download_url: 'https://github.com/iosifache/annas-mcp/releases/download/v0.1/annas-mcp_0.1_linux_amd64.tar.xz'
+      linux-aarch64:
+        download_url: 'https://github.com/iosifache/annas-mcp/releases/download/v0.1/annas-mcp_0.1_linux_arm64.tar.xz'
+      darwin-x86_64:
+        download_url: 'https://github.com/iosifache/annas-mcp/releases/download/v0.1/annas-mcp_0.1_darwin_amd64.tar.xz'
+      darwin-aarch64:
+        download_url: 'https://github.com/iosifache/annas-mcp/releases/download/v0.1/annas-mcp_0.1_darwin_arm64.tar.xz'
   - logical_name: camoufox
     description: |-
       Firefox-based browser distribution. Manual full-bundle installation: download the matching OS/CPU browser ZIP from https://github.com/daijro/camoufox/releases and extract its entire contents under .mrmcp/bin/camoufox, preserving libraries, resources, fonts and the macOS app structure. Do not copy only the executable. This catalog entry intentionally has no automatic download URL because Commands currently installs one executable rather than a browser bundle. No browser download or launch happens on registration or discovery.
@@ -237,3 +253,20 @@ commands:
         path: camoufox/Camoufox.app/Contents/MacOS/camoufox
       darwin-aarch64:
         path: camoufox/Camoufox.app/Contents/MacOS/camoufox
+  - logical_name: gws
+    description: |-
+      Google Workspace CLI for Drive, Gmail, Calendar, Sheets, Docs, Chat, Admin and other Workspace APIs, with structured JSON output and commands built dynamically from Google Discovery. Native standalone binary; no Node.js installation is needed. Invoke logical name gws through exec. Consult gws --help, gws drive --help, gws gmail --help or gws schema drive.files.list. Pass query parameters with --params JSON and request bodies with --json JSON; --page-all and --page-limit control pagination, and --dry-run previews requests.
+
+      Google API access requires authentication: configure a Google Cloud Desktop OAuth client, then gws auth login -s drive,gmail. Use exec_start for interactive setup/login and complete the browser consent flow. gws auth setup requires a separately installed gcloud CLI; manual OAuth setup is documented upstream. Existing credentials can instead use GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE or GOOGLE_WORKSPACE_CLI_TOKEN. GOOGLE_WORKSPACE_CLI_CONFIG_DIR selects the CLI's own configuration directory. Authentication remains owned by gws.
+    documentation_url: 'https://github.com/googleworkspace/cli#authentication'
+    platforms:
+      windows-x86_64:
+        download_url: 'https://github.com/googleworkspace/cli/releases/download/v0.22.5/google-workspace-cli-x86_64-pc-windows-msvc.zip'
+      linux-x86_64:
+        download_url: 'https://github.com/googleworkspace/cli/releases/download/v0.22.5/google-workspace-cli-x86_64-unknown-linux-gnu.tar.gz'
+      linux-aarch64:
+        download_url: 'https://github.com/googleworkspace/cli/releases/download/v0.22.5/google-workspace-cli-aarch64-unknown-linux-gnu.tar.gz'
+      darwin-x86_64:
+        download_url: 'https://github.com/googleworkspace/cli/releases/download/v0.22.5/google-workspace-cli-x86_64-apple-darwin.tar.gz'
+      darwin-aarch64:
+        download_url: 'https://github.com/googleworkspace/cli/releases/download/v0.22.5/google-workspace-cli-aarch64-apple-darwin.tar.gz'
