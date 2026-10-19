@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.3
+
+- Prepare the verification build directory before creating isolated fixtures, so checks work from a clean checkout on every release runner. The 0.11.2 tag stopped before building or publishing; this release includes its changes below.
+- Run on Bun 1.4.3 with the official native React/GPUIX renderer and direct asynchronous backend/UI state. Keep Turso persistence and rag.js fulltext/vector/hybrid retrieval with lazy local embeddings/PaddleOCR, without external runtime installation.
+- Use CDP.js 0.5.0 system-browser URL bootstrap for goals and persistent Session-owned workers. Add the Subagents GUI, optional goal conversation IDs and offline CDP Ext export with manual installation/reload instructions.
+- Publish Windows x64, Linux x64 and macOS Apple Silicon desktop assets. macOS Intel, tray and OS notifications remain suspended. Schema 6 requires explicit archive-and-recreate for older databases; no migration or silent reset.
+
 ## 0.11.2
 
 - Move application execution to Bun 1.4.3 and the native React/GPUIX GUI. Keep one process/event loop, direct asynchronous backend intents and official React reconciliation; remove the backend Worker and application input/render transport. Windows x64, Linux x64 and macOS Apple Silicon remain supported; macOS Intel, tray and OS notifications are suspended.

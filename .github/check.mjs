@@ -8,6 +8,7 @@ function replaceFixture(source, pattern, replacement) {
   return updated;
 }
 const root = resolve(import.meta.dir, "..");
+await fs.mkdir(join(root, "build"), { recursive: true });
 const directory = await fs.mkdtemp(join(root, "build", "bun-check-"));
 const semantic = process.argv.includes("--semantic");
 const standalone = process.argv.includes("--standalone");

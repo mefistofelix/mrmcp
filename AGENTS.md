@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.11.2 consists of thirteen root project files, a Bun dependency manifest/lockfile, build/check scripts, one GitHub Actions workflow and one versioned asset directory:
+MrMCP 0.11.3 consists of thirteen root project files, a Bun dependency manifest/lockfile, build/check scripts, one GitHub Actions workflow and one versioned asset directory:
 
 - `mrmcp.js` — Bun backend, MCP `2026-07-28`, OAuth/Basic authentication, Turso, native GPUIX UI and desktop launcher.
 - `mcp.yaml` — separate authoritative stdio MCP server catalog, managed by the MCP Servers page. Embed/materialize it once beside the other catalogs without overwriting edits; binaries live in `.mrmcp/mcp/bin`, outside Commands discovery.
@@ -416,6 +416,9 @@ README describes only current behavior. Keep it concise and do not append releas
 For a release, update `CHANGELOG.md`, the source header and the `VERSION` constant in `mrmcp.js`; always synchronize the README version heading and this guide's current-release identifier. Update the README body when current user/operator behavior changed, and implementation guidance when invariants or release checks changed. GitHub Release notes must come from the matching CHANGELOG section, with a link to the full history; never publish only a comparison link. The release commit message must be descriptive, not a generic `release X.Y.Z`: include the version plus a short summary of the primary change, for example `0.10.82: color Tool Call status filter options`. Keep it concise but specific enough that `git log` explains what changed without opening the commit. Invoke Git/GitHub CLI through MrMCP `exec` with `program` + `args`; never add a `shell` boolean/field, because it is not part of the tool schema. After creating the release tag, prefer one direct combined push with `git push origin main X.Y.Z`; the pushed version tag is the publication trigger. Do not manually create/upload the normal GitHub Release afterward: `.github/workflows/release.yml` verifies the tag against `VERSION`, builds the three release targets on matching native runners and publishes them. Split branch/tag pushes only when Git itself returns an execution error, not when a tool invocation was rejected before reaching MrMCP.
 
 ## Release checks
+
+Run verification from a clean checkout as well as the development directory. Check/build scripts
+create their own build/output parents and must not rely on ignored local files, caches or fixtures.
 
 For Goals test extension-ID validation/persistence, no listener/target before requested work,
 reverse attachment without a process/profile, named purple group creation, owned logical target reuse

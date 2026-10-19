@@ -1,6 +1,6 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.11.2
+# MrMCP 0.11.3
 
 MrMCP is a stateless Model Context Protocol server implemented in Bun. It exposes one authenticated `/mcp` endpoint, Workspace-scoped Sessions, filesystem and process tools, OAuth/Basic authentication, TLS automation, and a native GPUIX administration UI.
 
