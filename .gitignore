@@ -7,11 +7,18 @@
 !/LICENSE
 !/WEBGUI_PREF.md
 !/mrmcp.js
+!/package.json
+!/bun.lock
 !/commands.yaml
+!/mcp.yaml
 !/guided_prompts.yaml
 !/.github/
 !/.github/workflows/
 !/.github/workflows/release.yml
+!/.github/build.mjs
+!/.github/check.mjs
+!/.github/check-goals.inc.js
+!/.github/check-subagents.inc.js
 !/assets/
 !/assets/**
 

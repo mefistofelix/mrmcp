@@ -16,30 +16,31 @@ Filesystem paths are relative to the Session's current Workspace unless the spec
 
 `structuredContent` remains the complete structured result. Filesystem tools, `tools_log`, `memory_find`, Workspace discovery, command discovery and `tools_schema` also return a short text summary of counts, failures and applicable continuation fields. Summaries are derived only from current result metadata; they never duplicate file contents, match snippets, fingerprints, nested payloads or complete JSON. Batch mutation summaries report both succeeded and failed entries, including all-failed batches; the per-entry statuses remain authoritative and the existing call-level completion semantics are unchanged.
 
-Choose `fs_glob` for paths, `fs_grep` for textual occurrences (including comments, strings and configuration), `fs_navigate` for next/previous matches in known files, and `fs_read` for known ranges. Use `source_code_search` for Lucerna BM25 relevance search and AST symbols. Batch independent reads. Request a few context lines when nearby source can avoid another read; the default remains zero. For additional caller/impact exploration, prefer a suitable available command from `discover_commands`, following its catalog description; the versioned catalog already includes Cymbal.
+Choose `fs_glob` for paths, `fs_grep` for textual occurrences (including comments, strings and configuration), `fs_navigate` for next/previous matches in known files, and `fs_read` for known ranges. Batch independent reads. Request a few context lines when nearby source can avoid another read; the default remains zero. For additional caller/impact exploration, prefer a suitable available command from `discover_commands`, following its catalog description; the versioned catalog already includes Cymbal.
 
 ### `document_grep`
 
-Requires `chat_session`. Uses its selected Workspace, or Search `default_path` when none is selected. Empty/omitted `default_path` means OS Desktop/`_default`, created on the first search. This does not create or attach a Workspace; other file/process/kernel tools still require one. Xberg 1.3.2 extracts local documents; LanceDB 0.27.2 (0.22.3 on Intel macOS, the last stable Intel binding) stores passages and performs fulltext/BM25 and vector search. The separate Lucerna tool provides lexical/AST source retrieval. On macOS Intel, extraction uses Xberg's public npm WASM initializer. Deno manages the package and its WASM/license; standalone builds embed that dependency and work without downloading it at runtime. Other supported platforms use native Xberg. There is no separate WASM asset under assets.
+Requires `chat_session`. Uses its Workspace or Search `default_path` (empty means lazy OS Desktop/`_default`) without assigning a Workspace. The engine is [rag.js](https://github.com/mefistofelix/rag.js), using its public API and Turso storage.
 
 | Argument | Behavior |
 |---|---|
 | `query` | Required nonempty text, up to 4,096 characters. |
-| `mode` | `auto` (default), `fulltext`, `vector` or `hybrid`. Auto uses hybrid when an embedding model is configured, otherwise fulltext. |
-| `path/include/exclude/gitignore/hidden` | Source-directory selection with globstar `**`, parent/nested ignore rules and negations. Gitignore defaults true; hidden defaults false. Symlinks are skipped. |
-| `mime[]` | Exact types or `type/*`; inferred from local filename extensions. |
-| `limit` | Default 10, maximum 100 hits. |
-| `max_files`, `max_file_bytes` | Defaults 1,000 files and 20 MiB per file; maxima 5,000 and 50 MiB. |
+| `mode` | `auto`, `fulltext`, `vector` or `hybrid`. MrMCP auto chooses hybrid when a model is configured, otherwise fulltext. |
+| `path/include/exclude/gitignore/hidden` | Existing globstar selection, applicable parent/nested gitignore rules and negations. Gitignore defaults true; hidden false. Symlinks are skipped. |
+| `mime[]` | Exact types or type/*, selecting by filename MIME; citations retain the extractor's content-aware MIME. |
+| `limit` | Default 10, maximum 100 deduplicated passage hits. |
+| `max_files/max_file_bytes` | Defaults 1,000 files/20 MiB; maxima 5,000/50 MiB. Selection observes at most 64 MiB and 100,000 traversal entries; extracted text is bounded to 8 MiB per file. |
 
-Every call hashes current selected files. A changed hash or extraction version replaces only that file's passages; unchanged extraction and embeddings survive restart. Completed traversal prunes vanished/newly ignored paths only inside the requested path/glob/MIME selection. Incomplete traversal never prunes unseen paths. Other selections remain stored but cannot appear in results: both fulltext and vector queries filter current eligible files/chunks. Failed/oversized files are excluded even if an older snapshot exists. No background Workspace crawl runs.
+MrMCP selects safe files first, then passes their exact paths to Rag.index with verify=hash. Unchanged extraction/chunks/vectors persist across calls and restarts. Only complete traversal reconciles missing/newly ignored paths; truncated traversal preserves unseen records. Failed, oversized, ignored and unvisited files cannot contribute hits or citations, including stored older revisions. Rag.search uses refresh=none after explicit indexing. Each instance closes in finally; no watcher or ingestion loop remains running between calls. The library's internal ingestion loop can recover known stale records while open; a public extraction callback rejects files outside the current eligible set.
 
-Functional indices and a hash/MIME manifest live under `.mrmcp/search/<hash-of-real-Workspace-path>/`; unassigned Sessions use `.mrmcp/search/_default/<hash-of-real-source-path>/`. These survive restart and Tool Call cleanup. Changing the default source directory gets a different hash and cannot expose an earlier directory’s stored results. Index mutation serializes only within the same Workspace. Vector tables are separated by provider/endpoint/model; changed/deleted selected files lose obsolete vectors. Fulltext requires no embedding provider. Ollama `/api/embed` and OpenAI-compatible `/embeddings` receive bounded batches; no model is downloaded automatically. Hybrid uses reciprocal-rank fusion (`k=60`).
+Stores live under `.mrmcp/search/<real-path-hash>/rag/<profile-hash>/`, or `.mrmcp/search/_default/<hash>/rag/<profile-hash>/` without a Workspace. Every profile contains Rag's `turso.db`, `models/` and temporary/lock state. Lexical and embedding/OCR/provider/model/limit profiles are separate, so fulltext never generates embeddings or downloads an embedding model. Old LanceDB indices and previous embedding caches are preserved, without conversion; explicit searches build the new derived store. Operational cleanup preserves all search stores/models. A stale `writer.lock` after a crash requires establishing that no instance owns the store before manual recovery, as documented by rag.js; MrMCP never removes it automatically.
 
-Calls read at most 64 MiB of selected source bytes, bound extracted text to 8 MiB per file and changed/vector-selected passages to 20,000, and bound returned traversal entries to 100,000. Passages contain at most 2,400 UTF-16 characters without splitting surrogate pairs. Output includes effective mode/gitignore, indexing/reuse/removal/scanning counts, truncation, total error count with at most 100 details, returned count and hits with id, Workspace-relative path, MIME, chunk number, text, extracted line bounds and score. PDF lines refer to extracted text rather than original page/source coordinates.
+rag.js owns extraction (Xberg 1.3.10), Unicode-aware overlapping chunks (default 1,200 characters, overlap 150), chunk deduplication, native embeddings and retrieval. Turso performs fulltext term matching/ranking and exact cosine vector search; hybrid uses reciprocal-rank fusion, k=60. Models remain local and lazy: fast is English MiniLM, multilingual is E5 with query/passage prefixes. Weights persist inside the profile's `models/embeddings`, with no external service/API key. Ollama /api/embed and OpenAI-compatible /embeddings remain available through the public embedding callback. OCR defaults to the public Rag Paddle provider (PP-OCRv6 small, languages auto), using its existing Xberg dependency without another library or OS COM OCR calls. Models download on the first actual OCR operation and persist in the profile’s models/paddle folder. Auto has fixed language coverage, not unrestricted script autodetection. Explicit native OCR uses current Auto.js public vips/ocr; disabled OCR passes false. Neither mode silently falls back to Tesseract. Searchable PDF pages retain usable embedded text and page citations. Media transcription/video OCR remain disabled here; use catalog whisper-cli or yt-dlp explicitly.
 
-Settings → **Search** shows the resolved fallback source folder and edits root `search.yaml`, containing `default_path` (empty for OS Desktop/`_default`, otherwise absolute or relative to the MrMCP directory), `embedding` (provider, endpoint, model, api_key) and `ocr` (native or disabled). Native OCR uses Auto.js public image/OCR APIs and the OS's installed recognition support, with no custom FFI wrapper or external OCR fallback. Standalone builds preserve existing YAML edits and use Application Support on macOS.
+The result retains source_directory/index_directory/workspace_selected, mode/gitignore, current eligible indexed_files, reindexed/unchanged/removed/scanned file counts, truncation/errors and results. engine is rag.js and storage is turso. Hits retain id/path/mime/chunk/text/score and add the library's complete current citations: document/occurrence IDs, relative/absolute file paths, UTF-8 byte offsets, page/time bounds, origin and locator/metadata. Identical text can have several citations. start_line/end_line are null because Rag exposes offsets/pages rather than extracted line numbers; indexed_chunks is null because scoped chunk counts are not in its public API. index_counts explicitly contains profile-wide Rag counts, including retained derived records, and must not be interpreted as scoped totals.
 
-Download subtitles with the catalog `yt-dlp` command and index the resulting Workspace files. This tool has no URL, transcript-download, proxy or audio-download integration. For example, execute `yt-dlp --skip-download --write-subs --write-auto-subs --sub-format vtt --sub-langs en.* --paths . URL`, then call `document_grep` with an appropriate file selection.
+Settings → Search retains shared Save/drafts/inline validation and authoritative search.yaml: default_path, embedding (local|ollama|openai, model and optional endpoint/api_key), ocr (paddle|native|disabled). Existing YAML edits are preserved; Use local embeddings and Use PaddleOCR change the draft only. Opening/saving Settings downloads no models.
+
 
 ### `proxy_get`
 
@@ -49,7 +50,7 @@ Requires `chat_session`, with no selected Workspace. The configured global pool 
 - `action=list`: paginate configured/resolved order with `offset` (default 0, maximum 10,000), `limit` (default 20, maximum 50) and `next_offset`. Listing includes unavailable/cooled-down entries and never advances selection.
 - `action=report`: require a previously picked `proxy_id` and boolean `success`. Success increments successes and clears consecutive failures/cooldown. Failure increments failures/consecutive failures and applies `failure_cooldown_seconds * 2^previous_consecutive_failures`, capped at 24 hours. Optional `retry_after_seconds` (0–86,400) overrides that delay. Report does not fetch list sources. Report arguments on other actions and nonzero pick offsets are rejected.
 
-`include_direct` defaults true; false excludes the special `direct` entry representing a direct HTTP request. Explicit proxy entries accept HTTP(S), SOCKS5/SOCKS5H, bare host:port and optional URL credentials. Returned URLs include those credentials when configured. Proxy ids are SHA-256 of normalized entries; only ids, successes, failures, consecutive failures, selection/report timestamps and cooldowns are stored in the main SQLite `proxy_stats` table. Statistics are shared across Sessions, survive restart and Clear Operational Data, and never appear in the YAML pool file. No automatic network probe or outcome inference runs: callers must report the actual request outcome.
+`include_direct` defaults true; false excludes the special `direct` entry representing a direct HTTP request. Explicit proxy entries accept HTTP(S), SOCKS5/SOCKS5H, bare host:port and optional URL credentials. Returned URLs include those credentials when configured. Proxy ids are SHA-256 of normalized entries; only ids, successes, failures, consecutive failures, selection/report timestamps and cooldowns are stored in the main Turso `proxy_stats` table. Statistics are shared across Sessions, survive restart and Clear Operational Data, and never appear in the YAML pool file. No automatic network probe or outcome inference runs: callers must report the actual request outcome.
 
 `proxies.yaml` contains `proxies[]`, newline-list `proxy_lists[]`, `list_ttl_minutes` (default 60), `request_timeout_seconds` (15), `max_entries` (200) and `failure_cooldown_seconds` (30). It seeds direct access and two public list URLs. At most 20 sources and 2,000 configured entries/source URLs are allowed. Sources are fetched only during explicit pick/list calls, with a shared per-source fetch across concurrent callers, a 1 MiB response cap and memory TTL. Invalid/comment lines are skipped, normalized duplicates removed, configured order preserved and the final pool bounded. Source failures are reported without discarding other usable entries. Saving configuration clears source caches; no background fetch/probe runs.
 
@@ -61,107 +62,9 @@ Examples:
 
 `{"chat_session":"ctx_...","action":"report","proxy_id":"<returned id>","success":false,"retry_after_seconds":120}`
 
-### `source_code_search`
-
-Requires `chat_session`. Uses its selected Workspace, or Search `default_path` when none is selected. Empty/omitted `default_path` means OS Desktop/`_default`, created on the first search. This does not create or attach a Workspace; other file/process/kernel tools still require one. Uses the public Lucerna 0.2.9 `TreeSitterChunker` and `Searcher` APIs. This build supports local **lexical BM25 and AST**, without semantic embeddings, remote providers, reranking or call-graph analysis. Code-aware tokenization keeps identifiers and splits camelCase/underscores. Queries are ordinary words/identifiers, not FTS query syntax or regular expressions.
-
-| Argument | Meaning |
-| --- | --- |
-| `action` | `search` (default), `map`, `files`, `chunks`, `stats`. |
-| `query` | Required for search. Results appear in relevance order with `matchType: lexical`. |
-| `path`, `include[]`, `exclude[]`, `hidden` | Same path-selection rules as filesystem tools, relative to `source_directory`. Include/exclude are relative to `path`; hidden defaults false. |
-| `file_path` | File relative to `source_directory`, required for chunks; a path/glob filter for search. |
-| `language`, `types[]` | Search filters by one/many languages and Lucerna chunk types. Language aliases include `c++` → `cpp`, `c#` → `csharp`, `js`/`jsx`, `ts`/`tsx`, `py`, `yml`, `sh`/`shell`, `ps1`, `md` and `objective-c`. Results use canonical names. Map accepts types. |
-| `include_content` | Default true; false omits source `content` and enriched `contextContent` from returned chunks. |
-| `limit`, `offset` | Stateless result pagination; defaults 10/0, limit up to 100. Reuse the selection/query and pass `next_offset` as offset. |
-| `max_files`, `max_file_bytes` | Indexing bounds: defaults 5,000 files and 1 MiB per file, maxima 10,000 and 2 MiB. Also capped at 32 MiB total selected source and 100,000 traversal entries. |
-
-`.gitignore` is **always enabled** and cannot be overridden. Uses the existing Workspace selector, including applicable parent rules, nested rules and negations. Symlinks are skipped. Every call reselects and hashes live eligible files. File hashes, AST chunks and a contentless SQLite FTS5/BM25 index persist in `lucerna.sqlite` under `.mrmcp/search/<hash-of-real-Workspace-path>/`, or `.mrmcp/search/_default/<hash-of-real-source-path>/` without a Workspace. Unchanged AST chunks are reused after restart; only changed selected files are parsed again. Completed traversal prunes missing/newly ignored files only inside that requested selection. Other scopes remain stored; incomplete traversal never prunes unseen paths. Failed, oversized, ignored and out-of-scope files cannot appear because results join the current eligible selection. No `.lucerna`, index database or configuration file is created in the source folder. Indices survive operational-history cleanup. Workspace `lucerna.config.ts` is never evaluated. Supported canonical languages: `javascript`, `typescript`, `json`, `markdown`, `go`, `c`, `cpp`, `zig`, `html`, `python`, `yaml`, `php`, `java`, `rust`, `csharp`, `kotlin`, `swift`, `ruby`, `bash`, `powershell`, `sql`, `css`, `scss`, `vue`, `svelte`, `toml`, `lua`, `r`, `scala`, `dart`, `perl`, `haskell`, `elixir`, `clojure`, `matlab`, `groovy`, `solidity`, `julia`, `ocaml`, `erlang`, `objc`. Common extensions include Go, C headers, C++ `.cpp/.cc/.cxx/.c++/.hpp/.hh/.hxx/.h++` (uppercase `.C` is C++), Zig, HTML/HTM, Python/PYI/PYW, YAML/YML and PHP/PHTML/PHPS/PHP3/PHP4/PHP5/PHP7/PHP8. Extension matching is case-insensitive except the conventional uppercase `.C` distinction. Languages detected by the pack without a Lucerna extractor are counted as unsupported. Grammar libraries are not embedded in the executable. The parser's public API initializes JavaScript, TypeScript and JSON on first use and downloads additional supported grammars when selected files need them; Markdown uses its grammar-free extractor. These libraries use the package's normal OS cache, independently of the MrMCP index. Standalone builds retain only their target's native parser binding. Intel macOS resolves the companion's public npm entry and loads it through the main parser's NAPI_RS_NATIVE_LIBRARY_PATH option; loading is synchronous, the previous environment value is restored immediately, and vendor loaders are unchanged.
-
-Both retrieval tools return absolute `source_directory` and `index_directory`, plus `workspace_selected`; false means the Session stayed unassigned and used the default source folder. Search-index storage cannot be used as input files. Source results also report `reindexed_files`, `unchanged_files`, `removed_files` and `scanned_files`.
-
-The result includes `mode: lexical`, `gitignore: true`, scope `path`, indexed file/chunk counts, skipped oversized/unsupported counts, total `error_count` plus at most 100 error details, indexing `truncation_reason`, result `returned` and `next_offset`. `truncated` means an indexing bound was reached or another result page exists; skipped files and errors also indicate incomplete coverage. `data.results` contains search hits (`chunk`, `matchType`), chunks, symbol-map entries or file paths according to action. `data.stats` contains counts and language breakdown. Chunk IDs remain stable for unchanged content. Distinct symbols sharing Lucerna's file/start-line ID receive deterministic distinct IDs; their original ID is retained in `metadata.lucerna_id`. Native Lucerna chunk fields retain `id`, source-directory-relative `filePath`, `language`, `type`, optional `name`, and one-based `startLine`/`endLine`; use filesystem tools to obtain edit fingerprints.
-
-```json
-{"chat_session":"ctx_...","query":"authentication middleware","types":["function","method"],"limit":10}
-{"chat_session":"ctx_...","action":"map","include_content":false,"limit":50}
-{"chat_session":"ctx_...","action":"chunks","file_path":"src/auth.ts"}
-```
-
-The compatible parser is pinned to 1.6.2; current newer npm native packages are not usable on the tested Deno/Windows runtime. The Intel macOS companion is provided as a normal npm dependency. Do not infer caller/semantic capabilities from lexical hits. Refresh the connector and test this new tool from a new chat/branch after updating the executable.
-
-### Stateless filesystem navigation
-
-Filesystem discovery, search and navigation keep no server-side cursor state.
-
-- `fs_glob` continues with `after_path` / `next_after_path`.
-- `fs_grep` continues with `resume_after` / `next_resume_after`.
-- `fs_navigate` receives an explicit `from_line` and direction for every file on every call.
-- `fs_read` continues a truncated range with `next_start_line`.
-
-These cursors describe positions in the current data, not a frozen snapshot. Reuse the same selection and search arguments on continuation. Changes to files or line positions between calls can change subsequent results; returned fingerprints identify the content version read. Each text read/search still decodes complete files and computes whole-file metadata where required, even when the returned page is small.
-
-The continuation value is ordinary call data. Losing a previous response loses no hidden server state.
-
-### Path selection
-
-`fs_glob`, `fs_grep` and `fs_trash.selection` share the same selection fields:
-
-- `path` — Workspace-relative file or directory at which traversal starts; default `.`.
-- `include[]` — globstar patterns relative to `path`; default `['**/*']`.
-- `exclude[]` — globstar patterns removed from the candidate set; default empty.
-- `gitignore` — when true, apply applicable parent `.gitignore` rules and nested `.gitignore` files encountered while descending; default true.
-- `hidden` — include dot-prefixed files/directories; default false. `.gitignore` files are still read when hidden entries are not returned.
-
-Nested `.gitignore` discovery is always recursive when `gitignore=true`; there is deliberately no separate recursive switch. MrMCP reads `.gitignore` files themselves, not Git's index, global excludes or `.git/info/exclude`.
-
-### Text representation
-
-Text content and its physical representation are deliberately separate. The agent works on decoded text; MrMCP owns charset encoding, physical BOM bytes and CR/LF serialization.
-
-Design rationale: agents are good at expressing the intended logical text but should not be forced to reproduce incidental byte-level representation exactly on every tool call. Requiring them to remember or emit the original charset, BOM and CR/LF convention would increase prompt/tool-call burden and create avoidable errors and retry round-trips. MrMCP therefore infers and preserves representation whenever the existing bytes provide one unambiguous answer, and normalizes harmless payload differences such as agent-supplied LF versus CRLF. New files use LF when no line-ending style exists yet; an explicit representation choice is required only for a genuinely ambiguous existing source such as a single-line/empty file that is being expanded or a mixed-EOL file. This convenience never permits silent data loss: malformed input, unsupported characters, ambiguous representation choices and non-lossless conversions fail instead of being guessed or repaired.
-
-Character-set rules:
-
-- `encoding:"auto"` uses only the charset reported by pinned `chardet`. For `fs_read`, `fs_grep` and `fs_navigate`, Settings → Files selects **Initial 16 KiB** (default, persisted as `text_encoding_detection=sample`) or **Complete file** (`full`). The sample is a zero-copy prefix of the original byte buffer; files at or below 16 KiB are detected in full. The selected decoder still reads the entire file strictly. Sample mode uses the first candidate from the public `chardet.analyse` API only when its confidence score is at least 80. If the candidate is absent, has a lower confidence score, yields no charset or decoding fails, `chardet.detect` and strict decoding retry once with the complete original buffer. A sample may miss later charset clues even when decoding succeeds; Complete file inspects all bytes. Mutations (`fs_write`, `fs_edit`, `fs_text_convert_encoding_eol`) always detect the complete source when automatic decoding is needed, regardless of this read/search setting. BOM, UTF-8 validity, NUL patterns and other local heuristics never select or override a charset. If full detection/decoding fails, the tool reports the error. An explicit input encoding bypasses `chardet` entirely in both modes.
-- Physical BOM inspection is independent metadata only. A recognized UTF-8/UTF-16/UTF-32 prefix produces `bom:true`; it never selects the charset. The selected decoder may consume a matching BOM according to that charset's normal decoding semantics (including the custom UTF-32 decoder), which is distinct from using BOM as a detector.
-- Native `TextDecoder` charsets decode with `fatal:true`; malformed data is not retried through a permissive decoder. A charset unavailable to `TextDecoder` may use `iconv-lite`, but only when decode/re-encode reproduces the original bytes exactly.
-- `output_encoding:"preserve"` reuses the detected source charset. On a new file, where there is nothing to preserve, it means UTF-8. A `chardet` result of ASCII remains strict ASCII; it is not silently promoted to UTF-8 or interpreted through the WHATWG Windows-1252 `ascii` alias. Encoding intent is not stored separately from file bytes: a newly written UTF-8 file containing only ASCII-compatible bytes may later be reported as `ascii` by `auto` if that is what `chardet` detects, because those bytes do not physically distinguish the two encodings. Encoding is checked by decoding the final bytes through MrMCP's own read path and comparing the exact text, so unsupported characters are rejected instead of becoming `?` or replacement characters. Auto-detected legacy encodings can therefore be preserved only when both decoding and encoding are lossless.
-- `bom:"preserve"` preserves physical recognized-BOM prefix presence, not a particular BOM byte sequence: converting a BOM-bearing UTF-16 file to UTF-8 therefore produces the UTF-8 BOM. A new file with `preserve` has no BOM. `add` requires a BOM-capable Unicode output encoding because adding Unicode BOM bytes to a legacy charset would change its decoded text. With an explicitly decoded legacy source whose ordinary text bytes already happen to begin with a recognized BOM sequence, `preserve` does not invent another prefix; the final byte-prefix check decides whether physical presence was actually retained. `remove` similarly fails rather than alter logical text if the requested text itself necessarily encodes to recognized BOM bytes at byte zero.
-
-Line-ending rules:
-
-- Read/search outputs are normalized to LF so matching and edits operate on one stable logical representation. Source metadata still reports `line_endings:"lf"|"crlf"|"cr"|"mixed"|"none"`. `none` means there is no CR or LF separator at all; it includes an empty file and a non-empty single-line file.
-- LF, CRLF, CR or mixed separators arriving in `content`, `old_text` or `new_text` are logical text, not an implicit declaration of the desired file format. `fs_edit` normalizes edit anchors/replacements to LF for matching. On output, an explicit `line_endings:"lf"|"crlf"|"cr"` normalizes every break to that requested style.
-- `line_endings:"preserve"` reuses an existing uniform source style (`lf`, `crlf` or `cr`) regardless of which separators the agent happened to send. For a new file, where there is no source style to preserve, it defaults to LF and normalizes any incoming LF/CRLF/CR/mixed separators to LF. This intentionally avoids needless retry round-trips and guarantees that a successful new-file write does not inherit mixed line endings from the tool payload.
-- If an existing source is `mixed`, `preserve` returns `mixed_line_endings` when the result contains line breaks; if an existing source is `none` and the result introduces line breaks, it returns `line_endings_required`. The agent must then choose `lf`, `crlf` or `cr`. New files are not ambiguous: `preserve` means LF. If the resulting text has no line breaks, no choice is required because the output style is factually `none`.
-- A terminating newline does not create a synthetic extra logical line; an empty file has `total_lines:0`.
-
-Tool string arguments are already JSON-decoded text. MrMCP never applies a second C/JavaScript-style escape-decoding pass, so e.g. `\\n` remains two literal characters unless the JSON value itself contains an actual newline.
-
-### Fingerprints
-
-A `fingerprint` is an opaque whole-file content token. Do not parse it or depend on its hashing algorithm.
-
-`fs_read`, matched `fs_grep` results and `fs_navigate` return fingerprints. `fs_stat` can compute one on request. `fs_write` and `fs_edit` accept `expected_fingerprint` per file and refuse that file with `fingerprint_mismatch` if the current bytes do not match.
-
-Mutation tools also recheck the source immediately before writing and report `source_changed` if it changed during the call. This is optimistic concurrency protection, not an OS file lock.
-
-### Batch behavior
-
-Batch entries are independent. There is no public `atomic` option and no cross-entry rollback. If three entries succeed and the fourth fails, the three successful operations remain applied and the structured result reports all four outcomes.
-
-This avoids best-effort rollback becoming a second failure mode. A single recursive copy/move/trash/untrash can report `failed_partial` when it leaves a destination or payload after failing.
-
-`fs_edit` has one important local invariant: all edits for one file are validated and applied to an evolving in-memory document before that file is written once. A validation failure means that file is not written; other files remain independent.
-
----
-
-## Session and Workspace
-
 ### `chat_set_goal`
 
-Set a user-requested, repeating follow-up message for a ChatGPT conversation. MrMCP sends the saved text after an interval without MrMCP Tool Call activity. It does not evaluate progress, interpret the goal, detect completion, or stop because ChatGPT says the work is finished. Repetition ends through explicit cancellation, global suspension, Session expiry/deletion or an uncertain delivery. No selected Workspace is required.
+Set a user-requested, repeating follow-up message for a ChatGPT conversation. MrMCP sends the saved text after an interval without Tool Call activity or observed response progress, with no Tool Call still running in that conversation. It observes turn activity/completion, but does not interpret whether the textual goal has been achieved or stop because ChatGPT says the work is finished. Repetition ends through explicit cancellation, global suspension, Session expiry/deletion or an uncertain delivery. No selected Workspace is required.
 
 #### Arguments and result
 
@@ -169,6 +72,7 @@ Set a user-requested, repeating follow-up message for a ChatGPT conversation. Mr
 | --- | --- |
 | `chat_session` | Required active capability from `init_chat_session`; identifies the MrMCP Session, not the ChatGPT conversation id. |
 | `goal` | Required string, at most 32,000 JavaScript string code units. Nonblank text is kept exactly, including whitespace; empty/whitespace-only becomes an empty goal and stops follow-ups. |
+| `chatgpt_chat_id` | Optional conversation ID from the ChatGPT `/c/<id>` URL, 8–80 ASCII letters/digits/hyphens. Explicitly replaces the association and bypasses matching; omission retains the current ID. It is unrelated to the Chrome extension/tab ID. Empty strings and full URLs are rejected. |
 | `timeout_seconds` | Optional integer, 30–86,400. Omission uses the current global default, initially 300. Each call selects its interval anew: omitting it when updating a goal uses the current default, not that goal's previous override. |
 
 Example tool arguments, using an already-created Session:
@@ -183,47 +87,110 @@ To stop:
 {"chat_session":"ctx_...","goal":""}
 ```
 
-Returns the common `chat_session` envelope plus `goal`, `timeout_seconds`, `status`, `chatgpt_chat_id`, `chat_url`, `next_check_at`, `last_sent_at`, `detail`, `browser` and `user_data_dir`. Missing association/timestamps/detail are `null`; timestamps are Unix milliseconds. `next_check_at` is a scheduler check time, not a promised delivery time, and can lag new activity until that check recomputes the deadline. `last_sent_at` is the last confirmed submission and remains available after clearing/replacing the goal.
+Returns the common `chat_session` envelope plus `goal`, `timeout_seconds`, `status`,
+`chatgpt_chat_id`, `chat_url`, `next_check_at`, `last_sent_at`, `detail`, `browser`,
+`transport` (always `reverse`), nullable `extension_id` and logical `target` (`goals`).
+Missing association/timestamps/detail are null; timestamps are Unix milliseconds. next_check_at is a
+scheduler check time, not a promised delivery time. last_sent_at remains available after clearing a goal.
 
-Without a verified login profile, a nonempty set saves the goal as `waiting_login`, with no next check and no browser launch. Initialize/verify login in Settings and call the tool again for an unassociated Session; linked goals may resume after verification. With a verified profile, for an unassociated Session each explicit nonempty set saves `pending` and schedules one matching attempt for no earlier than one second later; the actual start depends on the five-second scheduler. The call returns before discovery. Before opening Chrome, the scheduler persists `matching` and consumes the request by setting `goal_next_check_at=0`. One attempt may inspect up to 20 recent candidates. Missing login, a draft, no match, browser/capture errors, time-budget exhaustion or interruption finish that attempt with `next_check_at:null`; they never schedule another matching scan. Resolve the issue and call `chat_set_goal` again to rearm, including with the same text. Tool Call activity, login completion, global disable/re-enable and settings changes do not rearm a consumed attempt. Within the current run, an unstarted pending request can still run later. At restart, matching is off by default: interrupted `matching` and still-queued `pending` requests become unscheduled errors. The optional startup policy below is the only automatic rearm exception. A Session with an existing association immediately becomes `ready` and schedules its interval. `ready` means associated and eligible for scheduling, not that login, the page and Send have already been checked. Replacing or clearing a goal increments its revision, invalidating older work, clears its error and keeps the conversation association. The tool does not accept a manual conversation-id override.
+An unassociated Session without an explicit chatgpt_chat_id becomes pending,
+scheduled no earlier than one second later on the five-second scheduler. The call returns before
+discovery. Persist matching and next-check zero before connecting, consuming that one attempt.
+An unsuccessful, interrupted or failed scan remains unscheduled; repeat chat_set_goal to retry.
+Activity and ordinary settings saves do not rearm it. Existing associations are reused and schedule
+their full interval. Replacing/clearing a goal increments its revision and preserves its association.
+Restart matching defaults off, including never-started pending work; the startup option below is the
+only automatic exception. Supplying chatgpt_chat_id skips the scan, sets ready and schedules a full
+idle interval without connecting now. The latest explicit set wins across Sessions linked to that
+conversation. Clearing the goal retains its ID, including one supplied in the same call.
 
 #### Global settings and browser lifetime
 
-Initialize the dedicated profile through **Settings → Goals → Login ChatGPT** and sign in interactively or finish any challenge. One login observer checks that same page immediately and every 500 ms, without overlapping checks, until it recognizes an existing or newly completed login. No second confirmation is needed. Closing/disconnecting the window stops this observation without reopening Chrome; use the button again to continue. This explicit flow is available even when global management is off. Automatic matching/sending pauses throughout setup, including across a restart before verification. Setup launches Chrome visibly with images and `windowsHide:false`; a running headless/image-blocked dedicated browser is restarted only when its shared tab has no draft, active response or dialog. The ordinary system browser is never used. Existing running launch options otherwise remain unchanged.
+Goals use the user's system Chrome through public CDP.js 0.5.0 URL bootstrap and reverse transport.
+The operator installs CDP Ext and signs in normally. MrMCP sets cdp_ext=true, cdp_ext_install=false,
+user_data_dir=null and update_preferences=false; login/translations remain enabled. CDP.js opens its
+loopback bootstrap URL through Chrome, reusing the running system profile or opening Chrome if
+closed. It installs no extension, creates no profile and changes no profile preferences.
 
-Automatic login detection preserves drafts and requires a fresh successful recent-conversations response requested by the website on the canonical ChatGPT page, with no observed login screen. Editor availability is checked separately and cannot veto authenticated recent-chat evidence. The current editor’s `data-composer-markdown` / `data-chatgpt-composer` machine markers are supported alongside the native form fallbacks. Settings displays Opening, Checking, Signed in, Sign-in required, page/challenge waiting, closed or error states and an independent monitoring status; opening runs asynchronously so it cannot block GUI input. If an already-signed-in page loaded before attachment, the login observer may navigate home once after its composer becomes usable and its draft is empty; it never refreshes in a loop or navigates away from an active login flow. A public logged-out composer alone is insufficient. MrMCP reads neither authentication cookies/headers nor login/session payloads and issues no private authenticated HTTP request. Unknown layouts/capture formats, login screens and challenges leave setup pending with a diagnostic. After success, only the verification timestamp (`chat_goal_login_verified_at`, initially `0`) is persisted in the existing config table; credentials/site data stay in Chrome’s profile. This records a successful setup, not a permanent authentication guarantee. An observed login screen or a 401 on conversation data during matching/sending clears readiness and stops automatic browser work until the operator uses Login ChatGPT again. Login readiness and the user enable switch are independent: login detection never enables a disabled feature, disabling preserves readiness, and explicit login observation can finish with the feature disabled. Close the login window after verification to use the saved headless/image/process settings on the next launch.
+One-time setup:
 
-Verification can resume already-associated eligible goals; it never re-arms an unassociated match, evaluates a goal or sends a test message. Sessions → Login settings opens this same Settings tab. The remaining controls are persisted through **Save Settings**. No SQLite schema change is needed.
+1. In Settings → Goals, choose the CDP Ext export folder and click **Save CDP Ext folder**. The default
+   is APP_DIR/cdp_ext, beside the editable catalogs; macOS uses the application-support directory.
+   Export uses the exact manifest.json and cdp_ext.js from the bundled public package, including offline.
+2. In chrome://extensions in the intended system profile, enable **Developer mode**, click **Load
+   unpacked** and select that exact folder. See also the [upstream instructions](https://github.com/mefistofelix/cdp.js#reverse-chrome-extension-transport).
+3. Keep the export path stable. After upgrading MrMCP, save to the same folder, confirm replacement
+   of the packaged files and press **Reload** on the extension card in Chrome. Existing unrelated files
+   are preserved; unrelated nonempty folders, symlink destinations or nonregular extension files are
+   refused. Export alone opens no browser or connection and never installs/enables an extension.
+   No extension ID or WebSocket address is entered in MrMCP.
+4. Sign in to ChatGPT in the system profile. Set a goal to request matching, or supply chatgpt_chat_id.
+
+CDP.js lazily starts its shared loopback listener (default port 9223), then opens a real local HTTP
+/cdp_ext URL with browser=mrmcp-goals, the effective WebSocket endpoint and a generated binding token.
+The installed extension intercepts the tab URL and announces its logical browser name, native ID and
+token. CDP.js validates the token and extension origin; MrMCP does no socket scanning or guessed-profile
+selection. One extension copy/native ID can serve distinct profiles with distinct logical names.
+A profile already connected to another name/manager fails explicitly rather than changing its binding.
+Disconnect it from that manager before retrying. Bootstrap and owned page tabs remain open on Quit.
+Chrome's singleton routing and any user-selected raw launch flags determine instance reuse. The external
+opener skips the automation launch preset; its process is not owned Chrome and is never terminated by
+MrMCP. Reconnects are handled by the library without replaying interrupted commands or duplicating pages.
+
+There is no Login ChatGPT button, extension-ID setting or login-verification timestamp. Settings
+and debug report the current connection; automatic configuration is not proof of site authentication.
+An observed login screen/unauthorized current query suspends that goal as waiting_login. Sign in in
+the normal browser and explicitly retry chat_set_goal or a debug action. No network monitoring is used.
 
 | Control | Config key | Default | Effect |
 | --- | --- | --- | --- |
-| Enable chat goal management | `chat_goals_enabled` | On (`1`) | Starts/stops background goal work. |
-| Retry missing chat matches at startup | `chat_goal_match_on_startup` | Off (`0`) | At startup only, queue one matching attempt per active unassociated goal if global goal management is enabled. Saving the setting does not run matching immediately. |
-| Default inactivity timeout | `chat_goal_timeout_minutes` | 5 | Whole minutes, 1–1440; used by subsequent sets that omit `timeout_seconds`. Existing goals keep their interval. |
-| Stop the current response before sending | `chat_goal_stop_before_send` | Off (`0`) | When on, click Stop before inserting the prompt and check that it takes effect. Applies to subsequent send attempts without a browser restart. |
-| Headless | `chat_goal_headless` | Off (`0`) | Whether the next dedicated Chrome launch has a visible browser window. |
-| Disable page images | `chat_goal_disable_images` | Off (`0`) | Images load normally by default. Enabling this passes `images:false` to cdp.js at launch; screenshots remain possible. Existing saved choices are preserved. |
-| Spawned process window / console | `chat_goal_windows_hide` | `auto` | `auto` makes `windowsHide` equal to headless; `hide`/`show` explicitly override it. This controls process-console visibility, not headless rendering. |
+| Enable chat goal management | chat_goals_enabled | On (1) | Starts/stops goal work. |
+| Retry missing chat matches at startup | chat_goal_match_on_startup | Off (0) | One startup attempt per eligible unassociated goal; requires enabled goals and an installed extension. |
+| Default inactivity timeout | chat_goal_timeout_minutes | 5 | Whole minutes 1–1440; subsequent sets only. |
+| Stop the current response before sending | chat_goal_stop_before_send | Off (0) | Click Stop and verify its effect before sending. |
 
-MrMCP uses the shared unversioned `@mefistofelix/cdp.js` library, browser name `mrmcp-chatgpt`, profile `<active data directory>/cdp/mrmcp-chatgpt/`, and one logical page named `goals`. All Sessions use the ChatGPT account logged into that profile and share that single page. The normal desktop browser/profile is not used. Chrome is created by explicit login setup, or lazily for discovery/delivery after successful setup. An unverified profile never launches Chrome in the background. An enabled feature with no goals does not launch Chrome merely because its timer runs.
+These settings use the existing config table, schema 6. Headless, process visibility and image-loading
+launch settings no longer apply to Goals; Chrome is controlled by its user. The former dedicated
+profile is unused and remains untouched. Saved goals and conversation associations are preserved.
 
-The browser/profile and page identity are reused when available. Launch changes take effect after closing the dedicated browser and letting MrMCP launch it again; they do not reconfigure a running Chrome process. Keep headless off for interactive sign-in or challenges. The browser retains its own cookies/site data in the profile, subject to the site's expiry/revalidation rules. MrMCP does not guarantee that login or a challenge will never be requested again.
+The browser label is mrmcp-goals and its shared logical target is goals, in the native purple
+**MrMCP Goals** tab group, using CDP.js target.group. Attach/create the target only for an explicit
+matching attempt, a due delivery or a user-requested debug action. Startup without due work, Settings
+opening/saving and status diagnostics create no tab or browser connection. The opt-in startup matching
+policy and delivery retries still count as requested goal work. Reuse a surviving target by logical
+name; recreate a closed target only when the next action needs it. Do not adopt unrelated ChatGPT tabs
+or groups with the same visible title. A namespaced chrome.storage.session marker confirms the owned
+tab across MrMCP/extension-worker reconnects; a Chrome restart clears it so recycled numeric tab IDs
+cannot select a personal tab. Only the logical tab ID is stored there, never chat content or tokens.
 
-Turning global management off stops the interval, removes monitor listeners/captured metadata, disconnects the dedicated inspector and prevents subsequent automatic browser opening, navigation and sending. Chrome itself remains running; profile, associations and saved goals remain intact. The tool stays published: a valid nonblank set returns `disabled`, `next_check_at:null` and the existing goal without changing it. Validation still applies, and an empty goal can still clear saved state. Re-enabling resumes eligible goals without resetting elapsed time; an overdue goal can therefore run on the next tick. `delivery_uncertain` and consumed unsuccessful/interrupted matching attempts stay suspended. Operations already dispatched to Chrome cannot be recalled.
+Goals/Subagents share the logical browser mrmcp-goals; explicit browser tools can reuse that name
+to operate on the same profile. Another logical name cannot take over an already-connected profile. Native extension IDs
+are observed connection metadata, not a user configuration field. Bootstrap routing uses the logical
+name and token, so shared native IDs do not identify a unique Chrome profile.
 
-With **Retry missing chat matches at startup** off, restarting does not resume failed, interrupted or never-started matching requests. When on, each backend startup queues one new attempt for each nonexpired Session with a nonempty goal and no ChatGPT association, preserving its text, timeout and explicit-set timestamp. Cleared/disabled/expired goals, existing associations and `sending`/`delivery_uncertain` states are excluded. A failed startup attempt stays unscheduled until another explicit set or a later opted-in startup. Global management must be enabled and the login profile verified at startup; enabling it later does not replay startup matching. A normal settings save never triggers this startup hook.
+Disabling clears the interval/turn observer and disconnects the Goals inspector. It leaves Chrome,
+tabs, saved goals and associations intact; the shared reverse listener can remain for other browser
+users. The tool remains published and a nonblank set returns disabled without changing saved state.
+An empty set can clear it. Re-enabling resumes eligible deliveries without resetting elapsed time;
+consumed missing matches and uncertain delivery stay suspended. Already-dispatched actions cannot
+be recalled. Closing MrMCP disconnects its bridge and leaves the user's browser/tabs open.
+
+With startup matching off, restart never rearms failed/interrupted/pending matching requests.
+When on, backend startup queues one attempt for each nonexpired unassociated nonempty goal, excluding
+disabled/expired/sending/delivery_uncertain states. Preserve text, interval and explicit-set priority.
+An unsuccessful startup scan stays unscheduled until another set or a later opted-in startup.
 
 #### How the ChatGPT conversation is found
 
-1. Open/reuse the dedicated page. Goal setup uses `initialize:false`; it explicitly installs scoped Network event listeners and enables Network before navigating. DOM checks use `Runtime.evaluate` without enabling Runtime reporting or adding the normal page binding.
-2. Preserve an existing draft, login flow or modal dialog rather than navigating away. A current assistant response does not block discovery; candidate histories/tool details may be matched while that candidate is responding. Otherwise open `https://chatgpt.com/`.
-3. Observe requests made by the website itself. The monitor recognizes successful JSON responses for `/backend-api/conversations` and `/backend-api/conversation/<id>` or `/backend-api/conversations/<id>`, excluding list requests marked `is_archived=true`. After `Network.loadingFinished`, it reads that response body through `Network.getResponseBody` on the original page session. It does not issue authenticated HTTP fetches, replay private requests or extract authentication cookies/headers.
-4. Merge observed recent lists by conversation id and sort by `update_time`, newest first. Append canonical conversation links found in the rendered navigation areas, deduplicate, and consider at most 20 candidates. It does not exhaustively page through the account's archive or search every conversation.
-5. Navigate to each candidate. For a captured history, follow the complete active branch from `current_node` through each node's `parent`. Recognize assistant messages addressed to `api_tool.call_tool`, parse `content.text` as JSON, require the final segment of `path` to name a MrMCP built-in tool, and compare `args.chat_session` exactly. Any such call on the active branch can establish the association; it need not be `chat_set_goal` or the latest call. Abandoned branches and Session-like strings in ordinary messages are ignored.
-6. If a valid captured branch has no match, move to the next candidate. If capture is absent/unsupported, inspect rendered tool JSON and expand structurally identified disclosure panels. This fallback examines up to 12 recent assistant containers/disclosure candidates, parses complete JSON in tool-marked or related code blocks, and requires the exact Session handle in the supported tool wrappers. It does not infer association from a quoted token or prose example.
-7. Persist the first verified match in `contexts.chatgpt_chat_id`, re-read its current activity/revision and immediately continue to delivery if already due. The matched page is reused without a reload or another scheduler tick. If not due, save the deadline and continue to another goal. Later sends reuse `https://chatgpt.com/c/<id>` without rediscovery. If the stored conversation disappears or the account changes, failures are surfaced; the current tool has no reset/rebind argument, and clearing a goal retains its association.
+1. Open/reuse the owned Goals page with initialize:false. Use Runtime.evaluate in the page's main JavaScript world without enabling Runtime reporting or installing the general page binding. Normal goal matching/sending neither captures history responses nor subscribes to WebSocket pushes. There is no Network observer for Goals, including login.
+2. Preserve drafts, login flows and dialogs. Otherwise open the home page and read the rendered recent navigation links in the site's order, considering at most 20 conversations. This does not exhaustively search the account or archive.
+3. For each candidate, resolve DOM Fiber pointers through React's committed root.current path, including alternate pointers. Find the mounted query client through provider props and read only the exact chatgpt-conversation query whose id agrees with the route and any mounted conversation identities. Cached data works even when navigation makes no HTTP request. Do not enumerate arbitrary application stores or read authentication/session queries.
+4. A newer published renderedConversation snapshot can supersede history only when its renderedTurns reference the exact mounted turn and its user message proves ownership. Read named hook/memo-cache values; invoke no state-changing React callbacks. Ambiguous identities or multiple competing models cannot establish a match. Project/GPT conversation routes retain the same canonical conversation id.
+5. Follow the complete current_node → parent branch, rejecting cycles, missing ancestors and conflicting ids. Parse complete JSON only in assistant api_tool.call_tool messages, require a MrMCP tool name and compare args.chat_session exactly. Never match ordinary prose, nested example strings or inactive branches. Only the match boolean, bounded message ids and turn metadata leave the page; tool arguments and history bodies stay there.
+6. An inspected complete branch without a match advances to the next candidate. Missing/unsupported/truncated models can fall back to rendered, structurally identified tool JSON/disclosures; contradictory identity evidence cannot. A truncated request never proves absence, and a complete later matching request can still succeed. No private REST request is issued or replayed.
+7. Persist the verified association, recheck revision/activity and continue scheduling on the same tab. Existing one-attempt-per-explicit-set and optional-startup rules remain unchanged. Later delivery reuses the saved conversation id without rediscovery.
 
-The adapter follows the [cdp.js monitoring recipe](https://github.com/mefistofelix/cdp.js/blob/master/tests/chat-monitoring.md). Push frames for conversation creation/turn completion only update candidate ordering and invalidate old captured history; they never prove a Session match and do not reset the inactivity timer. Navigation generations discard history bodies that complete after their navigation has been superseded.
+The minimal read-only technique is adapted from [Chat On Steroids fiber.js](https://github.com/totec448-spec/chat-on-steroids/blob/5456eb390bb9c4d54b7a3d076a5201ec5677f5e2/extension/fiber.js), under MIT with notice in the root LICENSE. These are website internals, not a public ChatGPT API: unknown shapes remain explicit diagnostics/fallbacks.
 
 Only one nonempty goal may be associated with a given ChatGPT conversation. The most recent explicit set wins; association discovery also checks for a newer already-associated goal before replacing anything. Equal set times are resolved by the newer numeric Session id. Older replaced goals are cleared, with an explanatory detail.
 
@@ -236,22 +203,24 @@ max(last_active_at, goal_activity_at, goal_updated_at, goal_last_sent_at)
   + goal_timeout_seconds × 1000
 ```
 
-Authenticated `tools/call` requests with a valid nonexpired `chat_session` and a nonempty tool name record arrival activity before tool lookup/schema validation. Therefore schema-rejected/unknown-tool calls also defer a goal; rejected authentication or invalid/expired capabilities do not. Completion of an executed call records activity again, including failure. Activity from any Session already associated with the same conversation updates the active goal for that conversation. Calls that never reach MrMCP are invisible to this timer.
+Authenticated tools/call arrivals with a valid capability count before lookup/schema validation; completion counts again for success, rejection or failure. In-flight runtime controls for every Session currently linked to the conversation veto Stop, insertion and dispatch. The entire duration of a long call is excluded: after the last call completes, a full timeout starts. Unrelated conversations remain independent. A detached process remaining alive after exec_start returns is not an in-flight Tool Call.
 
-Ordinary user/assistant messages, typing in another browser, ChatGPT push events, and tools belonging to other connectors do not count as MrMCP activity. A foreground MrMCP call already in flight does not suppress a prompt once the inactivity interval expires; this lets Goals try to unblock a stalled call/chat. A detached process remaining alive after `exec_start` returns does not itself keep a Tool Call in flight; subsequent process tool calls count normally. Goal-generated browser operations create no synthetic MCP Tool Calls and do not renew Session activity.
+The shared page's React model supplies a bounded progress fingerprint from active-turn message ids, status/completion markers, content sizes and bounded tail hashes. Raw text/arguments never leave the page. Changed fingerprints update the persistent goal_activity_at; unchanged busy/streaming markers do not repeatedly reset it. A successful assistant final with end_turn:true proves completion; a finished tool/interim message alone does not. A mounted typed final additionally requires completed:true, phase:final_answer and turn.status:complete. Newer unfinished public answers supersede older finals, while trailing analysis scratch does not hide a completed final. Goal completion itself is never inferred.
 
-Every five seconds, one non-overlapping scheduler pass selects due nonempty goals, ordered by next check and Session id. It handles them sequentially through the shared page; ordinary MCP tool execution remains concurrent. A match, any due send and timer reset are consecutive operations in that pass. Once submission is confirmed, the page is available for the next goal immediately; the scheduler never waits for the assistant's resulting answer. Maintenance defers work. New Tool Call arrivals/completions move the deadline, but the continued existence of an older call does not. A future inactivity deadline is saved and checked later without opening the browser. Browser work, discovery and other earlier due goals can delay a send beyond the nominal timeout.
+The first observed running snapshot has no proven last-change time, so it establishes one conservative baseline interval. Subsequent identical observations do not extend it. The same non-overlapping five-second scheduler observes the already-open shared tab without navigating solely for observation. Other conversations are inspected when visited for matching/delivery; this is observed inactivity, not a claim to continuously monitor every account chat. Restart retains persisted activity/deadlines but starts a new in-memory fingerprint baseline. A completed turn still requires an idle interval before another goal; an unchanged unfinished turn can eventually receive the goal, optionally after Stop.
 
-Example: with a 300-second goal, a tool begins at 10:00 and finishes at 10:02. The earliest send is 10:07, followed by the next eligible scheduler pass and browser checks. A confirmed send at 10:07:04 sets the next interval to 10:12:04. Any later MrMCP activity postpones it again. A response still running in the destination does not veto delivery: MrMCP attempts to submit the prompt. A draft is preserved and defers delivery. With Stop-before-send enabled, it interrupts the destination response first; otherwise it leaves the response running and uses the available submission path.
+Due goals remain sequential on the shared tab while ordinary MCP calls remain concurrent. New activity, maintenance, drafts, dialogs, lost login or changed revision defer/cancel delivery. Recheck after the sending-state database commit as well as immediately before browser side effects; a call arriving during preparation prevents dispatch and clears only the exact draft inserted by that attempt. After submission confirmation, continue to another goal without waiting for its assistant response.
+
+For a 300-second goal, a tool starting at 10:00 and completing at 10:20 cannot receive a timer-driven goal during the call. The earliest deadline is 10:25, and newly observed response progress postpones it again. A stalled response with no in-flight Tool Calls and no new observed progress can receive the prompt after the interval. Browser waits, discovery and earlier goals can delay delivery beyond that deadline.
 
 #### Exact send sequence and cancellation
 
 1. Check the current shared page for a draft, dialog or login flow before changing it. An existing draft still prevents navigation to protect its contents; an assistant response in another conversation does not.
-2. Navigate to the associated conversation, or reuse it if already loaded. A response in progress is allowed. If Stop-before-send is enabled, recheck the goal revision, inactivity deadline and maintenance state, then click the unique enabled `[data-testid="stop-button"]` control only when response markers are present. Poll at 100 ms intervals for up to five seconds (plus CDP latency) until those markers clear and the composer is ready. Recheck cancellation/activity throughout; missing, ambiguous or disabled Stop, a changed conversation, or failure to become ready produces an error instead of pretending that interruption succeeded. If no response is active, this is a no-op. Then require a usable composer, the exact conversation path, an empty draft and an identifiable existing user message, and focus the editor.
+2. Navigate to the associated conversation, or reuse it if already loaded. A response in progress is allowed. If Stop-before-send is enabled, recheck the goal revision, inactivity deadline and maintenance state, then click the unique enabled machine-marked Stop control (`stop-button` or `composer-stop-button`) only when response markers are present. Poll at 100 ms intervals for up to five seconds (plus CDP latency) until those markers clear and the composer is ready. Recheck cancellation/activity throughout; missing, ambiguous or disabled Stop, a changed conversation, or failure to become ready produces an error instead of pretending that interruption succeeded. If no response is active, this is a no-op. Then require a usable composer, the exact conversation path, an empty draft and an identifiable existing user message, and focus the editor.
 3. Re-read the goal revision/activity, check maintenance, and confirm the deadline is still due. Related Tool Call arrivals/completions are already reflected in that deadline.
 4. Insert the exact saved text with CDP `Input.insertText`, then repeat the revision/activity/maintenance checks.
 5. Persist `sending` before dispatch. Re-resolve the page and require the exact URL, unchanged inserted text and a structurally valid composer. Activate the unique available submit control with DOM `.click()`. While a response is active and no submit control exists, use the native `HTMLFormElement.requestSubmit()` path only for a single-editor form; Stop controls are excluded from submit selection. This lets the website accept/queue the prompt according to its own behavior. Never click Stop implicitly when the option is off. When it is on, renewed response activity blocks dispatch because the requested interruption no longer holds. No clipboard operation or simulated Enter is used.
-6. Check up to 40 times, sleeping 250 ms between checks, for an empty composer and a new rendered user message whose id was absent before sending and whose text exactly equals the goal. CDP execution time adds to this roughly ten-second observation window. Confirmation saves `goal_last_sent_at`, returns to `ready` and starts another full interval; the scheduler immediately continues to the next goal even if ChatGPT has started responding to the message.
+6. Check up to 40 times, sleeping 250 ms between checks, for an empty composer and a new user message whose id was absent before sending and whose text exactly equals the goal. Use either rendered message markers or the exact mounted React model receipt; no unrelated user text is exported by the model reader. CDP execution time adds to this roughly ten-second observation window. Confirmation saves `goal_last_sent_at`, returns to `ready` and starts another full interval; the scheduler immediately continues to the next goal even if ChatGPT has started responding to the message.
 
 Attempting submission during a response does not guarantee that a particular ChatGPT UI version accepts or immediately renders it; disabled/ambiguous controls remain errors, and a dispatched form submission that produces no observable acknowledgement follows the same uncertain-delivery rule. Confirmation is an observation of ChatGPT's rendered UI, not an independent server delivery receipt. If dispatch may have happened but confirmation is missing, the state becomes `delivery_uncertain` and there is no automatic retry. Restart converts a saved `sending` state to `delivery_uncertain`. Inspect the conversation and explicitly set the goal again to rearm it.
 
@@ -265,28 +234,29 @@ Replacing/clearing a goal, disabling management, Session deletion/expiry and new
 | `pending` | An explicit set or opted-in startup has queued one matching attempt which has not started yet. |
 | `matching` | That attempt is in progress; it has already been consumed persistently, so a crash cannot repeat it. |
 | `ready` | Associated and scheduled. Login/composer checks still happen at delivery time. |
-| `waiting_login` | Login setup is missing or a logout was detected. Use **Settings → Goals → Login ChatGPT** and sign in; recognition is automatic. No background browser work resumes before recognition. Then call `chat_set_goal` again for an unassociated Session; eligible linked goals resume when the user enable switch is on. |
+| `waiting_login` | The site requires sign-in. Sign in normally in system Chrome and retry chat_set_goal or a debug action. This goal remains suspended until that explicit retry. |
+| `waiting_browser` | CDP Ext ID is not configured. Install the extension, save its ID in Settings → Goals and repeat the set. |
 | `not_found` | No exact Session match in the bounded recent candidates. Ensure the correct account/chat and a visible MrMCP tool call, then call `chat_set_goal` again. No automatic discovery retry. |
-| `busy` | Discovery was interrupted by maintenance or exhausted its soft time budget. Call `chat_set_goal` again to request another matching attempt. An assistant response alone no longer puts a goal into this deferred state. |
+| `busy` | An associated chat still has in-flight Tool Calls; the scheduler waits for completion and a fresh full timeout. For an unassociated chat it can also mean discovery was interrupted or exhausted its budget; call `chat_set_goal` again to request another match. |
 | `draft_present` | The shared page contains text that MrMCP will not overwrite. Send or remove that draft manually. An unassociated goal needs another `chat_set_goal` call to retry matching. |
 | `error` | Browser, navigation, unsupported page structure or pre-dispatch failure. Read the bounded detail in Sessions. Before association, another explicit set is required; after association, normal delivery retry applies. Internal DOM `not_ready` is projected as `error`. |
 | `sending` | Dispatch has been prepared and acknowledgement is being observed. |
 | `delivery_uncertain` | Dispatch outcome could not be confirmed, or restart interrupted sending. Automatic sends are suspended; inspect and explicitly rearm. |
 | `expired` | Session exceeded its 30-day inactivity lifetime. Automatic goal messages do not extend that lifetime. Use an active Session. |
 
-For already-associated goals, normal stored delivery deferrals/errors schedule another check 60 seconds later, subject to the global enable switch and login readiness. Unassociated matching attempts never use that automatic retry; their result has `next_check_at:null` and a detail asking for another `chat_set_goal` call. An opted-in future startup can also queue one new attempt. A scheduler pass skipped solely because of maintenance or an existing scheduler task uses the next available tick instead. **Sessions** shows the goal preview, interval, status/detail, conversation id, next check and last confirmed send. **Stop goal** clears it immediately. **Login settings** opens the Goals tab, whose single **Login ChatGPT** button initializes or repairs the dedicated login. Neither action retries a missing match or forces a send. Explicit login setup is also available while global management is off.
+For already-associated goals, normal stored delivery deferrals/errors schedule another check 60 seconds later, subject to the global enable switch and extension configuration. Unassociated matching attempts never use that automatic retry; their result has `next_check_at:null` and a detail asking for another `chat_set_goal` call. An opted-in future startup can also queue one new attempt. A scheduler pass skipped solely because of maintenance or an existing scheduler task uses the next available tick instead. **Sessions** shows the goal preview, interval, status/detail, conversation id, next check and last confirmed send. **Stop goal** clears it immediately. **Goal settings** opens the Goals tab and its CDP Ext setup instructions. Opening Settings does not connect, retry a match or send a message.
 
 #### Persistence, bounds and interface compatibility
 
-Persistent Session fields are `chatgpt_chat_id`, `goal_text`, `goal_timeout_seconds`, `goal_revision`, `goal_updated_at`, `goal_activity_at`, `goal_status`, `goal_next_check_at`, `goal_last_sent_at` and `goal_error` (bounded to 500 characters), alongside ordinary Session activity. They survive restart and **Clear Operational Data**, independently of Tool Call Disk/Memory and Payload/Metadata policies. Clearing/deleting Sessions removes their goals. Closing/stopping MrMCP stops monitoring; its detached Chrome process/profile can remain. Restart resumes eligible overdue deliveries only with global management enabled and login readiness retained. Missing matching requests, including never-started ones, remain stopped unless the startup matching option is also enabled. In that case it queues one attempt per eligible goal, without resetting the delivery interval or explicit-set timestamp. Matching uses the existing status/next-check/revision fields; no new schema column is needed.
+Persistent Session fields are `chatgpt_chat_id`, `goal_text`, `goal_timeout_seconds`, `goal_revision`, `goal_updated_at`, `goal_activity_at`, `goal_status`, `goal_next_check_at`, `goal_last_sent_at` and `goal_error` (bounded to 500 characters), alongside ordinary Session activity. They survive restart and **Clear Operational Data**, independently of Tool Call Disk/Memory and Payload/Metadata policies. Clearing/deleting Sessions removes their goals. Closing/stopping MrMCP stops monitoring; the user's Chrome and tabs remain open. Restart resumes eligible overdue deliveries only with global management enabled and CDP Ext configured. Missing matching requests, including never-started ones, remain stopped unless the startup matching option is also enabled. In that case it queues one attempt per eligible goal, without resetting the delivery interval or explicit-set timestamp. Matching uses the existing status/next-check/revision fields; no new schema column is needed.
 
-Captured lists/history summaries are memory-only: at most 200 recent ids, 20 history summaries, 100 tracked response requests/epochs each, and 8 concurrent body reads. The monitor rejects bodies above 8 MiB encoded transfer size or 12 MiB returned string length; branch traversal is capped at 20,000 nodes and 100 distinct Session handles. Full history bodies are not stored in the database or exposed as goal Tool Call results. Internal goal CDP responses do not enter the public response ring; an explicitly configured general CDP notification subscription on this browser still follows the normal CDP subscription contract.
+React inspection retains no Fiber, query client or history across observations. Bounds are 32 DOM anchors, root depth 2048, 8192 child-list steps per path, 4096 queries per client, 4096 live hook/memo inspection steps and 20,000 active-branch nodes. Request JSON is limited to 1 MiB per request / 8 MiB aggregate. The backend keeps at most 100 conversation fingerprints with state/observed-change time, never text or argument payloads. No history body is persisted or returned by goal tools.
 
-Connection/goal RPC waits are bounded (15 seconds; target acquisition 20 seconds). Navigation readiness is polled for 15 seconds; discovery waits up to 2 seconds for a recent-list capture and up to 3 seconds per candidate history. Candidate discovery uses a 90-second soft deadline checked between operations, not a hard whole-task limit: an already-awaited browser operation can extend it.
+RPC waits are bounded at 15 seconds and target acquisition at 20 seconds. Navigation checks run for up to 15 seconds; each candidate waits at most 3 seconds for a mounted model. Discovery retains its 90-second soft budget checked between operations. A timed-out optional observation cannot prevent the scheduler from processing all other due goals. The first running observation is intentionally conservative because the page cannot prove how long an unobserved chat was already stalled.
 
 DOM identification uses machine attributes and native HTML/ARIA structure: unique editors, form-owned submit controls (including external `form=` controls), canonical conversation links, `aria-controls`/`aria-expanded` and `details`/`summary`. It never selects controls by translated labels, accessible-name wording, generated CSS classes or icon shapes. Login and ongoing-response recognition also use structural/machine markers. It refuses ambiguous editors/submits, dialogs, unavailable controls or missing message identity. This tolerates locale changes and some layout changes, but endpoint/payload contracts, machine attributes and form structure can change; the adapter reports failure/deferral instead of guaranteeing compatibility with every future website version.
 
-Implementation entry points in `mrmcp.js`: `setChatGoal` / `chatGoalView` (contract), `recoverChatGoals` / `chatGoalConfigure` / `chatGoalTick` / `chatGoalRun` (recovery and scheduling), `noteChatGoalActivity` / `chatGoalDue` (activity), `chatGoalPage` / `chatGoalMonitor` / `chatGoalHistorySessions` / `chatGoalFindChat` / `chatGoalBind` (browser and association), and `chatGoalDom` / `chatGoalSend` (submission).
+Implementation entry points in `mrmcp.js`: `setChatGoal` / `chatGoalView` (contract), `recoverChatGoals` / `chatGoalConfigure` / `chatGoalTick` / `chatGoalRun` (recovery and scheduling), `noteChatGoalActivity` / `chatGoalDue` / `chatGoalActiveCalls` / `chatGoalObserveTurn` (activity), `chatGoalPage` / `chatGoalReact` / `chatGoalReadReact` / `chatGoalFindChat` / `chatGoalBind` (browser and association), and `chatGoalDom` / `chatGoalSend` (submission).
 
 ### `chat_goal_debug`
 
@@ -298,9 +268,11 @@ User-requested diagnostics and manual actions for the current `chat_session`; no
 | `action` | `status` (default), `match`, or `send`. |
 | `stop_before_send` | Optional boolean for `send` only, overriding the global Stop option for this attempt without changing Settings. |
 
-`status` reads saved association, goal, deadline, login readiness and enablement without opening Chrome. `match` immediately performs one normal exact-Session matching scan, including rechecking a stored association; it sends no prompt and retains the old id if rechecking fails. A successful match uses the normal newest-goal ownership rule. `send` submits the saved nonempty goal to the already-associated chat immediately, bypassing the inactivity deadline. It uses the same shared tab/pass lock and the same Stop, draft, maintenance, revision, activity and acknowledgement checks as timed delivery. New Tool Call activity during the attempt still cancels pre-dispatch work. Confirmation resets the ordinary inactivity interval. Global disable, missing login, a missing goal/association or a previous `sending`/`delivery_uncertain` state defers the action; inspect and rearm uncertain delivery through `chat_set_goal` first. These calls themselves count as normal MrMCP activity.
+`status` reads saved association, goal, deadline, extension configuration/connection and enablement without connecting to Chrome. `match` immediately performs one normal exact-Session matching scan, including rechecking a stored association; it sends no prompt and retains the old id if rechecking fails. A successful match uses the normal newest-goal ownership rule. `send` submits the saved nonempty goal to the already-associated chat immediately, bypassing the inactivity deadline. It uses the same shared tab/pass lock and the same Stop, draft, maintenance, revision, activity and acknowledgement checks as timed delivery. New Tool Call activity during the attempt still cancels pre-dispatch work. Confirmation resets the ordinary inactivity interval. Global disable, a missing goal/association or a previous `sending`/`delivery_uncertain` state defers the action; inspect and rearm uncertain delivery through `chat_set_goal` first. These calls themselves count as normal MrMCP activity.
 
-The result contains the usual goal fields plus `action`, `operation_status` (`inspected|deferred|matched|not_found|sent|failed`), `operation_detail`, `enabled`, `login_ready`, `login_status`, `chat_session_matched`, `scheduler_busy` and `due_at` (Unix milliseconds or null). `chat_session_matched` reports whether an association is stored; only `operation_status:matched` confirms this scan, and only `operation_status:sent` confirms this submission. No arbitrary prompt, account id or conversation-id override is accepted.
+For status inspection, operation_detail also reports linked in-flight Tool Calls or the last observed turn state and seconds since observed progress. Manual send excludes only its own diagnostic Tool Call from the in-flight guard.
+
+The result contains the usual goal fields plus `action`, `operation_status` (`inspected|deferred|matched|not_found|sent|failed`), `operation_detail`, `enabled`, `browser_configured`, `browser_connected`, `chat_session_matched`, `scheduler_busy` and `due_at` (Unix milliseconds or null). `chat_session_matched` reports whether an association is stored; only `operation_status:matched` confirms this scan, and only `operation_status:sent` confirms this submission. No arbitrary prompt or conversation-id override is accepted by debug; set chatgpt_chat_id through chat_set_goal. browser_configured is true for automatic reverse discovery, independently of browser_connected and site login.
 
 Examples using the actual capability:
 
@@ -318,7 +290,93 @@ Creates one new persistent chat Session without opening or creating a Workspace.
 
 Arguments: none. Returns `chat_session`; call once per chat and reuse a valid existing value instead of initializing again. Sessions expire after 30 days without activity. Initialization and its Tool Call history are associated with the new Session.
 
-`document_grep` and `source_code_search` use the configured fallback source folder when no Workspace is selected. Workspace-dependent file operations, `workspace_dev_preferences_write`, new `exec`/`exec_start` or custom commands and JavaScript kernels require `open_workspace` first. Existing process follow-ups remain scoped to the same Session and work after Workspace removal. Desktop/CDP, discovery, diagnostics, memory, Telegram, OpenRouter and `publish(text|base64)` require only the Session; `publish(path)` requires a Workspace.
+ Workspace-dependent file operations, `workspace_dev_preferences_write`, new `exec`/`exec_start` or custom commands and JavaScript kernels require `open_workspace` first. Existing process follow-ups remain scoped to the same Session and work after Workspace removal. Desktop/CDP, discovery, diagnostics, memory, Telegram, OpenRouter and `publish(text|base64)` require only the Session; `publish(path)` requires a Workspace.
+
+### `subagents`
+
+Persistent ChatGPT workers inspired by [Chat On Steroids](https://github.com/totec448-spec/chat-on-steroids).
+One authenticated tool with the ordinary required chat_session capability; no Workspace is required.
+This is an application feature using the operator's ChatGPT account and CDP Ext, not a model API or
+an additional OS process. No extra quota, model access, worktree, software installation or filesystem
+isolation is created. Workers share the parent's selected Workspace and must coordinate edits.
+
+Setup uses **Settings → Goals**, shared with Goals: install CDP Ext in system Chrome and sign in normally.
+CDP.js 0.5.0 opens or reuses the system browser through URL bootstrap; no extension ID is entered.
+Also save the MrMCP ChatGPT app ID (asdk_app_…)
+from that installed app's Settings → Apps page URL, and its exact display name (default MrMCP).
+Workers attach that app using the native editor app-mention token, adapted minimally from the MIT
+Chat On Steroids chatgpt-dom.js implementation. If the token is unavailable, removed or changes the
+authored task, refuse Send and report the error. The configured app must already be connected and
+authorized in ChatGPT; this does not install/authorize an app or answer approval dialogs.
+
+The Goals enable flag controls Goals alone. Subagents operate independently through the same browser
+label mrmcp-goals, using targets subagent-<opaque agent id> in the native cyan **MrMCP Subagents** group.
+Goals keep their purple group. Each target has its own namespaced extension session-storage tab-ID
+marker, preventing adoption of recycled personal tab IDs. Browser bootstrap may open Chrome; no
+managed profile is created or edited.
+Tabs are acquired for requested work/resume; passive inspection does not connect or create targets.
+
+| Action | Inputs and behavior |
+| --- | --- |
+| spawn | workers[1–8] with task (1–8000 chars), optional label (80) and explicit requested model route id; optional shared context (8000). Atomically reserve up to eight active workers per parent Session, then open independent fresh chats asynchronously. Return a queued snapshot without waiting for worker completion. No parent conversation history is implicitly copied. |
+| join | Worker first calls init_chat_session, then joins with agent_id and the one-use claim_token from its private bootstrap. Parent and child use distinct persistent Session capabilities. The claim is not in public worker metadata. Join inherits the selected Workspace; the worker may open_workspace with its returned name to read cwd/guidance. Nested worker spawning is rejected. |
+| message | Parent supplies agent_id and text (16000 chars); queue it durably for that worker. A completed worker is reused with its chat/context. Running turns and in-flight worker Tool Calls finish before queued text is sent. A joined worker omits agent_id (or selects itself) to report text to its parent through the broker. Reports are collected by tools, never automatically pasted into a parent chat. |
+| status | Read only the caller's owned workers or the joined worker's own record, with optional agent_id/state/query, limit 1–50 (20), page (1) and after_message_id (0). It opens no tab and returns up to 50 ordered messages with a continuation id. Advance the cursor to avoid rereading old reports. |
+| wait | Optional agent_id and after_message_id, timeout_ms 0–60000 (30000). Wait asynchronously for a broker change, cancellation or timeout, then return a scoped current snapshot. Other Tool Calls remain concurrent. It never keeps a database transaction open while waiting. |
+| finish | Joined worker only; result (32000 chars) records its factual handoff. An exact repeated completed result is idempotent. If parent messages are already queued, they remain runnable. A complete public final answer can also settle the worker when no Tool Call is in flight; reasoning/tool/interim content never becomes the result. |
+| stop | Parent-only agent_id: invalidate work, cancel pending/uncertain messages, request cancellation of in-flight child Tool Calls and click the proven browser Stop when connected. Leave tabs and prior results open/intact. Browser Stop failure is visible; local stopped status does not prove the provider stopped. Already-detached processes are independent and remain visible separately. |
+| resume | Parent-only agent_id, after inspecting paused/error/stopped state. Reuse its chat or an unstarted queued bootstrap. Admission still respects eight active workers. A removed/expired joined child Session requires a new worker; prior history remains available. delivery_uncertain cannot be resumed/replayed: inspect it, stop its pending work explicitly, then decide what new work to send. |
+
+Each reply has action, status (accepted/joined/updated/snapshot/timeout), agents, messages, total, page,
+returned and next_after_message_id, plus the common chat_session. Each worker includes opaque id,
+label/task/shared context, state, numeric parent/child Session IDs, Workspace id/name, chat id/link,
+logical target, model_requested/model_observed, created/updated/start/completion/activity/check times,
+bounded error, latest result, message/pending/in-flight Tool Call and active-process counts.
+Unavailable identifiers/times/results are null. Model request is intent; only model evidence from
+the mounted response is observed. Tokens, cost and reasoning effort are not invented.
+
+Messages contain increasing numeric id, agent_id, kind (bootstrap/message/report/result), text,
+delivery state (queued/sending/delivered/uncertain/cancelled), created_at and nullable delivered_at.
+The bootstrap record has empty text: its task/context are on the worker, and its private claim is
+generated only for that worker's prompt. Queue capacity is 50 per worker; overflow refuses, never
+drops an older message. Authenticated parent/child Session capabilities select the family; neither
+agent names, OAuth client identity nor transport headers grant access to somebody else's workers.
+
+Native submission preserves drafts/dialogs, requires a fresh blank chat or the exact associated chat,
+checks revision around every awaited preparation step and the durable sending commit, and confirms
+a new exact user-message receipt before marking delivered. App mentions are excluded structurally
+from authored text; rich-text paragraph wrappers preserve logical newlines. Pre-dispatch cancellation
+can remove only the exact draft inserted by that attempt. Uncertain delivery is suspended without
+automatic retry. App/site changes can require an adapter update; synthetic tests cannot establish
+compatibility with a real authenticated account.
+
+Five-second worker checks are independent per worker and use existing open targets. They observe
+bounded React progress/completion/public final text, never Network/WebSocket history capture.
+The last public final is limited to 32000 characters, with a visible truncation marker. A missing
+connection/changed identity pauses the worker; background observation never recreates a closed tab.
+Long child Tool Calls veto automatic messages and page-final completion. Parent expiry pauses work.
+
+Turso tables subagents and subagent_messages are distinct functional stores, created directly under
+current schema 6; no migration/ALTER or alternative version mechanism is added. They survive restart
+and Clear Operational Data independently of log storage/payload retention. Restart pauses active
+workers; interrupted starting/sending work becomes delivery_uncertain. Explicit resume is required.
+Deleting the parent Session removes its workers/reports after stopping them; deleting a child stops
+that worker and removes its child binding. No other Session capability is returned to a caller.
+Shutdown stops timers, wakes waits and disconnects CDP without closing the system browser/tabs.
+
+The **Subagents** GUI lists workers with Session (parent or child), state and text filters, pagination,
+task preview, activity/silence, observed model, in-flight Tool Calls and detached-process counts.
+Details show complete task/context, requested/observed model, timestamps, result, error and paginated
+message/report history. Queue message, Stop, Resume and chat opening are explicit native actions;
+message drafts remain backend-owned React state. Opening the page never starts/resumes a worker.
+
+Example (use the actual capability):
+
+```json
+{"chat_session":"ctx_…","action":"spawn","context":"Review only; coordinate shared files.","workers":[{"label":"Tests","task":"Run the existing checks and report failures."},{"label":"Review","task":"Review concurrency and report concrete defects."}]}
+{"chat_session":"ctx_…","action":"wait","timeout_ms":30000}
+{"chat_session":"ctx_…","action":"message","agent_id":"agent_…","text":"Check the shutdown path too."}
+```
 
 ### `list_workspaces`
 
@@ -584,7 +642,7 @@ Arguments:
 - at least one of `paths` or `selection` is required.
 - `chat_session`.
 
-Nested selected targets collapse under their selected parent. Before payload moves, MrMCP records one SQLite transaction row plus per-item original path, type and cached byte size for non-directory payloads; directory size remains unknown rather than recursively pre-scanning the tree. Successful payloads are stored under one `trash_id`; failures do not roll successful entries back. A failed move with no retained payload removes that item metadata, while `failed_partial` keeps its row so the partial payload remains inspectable. If no tracked item remains, the result has `trash_id: null` and no empty transaction is kept.
+Nested selected targets collapse under their selected parent. Before payload moves, MrMCP records one Turso transaction row plus per-item original path, type and cached byte size for non-directory payloads; directory size remains unknown rather than recursively pre-scanning the tree. Successful payloads are stored under one `trash_id`; failures do not roll successful entries back. A failed move with no retained payload removes that item metadata, while `failed_partial` keeps its row so the partial payload remains inspectable. If no tracked item remains, the result has `trash_id: null` and no empty transaction is kept.
 
 Returns `trash_id`, the physical trash directory path, `succeeded`, `failed` and per-path statuses.
 
@@ -601,7 +659,7 @@ Arguments:
 
 Each payload is restored independently. Occupied destinations, missing parents, wrong-Workspace paths and unavailable payloads are reported per entry. Successful restores remain restored and delete their item metadata; failed or physically missing tracked items remain visible for retry/cleanup. The trash transaction is deleted only when no tracked item metadata remains.
 
-The desktop **Trash** section is an operator view over authoritative SQLite Trash metadata plus live payload presence, not over Tool Call history. Its sidebar badge counts tracked DB items without scanning the filesystem. Each item shows cached original path/type/size together with a live Present/Missing disk state; externally missing payloads remain visible in metadata until explicitly removed. Restore acts only on present payloads and never overwrites an occupied destination; permanent delete removes a present payload when available and always removes its DB metadata. Empty Trash clears both the global payload store and Trash metadata.
+The desktop **Trash** section is an operator view over authoritative Turso Trash metadata plus live payload presence, not over Tool Call history. Its sidebar badge counts tracked DB items without scanning the filesystem. Each item shows cached original path/type/size together with a live Present/Missing disk state; externally missing payloads remain visible in metadata until explicitly removed. Restore acts only on present payloads and never overwrites an occupied destination; permanent delete removes a present payload when available and always removes its DB metadata. Empty Trash clears both the global payload store and Trash metadata.
 
 ---
 
@@ -658,8 +716,15 @@ Advanced browser options are shared by `cdp_call`, `cdp_subs` and `cdp_poll`:
 - `headless` — boolean; defaults to `false` for a new configuration. `true` launches Chrome with `--headless=new`.
 - `executable_path` — path to a Chromium executable. Empty restores automatic discovery, including `MRMCP_CDP_BROWSER` and the library’s `CDP_BROWSER` fallback.
 - `images` — boolean, default true. Set false to disable page image loading through cdp.js. Local launch only; screenshots remain available. Raw `args` can override the generated `blink-settings` switch.
-- `user_data_dir` — profile directory. Empty restores `.mrmcp/cdp/<name>/`. Relative executable/profile paths resolve against the MrMCP application directory.
-- `args` — up to 100 additional verbatim arguments. A matching `--switch` replaces the built-in value of that switch. An empty array clears extra arguments. The `headless`, `user-data-dir` and `remote-debugging-*` transport switches are managed by MrMCP and cannot be overridden through this array; the argv terminator `--` is also rejected.
+- `user_data_dir` — profile directory. Empty restores `.mrmcp/cdp/<name>/`; omitted with cdp_ext or explicit null selects Chromium's system profile. Relative executable/profile paths resolve against the application directory. Modern Chrome requires a separate profile for ordinary debugging-port launches. System-profile preference files are never written.
+- `args` — up to 100 verbatim arguments, or the public cdp.js switch object. A matching switch replaces its generated default; object `false`/`null` removes a flag, `true` emits a flag, strings/numbers emit `--key=value`, arrays become comma-separated. Keys omit `--`. Empty clears overrides. `headless`, `user-data-dir`, `remote-debugging-*` and the argv terminator remain managed. Extension launches require named switches rather than positional arguments.
+- `reverse` — passive attachment to an already installed bridge, opening no URL and changing no profile. Supply extension_id from chrome://extensions, or use that native ID as the browser name. The initial manifest endpoint must reach the shared listener. Prefer cdp_ext for automatic system-browser bootstrap.
+- `cdp_ext` — public token-bound URL bootstrap. Defaults to the system profile and an extension installed by the user; opens/reuses Chrome without a debugging port or manually entered extension ID/endpoint. The bootstrap tab remains open. With an explicit custom user_data_dir, extension installation defaults on. Reload the extension after upgrades.
+- `cdp_ext_install` — only for cdp_ext=true; default false for the system profile, true for a custom directory. False uses the already-installed extension and skips the automation launch preset. True prepares/loads an extension copy and owns the launched process. It cannot install into an already running Chrome through forwarded flags; user/agent must explicitly choose that setup.
+- `translations` / `login` — browser translation and browser-account/sync integration flags. Default true for the external opener, false for managed launches. Website sign-in is independent. Existing Chrome does not apply newly forwarded flags.
+- `extension_id` — native identity only for passive reverse attachment, optional if the browser name is that ID. cdp_ext observes it automatically. Bootstrapped profiles with distinct logical names may share an extension directory/native ID; one profile has one active logical connection.
+- `extensions` — managed launch only: boolean or unpacked-directory array; `true` keeps profile extensions, an array selects local directories and `'*'` includes enabled profile extensions. Relative paths resolve against the application directory. `false` is the default.
+- `update_preferences` — managed launch only: `false` skips profile preference writes. External reverse attachment always leaves profile files untouched.
 - `websocket_url` — direct browser-level `ws://` or `wss://` endpoint, without URL credentials or a fragment. A nonempty endpoint cannot be combined with local launch options in the same object. Empty clears the endpoint and returns the name to managed local mode. Direct connections report `port:null` and `user_data_dir:null`, create no local profile directory and never fall back to launching Chrome when connection fails.
 
 - `port` — integer 1–65535 for attachment to an already-running browser; no automatic launch. `null` returns to managed local mode. This mode reports the explicit port and `user_data_dir:null`.
@@ -668,7 +733,13 @@ Advanced browser options are shared by `cdp_call`, `cdp_subs` and `cdp_poll`:
 - `request_timeout_ms` — 100–86400000, default 30000; bounds each individual CDP command and page setup step. Raise it for long `Runtime.evaluate` promises or XPath retries. Timeout does not cancel execution in Chrome; a late actual response can still appear in `cdp_poll` while the connection remains open.
 - `connect_timeout_ms` — 100–60000, default 15000; bounds each discovery, WebSocket handshake/setup phase and local launch readiness.
 
-Choose only one endpoint selector (`port`, `http_url`, `websocket_url`) per object. An explicit selector replaces any prior endpoint for that name. All attachment modes create no local profile/process, reject explicit local launch options and fail without local fallback.
+Choose one transport (`reverse`, `cdp_ext`, `port`, `http_url`, `websocket_url`). An explicit selector replaces the previous selection for that name; false/empty/null clears it. External attachment modes create no local profile/process, reject explicit launch options and fail without local fallback. Browser shutdown closes sockets and the shared extension listener, retaining launched browsers. A dropped extension connection does not prove Chrome exited: reuse its manager/process and wait for reconnection, never automatically spawn another browser while that child is alive.
+
+The tool supports all modes; agent and user choose the appropriate one. Direct CDP has its ordinary protocol coverage. Extension mode uses Chrome's restricted `chrome.debugger` domains: Runtime/Page/Network/DOM/Input/Emulation are available, ServiceWorker/BackgroundService are unsupported and their optional setup errors remain visible. Browser-level Target commands are limited; `create_params` accepts only `url`/`background`. Opening DevTools can detach the bridge. Unknown/unsupported operations return the original upstream errors. This requires an extension-capable public cdp.js npm release; an older installed package returns a clear unsupported-release error before launching or creating a listener.
+
+Extension connections also accept `chrome.<namespace>.<method>` with positional `params.args` and optional `params.callback:true`. Example: `chrome.tabs.query` with `args:[{}]`. Native JSON results are preserved in `cdp.result`. The logical target does not supply an implicit tab ID to these APIs: use native tab IDs inside `args`. There is no generic remote Chrome event registration. CDP.js 0.5.0 also forwards chrome.webRequest.* request lifecycle notifications independently of debugger attachment and target.network. They include native request metadata/headers, without response bodies or WebSocket frames. Existing cdp_subs/cdp_poll method/target filters and bounded rings apply; requests with tabId=-1 have no target. Goals/Subagents do not use this stream for matching or retain it implicitly.
+
+Typical system-browser request inside calls[]: {"browser":{"name":"personal","cdp_ext":true},"call":{"method":"chrome.tabs.query","params":{"args":[{}]}}}. Install CDP Ext manually using the [CDP.js instructions](https://github.com/mefistofelix/cdp.js#reverse-chrome-extension-transport); reload it after updates. Explicit managed setup: {"browser":{"name":"bridge","cdp_ext":true,"user_data_dir":"profiles/bridge","cdp_ext_install":true},"target":"page","call":{"method":"Runtime.evaluate","params":{"expression":"document.title","returnByValue":true}}}. Passive attachment remains available with reverse=true and extension_id. A profile already connected to another name/manager rejects rebinding until disconnected.
 
 Explicit fields update the name's configuration **only in memory for the current server run**; omitted fields retain their values. Subsequent calls may use just the name string. Reapply advanced options after restarting MrMCP: they are not persisted as browser configuration or restored from Tool Call history. Canonical request packets may still retain the supplied arguments for diagnostics and explicit Replay. Local launch options are used when a process must be started; reconnecting checks the profile and headless setting when Chromium exposes its command line. A connected or connecting name rejects different options, and a known local browser that is still running must be closed before changing its launch configuration. No option change automatically restarts a browser. Set the configuration on the first use of a name, or repeat the same object in concurrent calls.
 
@@ -680,7 +751,10 @@ Port example: `{"browser":{"name":"existing","port":9222},"call":{"method":"Brow
 
 Advanced target options apply only to `cdp_call.target`; subscription/poll target filters remain name strings:
 
+- `target_id` — bind the logical label to an existing page instead of creating one. Use the ID from `Target.getTargets`; extension mode also accepts the stringified tab ID from `chrome.tabs.query`. Example: `{"name":"existing","target_id":"123"}`. A live logical label cannot be rebound; choose another label or close it. The normal missing-page recreation policy still applies after that page disappears.
+
 - `name` — required logical page label, 1–128 characters.
+- `group` — reverse/extension-only false, a logical group name, or an object with required name and optional Chrome color (grey, blue, red, yellow, green, pink, purple, cyan, orange). Configure on first use. CDP.js groups targets natively, scoped to browser/window; direct CDP rejects grouping.
 - `create_params` — native [Target.createTarget parameters](https://chromedevtools.github.io/devtools-protocol/tot/Target/#method-createTarget), merged over `{url:"about:blank",background:true}`. For example `url`, `background`, `newWindow`, `width`, `height`, `browserContextId` or `hidden`. Chrome validates supported parameters/combinations; `forTab:true` is rejected because logical targets route to pages. Applied only when creating/recreating a page; existing pages are not navigated or resized. Supplying a new object replaces the saved create_params object.
 - `initialize` — default true; false skips all optional setup below. The debugger pause is always released.
 - `runtime` — default `"bootstrap"` enables Runtime during setup then disables reporting before resume; true leaves reporting enabled; false sends neither enable nor disable. JavaScript execution and explicit `Runtime.evaluate` remain available.
@@ -727,7 +801,7 @@ Each browser has one shared ring rather than one copy per subscription. It is ca
 
 ## Memory
 
-MrMCP exposes one small explicit persistent key-value memory surface: `memory_find` and `memory_set`. There is deliberately no separate `memory_get`; exact lookup is `memory_find` with `key`. Values are explicitly either validated JSON text or ordinary text and are stored in SQLite, not in hidden model state.
+MrMCP exposes one small explicit persistent key-value memory surface: `memory_find` and `memory_set`. There is deliberately no separate `memory_get`; exact lookup is `memory_find` with `key`. Values are explicitly either validated JSON text or ordinary text and are stored in Turso, not in hidden model state.
 
 `memory_set` explicitly chooses one scope. `memory_find` can choose one scope, a unique array of scopes, or `"*"` for Global + current Session + all Workspaces:
 
@@ -771,7 +845,7 @@ Arguments:
 
 Replacing a key creates a fresh row identity and `set_at`; TTL is therefore restarted from the replacement time. Deleting a Session or Workspace also removes memories owned by it; Global memory is independent of both. **Clear Operational Data intentionally preserves Memory**, just as it preserves Sessions, Workspaces and CDP browser/profile state.
 
-The desktop **Memory** page is a lazy administrative view over the same table. It filters by scope, Session, Workspace, set-date range and text, paginates results, labels JSON/TEXT, displays TTL/expiry, and supports creating Global entries or entries for an explicitly selected existing Session/Workspace, inspecting/editing the complete value/type/key/TTL, and confirmed deletion. GUI creation rejects an already-existing key for that owner rather than silently replacing it; use View / Edit for replacement. JSON memories use the same vendored JSONEditor tree as Tool Call JSON and support node-level editing; text memories use a plain textarea. Switching TEXT ↔ JSON preserves the current draft byte-for-byte as text; invalid JSON remains visible/editable with an error instead of being discarded. JSONEditor writes back through the normal managed form field and Deno submit path, while backend JSON validation remains authoritative.
+The desktop **Memory** page is a lazy administrative view over the same table. It filters by scope, Session, Workspace, set-date range and text, paginates results, labels JSON/TEXT, displays TTL/expiry, and supports creating Global entries or entries for an explicitly selected existing Session/Workspace, inspecting/editing the complete value/type/key/TTL, and confirmed deletion. GUI creation rejects an already-existing key for that owner rather than silently replacing it; use View / Edit for replacement. JSON memories use the native JSON tree/source editor tree as Tool Call JSON and support node-level editing; text memories use a plain textarea. Switching TEXT ↔ JSON preserves the current draft byte-for-byte as text; invalid JSON remains visible/editable with an error instead of being discarded. native JSON editor writes back through the normal managed form field and Bun submit path, while backend JSON validation remains authoritative.
 
 ---
 
@@ -805,8 +879,8 @@ The returned `uri` is the persistent HTTPS URL of the published content itself, 
 
 Tool Call history has two independent operator settings and every row exposes the policy that actually applied:
 
-- **Storage: Disk** — history lives in the main SQLite database and survives restart.
-- **Storage: Memory** — history lives in SQLite TEMP tables/FTS on the active connection and disappears on restart. It has a separate retention in minutes.
+- **Storage: Disk** — history lives in the main Turso database and survives restart.
+- **Storage: Memory** — history lives in Turso TEMP tables/FTS on the active connection and disappears on restart. It has a separate retention in minutes.
 - **Payload: Payload** — stores exactly the canonical MCP JSON-RPC request packet and canonical MCP JSON-RPC response packet once. Nested JSON/YAML/Base64/images are interpreted only while the fullscreen debugger renders the row.
 - **Payload: Metadata** — stores neither MCP packet; identity, Session/Workspace snapshot, status/timing, progress flag and bounded errors remain.
 
@@ -818,11 +892,11 @@ Storage and payload are orthogonal: `Memory + Payload`, `Disk + Metadata`, etc. 
 
 ### Platform-aware command catalog
 
-The authoritative file is root `commands.yaml`. Each entry has `logical_name`, description, optional documentation_url and shared optional path/download_url/archive_path. `platforms` maps `windows-x86_64`, `linux-x86_64`, `darwin-x86_64`, `darwin-aarch64` (also aarch64 Windows/Linux) or OS-only keys to path/download_url/archive_path overrides. Exact OS/CPU wins over an OS-only fallback. Omitted fields inherit shared values; explicit empty download_url disables download. An empty/absent platform mapping uses shared values; a nonempty mapping with no matching key marks that command unsupported. Missing download URLs permit manually installed executables; no source build/package-manager install is inferred.
+The authoritative file is root `commands.yaml`. Each entry has `logical_name`, description, optional documentation_url and shared optional path/download_url/archive_path/bundle/default_args. `platforms` maps `windows-x86_64`, `linux-x86_64`, `darwin-x86_64`, `darwin-aarch64` (also aarch64 Windows/Linux) or OS-only keys to path/download_url/archive_path/bundle/default_args overrides. Exact OS/CPU wins over an OS-only fallback. Omitted fields inherit shared values; explicit empty download_url disables download. An empty/absent platform mapping uses shared values; a nonempty mapping with no matching key marks that command unsupported. Missing download URLs permit manually installed executables; no source build/package-manager install is inferred.
 
-Discovery, logical exec resolution, GUI availability and Download/Download All use the selected current-platform variant. YAML order and every platform definition survive edits to another command. The command dialog exposes shared fields plus the complete platform YAML with inline validation. Download supports direct binaries, ZIP and TAR/TAR.GZ/TGZ/TAR.XZ; it installs only the selected regular-file payload below `.mrmcp/bin`, never an archive tree or TAR symlink. XZ decompression uses a lazy portable WASM dependency, with the same 512 MiB archive/output limit as gzip. `archive_path` selects an exact archive member; otherwise an unambiguous executable basename is required. Unix installs are chmod 0755. Existing files require the existing overwrite confirmation. Unsupported platform variants are never downloaded or executed.
+Discovery, logical exec resolution, GUI availability and Download/Download All use the selected current-platform variant. YAML order and every platform definition survive edits to another command. The command dialog exposes shared fields plus the complete platform YAML with inline validation. Download supports direct binaries, ZIP and TAR/TAR.GZ/TGZ/TAR.XZ; it installs only the selected regular-file payload below `.mrmcp/bin`, unless an explicit bundle mapping requests a complete runtime in its own subdirectory. Bundle installs preserve library files, materialize only internal TAR links as regular copies, reject traversal/unsafe links, bound expansion and replace the directory only after companion downloads pass SHA-256. They never create archive-controlled symlinks. XZ decompression uses a lazy portable WASM dependency, with the same 512 MiB archive/output limit as gzip. `archive_path` selects an exact archive member; otherwise an unambiguous executable basename is required. Unix installs are chmod 0755. Existing files require the existing overwrite confirmation. Unsupported platform variants are never downloaded or executed.
 
-The default catalog includes native `yt-dlp` variants for Windows x64, Linux x64 and both macOS CPUs. `libgen-cli` is metadata for a manually supplied Go-built binary: upstream has no published releases. Its descriptor documents the upstream Go install command; MrMCP does not install Go or compile source automatically.
+The default catalog includes native `yt-dlp`, Google Workspace `gws` and `whisper-cli`. Whisper Download also installs its shared-library bundle and multilingual `ggml-base.bin` model (~148 MB); inference is local. Its default_args prepend an absolute model path and language auto; caller arguments can override them. Windows/Linux use upstream b5454 CPU bundles; macOS uses sjoerdteunisse/OpenWhispr prebuilt CLI v1.0.0. Models are downloaded on demand and reused after hash verification, outside the executable. LibGen and Anna’s Archive are supplied by the independent MCP catalog.
 
 `camoufox` is a manual full-bundle entry: extract the upstream browser ZIP under `.mrmcp/bin/camoufox`, preserving its libraries/resources and macOS `Camoufox.app` structure. Its variants resolve `camoufox.exe` on Windows x64, `camoufox-bin` on Linux x64/arm64 and `Camoufox.app/Contents/MacOS/camoufox` on macOS x64/arm64. The release page is linked as documentation; no single-executable download is offered for this multi-file browser. Registration never downloads or launches it and does not alter the Chromium CDP integration.
 
@@ -1052,3 +1126,15 @@ Arguments:
 ## Guided prompts are not tools
 
 `guided_prompts.yaml` is exposed through MCP `prompts/list` / `prompts/get`, not `tools/list`. Guided prompts are user-controlled reusable workflows; they do not add model-controlled tool capability.
+
+## exec_mcp — separate stdio MCP catalog
+
+Requires chat_session, but no Workspace. Omit mcp and request to return enabled servers with description, availability, persistence and documentation URL. Otherwise mcp is an exact logical server name from mcp.yaml and request is an ordinary JSON-RPC request object with method and optional params/jsonrpc/id. MrMCP performs initialize/notifications/initialized itself; those methods and notification-only requests are rejected. Transport ids are unique within a shared process and restored to the caller’s id (or the outer Tool Call id if omitted). Other request fields and upstream response/result/error fields pass through. Return success=false for a JSON-RPC error or result.isError=true; retain the entire response. Timeout defaults to 60000 ms, range 1000–3600000; cancellation/disconnect/timeout closes that server and fails concurrent calls sharing it. No automatic retries or wrapper files. Progress requests forward upstream progress through the outer Tool Call. Sampling/interactive elicitation is unavailable.
+
+```json
+{"chat_session":"<handle>","mcp":"libgen-mcp","request":{"jsonrpc":"2.0","id":"catalog","method":"tools/list","params":{}}}
+```
+
+After inspecting the returned current upstream inputSchema, send tools/call with params {name, arguments}; search, get_details, download and read are currently published by libgen-mcp. Download its native binary first from MCP Servers. The authoritative mcp.yaml servers list uses logical_name, description, enabled, command-style platform/path/download/archive metadata and stdio {args, persistence, ttl_seconds, windows_hide}. Defaults: command persistence, TTL 300 seconds, hidden Windows terminal. The starter libgen-mcp v2.2.1 entry uses ttl persistence for 300 seconds and one engine for LibGen, Anna’s Archive/IPFS and open-access sources. Optional member credentials remain upstream environment variables configured through Settings → Process. Legacy libgen-cli and annas-mcp are removed from the default Commands catalog.
+
+command closes after each response; ttl reuses the server until it has no in-flight request for ttl_seconds; persistent starts on the first request and stays until MrMCP Quit. Hiding the GUI window keeps it alive. All actual processes are tracked in the Processes GUI, killed on Session deletion and closed on application shutdown. GUI/catalog edits invalidate existing instances. Pool keys include the Session, binary, argv, cwd, environment and policy. With a Workspace use its directory; otherwise use .mrmcp/mcp/files/<MCP name>/<Session id>. Launch args support ${CWD}, ${WORKSPACE}, ${MRMCP_DIR}, ${MRMCP_BIN}. Binaries live in .mrmcp/mcp/bin and never enter ordinary Commands discovery. Sidecar mcp.yaml is embedded as a first-run template and existing edits are preserved on upgrade. MCP Servers has independent pagination/search and register/edit/delete/download controls; options and every platform mapping survive edits.

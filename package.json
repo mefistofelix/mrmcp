@@ -1,0 +1,22 @@
+{
+  "name": "mrmcp",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "bun": ">=1.4.3"
+  },
+  "dependencies": {
+    "@gpuix/native": "0.10.0",
+    "@gpuix/react": "0.10.0",
+    "@mefistofelix/auto.js": "latest",
+    "@mefistofelix/cdp.js": "latest",
+    "@mefistofelix/rag.js": "latest",
+    "@peculiar/x509": "1.13.0",
+    "@tursodatabase/database": "0.8.3",
+    "chardet": "2.1.1",
+    "eta": "4.6.0",
+    "iconv-lite": "0.7.0",
+    "react": "19.2.0",
+    "xz-decompress": "0.2.3"
+  }
+}

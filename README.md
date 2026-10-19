@@ -1,63 +1,65 @@
 <p align="center"><img src="./assets/mrmcp-logo.png" alt="MrMCP" width="180"></p>
 
-# MrMCP 0.10.155
+# MrMCP 0.11.2
 
-MrMCP is a stateless Model Context Protocol server implemented in Deno. It exposes one authenticated `/mcp` endpoint, Workspace-scoped Sessions, filesystem and process tools, OAuth/Basic authentication, TLS automation, and a local Tauriless administration UI.
+MrMCP is a stateless Model Context Protocol server implemented in Bun. It exposes one authenticated `/mcp` endpoint, Workspace-scoped Sessions, filesystem and process tools, OAuth/Basic authentication, TLS automation, and a native GPUIX administration UI.
 
-![MrMCP Tool Calls view](./assets/mrmcp-screenshot1.png)
 
 ## Features
 
 - MCP `2026-07-28` with explicit `chat_session` Session capabilities.
 - Named Workspaces with drag-and-drop Session assignment.
-- Persistent ChatGPT goals through `chat_set_goal`: send a follow-up after Tool Call inactivity, using a dedicated Chrome login profile. Sessions shows the association, timer state and Stop goal control.
+- Persistent ChatGPT subagents through `subagents`: independent worker chats, Session-scoped messages/results, bounded waits and a native Subagents page.
+- Persistent ChatGPT goals through `chat_set_goal`: send a follow-up after Tool Call inactivity, using the user's system Chrome through CDP Ext reverse mode. Sessions shows the association, timer state and Stop goal control.
 - AAF desktop automation through `desktop_auto`, including zero/one/many model-visible WebP/PNG screenshots mixed with structured OCR, geometry and state output; the local Automation page reuses **Payload-retained** Tool Calls/screenshots for inspection and can replay a scenario directly as a local user action without creating another Tool Call.
-- Low-level Chrome DevTools Protocol control through [`@mefistofelix/cdp.js`](https://github.com/mefistofelix/cdp.js) using always-batched `cdp_call`, with persistent browser/profile and logical page labels plus subscription/poll access to CDP notifications; the local Browser page summarizes existing profile/target/ring/subscription state; recorded request/response inspection and Replay are available for **Payload-retained** Tool Calls only.
+- Browser control through [`cdp.js`](https://github.com/mefistofelix/cdp.js) and batched `cdp_call`: dedicated Chromium/CDP, existing debugging endpoints, or Chrome extension control without a debugging port. `cdp_ext:true` opens/reuses system Chrome through token-bound URL bootstrap; the user installs CDP Ext once, with no extension ID or endpoint to enter. Custom profiles and explicit extension installation remain available, alongside passive `reverse` attachment. Agent and user choose the mode. Existing tabs, `chrome.*` APIs, native groups, permitted CDP operations and request notifications use the existing subscription/poll, diagnostics and Replay tools. See [options and setup](TOOLS.md#cdp_call).
 - Explicit persistent Global/Session/Workspace key-value memory through `memory_find` and `memory_set`, with explicitly typed JSON/text values, TTL and a local Memory manager.
 - Filesystem, text search/editing, reversible trash and generated-file publishing.
-- Persistent local Lucerna BM25 source-code search and AST navigation through `source_code_search`, covering 41 languages including Go, C/C++, Zig, HTML, Python, YAML and PHP, with `.gitignore` always enabled, symbol maps, file/chunk inspection and stateless result pagination. Grammars download lazily into the OS cache. Embeddings and call-graph analysis are not enabled in this build.
-- Incremental document retrieval through `document_grep`: Xberg extraction, LanceDB fulltext/vector/hybrid search, globstar/MIME/`.gitignore` scopes, native OS OCR. Settings → Search edits `search.yaml`; fulltext works immediately, while vector/hybrid require an embedding model.
+- Incremental document retrieval through `document_grep`, backed by [rag.js](https://github.com/mefistofelix/rag.js): Turso fulltext/vector/hybrid search, Xberg extraction/local embeddings, local PaddleOCR and page/UTF-8 citations. MrMCP applies globstar/MIME/`.gitignore` scopes. Settings → Search edits `search.yaml`; embedding models download only for explicit vector/hybrid searches; PaddleOCR models download only when OCR is needed, with no additional software or API key.
 - Foreground and persistent processes with progress streaming when requested.
 - Persistent JavaScript kernels scoped to Session + Workspace.
-- Extra command catalog through `commands.yaml`, with OS/CPU variants, native yt-dlp, Anna's Archive CLI and Google Workspace `gws` downloads (including Drive/Gmail), and libgen-cli metadata.
+- Separate stdio MCP catalog `mcp.yaml` and **MCP Servers** GUI. `exec_mcp` forwards raw JSON-RPC requests with automatic handshake, per-command/idle-TTL/until-quit process reuse and hidden terminals. The default LibGen/Anna’s Archive engine is maintained `jmrplens/libgen-mcp` v2.2.1; use `tools/list` to discover its current search/download schemas.
+- Extra command catalog through `commands.yaml`, with OS/CPU variants, native yt-dlp, Google Workspace `gws` downloads (including Drive/Gmail), and whisper.cpp CLI with its multilingual model.
 - `proxy_get` provides paginated proxy discovery, weighted random/round robin selection and persistent reported outcome statistics. Settings → Proxies edits `proxies.yaml`.
 - User-managed MCP guided prompts through `guided_prompts.yaml`, with Eta templates, two editable starter examples (one argument-free and one parameterized), and a built-in template/model help view.
 - OpenRouter JSON API through `openrouter_req`, with the API key configured on the dedicated OpenRouter GUI page; model discovery and non-streaming requests work without a Workspace.
-- OAuth and Basic authentication.
+- OAuth and Basic authentication. OAuth client registrations remain valid until explicitly deleted; ChatGPT reconnect can recover its cached registration after a data reset for either documented callback format, with fresh consent and PKCE.
 - Automatic TLS/certificate handling.
-- Tool Call and optional HTTP diagnostic logs. Tool Call history has independent **Disk / Memory** storage and **Payload / Metadata** retention policies. Disk history survives restart; Memory history uses volatile SQLite TEMP storage. Payload stores exactly the canonical MCP JSON-RPC request and response packets once; Metadata stores neither packet. The fullscreen Tool Call debugger interprets nested JSON/YAML, multiline text, readable Base64 and images only while viewing a row, without persisting decoded copies. Disk retention is configured in hours and Memory retention in minutes. Functional process/CDP/Memory/Published/Trash state, authentication, Sessions, Workspaces and configuration are never disabled or made volatile by the Tool Call logging policy.
-- Local desktop UI with system tray and native notifications.
+- Tool Call and optional HTTP diagnostic logs. Tool Call history has independent **Disk / Memory** storage and **Payload / Metadata** retention policies. Disk history survives restart; Memory history uses volatile Turso TEMP storage. Payload stores exactly the canonical MCP JSON-RPC request and response packets once; Metadata stores neither packet. The fullscreen Tool Call debugger interprets nested JSON/YAML, multiline text, readable Base64 and images only while viewing a row, without persisting decoded copies. Disk retention is configured in hours and Memory retention in minutes. Functional process/CDP/Memory/Published/Trash state, authentication, Sessions, Workspaces and configuration are never disabled or made volatile by the Tool Call logging policy.
+- Native React/GPUIX desktop UI with compact dark panels, overlay dropdowns, keyboard navigation and OS directory drops. State and drafts stay in the backend; direct asynchronous actions let navigation and typing continue during independent operations. Tray and OS notification delivery are temporarily disabled while GPUIX lacks those APIs; preferences remain saved.
 - One MIME-aware `publish` MCP App helper for Workspace paths, direct text and Base64 bytes, with persistent deduplicated `.mrmcp/publish/` files, inline/download presentation hints, multi-Workspace publication references and a local Published manager for filtering, native opening and deletion.
 
 ## Requirements
 
-- Deno with `node:sqlite` support.
-- A Tauriless-supported platform.
+- Bun 1.4.3 or newer for source mode; release binaries include the runtime.
+- Windows x64, Linux x64 or macOS Apple Silicon for the native GUI.
 - Permission to bind public ports 80 and 443 when those listeners are enabled.
 
 ## Run
 
+Install source dependencies with `bun install`. Update Auto.js/CDP.js with `bun update @mefistofelix/auto.js @mefistofelix/cdp.js` when needed.
+
 Desktop GUI:
 
 ```bash
-deno run -A --unstable-ffi mrmcp.js
+bun mrmcp.js
 ```
 
 Headless backend:
 
 ```bash
-deno run -A mrmcp.js --backend
+bun mrmcp.js --backend
 ```
 
 Register a Workspace without starting the server:
 
 ```bash
-deno run -A mrmcp.js --add-workspace "Workspace name" "/path/to/workspace"
+bun mrmcp.js --add-workspace "Workspace name" "/path/to/workspace"
 ```
 
 The desktop UI is local-only and opens no GUI TCP listener. Public MCP/OAuth traffic uses HTTP/HTTPS listeners; occupied base ports fall back in `+50` steps without rewriting configuration.
 
-Document and source search also work without an open Workspace: Search `default_path` defaults to Desktop/`_default`, created on the first search. Both indices persist under `.mrmcp/search`, with a separate `_default` namespace and one hash per real source path. This leaves the Session unassigned; ordinary file/process tools still need a Workspace. Settings → Search shows the effective default source path.
+Document search also works without an open Workspace: Search `default_path` defaults to Desktop/`_default`, created on the first search. Indices persist under `.mrmcp/search`, with a separate `_default` namespace and one hash per real source path. This leaves the Session unassigned; ordinary file/process tools still need a Workspace. Settings → Search shows the effective default source path.
 
 Settings shows the absolute **Data Directory** path in every tab. Portable builds keep `.mrmcp` beside the executable; source mode keeps it beside `mrmcp.js`; the macOS app uses `~/Library/Application Support/MrMCP/.mrmcp`.
 
@@ -78,15 +80,56 @@ File operations, new processes, configured commands and JavaScript kernels requi
 
 The administration UI displays Sessions with short numeric ids. The opaque `ctx_...` value remains the MCP bearer capability. A Session may move between Workspaces, while historical Tool Calls retain the Workspace snapshot captured when each call started.
 
-`chat_set_goal(chat_session, goal, timeout_seconds?)` enables automatic follow-ups for a ChatGPT conversation. First use **Settings → Goals → Login ChatGPT** and sign in in the separate Chrome profile. The login observer automatically recognizes an existing or newly completed login from the site’s recent-chat traffic. Login recognition is independent of editor readiness. Settings shows Opening, Checking, Signed in, Sign-in required or a failure, separately from the monitoring enable switch. The GUI remains responsive while Chrome opens. Until verification succeeds, goals remain paused and never open Chrome automatically. Setup uses a visible browser with images and pauses automatic work; it also works while the global switch is off. Close that window after verification to apply the saved monitoring launch options. Login readiness persists across restart, but an observed logout during matching or sending suspends automatic work until Login ChatGPT is used again. This readiness is independent of the global enable switch: successful login never turns that switch on, and toggling it does not change login readiness. New unassociated goals set before login require another `chat_set_goal` afterward. **Settings → Goals** contains the global enable switch (on), default inactivity timeout (5 minutes), Retry missing chat matches at startup (off), Stop the current response before sending (off), Headless (off), Disable page images (off; images load by default) and spawned process visibility (Automatic: windowsHide follows headless). Disabling stops the background scheduler and monitor; the tool stays published and returns `disabled` without setting a new goal. Saved goals and the dedicated `.mrmcp/cdp/mrmcp-chatgpt/` login profile are retained. Launch options apply on the next browser launch; keep headless off for interactive login/challenges. MrMCP reuses one monitoring tab and observes the site’s own recent-list/history traffic through cdp.js, associates only an exact `chat_session` from an active-branch tool call, and falls back to rendered tool details when capture is unavailable. DOM controls use machine attributes and native HTML/ARIA structure rather than translated labels. Each explicit nonempty set for an unassociated Session schedules one bounded matching attempt. Missing login, no match, browser errors or interruption end that attempt; ticks, login completion and settings changes do not repeat it. By default restart does not resume any missing match, including requests still queued before shutdown. Enable Retry missing chat matches at startup to schedule one attempt per active unassociated goal at each startup, only when global goal management is also enabled and the login profile is verified. Otherwise call chat_set_goal again to retry. Existing associations are reused. Login, capture and UI failures remain visible in Sessions. Website changes can still require adapter updates.
+`chat_set_goal(chat_session, goal, timeout_seconds?, chatgpt_chat_id?)` enables automatic follow-ups for a ChatGPT
+conversation. Install [CDP Ext](https://github.com/mefistofelix/cdp.js#reverse-chrome-extension-transport)
+yourself in your system Chrome: load its cdp_ext directory from chrome://extensions in Developer mode,
+sign in to ChatGPT normally and reload CDP Ext after updating its files. CDP.js 0.5.0 opens or reuses
+that system browser through a token-bound loopback URL carrying its logical name and endpoint.
+No extension ID, endpoint or separate login/profile is configured. Goals use the page React cache,
+without monitoring history responses or WebSocket traffic.
 
-Once linked, MrMCP Tool Call arrivals/completions reset the inactivity interval. MrMCP sends the exact saved text after that interval and repeats while eligible; it does not evaluate completion or stop because ChatGPT says the goal is achieved. Ordinary chat messages and other connectors' calls do not reset this timer. Association and any already-due send run consecutively on the same page, without an extra scheduler tick or reload. Once submission is confirmed, MrMCP moves to the next goal without waiting for ChatGPT's reply. A responding destination still receives an attempted goal submission when the inactivity timer expires, including when an earlier Tool Call is still running. Enable Stop the current response before sending to interrupt that response first; this option applies to subsequent attempts without restarting Chrome. New Tool Call activity resets the timer. Existing drafts in the shared tab are preserved and can still delay navigation. The scheduler checks every five seconds, so the timeout is an earliest delivery time, not an exact alarm. Goal and association survive restart and history cleanup. Set `goal:""` or use **Sessions → Stop goal** to stop; an uncertain send pauses until the operator checks the chat and explicitly sets the goal again. A newer goal replaces an earlier goal associated with the same conversation. MrMCP must be running, and an interactive desktop is needed for Chrome login. See the [complete Goals contract](TOOLS.md#chat_set_goal) for association rules, timer calculation, send confirmation, states, persistence and limits.
+Use **Settings → Goals → Save CDP Ext folder** to export the bundled extension, including offline.
+The destination is editable and defaults to `cdp_ext` beside MrMCP's catalogs. In `chrome://extensions`,
+enable Developer mode, select **Load unpacked** and choose that folder. Keep its path stable.
+For updates, export to the same folder, confirm replacement and press **Reload** in Chrome.
+
+Settings retains enable (on), default timeout (5 minutes), missing-match retry at startup (off) and
+Stop-before-send (off). Browser bootstrap and logical goal-tab acquisition happen only when a
+match or due/manual delivery needs them. MrMCP creates/reuses one logical goals tab
+in a purple **MrMCP Goals** group. Settings/status inspection creates nothing. Reconnects reuse the
+owned tab; recycled browser tab IDs cannot adopt personal tabs. Disable/Quit leaves Chrome and tabs open.
+
+Each nonempty set for an unassociated Session requests one bounded scan of up to 20 rendered recent
+chat links. Open candidates one at a time and match the exact chat_session in their active-branch
+React conversation cache, with rendered tool details as a fallback. Failed attempts require another
+set or manual debug action; startup retries remain opt-in. Optional `chatgpt_chat_id` takes the
+conversation ID from its `/c/<id>` URL and bypasses the scan. Omission retains the existing ID. Site
+sign-in failures suspend the affected goal; sign in normally and retry explicitly. Website changes
+can require adapter updates. Goal state is independent of history retention and no schema change is needed.
+
+Once linked, Tool Call arrivals/completions and observed changes in the ChatGPT turn reset inactivity. Every in-flight Tool Call in any Session linked to the same conversation suspends delivery, including long calls; a full timeout starts after completion. MrMCP recognizes completed turns from explicit model markers, while an unchanged streaming/busy state can become idle and receive a follow-up after the timeout. The first observed running turn receives one conservative baseline interval. Only the shared tab is observed; other conversations are inspected when visited. Turn completion does not mean the goal has been achieved and does not clear it. Stop-before-send optionally interrupts a stalled response, while drafts and dialogs are preserved. The scheduler checks every five seconds and moves to other goals after submission confirmation, without waiting for an answer. Set `goal:""` or use **Sessions → Stop goal** to stop; uncertain delivery suspends further sends until inspection and an explicit new set. Goals/associations persist through restart and history cleanup. See the [complete Goals contract](TOOLS.md#chat_set_goal).
+
+## Subagents
+
+The `subagents` tool creates reusable ChatGPT worker chats with explicit tasks/shared context,
+messages, status/wait, final reports, Stop and Resume. Each worker initializes its own Session and
+inherits the selected Workspace; workers share files and must coordinate edits. Configure CDP Ext
+and the installed MrMCP ChatGPT app's asdk_app_… ID/display name in **Settings → Goals**. Keep system
+Chrome signed in; CDP.js opens or reuses it on demand. Workers use a separate cyan **MrMCP Subagents** tab group, independently of the
+Goals enable switch. There is no model API, separate browser profile or additional quota.
+
+**Subagents** lists workers with parent/child Session, state and text filters, pagination, task,
+Workspace, activity, model evidence, pending messages, running Tool Calls and detached processes.
+Open details for the task/context, timestamps, result, errors and paginated message/report history;
+queue a message, Stop or Resume there. Reports are collected through the tool rather than injected
+into the parent's chat. Restart pauses workers and uncertain sends are never replayed automatically.
+State survives history cleanup. See the [complete contract](TOOLS.md#subagents).
 
 ## Tools
 
 Session and Workspace:
 
-- `init_chat_session`, `chat_set_goal`, `chat_goal_debug`, `list_workspaces`, `open_workspace`, `tools_log` — chat initialization/goals, Workspace selection and history inspection.
+- `init_chat_session`, `chat_set_goal`, `chat_goal_debug`, `subagents`, `list_workspaces`, `open_workspace`, `tools_log` — chat initialization/goals, Workspace selection and history inspection.
 - `workspace_dev_preferences_write` — only on explicit user request, copy sidecar `DEV_PREF.md` from beside MrMCP into the current Workspace when that file is absent; never overwrite an existing project file or return preference content.
 
 Desktop and browser automation:
@@ -126,7 +169,7 @@ Commands and execution:
 - `telegram_req` — make one generic pre-authenticated Telegram Bot API JSON request using the Bot token configured by the user on the dedicated **✈️ Telegram** sidebar page.
 - `openrouter_req` — make an authenticated OpenRouter JSON API request using the key saved on the OpenRouter page; model discovery, chat, responses and embeddings require only a Session. Returns provider JSON, status, usage and errors; streaming is unsupported.
 
-Filesystem removal is reversible: `fs_trash`/`fs_untrash` use explicit `trash_id` transactions instead of a permanent delete tool. All Workspaces share the single MrMCP-managed `APP_DIR/.mrmcp/trash/` payload store; MrMCP never creates `.mrmcp` metadata directories inside named Workspaces. Trash transaction/item metadata lives in SQLite (`trash_transactions` / `trash_items`) with original path, cached type and cached byte size for non-directory payloads; directory size is deliberately left unknown to avoid recursively scanning a tree before a rename; no JSON manifest copy is written. The desktop **Trash** page uses the DB for inventory/sidebar counts and checks each tracked payload live on disk, making missing payloads explicit while preserving their cached metadata until deleted. Restore/delete and Empty Trash remain independent of Tool Call logging.
+Filesystem removal is reversible: `fs_trash`/`fs_untrash` use explicit `trash_id` transactions instead of a permanent delete tool. All Workspaces share the single MrMCP-managed `APP_DIR/.mrmcp/trash/` payload store; MrMCP never creates `.mrmcp` metadata directories inside named Workspaces. Trash transaction/item metadata lives in Turso (`trash_transactions` / `trash_items`) with original path, cached type and cached byte size for non-directory payloads; directory size is deliberately left unknown to avoid recursively scanning a tree before a rename; no JSON manifest copy is written. The desktop **Trash** page uses the DB for inventory/sidebar counts and checks each tracked payload live on disk, making missing payloads explicit while preserving their cached metadata until deleted. Restore/delete and Empty Trash remain independent of Tool Call logging.
 
 Foreground `exec` defaults to **45 seconds** but `timeout_ms` may be raised up to **1 hour**. High request timeouts deserve care: some clients/proxies/gateways retry or replay long requests (a ~60-second replay boundary was observed in ChatGPT testing). `exec` and `exec_start` therefore accept optional client-chosen `operation_id`: within the same Session and tool, identical retries reuse the original process while it is active and for **5 minutes after completion**; different process arguments with the same live key are rejected, and the key may be reused normally after the grace period. This key is transient replay protection, not a permanent Session-wide identifier. Prefer `exec_start` for long or non-idempotent jobs and poll with `exec_status` or bounded `exec_attach` calls. `exec_attach` defaults to 45 seconds, allows up to 1 hour, and returns `wait_timed_out=true` when only the attachment wait expires while the persistent child remains running; shorter repeated attaches avoid overlapping retry windows. Persistent processes use the integer `exec_id` returned by `exec_start`; a replay-protected `exec_start` returns that same `exec_id`. Follow-up process tools require the same Session `chat_session`. Process runtime/history is owned by the process subsystem and remains independent of Tool Call Disk/Memory storage, payload retention, retention pruning and Tool Call Clear.
 
@@ -149,9 +192,15 @@ ACME HTTP-01 is available only while the effective HTTP listener remains on port
 
 ## Desktop application
 
-Desktop mode uses Tauriless from npm latest and keeps the native event loop plus Deno backend Worker in one OS process. The window can be hidden to the tray without stopping MrMCP. Native directory drops can add Workspaces, and Session/Workspace/Tool Call notifications are configurable independently. Tool Call notifications default off; Session and Workspace notifications default on. Saved preferences are preserved.
+Desktop mode runs GPUIX and the backend directly in one Bun process/event loop, without a backend Worker or render-message copies. The main database uses Turso’s public asynchronous driver; transactions retain exclusive connection ownership. Local native providers and external child processes retain their own execution mechanisms. Application state, validation, dialogs, drafts and actions stay in the backend. Inline JSX in mrmcp.js compiles through Bun using a small local native factory and file-level pragmas, without React or extra JSX configuration. Components produce native declarations directly, then GPUIX reconciles keyed widgets; there is no HTML generation/parsing on the GUI path. Eta loads only when rendering the editable text templates in guided_prompts.yaml. The administrative GUI has no WebView, DOM, Morphlex, Tauri bridge or network listener. Page/sidebar/table/popup scroll containers show native widgets for dragging and keyboard scrolling; precise trackpad motion stays native and mouse-wheel steps are enhanced. These presentation updates do not rerender backend pages. OAuth consent and published MCP Apps remain web content.
 
-Windows standalone builds use `--no-terminal` and the versioned application icon. macOS releases are Finder-launchable `MrMCP.app` bundles distributed inside DMG images.
+Closing the window stops the backend and its managed processes. Tray, hide-on-close and native OS notification delivery are temporarily unavailable; the Notifications tab retains the saved preferences and explains their suspended state. Directory drops and Session-to-Workspace drag/drop remain supported. JSON values use the native tree and an editable JSON source view. GPUIX currently exposes no reliable minimize/visibility event, so backend projections may continue while minimized; native focus and selection remain with GPUIX.
+
+Windows builds use Bun's console-hiding and executable-icon build flags. macOS Apple Silicon is distributed as an ad-hoc signed app bundle in a DMG. macOS Intel is no longer supported.
+
+The standalone embeds a compressed, target-specific copy of the unchanged public dependency packages and their licenses. The first native-package use extracts them atomically to a content-addressed cache: Windows `%LOCALAPPDATA%/MrMCP/runtime`, macOS `~/Library/Caches/MrMCP/runtime`, Linux `$XDG_CACHE_HOME/mrmcp/runtime` (or `~/.cache/mrmcp/runtime`). Rebuilds with unchanged dependencies reuse this cache. No external Bun, Node, Python or model server needs installation. Search indices, browser profiles and embedding models retain their existing `.mrmcp` paths.
+
+Build locally with `bun .github/build.mjs`; validate with `bun .github/check.mjs`, or add `--semantic --standalone` for actual embeddings/OCR/CDP and standalone checks.
 
 ## Release binaries
 
@@ -159,28 +208,29 @@ A version tag matching `mrmcp.js` `VERSION` triggers `.github/workflows/release.
 
 - `mrmcp-windows-x64.exe`
 - `mrmcp-linux-x64`
-- `mrmcp-macos-x64.dmg`
 - `mrmcp-macos-arm64.dmg`
 
 The macOS app is currently ad-hoc signed; warning-free first launch of an Internet-downloaded build requires Developer ID signing and Apple notarization.
 
 ## Project files
 
-- `mrmcp.js` — server, tools, SQLite, local UI and desktop launcher.
+- `mrmcp.js` — server, tools, Turso, local UI and desktop launcher.
 - `commands.yaml` — editable extra-command catalog.
 - `guided_prompts.yaml` — editable MCP guided-prompt catalog and Eta templates.
 - `proxies.yaml` — proxy entries, public list sources and cooldown configuration, editable in Settings → Proxies.
-- `search.yaml` — document search, embeddings and native OCR configuration, editable in Settings → Search.
+- `search.yaml` — document search, embeddings and OCR configuration, editable in Settings → Search.
 - `README.md` — current user/operator overview.
 - `CHANGELOG.md` — release history.
-- `AGENTS.md` — implementation invariants, server-authoritative Web GUI/Morphlex/state/channel rules and release checks.
+- `AGENTS.md` — implementation invariants, backend-authoritative native GUI/state contracts and release checks.
 - `LICENSE` — MIT license for MrMCP and JSONEditor third-party license notice/text.
-- `.github/workflows/` — release and native macOS GUI test workflows.
-- `assets/` — Morphlex, branding, icons and screenshots.
+- `package.json`, `bun.lock` — existing runtime dependencies and reproducible installation; Auto.js/CDP.js retain unversioned public imports and latest update policy.
+- `.github/build.mjs`, `.github/check.mjs` — target packaging and isolated integration checks.
+- `.github/workflows/` — native build/release automation.
+- `assets/` — branding/icons and historical screenshots/vendor assets. Retired WebView scripts are not loaded or compiled.
 
-Runtime data lives under `.mrmcp`. Packaged macOS builds keep mutable state, `commands.yaml`, `guided_prompts.yaml`, `search.yaml` and `proxies.yaml` under `~/Library/Application Support/MrMCP/` rather than inside the application bundle. Document indices live under `.mrmcp/search/` and survive operational history cleanup. Fulltext works without an embedding provider; configure the endpoint/model in Settings → Search for vector/hybrid search. Use the catalog yt-dlp command to download subtitles, then index the saved Workspace files. Proxy outcomes must be reported explicitly through proxy_get. Native OCR depends on the OS's installed recognition support.
+Runtime data lives under `.mrmcp`. Packaged macOS builds keep mutable state, `commands.yaml`, `guided_prompts.yaml`, `search.yaml` and `proxies.yaml` under `~/Library/Application Support/MrMCP/` rather than inside the application bundle. Document indices live under `.mrmcp/search/` and survive operational history cleanup. Local embeddings are enabled by default (`provider: local`, `model: fast`). The first vector/hybrid search automatically downloads the model (~24 MB), then cached models work offline inside each Rag profile’s `models/embeddings` folder under `.mrmcp/search/`; opening/saving Settings downloads nothing and fulltext never downloads an embedding model. Choose `model: multilingual` for Italian and other languages (~1.1 GB). Existing edited configurations are preserved: Settings → Search → **Use local embeddings**, then Save, switches an existing install. Ollama and OpenAI-compatible endpoints remain optional. Searchable PDF pages use embedded text. OCR defaults to rag.js/Xberg PaddleOCR (PP-OCRv6 small), with lazy local models in each profile’s `models/paddle` folder; `ocr: native` explicitly selects OS OCR and `ocr: disabled` turns OCR off. Existing YAML is preserved; **Use PaddleOCR**, then Save, switches an existing install. Use the catalog yt-dlp command to download subtitles, then index the saved Workspace files. Proxy outcomes must be reported explicitly through proxy_get. The optional native OCR provider depends on the OS's installed recognition support. Paddle’s auto language profile has fixed coverage; it is not universal script detection.
 
-Proxy statistics use SQLite schema 5. Older databases require the normal Start Fresh recovery, which archives the previous data directory. Existing editable YAML catalogs are preserved; update their platform definitions manually when keeping an older catalog.
+The Turso main database uses schema 6 and native full-text indices instead of SQLite FTS5, including persistent proxy statistics. Earlier schemas require Start Fresh, which archives the entire previous data directory; there is no automatic migration or import. One process owns a data directory at a time: close the running instance before a separate --add-workspace invocation. Existing editable YAML catalogs are preserved; update their platform definitions manually when keeping an older catalog.
 
 ## Changelog
 

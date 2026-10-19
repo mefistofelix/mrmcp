@@ -217,28 +217,82 @@ commands:
         download_url: 'https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_macos'
       darwin-aarch64:
         download_url: 'https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp_macos'
-  - logical_name: libgen-cli
-    description: 'Library Genesis CLI for title/author/ISBN search, filtering, link resolution and mirror status. Use libgen-cli --help, search QUERY, link MD5 or status. Upstream currently publishes no release binaries: build with Go (go install github.com/anilpdv/libgen-cli@latest) and place libgen-cli.exe on Windows or libgen-cli on Unix in .mrmcp/bin. This catalog entry does not install Go or build source automatically.'
-    documentation_url: 'https://github.com/anilpdv/libgen-cli'
-  - logical_name: annas-mcp
-    description: "Anna's Archive CLI for book/article search and downloads. Invoke annas-mcp --help, book-search QUERY, article-search DOI_OR_QUERY, book-download MD5 FILENAME or article-download DOI. Search requires no API key; downloads require ANNAS_SECRET_KEY and ANNAS_DOWNLOAD_PATH. Optional ANNAS_BASE_URL selects a mirror and ANNAS_AUTO_BASE_URL=true enables automatic mirror discovery; --timeout overrides the request timeout. Use CLI subcommands through exec; the mcp subcommand starts a separate MCP server."
-    documentation_url: 'https://github.com/iosifache/annas-mcp#available-operations'
+  - logical_name: whisper-cli
+    path: whisper/whisper-cli
+    description: |-
+      Local audio transcription/translation using whisper.cpp. Commands Download installs the CPU binary with its required libraries and automatically downloads the multilingual ggml-base.bin model (~148 MB), since whisper-cli does not fetch models itself. Invoke program whisper-cli with args ["-f", "audio.wav", "-otxt"] through exec; the catalog supplies the installed model's absolute path and language auto, independent of the Workspace current directory. Pass -l it to force Italian, -tr to translate, or another -m PATH to override the default model. Inspect --help for supported formats/output options. Use exec_start for long recordings. All inference is local; no API key or remote transcription service.
+
+      Windows/Linux use upstream CPU bundles b5454; macOS uses the prebuilt OpenWhispr whisper.cpp CLI v1.0.0 from sjoerdteunisse (Apple Silicon Metal or Intel CPU), because upstream's Apple release asset is a framework rather than a runnable CLI. Downloads only run when requested in Commands; reinstalling reuses an existing verified model. Full bundles remain under .mrmcp/bin/whisper; models are runtime downloads, not embedded in MrMCP.
+    documentation_url: 'https://github.com/ggml-org/whisper.cpp#quick-start'
+    default_args: ['-m', '${MRMCP_BIN}/whisper/models/ggml-base.bin', '-l', 'auto']
+    bundle:
+      files:
+        - path: models/ggml-base.bin
+          download_url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.bin'
+          sha256: '60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe'
+        - path: LICENSE.whisper.cpp
+          download_url: 'https://raw.githubusercontent.com/ggml-org/whisper.cpp/v1.9.5/LICENSE'
+          sha256: '94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d'
     platforms:
       windows-x86_64:
-        download_url: 'https://github.com/iosifache/annas-mcp/releases/download/v0.1/annas-mcp_0.1_windows_amd64.zip'
+        path: whisper/whisper-cli.exe
+        download_url: 'https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-x64.zip'
+        archive_path: Release/whisper-cli.exe
+        bundle:
+          archive_prefix: Release/
+          files:
+            - path: models/ggml-base.bin
+              download_url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.bin'
+              sha256: '60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe'
+            - path: LICENSE.whisper.cpp
+              download_url: 'https://raw.githubusercontent.com/ggml-org/whisper.cpp/v1.9.5/LICENSE'
+              sha256: '94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d'
       windows-aarch64:
-        download_url: 'https://github.com/iosifache/annas-mcp/releases/download/v0.1/annas-mcp_0.1_windows_arm64.zip'
+        path: whisper/whisper-cli.exe
+        download_url: 'https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-win-cpu-arm64.zip'
+        archive_path: Release/whisper-cli.exe
+        bundle:
+          archive_prefix: Release/
+          files:
+            - path: models/ggml-base.bin
+              download_url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.bin'
+              sha256: '60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe'
+            - path: LICENSE.whisper.cpp
+              download_url: 'https://raw.githubusercontent.com/ggml-org/whisper.cpp/v1.9.5/LICENSE'
+              sha256: '94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d'
       linux-x86_64:
-        download_url: 'https://github.com/iosifache/annas-mcp/releases/download/v0.1/annas-mcp_0.1_linux_amd64.tar.xz'
+        download_url: 'https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-ubuntu-x64.tar.gz'
+        archive_path: whisper-bin-ubuntu-x64/whisper-cli
+        bundle:
+          archive_prefix: whisper-bin-ubuntu-x64/
+          files:
+            - path: models/ggml-base.bin
+              download_url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.bin'
+              sha256: '60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe'
+            - path: LICENSE.whisper.cpp
+              download_url: 'https://raw.githubusercontent.com/ggml-org/whisper.cpp/v1.9.5/LICENSE'
+              sha256: '94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d'
       linux-aarch64:
-        download_url: 'https://github.com/iosifache/annas-mcp/releases/download/v0.1/annas-mcp_0.1_linux_arm64.tar.xz'
+        download_url: 'https://github.com/ggml-org/whisper.cpp/releases/download/b5454/whisper-bin-ubuntu-arm64.tar.gz'
+        archive_path: whisper-bin-ubuntu-arm64/whisper-cli
+        bundle:
+          archive_prefix: whisper-bin-ubuntu-arm64/
+          files:
+            - path: models/ggml-base.bin
+              download_url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.bin'
+              sha256: '60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe'
+            - path: LICENSE.whisper.cpp
+              download_url: 'https://raw.githubusercontent.com/ggml-org/whisper.cpp/v1.9.5/LICENSE'
+              sha256: '94f29bbed6a22c35b992c5c6ebf0e7c92f13b836b90f36f461c9cf2f0f1d010d'
       darwin-x86_64:
-        download_url: 'https://github.com/iosifache/annas-mcp/releases/download/v0.1/annas-mcp_0.1_darwin_amd64.tar.xz'
+        download_url: 'https://github.com/sjoerdteunisse/whisper.cpp/releases/download/v1.0.0/whisper-cpp-darwin-x64.zip'
+        archive_path: whisper-cpp-darwin-x64
       darwin-aarch64:
-        download_url: 'https://github.com/iosifache/annas-mcp/releases/download/v0.1/annas-mcp_0.1_darwin_arm64.tar.xz'
+        download_url: 'https://github.com/sjoerdteunisse/whisper.cpp/releases/download/v1.0.0/whisper-cpp-darwin-arm64.zip'
+        archive_path: whisper-cpp-darwin-arm64
   - logical_name: camoufox
     description: |-
-      Firefox-based browser distribution. Manual full-bundle installation: download the matching OS/CPU browser ZIP from https://github.com/daijro/camoufox/releases and extract its entire contents under .mrmcp/bin/camoufox, preserving libraries, resources, fonts and the macOS app structure. Do not copy only the executable. This catalog entry intentionally has no automatic download URL because Commands currently installs one executable rather than a browser bundle. No browser download or launch happens on registration or discovery.
+      Firefox-based browser distribution. Manual full-bundle installation: download the matching OS/CPU browser ZIP from https://github.com/daijro/camoufox/releases and extract its entire contents under .mrmcp/bin/camoufox, preserving libraries, resources, fonts and the macOS app structure. Do not copy only the executable. This catalog entry intentionally has no automatic download URL because this browser remains a manual full-distribution install. No browser download or launch happens on registration or discovery.
 
       Release assets are named camoufox-<version>-win.x86_64.zip, camoufox-<version>-lin.x86_64.zip, camoufox-<version>-lin.arm64.zip, camoufox-<version>-mac.x86_64.zip and camoufox-<version>-mac.arm64.zip. Consult the release page for the desired version. Once installed, invoke the logical name camoufox through exec; consult the upstream launcher documentation for automation parameters. This is a catalog entry, not an integration with MrMCP's Chromium CDP tools.
     documentation_url: 'https://github.com/daijro/camoufox/releases'

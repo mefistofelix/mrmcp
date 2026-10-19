@@ -1,0 +1,25 @@
+# Separate stdio MCP servers; runtime binaries live in .mrmcp/mcp/bin.
+# Starts on the first exec_mcp request. command / ttl / persistent are process policies.
+servers:
+  - logical_name: libgen-mcp
+    description: "Unified maintained LibGen / Anna's Archive and open-access search, details, download and reading engine. Native v2.2.1 binary; no Go/Python installation. Discover current upstream tools with exec_mcp request tools/list, then use tools/call. Optional LIBGEN_MCP_ANNAS_KEY enables member downloads; configure credentials in Settings → Process environment. Mirror failover, resumable transfers and verification remain owned by upstream."
+    enabled: true
+    stdio:
+      args: ["--transport", "stdio", "--download-dir", "${CWD}"]
+      persistence: ttl
+      ttl_seconds: 300
+      windows_hide: true
+    documentation_url: 'https://github.com/jmrplens/libgen-mcp/blob/v2.2.1/docs/tools.md'
+    platforms:
+      windows-x86_64:
+        download_url: 'https://github.com/jmrplens/libgen-mcp/releases/download/v2.2.1/libgen-mcp-windows-amd64.exe'
+      windows-aarch64:
+        download_url: 'https://github.com/jmrplens/libgen-mcp/releases/download/v2.2.1/libgen-mcp-windows-arm64.exe'
+      linux-x86_64:
+        download_url: 'https://github.com/jmrplens/libgen-mcp/releases/download/v2.2.1/libgen-mcp-linux-amd64'
+      linux-aarch64:
+        download_url: 'https://github.com/jmrplens/libgen-mcp/releases/download/v2.2.1/libgen-mcp-linux-arm64'
+      darwin-x86_64:
+        download_url: 'https://github.com/jmrplens/libgen-mcp/releases/download/v2.2.1/libgen-mcp-darwin-amd64'
+      darwin-aarch64:
+        download_url: 'https://github.com/jmrplens/libgen-mcp/releases/download/v2.2.1/libgen-mcp-darwin-arm64'

@@ -1,454 +1,84 @@
 name: Release
-
 on:
   push:
-    tags:
-      - "*.*.*"
+    tags: ["*.*.*"]
   workflow_dispatch:
     inputs:
       release_tag:
         description: Existing version tag to build and publish
         required: true
         type: string
-
 permissions:
   contents: write
-
 jobs:
-  build-portable:
-    name: Build Windows and Linux
-    runs-on: ubuntu-latest
-    env:
-      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
-    steps:
-      - name: Check out tag
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.release_tag || github.ref }}
-
-      - name: Set up Deno
-        uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.9.5
-
-      - name: Verify version matches tag
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="$(sed -n 's/^const VERSION = "\([^"]*\)";/\1/p' mrmcp.js)"
-          test -n "$version"
-          test "$version" = "$RELEASE_TAG"
-
-      - name: Check source
-        run: deno check --minimum-dependency-age=0 mrmcp.js
-
-      - name: Verify native Lucerna AST parser
-        run: |
-          deno eval --minimum-dependency-age=0 '
-          import pin from "npm:@kreuzberg/tree-sitter-language-pack@1.6.2/package.json" with { type: "json" };
-          import mac from "npm:@kreuzberg/tree-sitter-language-pack-darwin-x64@1.10.9/package.json" with { type: "json" };
-          if (Deno.build.os === "darwin" && Deno.build.arch === "x86_64") {
-            const { createRequire } = await import("node:module");
-            const { fileURLToPath } = await import("node:url");
-            const requireModule = createRequire(import.meta.url);
-            const previous = Deno.env.get("NAPI_RS_NATIVE_LIBRARY_PATH");
-            try {
-              Deno.env.set("NAPI_RS_NATIVE_LIBRARY_PATH", fileURLToPath(import.meta.resolve("npm:@kreuzberg/tree-sitter-language-pack-darwin-x64@1.10.9")));
-              requireModule(fileURLToPath(import.meta.resolve("npm:@kreuzberg/tree-sitter-language-pack@1.6.2")));
-            } finally {
-              if (previous === undefined) Deno.env.delete("NAPI_RS_NATIVE_LIBRARY_PATH");
-              else Deno.env.set("NAPI_RS_NATIVE_LIBRARY_PATH", previous);
-            }
-          }
-          const { TreeSitterChunker } = await import("npm:@upstart.gg/lucerna@0.2.9");
-          const parser = new TreeSitterChunker();
-          try {
-            await parser.initialize();
-            const chunks = await parser.chunkSource("export function lucernaSmoke(x) { return x; }", "smoke.js", "smoke", "javascript");
-            if (!chunks.some(chunk => chunk.name === "lucernaSmoke")) throw new Error("Native Lucerna AST extraction failed");
-            for (const [language, extension, source] of [
-              ["go", "go", "package main\nfunc smoke() int { return 7 }"],
-              ["c", "c", "int smoke(void) { return 7; }"],
-              ["cpp", "cpp", "int smoke() { return 7; }"],
-              ["zig", "zig", "pub fn smoke() u32 { return 7; }"],
-              ["html", "html", "<section id=smoke>smoke</section>"],
-              ["python", "py", "def smoke():\n    return 7\n"],
-              ["yaml", "yaml", "smoke:\n  enabled: true\n"],
-              ["php", "php", "<?php function smoke() { return 7; }"],
-            ]) {
-              const parsed = await parser.chunkSource(source, "smoke." + extension, "smoke", language);
-              if (!parsed.length || parsed.some(chunk => !Number.isInteger(chunk.startLine) || chunk.startLine < 1 || !Number.isInteger(chunk.endLine) || chunk.endLine < chunk.startLine)) throw new Error("Native Lucerna parser/line mapping failed for " + language);
-            }
-          } finally { await parser.close(); }
-          '
-
-      - name: Verify document extraction and LanceDB
-        run: |
-          deno eval --minimum-dependency-age=0 '
-          const bytes = new TextEncoder().encode("Searchable document smoke");
-          let content;
-          if (Deno.build.os === "darwin" && Deno.build.arch === "x86_64") {
-            const x = await import("npm:@xberg-io/xberg-wasm@1.3.2");
-            await x.default();
-            const c = x.WasmExtractionConfig.default(); c.disableOcr = true;
-            const r = await x.extract(x.WasmExtractInput.fromBytes(bytes, "text/plain"), c);
-            const documents = r.results; content = documents[0]?.content;
-            documents.forEach(v => v.free()); r.free();
-          } else {
-            const x = await import("npm:@xberg-io/xberg@1.3.2");
-            content = (await x.extract({kind: "bytes", bytes, mimeType: "text/plain"}, {disableOcr: true})).results[0]?.content;
-          }
-          if (content !== "Searchable document smoke") throw new Error("Xberg extraction failed");
-          const l = Deno.build.os === "darwin" && Deno.build.arch === "x86_64" ? await import("npm:@lancedb/lancedb@0.22.3") : await import("npm:@lancedb/lancedb@0.27.2");
-          const directory = await Deno.makeTempDir();
-          try {
-            const db = await l.connect(directory);
-            const table = await db.createTable("smoke", [{id: "a", text: content, vector: [1, 0]}, {id: "b", text: "other", vector: [0, 1]}]);
-            await table.createIndex("text", {config: l.Index.fts()});
-            if ((await table.search("Searchable").limit(1).toArray())[0]?.id !== "a") throw new Error("Fulltext query failed");
-            if ((await table.search([1, 0]).limit(1).toArray())[0]?.id !== "a") throw new Error("Vector query failed");
-          } finally { await Deno.remove(directory, {recursive: true}); }
-          '
-
-      - name: Prepare target-specific embedded files
-        shell: bash
-        run: |
-          set -euo pipefail
-          deno eval --minimum-dependency-age=0 '
-          const info = await new Deno.Command(Deno.execPath(), {
-            args: ["info", "--json", "--minimum-dependency-age=0", "mrmcp.js"], stdout: "piped", stderr: "inherit",
-          }).output();
-          if (!info.success) throw new Error("Cannot inspect build dependencies");
-          const packages = Object.values(JSON.parse(new TextDecoder().decode(info.stdout)).npmPackages);
-          const packagePath = name => {
-            const directory = packages.find(entry => entry.name === name)?.localPath;
-            if (!directory) throw new Error(`Cannot locate ${name}`);
-            return directory;
-          };
-          // Compile can resolve new optional packages for a cross target after deno info.
-          // Cache each supported native variant before constructing the exclusion paths.
-          for (const [native, versions] of Object.entries({
-            "win32-x64-msvc": ["0.22.3", "0.27.2"],
-            "linux-x64-gnu": ["0.22.3", "0.27.2"],
-            "darwin-arm64": ["0.22.3", "0.27.2"],
-            "darwin-x64": ["0.22.3"],
-          })) {
-            for (const version of versions) {
-              const name = "@lancedb/lancedb-" + native;
-              const specifier = "npm:" + name + "@" + version + "/package.json";
-              await import(specifier, { with: { type: "json" } });
-              const { fileURLToPath } = await import("node:url");
-              const { dirname } = await import("node:path");
-              if (!packages.some(p => p.name === name && p.version === version)) packages.push({ name, version, localPath: dirname(fileURLToPath(import.meta.resolve(specifier))) });
-            }
-          }
-          const shell = packagePath("@mefistofelix/tauriless");
-          const parser = packagePath("@kreuzberg/tree-sitter-language-pack");
-          const companion = packagePath("@kreuzberg/tree-sitter-language-pack-darwin-x64");
-          const wasm = packagePath("@xberg-io/xberg-wasm");
-          const targets = {
-            "x86_64-pc-windows-msvc": ["win32-x64", "ts-pack-node.win32-x64-msvc.node"],
-            "x86_64-unknown-linux-gnu": ["linux-x64", "ts-pack-node.linux-x64-gnu.node"],
-            "x86_64-apple-darwin": ["darwin-x64", null],
-            "aarch64-apple-darwin": ["darwin-arm64", "ts-pack-node.darwin-arm64.node"],
-          };
-          const exclusions = {};
-          for (const [target, [native, binding]] of Object.entries(targets)) {
-            const paths = [];
-            if (!(await Deno.stat(`${shell}/native/${native}`)).isDirectory) throw new Error(`Missing Tauriless target ${native}`);
-            const parserFile = binding ? `${parser}/${binding}` : `${companion}/ts-pack-core-node.darwin-x64.node`;
-            if (!(await Deno.stat(parserFile)).isFile) throw new Error(`Missing parser target ${target}`);
-            for await (const entry of Deno.readDir(`${shell}/native`)) {
-              if (entry.isDirectory && entry.name !== native) paths.push(`${shell}/native/${entry.name}`);
-            }
-            for await (const entry of Deno.readDir(parser)) {
-              if (entry.isFile && entry.name.endsWith(".node") && entry.name !== binding) paths.push(`${parser}/${entry.name}`);
-            }
-            if (target !== "x86_64-apple-darwin") {
-              for await (const entry of Deno.readDir(companion)) {
-                if (entry.isFile && entry.name.endsWith(".node")) paths.push(`${companion}/${entry.name}`);
-              }
-              paths.push(`${wasm}/pkg/web/xberg_wasm_bg.wasm`);
-            }
-            const lanceVersion = target === "x86_64-apple-darwin" ? "0.22.3" : "0.27.2";
-            async function excludeNativeFiles(directory) {
-              try {
-                for await (const entry of Deno.readDir(directory)) {
-                  const path = directory + "/" + entry.name;
-                  if (entry.isDirectory) await excludeNativeFiles(path);
-                  else if (entry.isFile && entry.name.endsWith(".node")) paths.push(path);
-                }
-              } catch(error) { if (!(error instanceof Deno.errors.NotFound)) throw error; }
-            }
-            const lanceTarget = native === "linux-x64" ? "linux-x64-gnu" : native === "win32-x64" ? "win32-x64-msvc" : native;
-            for (const entry of packages) {
-              if (entry.name.startsWith("@lancedb/lancedb-") && (entry.version !== lanceVersion || entry.name !== "@lancedb/lancedb-" + lanceTarget)) await excludeNativeFiles(entry.localPath);
-            }
-            exclusions[target] = paths;
-          }
-          await Deno.mkdir("dist", {recursive: true});
-          await Deno.writeTextFile("dist/compile-exclusions.json", JSON.stringify(exclusions));
-          for (const [target, paths] of Object.entries(exclusions)) {
-            await Deno.writeTextFile(`dist/exclude-${target}.txt`, paths.join("\n") + "\n");
-          }
-          '
-
-      - name: Build Linux x64
-        shell: bash
-        run: |
-          set -euo pipefail
-          exclude_args=()
-          while IFS= read -r path; do exclude_args+=(--exclude "$path"); done < "dist/exclude-x86_64-unknown-linux-gnu.txt"
-          deno compile --minimum-dependency-age=0 -A --unstable-ffi \
-            --target x86_64-unknown-linux-gnu \
-            --include LICENSE --include assets --include commands.yaml --include guided_prompts.yaml --include search.yaml --include proxies.yaml \
-            "${exclude_args[@]}" \
-            --output dist/mrmcp-linux-x64 mrmcp.js
-
-      - name: Build Windows x64
-        shell: bash
-        run: |
-          set -euo pipefail
-          exclude_args=()
-          while IFS= read -r path; do exclude_args+=(--exclude "$path"); done < "dist/exclude-x86_64-pc-windows-msvc.txt"
-          deno compile --minimum-dependency-age=0 -A --unstable-ffi \
-            --target x86_64-pc-windows-msvc \
-            --no-terminal --icon assets/mrmcp.ico \
-            --include LICENSE --include assets --include commands.yaml --include guided_prompts.yaml --include search.yaml --include proxies.yaml \
-            "${exclude_args[@]}" \
-            --output dist/mrmcp-windows-x64.exe mrmcp.js
-
-      - name: Stage Windows and Linux assets
-        uses: actions/upload-artifact@v4
-        with:
-          name: portable-release-assets
-          path: |
-            dist/mrmcp-windows-x64.exe
-            dist/mrmcp-linux-x64
-          if-no-files-found: error
-
-  build-macos:
-    name: Build macOS ${{ matrix.arch }} app
+  build:
+    name: Build ${{ matrix.platform }} ${{ matrix.arch }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: x64
-            runner: macos-15-intel
-            target: x86_64-apple-darwin
-            asset: mrmcp-macos-x64.dmg
-          - arch: arm64
-            runner: macos-15
-            target: aarch64-apple-darwin
-            asset: mrmcp-macos-arm64.dmg
+          - {runner: windows-latest, platform: win32, arch: x64, asset: mrmcp-windows-x64.exe, desktop: true}
+          - {runner: ubuntu-latest, platform: linux, arch: x64, asset: mrmcp-linux-x64, desktop: true}
+          - {runner: macos-15, platform: darwin, arch: arm64, asset: mrmcp-macos-arm64.dmg, desktop: true}
     runs-on: ${{ matrix.runner }}
     env:
       RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
-      TARGET: ${{ matrix.target }}
-      MAC_ASSET: ${{ matrix.asset }}
+      PLATFORM: ${{ matrix.platform }}
+      ARCH: ${{ matrix.arch }}
+      ASSET: ${{ matrix.asset }}
+    defaults:
+      run:
+        shell: bash
     steps:
-      - name: Check out tag
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.release_tag || github.ref }}
-
-      - name: Set up Deno
-        uses: denoland/setup-deno@v2
+      - uses: oven-sh/setup-bun@v2
         with:
-          deno-version: v2.9.5
-
+          bun-version: "1.4.3"
       - name: Verify version matches tag
-        shell: bash
         run: |
           set -euo pipefail
           version="$(sed -n 's/^const VERSION = "\([^"]*\)";/\1/p' mrmcp.js)"
           test -n "$version"
           test "$version" = "$RELEASE_TAG"
-
-      - name: Verify native Lucerna AST parser
+      - name: Install declared dependencies
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Install Linux desktop libraries
+        if: matrix.platform == 'linux'
         run: |
-          deno eval --minimum-dependency-age=0 '
-          import pin from "npm:@kreuzberg/tree-sitter-language-pack@1.6.2/package.json" with { type: "json" };
-          import mac from "npm:@kreuzberg/tree-sitter-language-pack-darwin-x64@1.10.9/package.json" with { type: "json" };
-          if (Deno.build.os === "darwin" && Deno.build.arch === "x86_64") {
-            const { createRequire } = await import("node:module");
-            const requireModule = createRequire(import.meta.url);
-            const previous = Deno.env.get("NAPI_RS_NATIVE_LIBRARY_PATH");
-            try {
-              Deno.env.set("NAPI_RS_NATIVE_LIBRARY_PATH", requireModule.resolve("@kreuzberg/tree-sitter-language-pack-darwin-x64"));
-              requireModule("@kreuzberg/tree-sitter-language-pack");
-            } finally {
-              if (previous === undefined) Deno.env.delete("NAPI_RS_NATIVE_LIBRARY_PATH");
-              else Deno.env.set("NAPI_RS_NATIVE_LIBRARY_PATH", previous);
-            }
-          }
-          const { TreeSitterChunker } = await import("npm:@upstart.gg/lucerna@0.2.9");
-          const parser = new TreeSitterChunker();
-          try {
-            await parser.initialize();
-            const chunks = await parser.chunkSource("export function lucernaSmoke(x) { return x; }", "smoke.js", "smoke", "javascript");
-            if (!chunks.some(chunk => chunk.name === "lucernaSmoke")) throw new Error("Native Lucerna AST extraction failed");
-            for (const [language, extension, source] of [
-              ["go", "go", "package main\nfunc smoke() int { return 7 }"],
-              ["c", "c", "int smoke(void) { return 7; }"],
-              ["cpp", "cpp", "int smoke() { return 7; }"],
-              ["zig", "zig", "pub fn smoke() u32 { return 7; }"],
-              ["html", "html", "<section id=smoke>smoke</section>"],
-              ["python", "py", "def smoke():\n    return 7\n"],
-              ["yaml", "yaml", "smoke:\n  enabled: true\n"],
-              ["php", "php", "<?php function smoke() { return 7; }"],
-            ]) {
-              const parsed = await parser.chunkSource(source, "smoke." + extension, "smoke", language);
-              if (!parsed.length || parsed.some(chunk => !Number.isInteger(chunk.startLine) || chunk.startLine < 1 || !Number.isInteger(chunk.endLine) || chunk.endLine < chunk.startLine)) throw new Error("Native Lucerna parser/line mapping failed for " + language);
-            }
-          } finally { await parser.close(); }
-          '
-
-      - name: Verify document extraction and LanceDB
+          sudo apt-get update
+          sudo apt-get install -y libx11-6 libx11-xcb1 libxcb1 libxcb-xkb1 libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 libvulkan1 libasound2t64 libgl1 libegl1 libxrandr2 libxtst6 libxinerama1 libxcursor1
+      - name: Verify backend and native page projections
+        run: bun .github/check.mjs
+      - name: Verify standalone tools, TLS and semantic retrieval
+        run: bun .github/check.mjs --standalone --semantic
+      - name: Build portable server
+        if: matrix.platform != 'darwin' || !matrix.desktop
         run: |
-          deno eval --minimum-dependency-age=0 '
-          const bytes = new TextEncoder().encode("Searchable document smoke");
-          let content;
-          if (Deno.build.os === "darwin" && Deno.build.arch === "x86_64") {
-            const x = await import("npm:@xberg-io/xberg-wasm@1.3.2");
-            await x.default();
-            const c = x.WasmExtractionConfig.default(); c.disableOcr = true;
-            const r = await x.extract(x.WasmExtractInput.fromBytes(bytes, "text/plain"), c);
-            const documents = r.results; content = documents[0]?.content;
-            documents.forEach(v => v.free()); r.free();
-          } else {
-            const x = await import("npm:@xberg-io/xberg@1.3.2");
-            content = (await x.extract({kind: "bytes", bytes, mimeType: "text/plain"}, {disableOcr: true})).results[0]?.content;
-          }
-          if (content !== "Searchable document smoke") throw new Error("Xberg extraction failed");
-          const l = Deno.build.os === "darwin" && Deno.build.arch === "x86_64" ? await import("npm:@lancedb/lancedb@0.22.3") : await import("npm:@lancedb/lancedb@0.27.2");
-          const directory = await Deno.makeTempDir();
-          try {
-            const db = await l.connect(directory);
-            const table = await db.createTable("smoke", [{id: "a", text: content, vector: [1, 0]}, {id: "b", text: "other", vector: [0, 1]}]);
-            await table.createIndex("text", {config: l.Index.fts()});
-            if ((await table.search("Searchable").limit(1).toArray())[0]?.id !== "a") throw new Error("Fulltext query failed");
-            if ((await table.search([1, 0]).limit(1).toArray())[0]?.id !== "a") throw new Error("Vector query failed");
-          } finally { await Deno.remove(directory, {recursive: true}); }
-          '
-
-
-      - name: Prepare target-specific embedded files
-        shell: bash
+          mkdir -p dist
+          bun .github/build.mjs "$PLATFORM" "$ARCH" "dist/$ASSET"
+          if [ "$PLATFORM" != win32 ]; then chmod 755 "dist/$ASSET"; fi
+      - name: Build macOS app and DMG
+        if: matrix.platform == 'darwin' && matrix.desktop
         run: |
           set -euo pipefail
-          deno eval --minimum-dependency-age=0 '
-          const info = await new Deno.Command(Deno.execPath(), {
-            args: ["info", "--json", "--minimum-dependency-age=0", "mrmcp.js"], stdout: "piped", stderr: "inherit",
-          }).output();
-          if (!info.success) throw new Error("Cannot inspect build dependencies");
-          const packages = Object.values(JSON.parse(new TextDecoder().decode(info.stdout)).npmPackages);
-          const packagePath = name => {
-            const directory = packages.find(entry => entry.name === name)?.localPath;
-            if (!directory) throw new Error(`Cannot locate ${name}`);
-            return directory;
-          };
-          // Compile can resolve new optional packages for a cross target after deno info.
-          // Cache each supported native variant before constructing the exclusion paths.
-          for (const [native, versions] of Object.entries({
-            "win32-x64-msvc": ["0.22.3", "0.27.2"],
-            "linux-x64-gnu": ["0.22.3", "0.27.2"],
-            "darwin-arm64": ["0.22.3", "0.27.2"],
-            "darwin-x64": ["0.22.3"],
-          })) {
-            for (const version of versions) {
-              const name = "@lancedb/lancedb-" + native;
-              const specifier = "npm:" + name + "@" + version + "/package.json";
-              await import(specifier, { with: { type: "json" } });
-              const { fileURLToPath } = await import("node:url");
-              const { dirname } = await import("node:path");
-              if (!packages.some(p => p.name === name && p.version === version)) packages.push({ name, version, localPath: dirname(fileURLToPath(import.meta.resolve(specifier))) });
-            }
-          }
-          const shell = packagePath("@mefistofelix/tauriless");
-          const parser = packagePath("@kreuzberg/tree-sitter-language-pack");
-          const companion = packagePath("@kreuzberg/tree-sitter-language-pack-darwin-x64");
-          const wasm = packagePath("@xberg-io/xberg-wasm");
-          const targets = {
-            "x86_64-pc-windows-msvc": ["win32-x64", "ts-pack-node.win32-x64-msvc.node"],
-            "x86_64-unknown-linux-gnu": ["linux-x64", "ts-pack-node.linux-x64-gnu.node"],
-            "x86_64-apple-darwin": ["darwin-x64", null],
-            "aarch64-apple-darwin": ["darwin-arm64", "ts-pack-node.darwin-arm64.node"],
-          };
-          const exclusions = {};
-          for (const [target, [native, binding]] of Object.entries(targets)) {
-            const paths = [];
-            if (!(await Deno.stat(`${shell}/native/${native}`)).isDirectory) throw new Error(`Missing Tauriless target ${native}`);
-            const parserFile = binding ? `${parser}/${binding}` : `${companion}/ts-pack-core-node.darwin-x64.node`;
-            if (!(await Deno.stat(parserFile)).isFile) throw new Error(`Missing parser target ${target}`);
-            for await (const entry of Deno.readDir(`${shell}/native`)) {
-              if (entry.isDirectory && entry.name !== native) paths.push(`${shell}/native/${entry.name}`);
-            }
-            for await (const entry of Deno.readDir(parser)) {
-              if (entry.isFile && entry.name.endsWith(".node") && entry.name !== binding) paths.push(`${parser}/${entry.name}`);
-            }
-            if (target !== "x86_64-apple-darwin") {
-              for await (const entry of Deno.readDir(companion)) {
-                if (entry.isFile && entry.name.endsWith(".node")) paths.push(`${companion}/${entry.name}`);
-              }
-              paths.push(`${wasm}/pkg/web/xberg_wasm_bg.wasm`);
-            }
-            const lanceVersion = target === "x86_64-apple-darwin" ? "0.22.3" : "0.27.2";
-            async function excludeNativeFiles(directory) {
-              try {
-                for await (const entry of Deno.readDir(directory)) {
-                  const path = directory + "/" + entry.name;
-                  if (entry.isDirectory) await excludeNativeFiles(path);
-                  else if (entry.isFile && entry.name.endsWith(".node")) paths.push(path);
-                }
-              } catch(error) { if (!(error instanceof Deno.errors.NotFound)) throw error; }
-            }
-            const lanceTarget = native === "linux-x64" ? "linux-x64-gnu" : native === "win32-x64" ? "win32-x64-msvc" : native;
-            for (const entry of packages) {
-              if (entry.name.startsWith("@lancedb/lancedb-") && (entry.version !== lanceVersion || entry.name !== "@lancedb/lancedb-" + lanceTarget)) await excludeNativeFiles(entry.localPath);
-            }
-            exclusions[target] = paths;
-          }
-          await Deno.mkdir("dist", {recursive: true});
-          await Deno.writeTextFile("dist/compile-exclusions.json", JSON.stringify(exclusions));
-          for (const [target, paths] of Object.entries(exclusions)) {
-            await Deno.writeTextFile(`dist/exclude-${target}.txt`, paths.join("\n") + "\n");
-          }
-          '
-
-      - name: Build MrMCP.app
-        shell: bash
-        run: |
-          set -euo pipefail
-          app="dist/MrMCP.app"
+          app=dist/MrMCP.app
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-
-          exclude_args=()
-          while IFS= read -r path; do exclude_args+=(--exclude "$path"); done < "dist/exclude-${TARGET}.txt"
-          deno compile --minimum-dependency-age=0 -A --unstable-ffi \
-            --target "$TARGET" \
-            "${exclude_args[@]}" \
-            --include LICENSE --include assets --include commands.yaml --include guided_prompts.yaml --include search.yaml --include proxies.yaml \
-            --output "$app/Contents/MacOS/MrMCP" \
-            mrmcp.js
+          bun .github/build.mjs darwin "$ARCH" "$app/Contents/MacOS/MrMCP"
           chmod 755 "$app/Contents/MacOS/MrMCP"
-
-          iconset="dist/MrMCP.iconset"
+          iconset=dist/MrMCP.iconset
           mkdir -p "$iconset"
           for size in 16 32 128 256 512; do
             double=$((size * 2))
-            sips -s format png -z "$size" "$size" assets/mrmcp-logo.png \
-              --out "$iconset/icon_${size}x${size}.png" >/dev/null
-            sips -s format png -z "$double" "$double" assets/mrmcp-logo.png \
-              --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
+            sips -s format png -z "$size" "$size" assets/mrmcp-logo.png --out "$iconset/icon_${size}x${size}.png" >/dev/null
+            sips -s format png -z "$double" "$double" assets/mrmcp-logo.png --out "$iconset/icon_${size}x${size}@2x.png" >/dev/null
           done
           iconutil -c icns "$iconset" -o "$app/Contents/Resources/MrMCP.icns"
-
           cat > "$app/Contents/Info.plist" <<PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
+          <plist version="1.0"><dict>
             <key>CFBundleDisplayName</key><string>MrMCP</string>
             <key>CFBundleExecutable</key><string>MrMCP</string>
             <key>CFBundleIconFile</key><string>MrMCP.icns</string>
@@ -459,39 +89,28 @@ jobs:
             <key>CFBundleShortVersionString</key><string>${RELEASE_TAG}</string>
             <key>CFBundleVersion</key><string>${RELEASE_TAG}</string>
             <key>NSHighResolutionCapable</key><true/>
-          </dict>
-          </plist>
+          </dict></plist>
           PLIST
-
+          cat > dist/entitlements.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>com.apple.security.cs.allow-jit</key><true/>
+            <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
+          </dict></plist>
+          PLIST
           plutil -lint "$app/Contents/Info.plist"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Contents/Info.plist")" = "MrMCP"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconFile' "$app/Contents/Info.plist")" = "MrMCP.icns"
-          test -x "$app/Contents/MacOS/MrMCP"
-          test -f "$app/Contents/Resources/MrMCP.icns"
-          file "$app/Contents/MacOS/MrMCP"
-
           xattr -cr "$app"
-          codesign --force --sign - "$app"
+          codesign --force --sign - --entitlements dist/entitlements.plist "$app"
           codesign --verify --deep --strict "$app"
-
-          dmg_root="dist/dmg-root"
-          mkdir -p "$dmg_root"
-          ditto "$app" "$dmg_root/MrMCP.app"
-          ln -s /Applications "$dmg_root/Applications"
-          for attempt in 1 2 3; do
-            rm -f "dist/$MAC_ASSET"
-            if hdiutil create -volname "MrMCP $RELEASE_TAG" -srcfolder "$dmg_root" -size 512m -ov -format UDZO "dist/$MAC_ASSET"; then
-              break
-            fi
-            if [ "$attempt" -eq 3 ]; then exit 1; fi
-            hdiutil detach "/Volumes/MrMCP $RELEASE_TAG" -force >/dev/null 2>&1 || true
-            sleep 2
-          done
-          hdiutil verify "dist/$MAC_ASSET"
-
+          mkdir -p dist/dmg-root
+          ditto "$app" dist/dmg-root/MrMCP.app
+          ln -s /Applications dist/dmg-root/Applications
+          hdiutil create -volname "MrMCP $RELEASE_TAG" -srcfolder dist/dmg-root -ov -format UDZO "dist/$ASSET"
+          hdiutil verify "dist/$ASSET"
           verify="$RUNNER_TEMP/mrmcp-dmg"
           mkdir -p "$verify"
-          hdiutil attach -readonly -nobrowse -mountpoint "$verify" "dist/$MAC_ASSET" >/dev/null
+          hdiutil attach -readonly -nobrowse -mountpoint "$verify" "dist/$ASSET" >/dev/null
           trap 'hdiutil detach "$verify" >/dev/null 2>&1 || true' EXIT
           plutil -lint "$verify/MrMCP.app/Contents/Info.plist"
           test -x "$verify/MrMCP.app/Contents/MacOS/MrMCP"
@@ -500,54 +119,29 @@ jobs:
           codesign --verify --deep --strict "$verify/MrMCP.app"
           hdiutil detach "$verify" >/dev/null
           trap - EXIT
-
-      - name: Stage macOS disk image
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: macos-${{ matrix.arch }}-release-asset
+          name: release-${{ matrix.platform }}-${{ matrix.arch }}
           path: dist/${{ matrix.asset }}
           if-no-files-found: error
-
   release:
     name: Publish GitHub Release
-    needs:
-      - build-portable
-      - build-macos
+    needs: build
     runs-on: ubuntu-latest
     env:
       RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
-      - name: Check out release documentation
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.release_tag || github.ref }}
-
-      - name: Download Windows and Linux assets
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: portable-release-assets
+          pattern: release-*
+          merge-multiple: true
           path: dist
-
-      - name: Download macOS x64 app
-        uses: actions/download-artifact@v4
-        with:
-          name: macos-x64-release-asset
-          path: dist
-
-      - name: Download macOS arm64 app
-        uses: actions/download-artifact@v4
-        with:
-          name: macos-arm64-release-asset
-          path: dist
-
-      - name: Show checksums
-        shell: bash
-        run: sha256sum dist/*
-
-      - name: Publish GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
+      - name: Publish matching changelog and exactly three assets
         shell: bash
         run: |
           set -euo pipefail
@@ -559,20 +153,12 @@ jobs:
           ' CHANGELOG.md > release-notes.md
           test -s release-notes.md
           printf '\n[Complete release history](https://github.com/%s/blob/%s/CHANGELOG.md)\n' "$GH_REPO" "$RELEASE_TAG" >> release-notes.md
-          files=(
-            dist/mrmcp-windows-x64.exe
-            dist/mrmcp-linux-x64
-            dist/mrmcp-macos-x64.dmg
-            dist/mrmcp-macos-arm64.dmg
-          )
+          files=(dist/mrmcp-windows-x64.exe dist/mrmcp-linux-x64 dist/mrmcp-macos-arm64.dmg)
+          test "$(find dist -maxdepth 1 -type f | wc -l)" -eq 3
           if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release delete-asset "$RELEASE_TAG" mrmcp-macos-x64 --yes >/dev/null 2>&1 || true
-            gh release delete-asset "$RELEASE_TAG" mrmcp-macos-arm64 --yes >/dev/null 2>&1 || true
+            for retired in mrmcp-macos-x64.dmg mrmcp-macos-x64; do gh release delete-asset "$RELEASE_TAG" "$retired" --yes >/dev/null 2>&1 || true; done
             gh release upload "$RELEASE_TAG" "${files[@]}" --clobber
             gh release edit "$RELEASE_TAG" --notes-file release-notes.md
           else
-            gh release create "$RELEASE_TAG" "${files[@]}" \
-              --verify-tag \
-              --title "MrMCP $RELEASE_TAG" \
-              --notes-file release-notes.md
+            gh release create "$RELEASE_TAG" "${files[@]}" --verify-tag --title "MrMCP $RELEASE_TAG" --notes-file release-notes.md
           fi

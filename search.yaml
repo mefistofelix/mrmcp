@@ -1,9 +1,12 @@
 # Search configuration; edited in Settings → Search or directly in this file.
-# No model is downloaded automatically. Fulltext works without embeddings.
+# rag.js owns document extraction, Turso retrieval and local Xberg Rust/ONNX embeddings.
+# Models download on first vector/hybrid use; no software or service to install,
+# then stay cached in each .mrmcp/search/.../rag/<profile>/models/embeddings directory.
+# Startup and Settings download no models; fulltext downloads no embedding model.
+# PaddleOCR downloads its own models only when a selected file needs OCR.
 default_path: "" # Empty: OS Desktop/_default. Otherwise absolute or relative to the MrMCP directory.
 embedding:
-  provider: ollama # ollama | openai
-  endpoint: http://127.0.0.1:11434
-  model: ""
-  api_key: ""
-ocr: native # native | disabled; no Tesseract fallback
+  provider: local # local | ollama | openai
+  model: fast # fast: English, ~24 MB. multilingual: Italian/100+ languages, ~1.1 GB.
+  # ollama/openai additionally require endpoint and api_key (empty if not needed).
+ocr: paddle # paddle | native | disabled; usable PDF text is retained, no Tesseract fallback.
