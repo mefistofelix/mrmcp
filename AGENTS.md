@@ -2,7 +2,7 @@
 
 ## Current release and files
 
-MrMCP 0.11.3 consists of thirteen root project files, a Bun dependency manifest/lockfile, build/check scripts, one GitHub Actions workflow and one versioned asset directory:
+MrMCP 0.11.4 consists of thirteen root project files, a Bun dependency manifest/lockfile, build/check scripts, one GitHub Actions workflow and one versioned asset directory:
 
 - `mrmcp.js` — Bun backend, MCP `2026-07-28`, OAuth/Basic authentication, Turso, native GPUIX UI and desktop launcher.
 - `mcp.yaml` — separate authoritative stdio MCP server catalog, managed by the MCP Servers page. Embed/materialize it once beside the other catalogs without overwriting edits; binaries live in `.mrmcp/mcp/bin`, outside Commands discovery.

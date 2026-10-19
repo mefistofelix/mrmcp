@@ -2,7 +2,7 @@
 /** @jsx nativeElement */
 /** @jsxFrag NativeFragment */
 /*
-MrMCP 0.11.3 — Bun runtime and native GPUIX administration UI.
+MrMCP 0.11.4 — Bun runtime and native GPUIX administration UI.
 Runtime data: .mrmcp beside source/portable executables; macOS .app data lives under ~/Library/Application Support/MrMCP/.
 Run desktop GUI: bun mrmcp.js
 Run headless backend: bun mrmcp.js --backend
@@ -388,7 +388,7 @@ const READ_TOOLS = new Set([
 ]);
 const MCP_MODERN_PROTOCOL = "2026-07-28";
 const MCP_PROTOCOLS = [MCP_MODERN_PROTOCOL];
-const VERSION = "0.11.3";
+const VERSION = "0.11.4";
 const DB_SCHEMA_VERSION = 6;
 const OAUTH_ACCESS_TOKEN_TTL_SECONDS = 365 * 24 * 60 * 60;
 const CONTEXT_TTL_MS = 30 * 24 * 60 * 60 * 1000;

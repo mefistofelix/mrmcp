@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.11.4
+
+- Publish the Bun 1.4.3/native React-GPUIX desktop architecture with one backend/UI event loop, asynchronous Turso persistence and local rag.js retrieval. Keep fulltext/vector/hybrid search, lazy persistent embeddings/PaddleOCR, explicit native/disabled OCR and the independent stdio MCP catalog/bridge.
+- Use CDP.js 0.5.0 URL bootstrap to open/reuse the system browser on demand for goals and reusable Session-owned workers. Add the Subagents GUI, optional goal conversation ID and bundled CDP Ext export with confirmed updates and manual Chrome installation/reload instructions.
+- Fix clean-checkout verification, use ephemeral listener ports and compare native overlay frames with their viewport. Respect GPUIX's platform-specific interaction-harness availability while checking the complete Linux public renderer package closure from an empty cache. Add build-only workflow dispatch so verification does not rewrite published tags. Earlier 0.11.2/0.11.3 attempts did not publish releases.
+- Update implementation guidance, operator/tool documentation and repository description to the current Bun/GPUIX stack. Preserve readable multiline source and remove redundant goal-enable/query aliases and custom reverse-connection scanning.
+- Ship exactly Windows x64, Linux x64 and macOS Apple Silicon assets. Schema remains 6: older incompatible stores require explicit Start Fresh, archiving all existing state; no migration or silent reset. macOS Intel, tray and OS notifications remain suspended.
+
 ## 0.11.3
 
 - Prepare the verification build directory before creating isolated fixtures, so checks work from a clean checkout on every release runner. The 0.11.2 tag stopped before building or publishing; this release includes its changes below.
