@@ -2078,7 +2078,17 @@ if (standalone) {
   const smoke =
     application.slice(0, application.lastIndexOf("\nif (import.meta.main) {")) +
     String.raw`
-const { TestGpuixRenderer } = await loadRuntimePackage("@gpuix/native");
+const { TestGpuixRenderer, hasTestGpuixRenderer, GpuixRenderer } = await loadRuntimePackage("@gpuix/native");
+if (!hasTestGpuixRenderer()) {
+  const [react, gpuix, host] = await Promise.all([
+    loadRuntimePackage("react"), loadRuntimePackage("@gpuix/react"), loadRuntimePackage("@gpuix/native/host"),
+  ]);
+  if (typeof react.createElement !== "function" || typeof gpuix.createRoot !== "function" ||
+      typeof host.createMutationQueue !== "function" || typeof GpuixRenderer !== "function")
+    throw Error("Standalone public React/native package closure is incomplete");
+  console.log("Standalone React: public renderer/host/dependencies load from empty cache; native interaction harness unavailable on this platform");
+  process.exit(0);
+}
 const renderer = new TestGpuixRenderer(1180, 760);
 const events = [];
 const host = await NativeUiHost.create(renderer, (event) => events.push(event));

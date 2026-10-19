@@ -423,6 +423,9 @@ Listener lifecycle fixtures use ephemeral ports and report startup errors, avoid
 requirements. Native dialog checks compare the outer overlay frame with the measured app viewport,
 not hard-coded Windows pixel dimensions. Manual workflow dispatch may set publish=false to verify a
 branch/ref and build artifacts without changing release tags; publishing always verifies VERSION==tag.
+Use hasTestGpuixRenderer in source and standalone checks. GPUIX 0.10.0 exposes its interaction harness
+only on Windows/macOS; Linux verifies projections and the complete public React/native/host closure
+from an empty cache without claiming native interaction coverage or constructing an unsupported test renderer.
 
 For Goals test extension-ID validation/persistence, no listener/target before requested work,
 reverse attachment without a process/profile, named purple group creation, owned logical target reuse
