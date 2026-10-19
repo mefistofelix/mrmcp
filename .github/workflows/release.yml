@@ -5,9 +5,13 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing version tag to build and publish
-        required: true
+        description: Existing tag/ref (empty uses the selected workflow ref)
+        required: false
         type: string
+      publish:
+        description: Publish the matching version tag after verification
+        type: boolean
+        default: true
 permissions:
   contents: write
 jobs:
@@ -23,6 +27,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     env:
       RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+      PUBLISH_RELEASE: ${{ github.event_name == 'push' || inputs.publish }}
       PLATFORM: ${{ matrix.platform }}
       ARCH: ${{ matrix.arch }}
       ASSET: ${{ matrix.asset }}
@@ -41,7 +46,11 @@ jobs:
           set -euo pipefail
           version="$(sed -n 's/^const VERSION = "\([^"]*\)";/\1/p' mrmcp.js)"
           test -n "$version"
-          test "$version" = "$RELEASE_TAG"
+          if [ "$PUBLISH_RELEASE" = true ]; then
+            test "$version" = "$RELEASE_TAG"
+          else
+            echo "RELEASE_TAG=$version" >> "$GITHUB_ENV"
+          fi
       - name: Install declared dependencies
         run: bun install --frozen-lockfile --ignore-scripts
       - name: Install Linux desktop libraries
@@ -126,6 +135,7 @@ jobs:
           if-no-files-found: error
   release:
     name: Publish GitHub Release
+    if: github.event_name == 'push' || inputs.publish
     needs: build
     runs-on: ubuntu-latest
     env:

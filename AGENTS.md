@@ -419,6 +419,10 @@ For a release, update `CHANGELOG.md`, the source header and the `VERSION` consta
 
 Run verification from a clean checkout as well as the development directory. Check/build scripts
 create their own build/output parents and must not rely on ignored local files, caches or fixtures.
+Listener lifecycle fixtures use ephemeral ports and report startup errors, avoiding privileged-port
+requirements. Native dialog checks compare the outer overlay frame with the measured app viewport,
+not hard-coded Windows pixel dimensions. Manual workflow dispatch may set publish=false to verify a
+branch/ref and build artifacts without changing release tags; publishing always verifies VERSION==tag.
 
 For Goals test extension-ID validation/persistence, no listener/target before requested work,
 reverse attachment without a process/profile, named purple group creation, owned logical target reuse

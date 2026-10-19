@@ -1597,15 +1597,18 @@ console.log("Lifecycle: CLI relative path and unattended schema-5 refusal/preser
 // Waiting for graceful HTTP stop before cancelling that process would deadlock.
 let lifecycle = await fs.readFile(join(root, "mrmcp.js"), "utf8");
 lifecycle = replaceFixture(lifecycle, /const GUI_RUNTIME\s*=[^;]+;/, "const GUI_RUNTIME = true;");
+lifecycle = replaceFixture(lifecycle, "const HTTP_PORT = 80;", "const HTTP_PORT = 0;");
+lifecycle = replaceFixture(lifecycle, "const HTTPS_PORT = 443;", "const HTTPS_PORT = 0;");
 lifecycle = replaceFixture(
   lifecycle,
   /return \{\s*input:\s*dispatchUiInput,\s*visible:\s*setUiRenderVisible,\s*shutdown,?\s*\};/,
-  "return { input:dispatchUiInput,visible:setUiRenderVisible,shutdown,testPorts:readyPayload.ports,testActive:()=>activeCallControls.size };",
+  "return { input:dispatchUiInput,visible:setUiRenderVisible,shutdown,testPorts:{http:mcpHttpServer?.port,https:mcpHttpsServer?.port},testListenError:mcpListenError,testActive:()=>activeCallControls.size };",
 );
 lifecycle =
   lifecycle.slice(0, lifecycle.lastIndexOf("\nif (import.meta.main) {")) +
   String.raw`
 const service = await runBackend();
+if (!service.testPorts.https) throw Error("Lifecycle TLS listener failed: " + service.testListenError);
 const base = "https://127.0.0.1:" + service.testPorts.https;
 let sequence = 0;
 let handle;
@@ -1709,9 +1712,23 @@ if (hasTestGpuixRenderer()) {
       );
     if (payload.section.startsWith("dialog:")) {
       const overlay = [...host.nodes.values()].find((n) => n.meta?.overlay);
-      const bounds = overlay && native.getElementBounds(overlay.nativeId);
-      if (!bounds || bounds.height < 700)
-        throw Error("Dialog does not fill the native window: " + payload.section);
+      const frame = overlay && (host.nodes.get(overlay.key + "/scroll-frame") || overlay);
+      const app = host.nodes.get("id:app");
+      const bounds = frame && native.getElementBounds(frame.nativeId);
+      const viewport = app && native.getElementBounds(app.nativeId);
+      if (
+        !bounds ||
+        !viewport ||
+        viewport.height <= 0 ||
+        viewport.width <= 0 ||
+        ["x", "y", "width", "height"].some((key) => Math.abs(bounds[key] - viewport[key]) > 1)
+      )
+        throw Error(
+          "Dialog does not fill the native viewport: " +
+            payload.section +
+            " " +
+            JSON.stringify({ bounds, viewport }),
+        );
     }
   }
   host.apply({ revision: revision++, section: "test", projection: page("new") });
