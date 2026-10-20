@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Align Select labels, chevrons and option text with explicit native Flex layout and consistent padding.
 - Fix severe GUI stalls by removing application scrollbar geometry polling and using the native frame loop. Explicit column widths avoid repeated intrinsic measurements in native nested grids, including during window resizing.
 - Keep native declarations immutable and memoize React widgets, so unchanged projections send no native updates and header changes preserve the active page subtree.
 - Replace custom dropdown geometry, focus/typeahead and backend open/close round trips with official GPUIX Select components. GPUIX 0.10 scrolls natively but does not yet paint scrollbar thumbs.

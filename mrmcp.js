@@ -31497,6 +31497,8 @@ class NativeUiHost {
             lineHeight: 20,
             color: "#e6e9ef",
             pointerEvents: "none",
+            whiteSpace: "nowrap",
+            textOverflow: "ellipsis",
           };
           return createElement(
             gpuix.Select,
@@ -31521,8 +31523,11 @@ class NativeUiHost {
                 role: "combobox",
                 "aria-id": node.meta.id,
                 style: {
+                  display: "flex",
                   height: 34,
-                  padding: 8,
+                  width: "100%",
+                  paddingLeft: 10,
+                  paddingRight: 8,
                   minWidth: 120,
                   background: "#13161a",
                   borderWidth: 1,
@@ -31531,11 +31536,20 @@ class NativeUiHost {
                   flexDirection: "row",
                   alignItems: "center",
                   justifyContent: "space-between",
+                  gap: 8,
                   opacity: disabled ? 0.45 : 1,
                 },
               },
-              createElement(gpuix.SelectValue, { style: textStyle }),
-              createElement("text", { style: textStyle }, "⌄"),
+              createElement(gpuix.SelectValue, {
+                style: {
+                  ...textStyle,
+                  flexGrow: 1,
+                  flexShrink: 1,
+                  minWidth: 0,
+                  overflow: "hidden",
+                },
+              }),
+              createElement("text", { style: { ...textStyle, flexShrink: 0 } }, "⌄"),
             ),
             createElement(
               gpuix.SelectContent,
@@ -31571,8 +31585,14 @@ class NativeUiHost {
                       role: "option",
                       "aria-label": option.label,
                       style: (state) => ({
+                        display: "flex",
+                        flexDirection: "row",
+                        alignItems: "center",
                         minHeight: 30,
-                        padding: 6,
+                        paddingLeft: 8,
+                        paddingRight: 8,
+                        paddingTop: 5,
+                        paddingBottom: 5,
                         borderRadius: 4,
                         background: state.highlighted
                           ? "#333e5b"
