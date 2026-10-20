@@ -154,7 +154,31 @@ The backend owns one ephemeral uiState: active section/tab, stable database IDs 
 6. There is no transport draft buffer or acknowledgment high-water mark. Draft ingestion is synchronous and invalidates stale model work, so an older async projection cannot replace new typing. React owns rendering; native editors retain caret/IME/undo. Password masking is transient React widget presentation derived from the native change event.
 7. JSON editing, folding/source mode and invalid partial literals remain backend-owned. TEXT/JSON switches preserve exact drafts. A submitted form validates a stable input snapshot and checks that the same draft/dialog is still current before starting a write; completing that write cannot close a newer dialog or discard further edits. Keep transactions only around genuinely atomic backend operations; Turso owns connection serialization, without an additional application DB queue.
 
-Use the shared native palette, compact sidebar, public SVG nodes and consistent focus/hover states. Group navigation visually and keep compact metric cards and control spacing. Native scroll containers have measured, visible horizontal/vertical scrollbar widgets, built only with GPUIX public nodes, bounds, offsets, pointer capture and scrollTo. Instantaneous rail/drag state is native presentation; only per-section page offsets are buffered to uiState. Update rails after native painting without backend projection/SQL work; hide non-overflowing rails and skip unchanged mutations. Preserve precise trackpad deltas, enhance line-wheel steps only, keep vertical wheel chaining over horizontally scrolling tables and retain keyboard/Home/End/Page navigation and pointer dragging. Do not add scroll polling to the backend or patch GPUIX. The existing 16 ms native tick may refresh measured widget geometry. Native textarea internal scrollbars remain a package capability boundary; never replace the editor/caret/IME with a second editing implementation. Table descriptions may collapse to three lines only with a backend-owned Show more/less action retaining the full text. Keep long handles clipped/ellipsized inside their cells and Tool Call IDs readable without wrapping. Workspace Session chips keep identity on one row and compact metadata underneath. Selects use GPUIX public anchored/deferred overlays, hoisted outside page flow; opening must never move subsequent content. The backend owns open/value state while the main thread supplies measured bounds, focus and bounded typeahead. Clamp popup geometry to the measured viewport, skip disabled options, restore trigger focus after selection/Escape, and dismiss on outside click, page actions, scroll or resize. Verify overlay layout, occlusion, disabled hits, keyboard navigation, focus restoration and edge fitting with the native test renderer; never patch the library or introduce a parallel GUI stack.
+Use the shared native palette, compact sidebar, public SVG nodes and consistent focus/hover states.
+GPUIX owns Flex/Grid layout, native scrolling, hit testing and window pacing. Declare full width on normal
+column containers so nested grids do not repeatedly measure intrinsic text widths; do not calculate pixel
+coordinates or replace the native layout engine. Use the public native runtime startFrameLoop with no
+application layout/geometry work per tick. Never restore custom scrollbar rails, thumb measurement, drag
+math or geometry polling: synchronous bounds queries can block the Bun event loop for hundreds of
+milliseconds. GPUIX 0.10 does not paint scrollbar thumbs; expose this package limitation honestly until
+the public package supports them. Native textarea/password editing capabilities remain package boundaries;
+do not replace caret/IME/undo with another editor. Retain the small transient password mask because this
+version exposes no password input mode. Preserve precise trackpad motion and native wheel chaining over
+wide tables; only per-section offsets are buffered to uiState. Keep table descriptions collapsible through
+backend-owned Show more/less, long handles ellipsized, Tool Call IDs readable and Session metadata compact.
+Use official @gpuix/react Select/SelectTrigger/SelectValue/SelectContent/SelectItem: the component owns
+transient opening, anchoring, collision handling, focus and keyboard interaction; the selected value stays
+in backend drafts. Do not rebuild popup geometry, typeahead, focus queues or open/close backend round trips.
+React.memo compares immutable native declarations using Bun.deepEquals; committed widget refs/metadata
+are separate objects, never mutations of those declarations. An identical projection must emit no native
+updates, and changing the header must leave the page subtree untouched. GPUI events do not bubble: wire
+Session source/drop intents and OS file-drop callbacks to their nested hit targets using public events.
+Use primary-button drags with transient numeric Session identity; never infer the drop target from text.
+Managed dialogs constrain the panel to the viewport and keep title/actions fixed around one scrolling
+body. Verify all dialog types at 900×620 and 900×760, including confirmation without a form. Test the
+official Select, real descendant-to-descendant pointer drags, OS drop dispatch, unchanged React bailouts,
+scroll preservation and absence of application geometry reads while scrolling. Never patch the library
+or introduce a parallel GUI stack.
 
 Non-user events (tool calls, logs, processes, Workspaces, OAuth, certificates, browser traffic and downloads) use the same dirty/render pipeline. Native controls never fetch GUI JSON routes. Backend GUI actions call uiOperation directly with an operation name and plain arguments; return plain data or throw an error. Do not recreate an internal HTTP router, Request/Response objects or JSON round trips. These operations are private and never exposed through the public listener.
 
@@ -420,7 +444,7 @@ For a release, update `CHANGELOG.md`, the source header and the `VERSION` consta
 Run verification from a clean checkout as well as the development directory. Check/build scripts
 create their own build/output parents and must not rely on ignored local files, caches or fixtures.
 Listener lifecycle fixtures use ephemeral ports and report startup errors, avoiding privileged-port
-requirements. Native dialog checks compare the outer overlay frame with the measured app viewport,
+requirements. Native dialog checks compare the overlay with its viewport and assert title/actions remain visible at short heights,
 not hard-coded Windows pixel dimensions. Manual workflow dispatch may set publish=false to verify a
 branch/ref and build artifacts without changing release tags; publishing always verifies VERSION==tag.
 Use hasTestGpuixRenderer in source and standalone checks. GPUIX 0.10.0 exposes its interaction harness

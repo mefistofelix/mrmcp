@@ -1199,7 +1199,7 @@ async function backend({ addWorkspace = null } = {}) {
     "help",
   ]);
   const uiState = {
-    native: { details: {}, select: "", jsonSource: {}, jsonEdits: {} },
+    native: { details: {}, jsonSource: {}, jsonEdits: {} },
     currentSection: "dashboard",
     scrollBySection: { dashboard: [0, 0] },
     scrollTarget: "",
@@ -27865,7 +27865,7 @@ h1 {
   async function handleUiAction(event) {
     const interaction = uiInteractionGeneration;
     const draftRevision = uiDraftRevision;
-    uiState.native.select = "";
+
     const action = String(event.action || "");
     const data = event.dataset || {};
     const values = event.values || {};
@@ -28671,15 +28671,6 @@ h1 {
       ];
     try {
       switch (event.type) {
-        case "native-select":
-          uiState.native.select = uiState.native.select === event.id ? "" : String(event.id || "");
-          uiState.native.selectAnchor = event.anchor || null;
-          queueUiRender("native-select", 0);
-          return;
-        case "native-select-close":
-          uiState.native.select = "";
-          queueUiRender("native-select-close", 0);
-          return;
         case "native-details":
           uiState.native.details[String(event.key)] = !!event.open;
           queueUiRender("native-details", 0);
@@ -28756,7 +28747,6 @@ h1 {
           return;
         }
         case "navigate": {
-          uiState.native.select = "";
           const section = String(event.section || "");
           if (UI_SECTIONS.has(section)) {
             uiState.currentSection = section;
@@ -28880,7 +28870,6 @@ h1 {
           return;
         }
         case "change": {
-          uiState.native.select = "";
           const id = String(event.id || "");
           uiUpdateDraft(id, event.value, event.checked);
           if (["logContext", "logStatus", "logPageSize"].includes(id) && uiLogFilterTimer) {
@@ -30775,189 +30764,27 @@ function nativeProjection(view, state = {}) {
       };
     }
     if (tag === "select") {
-      const options = node.children.filter((n) => typeof n !== "string" && n.tag === "option");
-      const current = controls[a.id]?.value;
-      const selected = options.find((o) => String(o.attrs.value ?? nativeText(o)) === current);
-      const open = state.select === a.id;
-      const label = nativeText(selected || { children: [] });
-      const trigger = button(
-        key + "/trigger",
-        label,
-        { type: "native-select", id: a.id },
-        {
-          height: 34,
-          minHeight: 34,
-          paddingLeft: 10,
-          paddingRight: 8,
-          background: theme.input,
-          borderColor: open ? theme.accent : theme.border,
-          justifyContent: "space-between",
-          opacity: disabled ? 0.45 : 1,
-        },
-      );
-      trigger.children[0].style = {
-        ...trigger.children[0].style,
-        whiteSpace: "nowrap",
-        textOverflow: "ellipsis",
-        flexShrink: 1,
-      };
-      trigger.children.push(icon(key + "/chevron", "chevron"));
-      trigger.meta = { ...meta, selectTrigger: a.id };
-      trigger.props = {
-        ...trigger.props,
-        role: "combobox",
-        "aria-expanded": open,
-        "aria-valuetext": label,
-        "aria-id": a.id,
-      };
-      trigger.events.keyDown = { type: "native-select-key", id: a.id };
-      const children = [trigger];
-      if (open && !disabled) {
-        const anchor = state.selectAnchor || {
-          x: 220,
-          y: 90,
-          width: 220,
-          height: 34,
-          windowWidth: 1180,
-          windowHeight: 760,
-        };
-        const width = Math.min(
-          Math.max(
-            180,
-            anchor.width || 220,
-            ...options.map((option) => nativeText(option).length * 6.5 + 48),
-          ),
-          Math.max(180, (anchor.windowWidth || 1180) - 24),
-          420,
-        );
-        const below = (anchor.windowHeight || 760) - anchor.y - anchor.height - 12;
-        const above = anchor.y - 12;
-        const upwards = below < Math.min(180, options.length * 32 + 12) && above > below;
-        const menuHeight = Math.max(
-          44,
-          Math.min(300, options.length * 32 + 16, Math.max(64, upwards ? above : below)),
-        );
-        const menuX = Math.max(8, Math.min(anchor.x, (anchor.windowWidth || 1180) - width - 16));
-        const menuY = Math.max(
-          8,
-          Math.min(
-            upwards ? anchor.y - menuHeight - 5 : anchor.y + anchor.height + 5,
-            (anchor.windowHeight || 760) - menuHeight - 16,
-          ),
-        );
-        const menu = {
-          key: key + "/options",
-          type: "div",
-          style: {
-            display: "flex",
-            flexDirection: "column",
-            width,
-            height: menuHeight,
-            maxHeight: menuHeight,
-            padding: 5,
-            gap: 2,
-            overflowY: "scroll",
-            background: theme.raised,
-            borderRadius: 8,
-            borderWidth: 1,
-            borderColor: "#454d5e",
-            boxShadow: {
-              offsetX: 0,
-              offsetY: 8,
-              blurRadius: 24,
-              spreadRadius: 0,
-              color: "#00000066",
-            },
-            pointerEvents: "auto",
-          },
-          props: { role: "listbox", "aria-label": a["aria-label"] || a.id },
-          events: { mouseDownOutside: { type: "native-select-close", id: a.id } },
-          meta: { selectPopup: a.id, viewport: anchor },
-          children: options.map((o, i) => {
-            const value = String(o.attrs.value ?? nativeText(o));
-            const selectedOption = o === selected;
-            const optionDisabled = Object.hasOwn(o.attrs, "disabled");
-            const option = button(
-              key + "/option/" + i,
-              nativeText(o),
-              { type: "change", id: a.id, value, dataset: data },
-              {
-                minHeight: 30,
-                paddingLeft: 8,
-                paddingRight: 8,
-                borderWidth: 0,
-                borderRadius: 4,
-                background: selectedOption ? theme.selected : "transparent",
-                opacity: optionDisabled ? 0.4 : 1,
-              },
-            );
-            option.meta = {
-              ...meta,
-              disabled: optionDisabled,
-              selectOption: a.id,
-              selected: selectedOption,
-              value,
-            };
-            option.props = {
-              ...option.props,
-              role: "option",
-              "aria-selected": selectedOption,
-              tabIndex: optionDisabled ? -1 : 0,
-            };
-            option.children[0].style = {
-              ...option.children[0].style,
-              flexGrow: 1,
-              whiteSpace: "nowrap",
-              textOverflow: "ellipsis",
-            };
-            option.children.push(
-              selectedOption
-                ? icon(option.key + "/check", "check", theme.accent, 14)
-                : {
-                    key: option.key + "/check",
-                    type: "div",
-                    style: { width: 14, flexShrink: 0 },
-                    children: [],
-                  },
-            );
-            option.events.keyDown = {
-              type: "native-select-option-key",
-              id: a.id,
-              value,
-              dataset: data,
-            };
-            return option;
-          }),
-        };
-        children.push({
-          key: key + "/popover",
-          type: "anchored",
-          style: { position: "absolute", width: 0, height: 0 },
-          props: {
-            position: { x: menuX, y: menuY },
-            anchor: "topLeft",
-            fit: "snap",
-            snapMargin: 8,
-            deferred: true,
-            priority: 120,
-            occlude: true,
-          },
-          meta: { overlay: true, popover: true },
-          children: [menu],
-        });
-      }
+      const options = node.children
+        .filter((child) => typeof child !== "string" && child.tag === "option")
+        .map((option) => ({
+          value: String(option.attrs.value ?? nativeText(option)),
+          label: nativeText(option),
+          disabled: Object.hasOwn(option.attrs, "disabled"),
+        }));
+      const value = controls[a.id]?.value;
+      const label = options.find((option) => option.value === value)?.label || "";
       return {
         key,
-        type: "div",
+        type: "select",
         style: {
-          ...style,
           minWidth: 120,
           width: Math.min(320, Math.max(150, label.length * 6.5 + 42)),
           maxWidth: "100%",
           alignSelf: "flex-start",
         },
+        props: { value, options, disabled, "aria-id": a.id },
         meta: { ...meta, control: true, select: true },
-        children,
+        children: [],
       };
     }
     if (data.jsonSource) {
@@ -31423,11 +31250,11 @@ function nativeProjection(view, state = {}) {
         bottom: 0,
         padding: 32,
         background: classes.has("tool-detail-overlay") ? theme.canvas : "#00000099",
-        overflowY: "scroll",
+        ...(classes.has("tool-detail-overlay") ? { overflowY: "scroll" } : { overflow: "hidden" }),
         pointerEvents: "auto",
         justifyContent: classes.has("dialog-overlay") ? "center" : "flex-start",
       });
-    if (tag === "dialog")
+    if (tag === "dialog") {
       Object.assign(style, {
         width: "100%",
         maxWidth: 760,
@@ -31439,9 +31266,35 @@ function nativeProjection(view, state = {}) {
         borderWidth: 1,
         borderColor: "#454d5e",
         borderRadius: 12,
-        overflowY: "scroll",
+        minHeight: 0,
+        overflow: "hidden",
         boxShadow: { offsetX: 0, offsetY: 16, blurRadius: 48, spreadRadius: 0, color: "#00000066" },
       });
+      const form = children.find((child) => child.meta?.tag === "form");
+      const sections = form ? form.children : children;
+      if (sections.length >= 2) {
+        const title = sections[0];
+        const actions = sections.at(-1);
+        title.style.flexShrink = 0;
+        actions.style.flexShrink = 0;
+        if (form) {
+          form.style.minHeight = 0;
+          form.style.gap = 12;
+        }
+        const layout = [
+          title,
+          {
+            key: key + "/body",
+            type: "div",
+            style: { minHeight: 0, flexShrink: 1, overflowY: "scroll", gap: 8 },
+            children: sections.slice(1, -1),
+          },
+          actions,
+        ];
+        if (form) form.children = layout;
+        else children.splice(0, children.length, ...layout);
+      }
+    }
     if (classes.has("notice-balloon"))
       Object.assign(style, {
         position: "absolute",
@@ -31502,48 +31355,39 @@ function nativeProjection(view, state = {}) {
     hoist(app);
     app.children.push(...overlays);
   }
-  return { tree: nativeScrollbars(tree), controls };
+  // GPUI events do not bubble: descendants must carry their enclosing drop/source intent.
+  const dragTargets = (node, sessionId, rootId) => {
+    const data = node.meta?.dataset || {};
+    sessionId = data.sessionDrag !== undefined ? data.sessionId : sessionId;
+    rootId = data.rootDrop !== undefined ? data.rootDrop : rootId;
+    node.events = { ...node.events };
+    node.events.fileDrop ??= { type: "native-drop" };
+    if (sessionId !== undefined) {
+      node.events.mouseDown = { type: "native-drag", sessionId };
+      node.style = { ...node.style, userSelect: "none", cursor: "grab" };
+    }
+    node.events.mouseUp ??=
+      rootId !== undefined ? { type: "native-drop-session", rootId } : { type: "native-drag-end" };
+    for (const child of node.children || []) dragTargets(child, sessionId, rootId);
+  };
+  dragTargets(tree);
+  return { tree: nativeScrollContent(tree), controls };
 }
 
-// Native scroll handles own offsets. These siblings only present their measured range.
-function nativeScrollbars(node) {
-  node.children = (node.children || []).map(nativeScrollbars);
+// Content stays at its natural size; GPUIX owns scroll handles and wheel input.
+function nativeScrollContent(node) {
+  node.children = (node.children || []).map(nativeScrollContent);
+  // Bound column width so nested grids do not repeatedly measure intrinsic text widths.
+  if (
+    node.type === "div" &&
+    node.style?.flexDirection === "column" &&
+    node.style.position !== "absolute" &&
+    node.style.width === undefined
+  )
+    node.style.width = "100%";
   const vertical = node.style?.overflowY === "scroll" || node.style?.overflow === "scroll";
   const horizontal = node.style?.overflowX === "scroll" || node.style?.overflow === "scroll";
   if (node.type !== "div" || (!vertical && !horizontal)) return node;
-  const frameStyle = {
-    display: "flex",
-    flexDirection: "column",
-    position: "relative",
-    minWidth: 0,
-    minHeight: 0,
-  };
-  for (const key of [
-    "width",
-    "height",
-    "minWidth",
-    "minHeight",
-    "maxWidth",
-    "maxHeight",
-    "flexGrow",
-    "flexShrink",
-    "flexBasis",
-    "alignSelf",
-    "position",
-    "top",
-    "right",
-    "bottom",
-    "left",
-    "margin",
-    "marginTop",
-    "marginRight",
-    "marginBottom",
-    "marginLeft",
-  ])
-    if (node.style[key] !== undefined) {
-      frameStyle[key] = node.style[key];
-      delete node.style[key];
-    }
   const content = {
     key: node.key + "/scroll-content",
     type: "div",
@@ -31551,104 +31395,36 @@ function nativeScrollbars(node) {
     children: node.children,
   };
   for (const key of [
-    "display",
     "flexDirection",
     "gap",
-    "rowGap",
-    "columnGap",
     "alignItems",
     "justifyContent",
     "flexWrap",
     "gridTemplateColumns",
   ])
-    if (node.style[key] !== undefined) content.style[key] = node.style[key];
+    if (node.style[key] !== undefined) {
+      content.style[key] = node.style[key];
+      delete node.style[key];
+    }
   if (horizontal) {
     content.style.minWidth = Math.max(
       0,
       ...content.children.map((child) => Number(child.style?.minWidth) || 0),
     );
+    // GPUIX 0.10 needs both axes to retain horizontal content extent.
+    if (!vertical) node.style.overflowY = "scroll";
   }
   node.children = [content];
-  Object.assign(node.style, {
-    display: "flex",
-    flexDirection: "column",
-    gap: 0,
-    flexGrow: 1,
-    flexShrink: 1,
-    minHeight: 0,
-    minWidth: 0,
-    width: "100%",
-  });
-  if (frameStyle.height !== undefined) node.style.height = "100%";
-  // The published GPUIX horizontal-only viewport loses its content range.
-  // A two-axis viewport keeps the range and native vertical wheel chaining.
-  if (horizontal && !vertical) {
-    node.style.overflowY = "scroll";
-    for (const key of ["borderWidth", "borderColor", "borderRadius"]) {
-      frameStyle[key] = node.style[key];
-      delete node.style[key];
-    }
-  }
+  node.style.display = "flex";
+  node.style.flexDirection = "column";
+  node.style.gap = 0;
   node.events = { ...node.events, scroll: { type: "native-scroll" } };
   node.meta = {
     ...node.meta,
     scroller: true,
-    scrollContent: content.key,
     scrollAxis: vertical ? (horizontal ? "both" : "y") : "x",
   };
-  const tracks = [vertical && "y", horizontal && "x"].filter(Boolean).map((axis) => ({
-    key: node.key + "/scrollbar-" + axis,
-    type: "div",
-    style: {
-      position: "absolute",
-      ...(axis === "y"
-        ? { top: 4, bottom: horizontal ? 14 : 4, right: 2, width: 10 }
-        : { left: 4, right: vertical ? 14 : 4, bottom: 2, height: 10 }),
-      borderRadius: 5,
-      background: "#ffffff08",
-      opacity: 0,
-      pointerEvents: "auto",
-      userSelect: "none",
-      cursor: "default",
-      hover: { background: "#ffffff12" },
-    },
-    meta: { scrollbarFor: node.key, axis },
-    props: {
-      role: "scrollbar",
-      "aria-label": axis === "y" ? "Vertical scroll" : "Horizontal scroll",
-      "aria-orientation": axis === "y" ? "vertical" : "horizontal",
-      tabIndex: 0,
-    },
-    events: Object.fromEntries(
-      ["mouseDown", "mouseMove", "mouseUp", "keyDown", "scroll"].map((name) => [
-        name,
-        { type: "native-scrollbar" },
-      ]),
-    ),
-    children: [
-      {
-        key: node.key + "/scrollbar-thumb-" + axis,
-        type: "div",
-        meta: { scrollbarThumb: axis },
-        style: {
-          position: "absolute",
-          ...(axis === "y"
-            ? { left: 2, width: 6, top: 0, height: 32 }
-            : { top: 2, height: 6, left: 0, width: 32 }),
-          borderRadius: 4,
-          background: "#697384",
-          pointerEvents: "none",
-        },
-        children: [],
-      },
-    ],
-  }));
-  return {
-    key: node.key + "/scroll-frame",
-    type: "div",
-    style: frameStyle,
-    children: [node, ...tracks],
-  };
+  return node;
 }
 
 class NativeUiHost {
@@ -31669,8 +31445,6 @@ class NativeUiHost {
     this.ids = new Map();
     this.controls = {};
     this.scrollTimer = null;
-    this.scrollbars = [];
-    this.scrollbarDrag = null;
     this.section = "";
     this.revision = 0;
     this.dragSession = "";
@@ -31682,45 +31456,155 @@ class NativeUiHost {
     };
     this.getSnapshot = () => this.snapshot;
     const host = this;
-    const { createElement, useRef, useLayoutEffect, useSyncExternalStore, useState } = React;
-    function NativeWidget({ node }) {
-      const instance = useRef(null);
-      const [preview, setPreview] = useState(null);
-      const text = preview && preview.base === node.text ? preview.value : node.text;
-      useLayoutEffect(() => {
-        if (!instance.current) return;
-        node.nativeId = instance.current.id;
-        node.setText = (value) => setPreview({ base: node.text, value });
-        host.nodes.set(node.key, node);
-        host.ids.set(node.nativeId, node.key);
-        return () => {
-          if (host.nodes.get(node.key) === node) host.nodes.delete(node.key);
-          host.ids.delete(node.nativeId);
-        };
-      }, [node]);
-      const src = node.props?.src;
-      useLayoutEffect(() => {
-        if (!instance.current || !String(src).startsWith("data:")) return;
-        const comma = src.indexOf(",");
-        const bytes = src.slice(0, comma).includes(";base64")
-          ? Buffer.from(src.slice(comma + 1), "base64")
-          : Buffer.from(decodeURIComponent(src.slice(comma + 1)));
-        host.renderer.setImage(instance.current.id, bytes);
-      }, [src]);
-      const props = { ...node.props, style: node.style, ref: instance };
-      if (String(src).startsWith("data:")) delete props.src;
-      for (const name of Object.keys(node.events || {}))
-        props["on" + name[0].toUpperCase() + name.slice(1)] = (event) =>
-          host.event({ ...event, elementId: instance.current.id, eventType: name });
-      return createElement(
-        node.type,
-        props,
-        ...(text === undefined ? [] : [text]),
-        ...(node.children || []).map((child) =>
-          createElement(NativeWidget, { key: child.key, node: child }),
-        ),
-      );
-    }
+    const { createElement, memo, useRef, useLayoutEffect, useSyncExternalStore, useState } = React;
+    const NativeWidget = memo(
+      function NativeWidgetView({ node }) {
+        const instance = useRef(null);
+        const [preview, setPreview] = useState(null);
+        const text = preview && preview.base === node.text ? preview.value : node.text;
+        useLayoutEffect(() => {
+          if (!instance.current) return;
+          const widget = {
+            ...node,
+            nativeId: instance.current.id,
+            baseStyle: node.style,
+            setText: (value) => setPreview({ base: node.text, value }),
+          };
+          host.nodes.set(node.key, widget);
+          host.ids.set(widget.nativeId, node.key);
+          return () => {
+            if (host.nodes.get(node.key) === widget) host.nodes.delete(node.key);
+            host.ids.delete(widget.nativeId);
+          };
+        }, [node]);
+        const src = node.props?.src;
+        useLayoutEffect(() => {
+          if (!instance.current || !String(src).startsWith("data:")) return;
+          const comma = src.indexOf(",");
+          const bytes = src.slice(0, comma).includes(";base64")
+            ? Buffer.from(src.slice(comma + 1), "base64")
+            : Buffer.from(decodeURIComponent(src.slice(comma + 1)));
+          host.renderer.setImage(instance.current.id, bytes);
+        }, [src]);
+        const style =
+          node.key === host.focusedKey && ["input", "textarea"].includes(node.type)
+            ? { ...node.style, borderColor: "#879aff" }
+            : node.style;
+        if (node.type === "select") {
+          const { value, options, disabled } = node.props;
+          const textStyle = {
+            fontSize: 13,
+            lineHeight: 20,
+            color: "#e6e9ef",
+            pointerEvents: "none",
+          };
+          return createElement(
+            gpuix.Select,
+            {
+              style: node.style,
+              disabled,
+              value: "value:" + value,
+              items: options.map((option) => ({
+                value: "value:" + option.value,
+                label: option.label,
+              })),
+              onValueChange: (selected) => {
+                const value = selected.slice(6);
+                if (host.controls[node.meta.id]) host.controls[node.meta.id].value = value;
+                host.send({ type: "change", id: node.meta.id, value, dataset: node.meta.dataset });
+              },
+            },
+            createElement(
+              gpuix.SelectTrigger,
+              {
+                ref: instance,
+                role: "combobox",
+                "aria-id": node.meta.id,
+                style: {
+                  height: 34,
+                  padding: 8,
+                  minWidth: 120,
+                  background: "#13161a",
+                  borderWidth: 1,
+                  borderColor: "#2d323b",
+                  borderRadius: 6,
+                  flexDirection: "row",
+                  alignItems: "center",
+                  justifyContent: "space-between",
+                  opacity: disabled ? 0.45 : 1,
+                },
+              },
+              createElement(gpuix.SelectValue, { style: textStyle }),
+              createElement("text", { style: textStyle }, "⌄"),
+            ),
+            createElement(
+              gpuix.SelectContent,
+              {
+                role: "listbox",
+                "aria-id": node.meta.id + "/options",
+                sideOffset: 5,
+                collisionPadding: 8,
+                style: {
+                  width: Math.max(180, Number(node.style.width)),
+                  maxHeight: 280,
+                  display: "flex",
+                  flexDirection: "column",
+                  overflowY: "scroll",
+                  padding: 5,
+                  background: "#20242b",
+                  borderRadius: 8,
+                  borderWidth: 1,
+                  borderColor: "#454d5e",
+                  pointerEvents: "auto",
+                },
+              },
+              createElement(
+                "div",
+                { style: { flexDirection: "column", flexShrink: 0 } },
+                ...options.map((option) =>
+                  createElement(
+                    gpuix.SelectItem,
+                    {
+                      key: option.value,
+                      value: "value:" + option.value,
+                      disabled: option.disabled,
+                      role: "option",
+                      "aria-label": option.label,
+                      style: (state) => ({
+                        minHeight: 30,
+                        padding: 6,
+                        borderRadius: 4,
+                        background: state.highlighted
+                          ? "#333e5b"
+                          : state.selected
+                            ? "#29324b"
+                            : "transparent",
+                        opacity: state.disabled ? 0.4 : 1,
+                      }),
+                    },
+                    createElement("text", { style: textStyle }, option.label),
+                  ),
+                ),
+              ),
+            ),
+          );
+        }
+        const props = { ...node.props, style, ref: instance };
+        if (String(src).startsWith("data:")) delete props.src;
+        for (const name of Object.keys(node.events || {}))
+          props["on" + name[0].toUpperCase() + name.slice(1)] = (event) =>
+            host.event({ ...event, elementId: instance.current.id, eventType: name });
+        return createElement(
+          node.type,
+          props,
+          ...(text === undefined ? [] : [text]),
+          ...(node.children || []).map((child) =>
+            createElement(NativeWidget, { key: child.key, node: child }),
+          ),
+        );
+      },
+      (previous, next) => Bun.deepEquals(previous.node, next.node),
+    );
     function NativePage() {
       const payload = useSyncExternalStore(host.subscribe, host.getSnapshot);
       useLayoutEffect(() => {
@@ -31739,65 +31623,6 @@ class NativeUiHost {
   dispatch(event) {
     if (!this.gpuix.handleGpuixEvent(event, this.renderer)) this.event(event);
   }
-  updateScrollbars() {
-    for (const track of this.scrollbars) {
-      const owner = this.nodes.get(track.meta.scrollbarFor);
-      const content = owner && this.nodes.get(owner.meta.scrollContent);
-      const viewport = owner && this.renderer.getElementBounds(owner.nativeId);
-      const bounds = content && this.renderer.getElementBounds(content.nativeId);
-      const rail = this.renderer.getElementBounds(track.nativeId);
-      if (!viewport || !bounds || !rail) continue;
-      const vertical = track.meta.axis === "y";
-      const offset = this.renderer.getScrollOffset(owner.nativeId) || [0, 0];
-      const padding = vertical
-        ? Number(owner.style.paddingTop ?? owner.style.padding ?? 0) +
-          Number(owner.style.paddingBottom ?? owner.style.padding ?? 0)
-        : Number(owner.style.paddingLeft ?? owner.style.padding ?? 0) +
-          Number(owner.style.paddingRight ?? owner.style.padding ?? 0);
-      const visible = vertical ? viewport.height : viewport.width;
-      const total = (vertical ? bounds.height : bounds.width) + padding;
-      const range = Math.max(0, total - visible);
-      const length = vertical ? rail.height : rail.width;
-      const thumbLength = Math.min(length, Math.max(28, (length * visible) / Math.max(1, total)));
-      const travel = Math.max(0, length - thumbLength);
-      const position = Math.max(
-        0,
-        Math.min(travel, (-offset[vertical ? 1 : 0] / Math.max(1, range)) * travel),
-      );
-      track.geometry = { range, travel, thumbLength, position, rail, owner, vertical };
-      for (const [key, value] of Object.entries({
-        tabIndex: range > 1 ? 0 : -1,
-        "aria-valuemin": 0,
-        "aria-valuemax": Math.round(range),
-        "aria-valuenow": Math.round(-offset[vertical ? 1 : 0]),
-      }))
-        if (track.props[key] !== value) {
-          track.props[key] = value;
-          this.presentation.setCustomProp(track.nativeId, key, value);
-        }
-      const thumb = track.children[0];
-      const thumbStyle = {
-        ...thumb.style,
-        ...(vertical
-          ? { top: position, height: thumbLength }
-          : { left: position, width: thumbLength }),
-      };
-      const style = {
-        ...track.style,
-        opacity: range > 1 ? 1 : 0,
-        pointerEvents: range > 1 ? "auto" : "none",
-      };
-      for (const [element, nextStyle] of [
-        [track, style],
-        [thumb, thumbStyle],
-      ])
-        if (Object.entries(nextStyle).some(([key, value]) => element.style[key] !== value)) {
-          element.style = nextStyle;
-          this.presentation.setStyle(element.nativeId, nextStyle);
-        }
-    }
-    this.presentation.flushMutations();
-  }
   recordScroll(owner, offset = this.renderer.getScrollOffset(owner.nativeId) || [0, 0]) {
     if (owner.meta?.tag !== "main") return;
     if (this.scrollTimer) clearTimeout(this.scrollTimer);
@@ -31807,55 +31632,6 @@ class NativeUiHost {
       this.send({ type: "scroll", section, x: -offset[0], y: -offset[1] });
     }, 80);
   }
-  scrollbarEvent(track, event) {
-    const g = track.geometry;
-    if (!g?.range) return;
-    const axis = g.vertical ? 1 : 0;
-    const offset = this.renderer.getScrollOffset(g.owner.nativeId) || [0, 0];
-    const point = (g.vertical ? event.y : event.x) - (g.vertical ? g.rail.y : g.rail.x);
-    let value = -offset[axis];
-    if (event.eventType === "mouseDown" && (event.button == null || event.button === 0)) {
-      this.renderer.focusElement(track.nativeId);
-      const inside = point >= g.position && point <= g.position + g.thumbLength;
-      this.scrollbarDrag = {
-        key: track.key,
-        grab: inside ? point - g.position : g.thumbLength / 2,
-      };
-    } else if (event.eventType === "mouseUp") {
-      this.scrollbarDrag = null;
-      return;
-    } else if (event.eventType === "keyDown") {
-      const step = Math.max(48, (g.vertical ? g.rail.height : g.rail.width) * 0.85);
-      const moves = {
-        home: 0,
-        end: g.range,
-        pageup: value - step,
-        pagedown: value + step,
-        up: value - 48,
-        arrowup: value - 48,
-        down: value + 48,
-        arrowdown: value + 48,
-        left: value - 48,
-        arrowleft: value - 48,
-        right: value + 48,
-        arrowright: value + 48,
-      };
-      if (!(event.key in moves)) return;
-      value = moves[event.key];
-    } else if (event.eventType === "scroll") {
-      value -=
-        Number(g.vertical ? event.deltaY : event.deltaX || event.deltaY) *
-        (event.precise === false ? 48 : 1);
-    } else if (event.eventType !== "mouseMove") return;
-    if (["mouseDown", "mouseMove"].includes(event.eventType)) {
-      if (this.scrollbarDrag?.key !== track.key) return;
-      value = ((point - this.scrollbarDrag.grab) / Math.max(1, g.travel)) * g.range;
-    }
-    offset[axis] = -Math.max(0, Math.min(g.range, value));
-    if (!g.vertical) offset[1] = 0;
-    this.renderer.scrollTo(g.owner.nativeId, ...offset);
-    this.recordScroll(g.owner, offset);
-  }
   collect(scope, form) {
     return Object.fromEntries(
       Object.entries(this.controls)
@@ -31863,80 +31639,13 @@ class NativeUiHost {
         .map(([id, c]) => [id, c.value]),
     );
   }
-  selectAnchor(node) {
-    const bounds = this.renderer.getElementBounds(node.nativeId);
-    const size = this.renderer.getWindowSize?.();
-    return bounds
-      ? {
-          ...bounds,
-          windowWidth: size?.width || size?.[0] || 1180,
-          windowHeight: size?.height || size?.[1] || 760,
-        }
-      : null;
-  }
-  checkPopupViewport() {
-    const anchor = this.popupViewport;
-    if (!anchor || this.popupResizeClosing) return;
-    const size = this.renderer.getWindowSize?.();
-    if (
-      size &&
-      (Math.abs(size.width - anchor.windowWidth) > 1 ||
-        Math.abs(size.height - anchor.windowHeight) > 1)
-    ) {
-      this.popupResizeClosing = true;
-      this.send({ type: "native-select-close" });
-    }
-  }
-  focusOption(id, key) {
-    const options = [...this.nodes.values()].filter(
-      (n) => n.meta?.selectOption === id && !n.meta.disabled,
-    );
-    if (!options.length) return;
-    const focused = this.renderer.getFocusedElementId?.();
-    let index = options.findIndex((n) => n.nativeId === focused);
-    if (key === "home") index = 0;
-    else if (key === "end") index = options.length - 1;
-    else if (key === "up" || key === "arrowup") index = (index <= 0 ? options.length : index) - 1;
-    else if (key === "down" || key === "arrowdown") index = (index + 1) % options.length;
-    else if (key?.length === 1 && !/\s/.test(key)) {
-      const now = Date.now();
-      this.typeAhead =
-        (now - (this.typeAheadAt || 0) < 600 ? this.typeAhead || "" : "") + key.toLowerCase();
-      this.typeAheadAt = now;
-      const found = options.findIndex((n) =>
-        (n.props?.["aria-label"] || "").toLowerCase().startsWith(this.typeAhead),
-      );
-      if (found < 0) return;
-      index = found;
-    } else
-      index = Math.max(
-        0,
-        options.findIndex((n) => n.meta.selected),
-      );
-    for (const option of options) {
-      const style = option.baseStyle || option.style;
-      this.presentation.setStyle(option.nativeId, {
-        ...style,
-        background: option === options[index] ? "#333e5b" : style.background,
-      });
-    }
-    this.presentation.flushMutations();
-    this.renderer.focusElement(options[index].nativeId);
-    this.renderer.scrollIntoView?.(options[index].nativeId);
-  }
   event(event) {
-    const popup = [...this.nodes.values()].find((n) => n.meta?.selectPopup);
     if (
       event.elementId === 0 &&
       ["keyDown", "windowKeyDown"].includes(event.eventType) &&
       event.key === "escape"
     ) {
-      this.popupRestoreFocus = !!popup;
-      this.send(
-        popup
-          ? { type: "native-select-close" }
-          : { type: "action", action: "close-dialog", dataset: {}, values: {} },
-      );
+      this.send({ type: "action", action: "close-dialog", dataset: {}, values: {} });
       return;
     }
     const node = this.nodes.get(this.ids.get(event.elementId));
@@ -31957,24 +31666,6 @@ class NativeUiHost {
       if (target) this.renderer.focusElement(target.nativeId);
       return;
     }
-    if (intent.type === "native-select-option-key") {
-      if (["enter", "space", " "].includes(event.key)) {
-        this.popupRestoreFocus = true;
-        this.send({ type: "change", id: intent.id, value: intent.value, dataset: intent.dataset });
-        return;
-      }
-      if (event.key === "tab") {
-        this.send({ type: "native-select-close" });
-        return;
-      }
-      this.focusOption(intent.id, event.key);
-      return;
-    }
-    if (
-      intent.type === "native-select-key" &&
-      !["enter", "space", " ", "down", "up", "arrowdown", "arrowup"].includes(event.key)
-    )
-      return;
     if (intent.keyboard && !["enter", "space", " "].includes(event.key)) return;
     if (intent.type === "native-copy") {
       void loadAuto()
@@ -31982,12 +31673,7 @@ class NativeUiHost {
         .catch(console.error);
       return;
     }
-    if (intent.type === "native-scrollbar") {
-      this.scrollbarEvent(node, event);
-      return;
-    }
     if (intent.type === "native-scroll") {
-      if (popup && !node.meta?.selectPopup) this.send({ type: "native-select-close" });
       if (node.meta.scrollAxis === "x") {
         const [x, y] = this.renderer.getScrollOffset(node.nativeId) || [0, 0];
         if (y) this.renderer.scrollTo(node.nativeId, x, 0);
@@ -32005,12 +31691,11 @@ class NativeUiHost {
       return;
     }
     if (intent.type === "native-drag-end") {
-      setTimeout(() => {
-        this.dragSession = "";
-      }, 0);
+      this.dragSession = "";
       return;
     }
     if (intent.type === "native-drag") {
+      if (event.button != null && event.button !== 0) return;
       this.dragSession = String(intent.sessionId || "");
       return;
     }
@@ -32038,21 +31723,6 @@ class NativeUiHost {
     }
     let outgoing = { ...intent };
     delete outgoing.keyboard;
-    if (intent.type === "native-select" || intent.type === "native-select-key")
-      outgoing = { type: "native-select", id, anchor: this.selectAnchor(node) };
-    if (intent.type === "native-select-close") {
-      const trigger = [...this.nodes.values()].find((n) => n.meta?.selectTrigger === intent.id);
-      const bounds = trigger && this.renderer.getElementBounds(trigger.nativeId);
-      if (
-        bounds &&
-        event.x >= bounds.x &&
-        event.x <= bounds.x + bounds.width &&
-        event.y >= bounds.y &&
-        event.y <= bounds.y + bounds.height
-      )
-        return;
-    }
-    if (intent.type === "change" && node.meta?.selectOption) this.popupRestoreFocus = true;
     if (intent.type === "native-checkbox") {
       const value = !this.controls[id]?.value;
       if (this.controls[id]) this.controls[id].value = value;
@@ -32079,53 +31749,14 @@ class NativeUiHost {
     if (!payload.projection) return;
     // React owns element allocation, keys, updates and destruction. These maps
     // contain only widget metadata/refs for native focus, scrolling and hit testing.
-    const prepare = (node) => {
-      const old = this.nodes.get(node.key);
-      node.baseStyle = node.style;
-      if (node.key === this.focusedKey && ["input", "textarea"].includes(node.type))
-        node.style = { ...node.style, borderColor: "#879aff" };
-      if (old && node.meta?.scrollbarFor)
-        node.style = {
-          ...node.style,
-          opacity: old.style.opacity,
-          pointerEvents: old.style.pointerEvents,
-        };
-      if (old && node.meta?.scrollbarThumb) {
-        const axis = node.meta.scrollbarThumb;
-        node.style = {
-          ...node.style,
-          ...(axis === "y"
-            ? { top: old.style.top, height: old.style.height }
-            : { left: old.style.left, width: old.style.width }),
-        };
-      }
-      for (const child of node.children || []) prepare(child);
-    };
-    prepare(payload.projection.tree);
     this.gpuix.flushSync(() => {
       this.snapshot = payload;
       for (const listener of this.listeners) listener();
     });
   }
   afterCommit(payload) {
-    const previousPopup = this.popupId;
     const next = this.nodes;
-    this.scrollbars = [...next.values()].filter((node) => node.meta?.scrollbarFor);
     this.mainScroller = [...next.values()].find((node) => node.meta?.tag === "main");
-    if (payload.section !== this.section) this.scrollbarDrag = null;
-    const nextPopup = [...next.values()].find((n) => n.meta?.selectPopup);
-    this.popupViewport = nextPopup?.meta.viewport || null;
-    if (!nextPopup || nextPopup.meta.selectPopup !== previousPopup) this.popupResizeClosing = false;
-    if (this.popupFocusTimer) clearTimeout(this.popupFocusTimer);
-    if (nextPopup?.meta.selectPopup !== previousPopup && nextPopup)
-      this.popupFocusTimer = setTimeout(() => this.focusOption(nextPopup.meta.selectPopup), 20);
-    else if (previousPopup && !nextPopup && this.popupRestoreFocus) {
-      this.popupRestoreFocus = false;
-      const trigger = [...next.values()].find((n) => n.meta?.selectTrigger === previousPopup);
-      if (trigger)
-        this.popupFocusTimer = setTimeout(() => this.renderer.focusElement(trigger.nativeId), 20);
-    }
-    this.popupId = nextPopup?.meta.selectPopup || "";
     this.controls = Object.fromEntries(
       Object.entries(payload.projection.controls).map(([id, control]) => [id, { ...control }]),
     );
@@ -32145,7 +31776,7 @@ class NativeUiHost {
   }
   close() {
     if (this.scrollTimer) clearTimeout(this.scrollTimer);
-    if (this.popupFocusTimer) clearTimeout(this.popupFocusTimer);
+
     this.root.unmount();
     this.listeners.clear();
     this.nodes.clear();
@@ -32221,17 +31852,12 @@ async function desktop() {
       ),
     });
     renderer.activateWindow();
-    pump = setInterval(() => {
-      try {
-        if (!renderer.tick()) resolveClosed();
-        else {
-          native.checkPopupViewport();
-          native.updateScrollbars();
-        }
-      } catch (error) {
-        rejectClosed(error);
-      }
-    }, 16);
+    const nativeRuntime = await loadRuntimePackage("@gpuix/native/runtime");
+    pump = nativeRuntime.startFrameLoop(renderer, {
+      frameMs: 16,
+      onTerminated: resolveClosed,
+      onError: rejectClosed,
+    });
     startup = runBackend()
       .then(async (service) => {
         runtime = service;
@@ -32252,7 +31878,7 @@ async function desktop() {
     await closed;
   } finally {
     closing = true;
-    if (pump) clearInterval(pump);
+    pump?.stop();
     native?.close();
     desktopHost.input = () => {};
     desktopHost.cancelStartup?.();

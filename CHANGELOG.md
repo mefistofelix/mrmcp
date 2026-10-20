@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Fix severe GUI stalls by removing application scrollbar geometry polling and using the native frame loop. Explicit column widths avoid repeated intrinsic measurements in native nested grids, including during window resizing.
+- Keep native declarations immutable and memoize React widgets, so unchanged projections send no native updates and header changes preserve the active page subtree.
+- Replace custom dropdown geometry, focus/typeahead and backend open/close round trips with official GPUIX Select components. GPUIX 0.10 scrolls natively but does not yet paint scrollbar thumbs.
+- Keep every dialog title and action row visible around one constrained scrolling body. Fix Session drag/drop and OS directory drop dispatch on nested content, where GPUI events do not bubble.
+
 ## 0.11.4
 
 - Publish the Bun 1.4.3/native React-GPUIX desktop architecture with one backend/UI event loop, asynchronous Turso persistence and local rag.js retrieval. Keep fulltext/vector/hybrid search, lazy persistent embeddings/PaddleOCR, explicit native/disabled OCR and the independent stdio MCP catalog/bridge.

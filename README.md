@@ -192,7 +192,22 @@ ACME HTTP-01 is available only while the effective HTTP listener remains on port
 
 ## Desktop application
 
-Desktop mode runs GPUIX and the backend directly in one Bun process/event loop, without a backend Worker or render-message copies. The main database uses Turso’s public asynchronous driver; transactions retain exclusive connection ownership. Local native providers and external child processes retain their own execution mechanisms. Application state, validation, dialogs, drafts and actions stay in the backend. Inline JSX in mrmcp.js compiles through Bun using a small local native factory and file-level pragmas, without React or extra JSX configuration. Components produce native declarations directly, then GPUIX reconciles keyed widgets; there is no HTML generation/parsing on the GUI path. Eta loads only when rendering the editable text templates in guided_prompts.yaml. The administrative GUI has no WebView, DOM, Morphlex, Tauri bridge or network listener. Page/sidebar/table/popup scroll containers show native widgets for dragging and keyboard scrolling; precise trackpad motion stays native and mouse-wheel steps are enhanced. These presentation updates do not rerender backend pages. OAuth consent and published MCP Apps remain web content.
+Desktop mode runs GPUIX and the backend directly in one Bun process/event loop, without a backend Worker or
+render-message copies. The main database uses Turso’s public asynchronous driver; transactions retain exclusive
+connection ownership. Application state, validation, dialogs, drafts and actions stay in the backend. Native
+providers and external child processes retain their own execution mechanisms.
+
+Bun compiles inline JSX in mrmcp.js with a small local declaration factory and file-level pragmas, without
+extra JSX configuration. The official React/GPUIX renderer reconciles the immutable keyed widget declarations
+and skips unchanged subtrees. Flex/Grid layout and scrolling stay native; explicit column widths avoid
+expensive intrinsic layout. Dropdowns use the official GPUIX Select components. Dialogs keep title/actions
+visible while their body scrolls. There is no application scrollbar or geometry polling loop. GPUIX 0.10
+currently scrolls without visible scrollbar thumbs; support awaits the public package. Precise trackpad
+motion stays native and line-wheel steps are enhanced.
+
+The administrative GUI has no WebView, DOM, HTML generation/parsing, Morphlex, Tauri bridge or network
+listener. Eta loads only for editable guided_prompts.yaml templates. OAuth consent and published MCP Apps
+remain web content.
 
 Closing the window stops the backend and its managed processes. Tray, hide-on-close and native OS notification delivery are temporarily unavailable; the Notifications tab retains the saved preferences and explains their suspended state. Directory drops and Session-to-Workspace drag/drop remain supported. JSON values use the native tree and an editable JSON source view. GPUIX currently exposes no reliable minimize/visibility event, so backend projections may continue while minimized; native focus and selection remain with GPUIX.
 

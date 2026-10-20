@@ -1704,8 +1704,6 @@ if (hasTestGpuixRenderer()) {
   )) {
     host.apply({ ...payload, revision: revision++ });
     native.flush();
-    host.updateScrollbars();
-    native.flush();
     if (process.argv.includes("--screenshots"))
       native.captureScreenshot(
         join(directory, "ui-" + payload.section.replaceAll(":", "-") + ".png"),
@@ -1721,7 +1719,10 @@ if (hasTestGpuixRenderer()) {
         !viewport ||
         viewport.height <= 0 ||
         viewport.width <= 0 ||
-        ["x", "y", "width", "height"].some((key) => Math.abs(bounds[key] - viewport[key]) > 1)
+        Math.abs(bounds.height - viewport.height) > 1 ||
+        Math.abs(bounds.width - viewport.width) > 1 ||
+        Math.abs(bounds.y - viewport.y) > 32 ||
+        Math.abs(bounds.x - viewport.x) > 32
       )
         throw Error(
           "Dialog does not fill the native viewport: " +
@@ -1729,6 +1730,39 @@ if (hasTestGpuixRenderer()) {
             " " +
             JSON.stringify({ bounds, viewport }),
         );
+      for (const height of [760, 620]) {
+        const projection = structuredClone(payload.projection);
+        Object.assign(projection.tree.style, { width: 900, height });
+        host.apply({ ...payload, projection, revision: revision++ });
+        native.flush();
+        const panel = [...host.nodes.values()].find((node) => node.meta?.tag === "dialog");
+        const form = [...host.nodes.values()].find((node) => node.meta?.tag === "form") || panel;
+        const title = form && host.nodes.get(form.children[0].key);
+        const actions = form && host.nodes.get(form.children.at(-1).key);
+        const titleBounds = title && native.getElementBounds(title.nativeId);
+        const actionBounds = actions && native.getElementBounds(actions.nativeId);
+        if (
+          !titleBounds ||
+          !actionBounds ||
+          titleBounds.y < 0 ||
+          actionBounds.y + actionBounds.height > height ||
+          actionBounds.y <= titleBounds.y
+        )
+          throw Error(
+            "Dialog title/actions clipped at height " +
+              height +
+              ": " +
+              payload.section +
+              " " +
+              JSON.stringify({ titleBounds, actionBounds }),
+          );
+        if (
+          [...host.nodes.values()].filter(
+            (node) => node.meta?.scroller && node.key.startsWith(panel.key),
+          ).length > 1
+        )
+          throw Error("Dialog has nested scroll viewports");
+      }
     }
   }
   host.apply({ revision: revision++, section: "test", projection: page("new") });
@@ -1753,24 +1787,37 @@ if (hasTestGpuixRenderer()) {
     if (native.getRetainedElementCount() !== retainedBaseline)
       throw Error("React leaked removed native elements");
   }
+  const gpuix = await import("@gpuix/react");
+  const dispatch = () =>
+    gpuix.flushSync(() => native.drainEvents().forEach((event) => host.dispatch(event)));
+  const settle = () => {
+    native.flush();
+    dispatch();
+    native.flush();
+  };
+  const flatten = (node) => [node, ...(node.children || []).flatMap(flatten)];
+  const inspect = () => flatten(JSON.parse(native.getTreeJson()));
+  const prop = (name, value) => inspect().find((node) => node.customProps?.[name] === value);
+  const click = (node) => {
+    const bounds = native.getElementBounds(node.id);
+    if (!bounds) throw Error("Widget has no painted bounds: " + JSON.stringify(node));
+    native.simulateClick(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+    settle();
+  };
   const selectPage = (value) =>
     element(
       "div",
       { id: "app" },
-      element("header", null, "Popover regression"),
+      element("header", null, "Select regression"),
       element(
         "main",
         null,
         element(
-          "div",
-          { class: "row" },
-          element(
-            "select",
-            { id: "choice" },
-            element("option", { value: "disk", selected: value === "disk" }, "Disk"),
-            element("option", { disabled: true }, "Unavailable"),
-            element("option", { value: "memory", selected: value === "memory" }, "Memory"),
-          ),
+          "select",
+          { id: "choice" },
+          element("option", { value: "disk", selected: value === "disk" }, "Disk"),
+          element("option", { disabled: true }, "Unavailable"),
+          element("option", { value: "memory", selected: value === "memory" }, "Memory"),
         ),
         element(
           "div",
@@ -1779,135 +1826,119 @@ if (hasTestGpuixRenderer()) {
         ),
       ),
     );
-  const dispatch = () => native.drainEvents().forEach((event) => host.dispatch(event));
-  native.setWindowKeyEvents(true, false, 0);
   host.apply({
     revision: revision++,
+    section: "select",
     projection: nativeProjection(selectPage("disk")),
-    section: "popover",
   });
-  native.flush();
-  native.drainEvents();
-  const selectTrigger = [...host.nodes.values()].find((n) => n.meta?.selectTrigger === "choice");
-  const triggerBounds = native.getElementBounds(selectTrigger.nativeId);
+  settle();
+  const trigger = prop("aria-id", "choice");
   const belowBefore = native.getElementBounds(host.nodes.get("id:below").nativeId);
-  native.simulateClick(
-    triggerBounds.x + triggerBounds.width / 2,
-    triggerBounds.y + triggerBounds.height / 2,
-  );
-  dispatch();
-  const opened = events.at(-1);
-  if (opened.type !== "native-select" || !opened.anchor)
-    throw Error("Native select trigger did not emit measured geometry");
-  host.apply({
-    revision: revision++,
-    projection: nativeProjection(selectPage("disk"), {
-      select: "choice",
-      selectAnchor: opened.anchor,
-    }),
-    section: "popover",
-  });
-  native.flush();
+  const eventsBeforeOpen = events.length;
+  click(trigger);
+  if (!prop("aria-id", "choice/options")) throw Error("Official Select did not open");
+  if (events.length !== eventsBeforeOpen) throw Error("Opening Select called the backend");
   if (
     JSON.stringify(native.getElementBounds(host.nodes.get("id:below").nativeId)) !==
     JSON.stringify(belowBefore)
   )
-    throw Error("Select popup changed the document layout");
-  let menu = [...host.nodes.values()].find((n) => n.meta?.selectPopup === "choice");
-  if (!menu) throw Error("Anchored native popup missing");
-  const disabled = [...host.nodes.values()].find(
-    (n) => n.meta?.selectOption === "choice" && n.meta.disabled,
-  );
-  const disabledBounds = native.getElementBounds(disabled.nativeId);
-  const beforeDisabled = events.length;
-  native.simulateClick(disabledBounds.x + 5, disabledBounds.y + 5);
-  dispatch();
-  if (events.slice(beforeDisabled).some((e) => e.type === "change" || e.action === "under-popup"))
-    throw Error("Disabled popup option selected or clicked through");
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  native.flush();
-  host.focusOption("choice", "home");
-  native.flush();
-  native.drainEvents();
-  native.simulateKeystrokes("down");
-  dispatch();
-  native.flush();
-  const focusedOption = host.nodes.get(host.ids.get(native.getFocusedElementId()));
-  if (focusedOption?.meta?.value !== "memory")
-    throw Error("Arrow navigation did not skip the disabled option");
-  native.simulateKeystrokes("enter");
-  dispatch();
-  const chosen = events.at(-1);
-  if (chosen.type !== "change" || chosen.value !== "memory")
-    throw Error("Enter did not choose the focused native option");
-  host.apply({
-    revision: revision++,
-    projection: nativeProjection(selectPage("memory")),
-    section: "popover",
-  });
-  native.flush();
-  await new Promise((resolve) => setTimeout(resolve, 30));
-  native.flush();
-  if (native.getFocusedElementId() !== host.nodes.get("id:choice/trigger").nativeId)
-    throw Error("Select did not restore trigger focus");
-  const viewport = native.getWindowSize();
-  const edgeAnchor = {
-    x: viewport.width - 80,
-    y: viewport.height - 40,
-    width: 150,
-    height: 34,
-    windowWidth: viewport.width,
-    windowHeight: viewport.height,
-  };
-  host.apply({
-    revision: revision++,
-    projection: nativeProjection(selectPage("memory"), {
-      select: "choice",
-      selectAnchor: edgeAnchor,
-    }),
-    section: "popover",
-  });
-  native.flush();
-  menu = [...host.nodes.values()].find((n) => n.meta?.selectPopup === "choice");
-  const edgeBounds = native.getElementBounds(menu.nativeId);
+    throw Error("Select changed page layout");
+  const disabled = prop("aria-label", "Unavailable");
+  click(disabled);
   if (
-    edgeBounds.x < 0 ||
-    edgeBounds.y < 0 ||
-    edgeBounds.x + edgeBounds.width > viewport.width + 1 ||
-    edgeBounds.y + edgeBounds.height > viewport.height + 1
+    events
+      .slice(eventsBeforeOpen)
+      .some((event) => event.type === "change" || event.action === "under-popup")
   )
-    throw Error("Popup did not fit the viewport edge: " + JSON.stringify({ viewport, edgeBounds }));
-  native.drainEvents();
-  native.simulateClick(350, 20);
-  dispatch();
-  if (events.at(-1)?.type !== "native-select-close")
-    throw Error("Click outside did not dismiss the popup");
-  native.drainEvents();
-  const beforeEscape = events.length;
+    throw Error("Disabled Select item selected or clicked through");
+  native.simulateKeystrokes("down");
+  settle();
+  native.simulateKeystrokes("enter");
+  settle();
+  if (events.at(-1)?.type !== "change" || events.at(-1)?.value !== "memory")
+    throw Error("Official Select keyboard selection failed: " + JSON.stringify(events.at(-1)));
+  host.apply({
+    revision: revision++,
+    section: "select",
+    projection: nativeProjection(selectPage("memory")),
+  });
+  settle();
+  if (native.getFocusedElementId() !== host.nodes.get("id:choice").nativeId)
+    throw Error("Official Select did not restore trigger focus");
+  click(prop("aria-id", "choice"));
   native.simulateKeystrokes("escape");
-  dispatch();
-  if (events.length <= beforeEscape || events.at(-1)?.type !== "native-select-close")
-    throw Error("Escape did not dismiss the popup");
-  const beforeWindowEscape = events.length;
-  host.event({ elementId: 0, eventType: "windowKeyDown", key: "escape" });
-  if (events.length !== beforeWindowEscape + 1 || events.at(-1)?.type !== "native-select-close")
-    throw Error("Production window-key event did not dismiss the popup");
-  console.log(
-    "GPUI: anchored popup layout, disabled/occluded clicks, arrow/Enter/Escape, focus restoration and viewport fit passed",
+  settle();
+  if (prop("aria-id", "choice/options")) throw Error("Official Select Escape did not close");
+  click(prop("aria-id", "choice"));
+  native.simulateClick(350, 20);
+  settle();
+  if (prop("aria-id", "choice/options")) throw Error("Official Select outside click did not close");
+  const longSelect = nativeProjection(
+    element(
+      "div",
+      { id: "app" },
+      element(
+        "select",
+        { id: "long-choice" },
+        ...Array.from({ length: 30 }, (_, i) =>
+          element("option", { value: String(i) }, "Option " + i),
+        ),
+      ),
+    ),
   );
+  const locate = (node, key) =>
+    node.key === key
+      ? node
+      : (node.children || []).map((child) => locate(child, key)).find(Boolean);
+  const size = native.getWindowSize();
+  Object.assign(locate(longSelect.tree, "id:long-choice").style, {
+    position: "absolute",
+    left: size.width - 170,
+    top: size.height - 60,
+    width: 150,
+  });
+  host.apply({ revision: revision++, section: "long-select", projection: longSelect });
+  settle();
+  click(prop("aria-id", "long-choice"));
+  const menu = prop("aria-id", "long-choice/options");
+  const menuBounds = menu && native.getElementBounds(menu.id);
+  if (
+    !menuBounds ||
+    menuBounds.x < 0 ||
+    menuBounds.y < 0 ||
+    menuBounds.x + menuBounds.width > size.width + 1 ||
+    menuBounds.y + menuBounds.height > size.height + 1
+  )
+    throw Error("Official Select overflows viewport: " + JSON.stringify(menuBounds));
+  native.simulateScrollWheel(menuBounds.x + 20, menuBounds.y + 60, 0, -90);
+  settle();
+  if (!prop("aria-id", "long-choice/options") || native.getScrollOffset(menu.id)[1] >= 0)
+    throw Error("Long official Select did not scroll or dismissed itself");
+  console.log(
+    "GPUI: official Select overlay, disabled hits, keyboard selection, focus and dismissal passed",
+  );
+
   const scrollView = element(
     "div",
     { id: "app" },
     element("header", null, "Native scroll regression"),
     element(
-      "aside",
-      null,
-      ...Array.from({ length: 45 }, (_, i) => element("p", null, "Navigation " + i)),
-    ),
-    element(
       "main",
       null,
-      element("table", { id: "wide" }, element("tr", null, element("td", null, "Wide table"))),
+      element(
+        "table",
+        { id: "wide" },
+        element(
+          "tr",
+          null,
+          ...Array.from({ length: 20 }, (_, i) => element("th", null, "Column " + i)),
+        ),
+        element(
+          "tr",
+          null,
+          ...Array.from({ length: 20 }, (_, i) => element("td", null, "Value " + i)),
+        ),
+      ),
       ...Array.from({ length: 60 }, (_, i) =>
         element(
           "article",
@@ -1918,42 +1949,50 @@ if (hasTestGpuixRenderer()) {
       ),
     ),
   );
-  const scrollProjection = nativeProjection(scrollView);
-  const findNode = (node, predicate) =>
-    predicate(node)
-      ? node
-      : (node.children || []).map((child) => findNode(child, predicate)).find(Boolean);
-  const tableFrame = findNode(scrollProjection.tree, (node) =>
-    node.children?.some((child) => child.meta?.id === "wide"),
-  );
-  tableFrame.style.width = 420;
-  host.apply({ revision: revision++, section: "scroll-regression", projection: scrollProjection });
-  const scrollFrame = () => {
-    native.flush();
-    dispatch();
-    host.updateScrollbars();
-    native.flush();
-  };
-  scrollFrame();
+  host.apply({ revision: revision++, section: "scroll", projection: nativeProjection(scrollView) });
+  settle();
   const main = host.mainScroller;
-  const track = host.scrollbars.find((node) => node.meta.scrollbarFor === main.key);
-  if (!track?.geometry || track.style.opacity !== 1 || track.geometry.range < 1000)
-    throw Error("Main scrollbar has no visible measured range");
-  const horizontal = host.scrollbars.find((node) => node.meta.axis === "x");
-  if (!horizontal?.geometry || horizontal.style.opacity !== 1 || horizontal.geometry.range < 100)
-    throw Error("Wide table has no horizontal scrollbar");
-  const mainBounds = native.getElementBounds(main.nativeId);
-  const x = mainBounds.x + 100,
-    y = mainBounds.y + 250;
-  const offsetBefore = native.getScrollOffset(main.nativeId)[1];
-  const eventCountBefore = events.length;
+  const bounds = native.getElementBounds(main.nativeId);
+  const x = bounds.x + 50,
+    y = bounds.y + 200;
+  const eventCount = events.length;
+  const startOffset = native.getScrollOffset(main.nativeId)[1];
   native.simulateScrollWheel(x, y, 0, -120);
-  scrollFrame();
-  const offsetAfter = native.getScrollOffset(main.nativeId)[1];
-  if (Math.abs(offsetAfter - offsetBefore + 120) > 1 || track.children[0].style.top <= 0)
-    throw Error("Precise wheel lost native pixel motion or scrollbar synchronization");
-  if (events.length !== eventCountBefore)
-    throw Error("Scrolling synchronously rerendered the backend");
+  settle();
+  if (Math.abs(native.getScrollOffset(main.nativeId)[1] - startOffset + 120) > 1)
+    throw Error(
+      "GPUIX precise wheel lost pixel motion: " +
+        JSON.stringify({
+          startOffset,
+          after: native.getScrollOffset(main.nativeId),
+          bounds,
+          content: native.getElementBounds(host.nodes.get(main.key + "/scroll-content").nativeId),
+        }),
+    );
+  if (events.length !== eventCount) throw Error("Wheel called the backend synchronously");
+  native.scrollTo(main.nativeId, 0, 0);
+  settle();
+  const table = [...host.nodes.values()].find((node) => node.meta?.scrollAxis === "x");
+  const tableBounds = native.getElementBounds(table.nativeId);
+  native.simulateScrollWheel(tableBounds.x + 30, tableBounds.y + 10, -120, 0);
+  settle();
+  if (native.getScrollOffset(table.nativeId)[0] >= 0)
+    throw Error("Native wide table did not pan horizontally");
+  const beforeChain = native.getScrollOffset(main.nativeId)[1];
+  native.simulateScrollWheel(tableBounds.x + 30, tableBounds.y + 10, 0, -120);
+  settle();
+  if (
+    Math.abs(native.getScrollOffset(main.nativeId)[1] - beforeChain + 120) > 1 ||
+    native.getScrollOffset(table.nativeId)[1] !== 0
+  )
+    throw Error(
+      "Vertical wheel over wide table did not chain to the page: " +
+        JSON.stringify({
+          main: native.getScrollOffset(main.nativeId),
+          table: native.getScrollOffset(table.nativeId),
+          tableBounds,
+        }),
+    );
   host.event({
     elementId: main.nativeId,
     eventType: "scroll",
@@ -1961,108 +2000,118 @@ if (hasTestGpuixRenderer()) {
     deltaX: 0,
     precise: false,
   });
-  scrollFrame();
-  if (native.getScrollOffset(main.nativeId)[1] > offsetAfter - 90)
-    throw Error("Line wheel did not receive the desktop step");
-  const rail = track.geometry.rail;
-  native.simulateMouseDown(rail.x + 5, rail.y + track.geometry.position + 5);
-  scrollFrame();
-  native.simulateMouseMove(rail.x + 5, rail.y + rail.height - 20, 0);
-  scrollFrame();
-  native.simulateMouseUp(rail.x + 5, rail.y + rail.height - 20);
-  scrollFrame();
-  if (-native.getScrollOffset(main.nativeId)[1] < track.geometry.range * 0.8)
-    throw Error("Scrollbar pointer capture did not drag to the bottom");
-  host.event({ elementId: track.nativeId, eventType: "keyDown", key: "home" });
-  scrollFrame();
-  if (native.getScrollOffset(main.nativeId)[1] !== 0) throw Error("Scrollbar Home key failed");
-  const horizontalRail = horizontal.geometry.rail;
-  native.simulateClick(horizontalRail.x + horizontalRail.width * 0.8, horizontalRail.y + 5);
-  scrollFrame();
-  if (native.getScrollOffset(horizontal.geometry.owner.nativeId)[0] >= -50)
-    throw Error("Horizontal scrollbar click did not move the table");
-  const tableRail = horizontal.geometry.rail;
-  native.simulateScrollWheel(tableRail.x + 80, tableRail.y - 15, 0, -120);
-  scrollFrame();
-  if (
-    Math.abs(native.getScrollOffset(main.nativeId)[1] + 120) > 1 ||
-    native.getScrollOffset(horizontal.geometry.owner.nativeId)[1] !== 0
-  )
-    throw Error("Vertical wheel over a wide table did not stay on the page");
+  settle();
   const preserved = native.getScrollOffset(main.nativeId)[1];
+  if (preserved > startOffset - 210) throw Error("Line wheel lost desktop step");
+  await Bun.sleep(0);
+  settle();
+  const applyBatch = native.applyBatch.bind(native);
+  const batches = [];
+  native.applyBatch = (packet) => {
+    batches.push(...JSON.parse(packet));
+    return applyBatch(packet);
+  };
+  host.apply({ revision: revision++, section: "scroll", projection: nativeProjection(scrollView) });
+  settle();
+  if (native.getScrollOffset(main.nativeId)[1] !== preserved)
+    throw Error("An unrelated projection reset scroll offset");
+  if (batches.some((mutation) => mutation[0] !== "destroyElement"))
+    throw Error("React resent unchanged widgets: " + JSON.stringify(batches));
+  batches.length = 0;
+  const changedView = structuredClone(scrollView);
+  changedView.children[0].children = ["Changed header"];
+  const changedProjection = nativeProjection(changedView);
   host.apply({
     revision: revision++,
-    section: "scroll-regression",
-    projection: nativeProjection(scrollView),
+    section: "scroll",
+    projection: changedProjection,
   });
-  scrollFrame();
-  if (native.getScrollOffset(host.mainScroller.nativeId)[1] !== preserved)
-    throw Error("An unrelated render reset native scroll position");
-  const scrollStarted = performance.now();
-  for (let i = 0; i < 24; i++) {
+  settle();
+  if (!batches.some((mutation) => mutation[0] === "setText") || batches.length > 10)
+    throw Error(
+      "A header update touched the unchanged page: " +
+        JSON.stringify(batches.slice(0, 12)) +
+        "; total " +
+        batches.length,
+    );
+  native.applyBatch = applyBatch;
+  let geometryReads = 0;
+  const getBounds = native.getElementBounds.bind(native);
+  native.getElementBounds = (id) => {
+    geometryReads++;
+    return getBounds(id);
+  };
+  const wheelStart = performance.now();
+  for (let i = 0; i < 12; i++) {
     native.simulateScrollWheel(x, y, 0, -48);
-    scrollFrame();
+    settle();
   }
-  const wheelMs = (performance.now() - scrollStarted) / 24;
-  host.apply({ revision: revision++, section: "short-page", projection: page("new") });
-  scrollFrame();
-  if (host.scrollbars.some((node) => node.style.opacity > 0))
-    throw Error("Scrollbars remain visible without overflow");
-  if (native.getRetainedElementCount() !== retainedBaseline)
-    throw Error("Scrollbar reconciliation leaked native elements");
+  if (geometryReads) throw Error("Application measured geometry while scrolling");
+  native.getElementBounds = getBounds;
   console.log(
-    "GPUI: visible rails, precise/line wheel, pointer drag, keyboard, horizontal pan and cleanup passed; test paint cycle " +
-      wheelMs.toFixed(2) +
-      " ms/wheel",
+    "GPUI: native scroll, stable offsets, zero geometry polling, unchanged React bailout; " +
+      ((performance.now() - wheelStart) / 12).toFixed(2) +
+      " ms/test wheel cycle",
   );
-  const manyOptions = element(
+
+  const dragView = element(
     "div",
     { id: "app" },
     element(
       "main",
       null,
       element(
-        "select",
-        { id: "many" },
-        ...Array.from({ length: 30 }, (_, i) =>
-          element("option", { value: String(i) }, "Option " + i),
-        ),
+        "div",
+        { "data-session-drag": "", "data-session-id": "42", class: "session-chip" },
+        element("div", { id: "drag-child" }, element("b", null, "Session #42")),
+      ),
+      element(
+        "div",
+        { "data-root-drop": "7", class: "card" },
+        element("div", { id: "drop-child" }, element("b", null, "Destination")),
+      ),
+      element(
+        "div",
+        { "data-root-drop": "0", class: "card" },
+        element("div", { id: "unassign-child" }, "No Workspace"),
       ),
     ),
   );
-  const viewportSize = native.getWindowSize();
-  host.apply({
-    revision: revision++,
-    section: "long-popup",
-    projection: nativeProjection(manyOptions, {
-      select: "many",
-      selectAnchor: {
-        x: 300,
-        y: 100,
-        width: 240,
-        height: 34,
-        windowWidth: viewportSize.width,
-        windowHeight: viewportSize.height,
-      },
-    }),
-  });
-  scrollFrame();
-  const popupRail = host.scrollbars.find(
-    (node) => host.nodes.get(node.meta.scrollbarFor)?.meta?.selectPopup === "many",
-  );
-  if (!popupRail || popupRail.style.opacity !== 1)
-    throw Error("Long select popup has no visible scrollbar");
-  const popupBox = popupRail.geometry.rail;
-  const beforePopupEvents = events.length;
-  native.simulateScrollWheel(popupBox.x - 50, popupBox.y + 80, 0, -90);
-  scrollFrame();
+  host.apply({ revision: revision++, section: "drag", projection: nativeProjection(dragView) });
+  settle();
+  const drag = (destination) => {
+    const from = native.getElementBounds(host.nodes.get("id:drag-child").nativeId);
+    const to = native.getElementBounds(host.nodes.get(destination).nativeId);
+    native.simulateMouseDown(from.x + 20, from.y + 10);
+    settle();
+    native.simulateMouseMove(to.x + 20, to.y + 10, 0);
+    settle();
+    native.simulateMouseUp(to.x + 20, to.y + 10);
+    settle();
+  };
+  drag("id:drop-child");
   if (
-    native.getScrollOffset(popupRail.geometry.owner.nativeId)[1] >= 0 ||
-    events.slice(beforePopupEvents).some((event) => event.type === "native-select-close")
+    events.at(-1)?.action !== "assign-session-root" ||
+    events.at(-1)?.dataset?.rootId !== "7" ||
+    events.at(-1)?.dataset?.id !== "42"
   )
-    throw Error("Scrolling a long popup dismissed it or did not scroll");
-  if (process.argv.includes("--screenshots"))
-    native.captureScreenshot(join(directory, "ui-native-scrollbars.png"));
+    throw Error(
+      "Native descendant-to-descendant drag did not assign Session: " +
+        JSON.stringify(events.at(-1)),
+    );
+  drag("id:unassign-child");
+  if (events.at(-1)?.dataset?.rootId !== "0") throw Error("Native drag did not unassign Workspace");
+  const dropBounds = native.getElementBounds(host.nodes.get("id:drop-child").nativeId);
+  const dropPaths = [join(directory, "fixture")];
+  native.simulateFileDrop(dropBounds.x + 20, dropBounds.y + 10, dropPaths);
+  settle();
+  if (
+    events.at(-1)?.type !== "native-drop" ||
+    JSON.stringify(events.at(-1)?.paths) !== JSON.stringify(dropPaths)
+  )
+    throw Error("OS file drop on nested content did not reach the backend");
+  console.log("GPUI: nested Session pointer drags and OS directory-drop dispatch passed");
+
   host.close();
   native.flush();
   if (native.getRetainedElementCount() !== 0) throw Error("React unmount leaked native elements");
@@ -2079,6 +2128,8 @@ if (standalone) {
     application.slice(0, application.lastIndexOf("\nif (import.meta.main) {")) +
     String.raw`
 const { TestGpuixRenderer, hasTestGpuixRenderer, GpuixRenderer } = await loadRuntimePackage("@gpuix/native");
+const nativeRuntime = await loadRuntimePackage("@gpuix/native/runtime");
+if (typeof nativeRuntime.startFrameLoop !== "function") throw Error("Standalone native frame loop missing");
 if (!hasTestGpuixRenderer()) {
   const [react, gpuix, host] = await Promise.all([
     loadRuntimePackage("react"), loadRuntimePackage("@gpuix/react"), loadRuntimePackage("@gpuix/native/host"),
@@ -2095,6 +2146,7 @@ const host = await NativeUiHost.create(renderer, (event) => events.push(event));
 const page = (value) => nativeProjection(
   <div id="app"><header>Standalone React</header><main>
     <input id="smoke-input" value={value} />
+    <select id="smoke-select"><option value="one">One</option><option value="two">Two</option></select>
     <button data-action="smoke-save">Save</button>
   </main></div>,
 );
@@ -2108,6 +2160,14 @@ host.apply({ revision: 2, section: "smoke", projection: page("typed") });
 renderer.flush();
 if (host.nodes.get("id:smoke-input").nativeId !== input.nativeId)
   throw Error("Standalone React replaced the retained editor");
+const gpuix = await loadRuntimePackage("@gpuix/react");
+const trigger = host.nodes.get("id:smoke-select");
+const bounds = renderer.getElementBounds(trigger.nativeId);
+renderer.simulateClick(bounds.x + 10, bounds.y + 10);
+gpuix.flushSync(() => renderer.drainEvents().forEach(event => host.dispatch(event)));
+renderer.flush();
+if (!renderer.getTreeJson().includes("smoke-select/options"))
+  throw Error("Standalone official Select failed to open");
 host.close();
 renderer.flush();
 if (renderer.getRetainedElementCount()) throw Error("Standalone React unmount leaked");
