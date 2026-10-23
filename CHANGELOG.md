@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Remove the subagent ChatGPT app ID/name settings and composer mention injection. Send the plain task/join/report/finish prompt through CDP Ext, using the operator's already-connected MrMCP app; retain exact delivery receipts and Session isolation.
 - Draw clear bordered checkbox squares with SVG checkmarks; preserve label, keyboard and disabled interactions. Fix horizontal table scrolling so header/body groups cannot hide the final column.
 - Fix GUI Copy writing `[object Object]` by passing text directly to Auto.js clipboard; use the same copy action for keyboard activation.
 - Update Bun to 1.4.4, GPUIX native/React to 0.11.0, React to 19.3.1, X.509 to 2.2.0, chardet to 2.2.0 and iconv-lite to 0.7.3; refresh compatible transitive dependencies and preserve latest policies for Auto.js/CDP.js/Rag.js. Pin CI and source runtime requirements to Bun 1.4.4.

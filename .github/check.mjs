@@ -822,23 +822,16 @@ if (process.env.MRMCP_TEST_SEMANTIC === "1") {
         ";document.querySelector('form').onsubmit=e=>{e.preventDefault();window.workerSent=true}",
       returnByValue: true,
     });
-    const app = { app_id: "asdk_app_fixture", app_name: "MrMCP", new_chat: true };
-    check((await chatGoalEvaluate(goalPage, "focus", app)).focused,
+    const worker = { new_chat: true };
+    check((await chatGoalEvaluate(goalPage, "focus", worker)).focused,
       "a proven fresh worker composer can focus without old message IDs");
     const workerText = "Worker fixture\n\nPreserve multiline text";
     await chatGoalRpc(goalPage, "Input.insertText", { text: workerText });
-    const mention = await chatGoalEvaluate(goalPage, "mention", { ...app, text: workerText });
-    const mentionState = await chatGoalEvaluate(goalPage, "mention_state", { ...app, text: workerText });
-    if (!mention.mention_ok || !mentionState.mention_ok) {
-      const fixtureState = await chatGoalRpc(goalPage, "Runtime.evaluate", {
-        expression: "JSON.stringify({html:document.querySelector('#prompt-textarea').innerHTML,text:document.querySelector('#prompt-textarea').innerText})",
-        returnByValue: true,
-      });
-      throw Error("Native mention fixture: " + JSON.stringify({ mention, mentionState, fixtureState }));
-    }
-    check(true, "real CDP inserts and verifies the native app token without altering multiline task text");
-    check((await chatGoalEvaluate(goalPage, "send", { ...app, text: workerText })).sent,
-      "a worker first prompt uses the unique native form with its app mention");
+    const workerState = await chatGoalEvaluate(goalPage, "state");
+    check(workerState.draft === workerText,
+      "real CDP preserves the exact multiline worker prompt without injecting app tokens: " + JSON.stringify({draft:workerState.draft, expected:workerText}));
+    check((await chatGoalEvaluate(goalPage, "send", { ...worker, text: workerText })).sent,
+      "a worker first prompt submits through the unique native form without app ID configuration");
   } finally {
     goalBrowserRecord.client.removeEventListener("Fetch.requestPaused", goalRequestHandler);
     await Promise.allSettled([...goalFulfillments]);

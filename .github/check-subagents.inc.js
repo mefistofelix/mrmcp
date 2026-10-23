@@ -1,6 +1,5 @@
 // Durable worker/broker checks. No real ChatGPT account or browser is used here.
 {
-  const savedApp = getCfg("subagent_app_id", "");
   const schedule = subagentSchedule;
   const page = subagentPage;
   const evaluate = chatGoalEvaluate;
@@ -29,7 +28,6 @@
   };
   try {
     subagentSchedule = () => {};
-    await setCfg("subagent_app_id", "asdk_app_fixture");
     const accepted = await probe(owner, {
       action: "spawn",
       context: "Shared fixture",
@@ -40,7 +38,7 @@
     });
     check(
       accepted.agents.length === 2 && accepted.agents.every((agent) => agent.state === "queued"),
-      "spawn durably reserves independent workers before browser publication",
+      "spawn reserves independent workers without app ID configuration before browser publication",
     );
     check(
       !JSON.stringify(accepted).includes("claim_token"),
@@ -48,6 +46,17 @@
     );
     const id = accepted.agents.find((agent) => agent.label === "Tests").id;
     const row = await subagentRecord(id);
+    const brief = subagentBrief(row);
+    check(
+      brief.includes("init_chat_session") &&
+        brief.includes("action=join, agent_id=" + JSON.stringify(id)) &&
+        brief.includes("claim_token=" + JSON.stringify(row.claim_token)) &&
+        brief.includes("action=message") &&
+        brief.includes("action=finish") &&
+        brief.includes("Run fixture tests") &&
+        brief.includes("Shared fixture"),
+      "bootstrap prompt carries the exact private join and task/report/finish instructions",
+    );
     await fails(stranger, { action: "message", agent_id: id, text: "foreign" }, "another Session");
     check(
       !(await probe(stranger, { action: "status" })).agents.length,
@@ -163,20 +172,23 @@
     // Exercise an acknowledged browser dispatch and the non-network final-answer fallback.
     await run("UPDATE subagents SET state='queued',chatgpt_chat_id='' WHERE id=?", id);
     await run(
-      "INSERT INTO subagent_messages(agent_id,kind,text,state,created_at) VALUES(?,'message','Browser task','queued',?)",
+      "INSERT INTO subagent_messages(agent_id,kind,text,state,created_at) VALUES(?,'bootstrap','','queued',?)",
       id,
       Date.now(),
     );
     const browserPage = { record: { open: true } };
     subagentPage = async () => browserPage;
     let sent = false,
+      submittedText = "",
       inserted = 0;
-    chatGoalRpc = async (_page, method) => {
-      if (method === "Input.insertText") inserted++;
+    chatGoalRpc = async (_page, method, params) => {
+      if (method === "Input.insertText") {
+        submittedText = params.text;
+        inserted++;
+      }
       return {};
     };
     chatGoalEvaluate = async (_page, action) => {
-      if (action === "mention" || action === "mention_state") return { mention_ok: true };
       if (action === "send") {
         sent = true;
         controls.push(await reserveToolCall({ goalActivity: true, contextHandle: child.handle }));
@@ -207,10 +219,11 @@
     check(
       sent &&
         inserted === 1 &&
+        submittedText === subagentBrief(await subagentRecord(id)) &&
         (await subagentRecord(id)).chatgpt_chat_id === goalFixtureId &&
         (await one("SELECT state FROM subagent_messages WHERE id=?", pending.id)).state ===
           "delivered",
-      "native app mention and exact new-user receipt confirm a worker prompt before binding its chat",
+      "plain bootstrap prompt and exact new-user receipt confirm delivery before binding the worker chat",
     );
     check(
       (await one("SELECT chatgpt_chat_id FROM contexts WHERE id=?", child.id)).chatgpt_chat_id ===
@@ -229,16 +242,16 @@
       "SELECT * FROM subagent_messages WHERE agent_id=? AND state='queued' ORDER BY id LIMIT 1",
       id,
     );
-    const fakeEvaluate = chatGoalEvaluate;
-    chatGoalEvaluate = async (...args) => {
-      const result = await fakeEvaluate(...args);
-      if (args[1] === "mention_state") toolCallGate = Promise.resolve();
+    const fakeRpc = chatGoalRpc;
+    chatGoalRpc = async (...args) => {
+      const result = await fakeRpc(...args);
+      if (args[1] === "Input.insertText") toolCallGate = Promise.resolve();
       return result;
     };
     const callsBefore = controls.length;
     await subagentSubmit(await subagentRecord(id), queued);
     toolCallGate = previousGate;
-    chatGoalEvaluate = fakeEvaluate;
+    chatGoalRpc = fakeRpc;
     check(
       controls.length === callsBefore &&
         (await subagentRecord(id)).state === "queued" &&
@@ -304,7 +317,6 @@
     subagentPages.clear();
     for (const wake of [...subagentWaiters]) wake();
     await run("DELETE FROM subagents WHERE parent_context_id=?", owner.id);
-    await setCfg("subagent_app_id", savedApp);
     uiState.currentSection = "dashboard";
     uiState.subagents.openRowId = "";
   }

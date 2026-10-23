@@ -302,12 +302,11 @@ isolation is created. Workers share the parent's selected Workspace and must coo
 
 Setup uses **Settings → Goals**, shared with Goals: install CDP Ext in system Chrome and sign in normally.
 CDP.js 0.5.0 opens or reuses the system browser through URL bootstrap; no extension ID is entered.
-Also save the MrMCP ChatGPT app ID (asdk_app_…)
-from that installed app's Settings → Apps page URL, and its exact display name (default MrMCP).
-Workers attach that app using the native editor app-mention token, adapted minimally from the MIT
-Chat On Steroids chatgpt-dom.js implementation. If the token is unavailable, removed or changes the
-authored task, refuse Send and report the error. The configured app must already be connected and
-authorized in ChatGPT; this does not install/authorize an app or answer approval dialogs.
+Connect and authorize MrMCP once as an MCP app in ChatGPT so it is available to new worker chats.
+The bootstrap is a plain task prompt: initialize a fresh Session, join with the exact agent_id and
+one-use claim_token, report progress/messages and finish through the tool. No app ID/display-name
+configuration, app discovery or injected composer mention is used. If tools are unavailable the
+worker is instructed to report that blocker; MrMCP does not install/authorize apps or answer consent.
 
 The Goals enable flag controls Goals alone. Subagents operate independently through the same browser
 label mrmcp-goals, using targets subagent-<opaque agent id> in the native cyan **MrMCP Subagents** group.
@@ -344,8 +343,8 @@ agent names, OAuth client identity nor transport headers grant access to somebod
 
 Native submission preserves drafts/dialogs, requires a fresh blank chat or the exact associated chat,
 checks revision around every awaited preparation step and the durable sending commit, and confirms
-a new exact user-message receipt before marking delivered. App mentions are excluded structurally
-from authored text; rich-text paragraph wrappers preserve logical newlines. Pre-dispatch cancellation
+a new exact user-message receipt before marking delivered. The submitted prompt and receipt must
+preserve the exact multiline task text. Pre-dispatch cancellation
 can remove only the exact draft inserted by that attempt. Uncertain delivery is suspended without
 automatic retry. App/site changes can require an adapter update; synthetic tests cannot establish
 compatibility with a real authenticated account.

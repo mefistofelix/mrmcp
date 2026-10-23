@@ -113,8 +113,8 @@ Once linked, Tool Call arrivals/completions and observed changes in the ChatGPT 
 
 The `subagents` tool creates reusable ChatGPT worker chats with explicit tasks/shared context,
 messages, status/wait, final reports, Stop and Resume. Each worker initializes its own Session and
-inherits the selected Workspace; workers share files and must coordinate edits. Configure CDP Ext
-and the installed MrMCP ChatGPT app's asdk_app_… ID/display name in **Settings → Goals**. Keep system
+inherits the selected Workspace; workers share files and must coordinate edits. Install CDP Ext
+and connect MrMCP once as an MCP app in ChatGPT. No app ID or composer mention is required. Keep system
 Chrome signed in; CDP.js opens or reuses it on demand. Workers use a separate cyan **MrMCP Subagents** tab group, independently of the
 Goals enable switch. There is no model API, separate browser profile or additional quota.
 

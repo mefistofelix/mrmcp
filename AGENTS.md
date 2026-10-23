@@ -344,10 +344,11 @@ return claims/other Session handles through public metadata or GUI. Keep ordered
 Reuse public CDP.js reverse with Goals' automatically discovered browser and separate subagent-<id> targets in the
 cyan MrMCP Subagents group. Goals' enable switch does not control workers; disconnecting Goals must
 not disrupt live subagents. Use one scoped extension session-storage marker per target to avoid
-recycled tab IDs. No managed profile/extension setup or extra runtime dependency; the public opener may start Chrome. Operator supplies the existing
-ChatGPT app ID/name in Settings → Goals (subagent_app_id, subagent_app_name); use the native composer
-mention technique adapted from MIT Chat On Steroids chatgpt-dom.js and retain attribution. Verify
-the token and unchanged logical authored text before sending; no app installation/consent automation,
+recycled tab IDs. No managed profile/extension setup or extra runtime dependency; the public opener may start Chrome.
+The operator connects MrMCP once as an MCP app in ChatGPT. Send the plain bootstrap prompt with
+fresh init_chat_session, exact one-use join, progress/message and finish instructions. Do not require,
+discover or configure a ChatGPT app ID/name or inject composer app mentions. Verify unchanged task
+text and the exact user receipt; no app installation/consent automation,
 private REST requests or Network capture. A model route is requested intent, not proven selection;
 export only observed model metadata and public final text, never reasoning or guessed token/cost data.
 
@@ -368,7 +369,7 @@ show useful task/Workspace/activity/model/queue/call/process metadata and bounde
 Keep draft messages in backend React state, preserve newer edits during sends and suppress duplicate
 exact per-worker mutations while independent workers stay concurrent. Test isolation/claims, limits,
 reusable workers, reports, cursors, cancellation, restart/cleanup persistence, shared reverse lifecycle,
-fresh-chat/native-mention/rich-text receipt behavior and standalone native GUI. Use isolated fixtures;
+fresh-chat/plain-prompt/multiline receipt behavior and standalone native GUI. Use isolated fixtures;
 live-account behavior requires a separate operator test and must not be claimed from fixtures.
 
 ## Persistent memory

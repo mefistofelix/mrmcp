@@ -2065,8 +2065,6 @@ async function backend({ addWorkspace = null } = {}) {
     ["tool_call_payload_mode", "payload"],
     ["chat_goals_enabled", "1"],
     ["chat_goal_timeout_minutes", "5"],
-    ["subagent_app_id", ""],
-    ["subagent_app_name", "MrMCP"],
     ["chat_goal_stop_before_send", "0"],
     ["chat_goal_match_on_startup", "0"],
     ["tool_call_retention_hours", "0"],
@@ -3821,43 +3819,32 @@ async function backend({ addWorkspace = null } = {}) {
     const editors = knownEditors.length ? knownEditors : fallbackEditors;
     const editor = editors.length === 1 ? editors[0] : null;
     const form = editor ? formOf(editor) : null;
-    const authoredText = (element) => {
-      if (!element) return "";
-      if (!input.app_id) return element.innerText;
-      const read = (parent) => {
-        let value = "";
-        for (const child of parent.childNodes) {
-          if (child.nodeType === Node.TEXT_NODE) {
-            value += child.textContent;
-            continue;
-          }
-          if (child.nodeType !== Node.ELEMENT_NODE) continue;
-          if (
-            [
-              child.getAttribute("app-mention-path"),
-              child.getAttribute("data-prompt-link-href"),
-            ].includes("app://" + input.app_id)
-          )
-            continue;
-          if (child.tagName === "BR") {
-            value += "\n";
-            continue;
-          }
-          const block = ["P", "DIV", "LI"].includes(child.tagName);
-          if (block && value && !value.endsWith("\n")) value += "\n";
-          value += read(child);
-          if (block && !value.endsWith("\n")) value += "\n";
+    // Chromium innerText adds a spurious newline around contenteditable <div><br></div> blocks.
+    const editableText = (element) => {
+      let value = "";
+      for (const child of element.childNodes) {
+        if (child.nodeType === Node.TEXT_NODE) {
+          value += child.textContent;
+          continue;
         }
-        return value;
-      };
-      return read(element).trimEnd();
+        if (child.nodeType !== Node.ELEMENT_NODE) continue;
+        if (child.tagName === "BR") {
+          value += "\n";
+          continue;
+        }
+        const block = ["P", "DIV", "LI"].includes(child.tagName);
+        if (block && value && !value.endsWith("\n")) value += "\n";
+        value += editableText(child);
+        if (block && !value.endsWith("\n")) value += "\n";
+      }
+      return value;
     };
     const editorText = () =>
       editor
-        ? (editor instanceof HTMLTextAreaElement ? editor.value : authoredText(editor)).replace(
-            /\r\n?/g,
-            "\n",
-          )
+        ? (editor instanceof HTMLTextAreaElement
+            ? editor.value
+            : editableText(editor).trimEnd()
+          ).replace(/\r\n?/g, "\n")
         : "";
     let composer = form;
     if (editor && !composer) {
@@ -4105,47 +4092,6 @@ async function backend({ addWorkspace = null } = {}) {
       input.new_chat === true
         ? !currentChatId && location.pathname === "/" && !users.length
         : currentChatId === input.chatId;
-    if (action === "mention") {
-      if (
-        !expectedChat ||
-        base.status !== "ready" ||
-        editorText() !== input.text ||
-        editor instanceof HTMLTextAreaElement ||
-        !/^asdk_app_[A-Za-z0-9_-]{1,160}$/.test(input.app_id || "")
-      )
-        return { mention_ok: false };
-      // Adapted from Chat On Steroids' native editor app-mention token (MIT).
-      const token = document.createElement("span");
-      const name = String(input.app_name || "MrMCP");
-      token.setAttribute(
-        "app-mention-name",
-        name.toLowerCase().replace(/[^a-z0-9]+/g, "-") || "mrmcp",
-      );
-      token.setAttribute("app-mention-display-name", name);
-      token.setAttribute("contenteditable", "false");
-      token.setAttribute("app-mention-path", "app://" + input.app_id);
-      token.setAttribute("data-prompt-link-href", "app://" + input.app_id);
-      token.setAttribute("data-prompt-link-label", "$mrmcp");
-      token.textContent = name;
-      editor.focus();
-      const selection = getSelection();
-      if (!selection || document.activeElement !== editor) return { mention_ok: false };
-      selection.selectAllChildren(editor);
-      selection.collapseToEnd();
-      document.execCommand("insertHTML", false, " " + token.outerHTML);
-      return {
-        mention_ok:
-          editorText() === input.text &&
-          !!editor.querySelector('[app-mention-path="app://' + input.app_id + '"]'),
-      };
-    }
-    if (action === "mention_state")
-      return {
-        mention_ok:
-          expectedChat &&
-          editorText() === input.text &&
-          !!editor?.querySelector('[app-mention-path="app://' + input.app_id + '"]'),
-      };
     if (action === "focus") {
       if (
         !["ready", "busy"].includes(base.status) ||
@@ -4597,19 +4543,8 @@ async function backend({ addWorkspace = null } = {}) {
         Array.isArray(parts) && parts.every((part) => typeof part === "string")
           ? parts.join("")
           : last?.content?.text;
-      const withoutMention =
-        typeof text === "string" && /^asdk_app_[A-Za-z0-9_-]{1,160}$/.test(input.app_id || "")
-          ? text
-              .replace(
-                new RegExp("\\s*\\[[^\\]\\n]{1,100}\\]\\(app://" + input.app_id + "\\)\\s*$"),
-                "",
-              )
-              .trimEnd()
-          : text;
       result.goal_receipt =
-        withoutMention === input.expected_text && result.user_ids.includes(last.id)
-          ? last.id
-          : null;
+        text === input.expected_text && result.user_ids.includes(last.id) ? last.id : null;
     }
     const messageId = latest?.id || active.at(-1)?.id;
     if (input.include_answer === true) {
@@ -5557,10 +5492,6 @@ async function backend({ addWorkspace = null } = {}) {
     let inserted = false,
       dispatched = false;
     const text = (message.kind === "bootstrap" ? subagentBrief(row) : message.text).trimEnd();
-    const app = {
-      app_id: getCfg("subagent_app_id", ""),
-      app_name: getCfg("subagent_app_name", "MrMCP"),
-    };
     try {
       if (!(await fresh())) return;
       let state = await chatGoalEvaluate(page, "state");
@@ -5604,15 +5535,6 @@ async function backend({ addWorkspace = null } = {}) {
       inserted = true;
       await chatGoalRpc(page, "Input.insertText", { text });
       if (!(await fresh())) return;
-      const mentionInput = { ...app, text, chatId: row.chatgpt_chat_id, new_chat: newChat };
-      if (!(await chatGoalEvaluate(page, "mention", mentionInput)).mention_ok)
-        throw new Error(
-          "The MrMCP app mention could not be inserted; check its app ID in Settings.",
-        );
-      await sleep(100);
-      if (!(await chatGoalEvaluate(page, "mention_state", mentionInput)).mention_ok)
-        throw new Error("ChatGPT did not retain the app mention. No prompt was sent.");
-      if (!(await fresh())) return;
       await withDbTransaction(async () => {
         await run(
           "UPDATE subagent_messages SET state='sending' WHERE id=? AND state='queued'",
@@ -5631,7 +5553,6 @@ async function backend({ addWorkspace = null } = {}) {
         chatId: row.chatgpt_chat_id,
         new_chat: newChat,
         text,
-        ...app,
       });
       if (!sent.sent) {
         dispatched = false;
@@ -5640,13 +5561,12 @@ async function backend({ addWorkspace = null } = {}) {
       const oldIds = new Set(focused.users?.map((user) => user.id) || []);
       for (let attempt = 0; attempt < 40; attempt++) {
         if (!(await fresh())) return;
-        const after = await chatGoalEvaluate(page, "state", app);
+        const after = await chatGoalEvaluate(page, "state");
         const id = chatGoalChatId(after.url);
         if (id && (!row.chatgpt_chat_id || id === row.chatgpt_chat_id) && !after.draft) {
           const receipt = await chatGoalReadReact(page, {
             chatId: id,
             expected_text: text,
-            ...app,
           });
           const user = after.users?.at(-1);
           const userId = receipt.goal_receipt || (user?.text === text ? user.id : null);
@@ -5714,7 +5634,6 @@ async function backend({ addWorkspace = null } = {}) {
           chatId: row.chatgpt_chat_id,
           new_chat: !row.chatgpt_chat_id,
           text,
-          ...app,
         }).catch(() => {});
     }
   }
@@ -5934,10 +5853,6 @@ async function backend({ addWorkspace = null } = {}) {
     }
     if (action === "spawn") {
       if (membership) throw new Error("A subagent cannot spawn nested workers");
-      if (!/^asdk_app_[A-Za-z0-9_-]{1,160}$/.test(getCfg("subagent_app_id", "")))
-        throw new Error(
-          "Configure the MrMCP ChatGPT app ID in Settings → Goals before spawning workers.",
-        );
       if (!input.workers?.length) throw new Error("spawn requires workers");
       await withDbTransaction(async () => {
         const active = Number(
@@ -12273,7 +12188,7 @@ html[data-mode="fullscreen"] #frame {
           "Requires chat_session but no Workspace. spawn creates up to eight independent persistent " +
           "worker chats, each with its own Session after init_chat_session and one-use join. Workers " +
           "inherit the parent's selected Workspace, not its conversation history; supply context and " +
-          "explicit tasks. The operator installs CDP Ext and sets the MrMCP ChatGPT app ID in Settings → Goals. " +
+          "explicit tasks. The operator installs CDP Ext and keeps MrMCP connected in ChatGPT. " +
           "The extension connection is discovered automatically; no Chrome extension ID is required. " +
           "No extension is installed automatically or separate profile created. CDP.js opens/reuses " +
           "system Chrome only for requested work. Tabs use a cyan MrMCP Subagents group. " +
@@ -20817,8 +20732,6 @@ h1 {
       inherit_system_path: getCfg("inherit_system_path", "1") === "1",
       git_preserve_line_endings: getCfg("git_preserve_line_endings", "1") === "1",
       chat_goals_enabled: chatGoalsEnabled(),
-      subagent_app_id: getCfg("subagent_app_id", ""),
-      subagent_app_name: getCfg("subagent_app_name", "MrMCP"),
       chat_goal_browser_connected: !!cdpBrowsers.get(CHAT_GOAL_BROWSER)?.open,
       chat_goal_timeout_minutes: chatGoalDefaultTimeout() / 60,
       chat_goal_stop_before_send: getCfg("chat_goal_stop_before_send", "0") === "1",
@@ -23125,32 +23038,11 @@ h1 {
                 </div>
                 <div class="card" hidden={tab !== "goals"}>
                   <h3>ChatGPT browser · Goals and Subagents</h3>
-                  <UiFieldLabel
-                    data={{
-                      label: "MrMCP ChatGPT app ID · required for subagents",
-                      warning: settings.field_warnings?.subagent_app_id,
-                      for: "subagentAppId",
-                    }}
-                  />
-                  <input
-                    id="subagentAppId"
-                    value={settings.subagent_app_id || ""}
-                    placeholder="asdk_app_…"
-                  />
-                  <UiFieldLabel
-                    data={{
-                      label: "MrMCP app display name",
-                      for: "subagentAppName",
-                      warning: settings.field_warnings?.subagent_app_name,
-                    }}
-                  />
-                  <input id="subagentAppName" value={settings.subagent_app_name || "MrMCP"} />
                   <p class="muted">
-                    Open your installed MrMCP app in ChatGPT Settings → Apps and copy the asdk_app_…
-                    identifier from its URL. Workers attach that app with the native composer
-                    mention token. Use the exact display name if you renamed it. No prompt is sent
-                    if the editor does not retain the app token. Model availability and usage remain
-                    those of your ChatGPT account.
+                    Keep MrMCP connected in ChatGPT. Subagents receive a task prompt that tells them
+                    to initialize their own Session, join their assigned worker and report through
+                    the MrMCP tools. No app ID or composer mention is required. Model availability
+                    and usage remain those of your ChatGPT account.
                   </p>
                   <h3>🎯 Chat Goals</h3>
                   <h3>System Chrome · CDP Ext</h3>
@@ -27023,15 +26915,6 @@ h1 {
     ])
       if (settings[key] != null && typeof settings[key] !== "boolean")
         warnings[key] = "Goal switches must be enabled or disabled.";
-    const appId = String(settings.subagent_app_id || "").trim();
-    if (appId && !/^asdk_app_[A-Za-z0-9_-]{1,160}$/.test(appId))
-      warnings.subagent_app_id =
-        "Use the exact asdk_app_… identifier from the ChatGPT app page URL.";
-    if (
-      settings.subagent_app_name != null &&
-      (!String(settings.subagent_app_name).trim() || String(settings.subagent_app_name).length > 80)
-    )
-      warnings.subagent_app_name = "App display name must contain 1–80 characters.";
     const external = String(settings.external_url || "").trim();
     if (external) {
       try {
@@ -27621,14 +27504,6 @@ h1 {
     chatGoalTimeoutMinutes: {
       key: "chat_goal_timeout_minutes",
       read: (value) => String(value ?? chatGoalDefaultTimeout() / 60),
-    },
-    subagentAppId: {
-      key: "subagent_app_id",
-      read: (value) => String(value ?? getCfg("subagent_app_id", "")).trim(),
-    },
-    subagentAppName: {
-      key: "subagent_app_name",
-      read: (value) => String(value ?? getCfg("subagent_app_name", "MrMCP")).trim(),
     },
     chatGoalStopBeforeSend: {
       key: "chat_goal_stop_before_send",
@@ -29257,8 +29132,6 @@ h1 {
             "UPDATE contexts SET goal_revision=goal_revision+1,goal_error=CASE WHEN goal_status='matching' THEN 'Matching was interrupted. Call chat_set_goal again to retry matching.' ELSE goal_error END,goal_status=CASE WHEN goal_status='sending' THEN 'delivery_uncertain' WHEN goal_status='matching' THEN 'error' ELSE goal_status END WHERE goal_text<>''",
           );
         }
-        for (const key of ["subagent_app_id", "subagent_app_name"])
-          if (x[key] != null) await saveSetting(key, String(x[key]).trim());
         if (x.chat_goal_timeout_minutes != null)
           await saveSetting(
             "chat_goal_timeout_minutes",
