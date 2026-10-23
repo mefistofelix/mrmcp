@@ -171,6 +171,9 @@ another editor. Retain the small transient password mask because this
 version exposes no password input mode. Preserve precise trackpad motion and native wheel chaining over
 wide tables; only per-section offsets are buffered to uiState. Keep table descriptions collapsible through
 backend-owned Show more/less, long handles ellipsized, Tool Call IDs readable and Session metadata compact.
+Checkboxes use bordered native squares and SVG checkmarks, not Unicode glyphs; retain clear unchecked
+and disabled states and label/keyboard activation. Project table header/body groups into shared native
+rows so their minimum width reaches the horizontal scroll content and the final column stays reachable.
 Use official @gpuix/react Select/SelectTrigger/SelectValue/SelectContent/SelectItem: the component owns
 transient opening, anchoring, collision handling, focus and keyboard interaction; the selected value stays
 in backend drafts. Register managed dialogs with the public DismissableLayer so Escape closes only the

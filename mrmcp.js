@@ -30662,16 +30662,53 @@ function nativeProjection(view, state = {}) {
       };
     if (tag === "input" || tag === "textarea") {
       const value = controls[a.id]?.value ?? String(a.value || "");
-      if (a.type === "checkbox")
-        return {
-          ...button(
-            key,
-            (value ? "☑" : "☐") + " " + (a["aria-label"] || ""),
-            { type: "native-checkbox", id: a.id, dataset: data, value: !value },
-            { padding: 5, background: "#171f2c", opacity: disabled ? 0.45 : 1 },
-          ),
-          meta: { ...meta, control: true, checkbox: true },
-        };
+      if (a.type === "checkbox") {
+        const label = a["aria-label"] || "";
+        const control = button(
+          key,
+          label,
+          { type: "native-checkbox", id: a.id, dataset: data },
+          {
+            padding: 0,
+            paddingLeft: 0,
+            paddingRight: 0,
+            minHeight: 22,
+            borderWidth: 0,
+            background: "transparent",
+            opacity: disabled ? 0.45 : 1,
+            hover: { background: "transparent" },
+          },
+        );
+        control.children = [
+          {
+            key: key + "/box",
+            type: "div",
+            style: {
+              display: "flex",
+              flexDirection: "row",
+              alignItems: "center",
+              justifyContent: "center",
+              width: 18,
+              height: 18,
+              flexShrink: 0,
+              borderWidth: 1,
+              borderRadius: 4,
+              borderColor: value ? theme.accent : "#8290a3",
+              background: value ? theme.accent : theme.input,
+              pointerEvents: "none",
+            },
+            children: value ? [icon(key + "/check", "check", theme.canvas, 14)] : [],
+          },
+          ...(label ? control.children : []),
+        ];
+        Object.assign(control.props, {
+          role: "checkbox",
+          tabIndex: disabled ? -1 : 0,
+          "aria-valuetext": value ? "checked" : "unchecked",
+        });
+        control.meta = { ...meta, control: true, checkbox: true };
+        return control;
+      }
       Object.assign(style, {
         padding: 9,
         minWidth: 60,
@@ -30955,6 +30992,8 @@ function nativeProjection(view, state = {}) {
         else n.children?.forEach(collectRows);
       };
       children.forEach(collectRows);
+      // Native Flex uses one shared row width, including HTML-style header/body groups.
+      children.splice(0, children.length, ...rows);
       const content = (n) => n.text ?? n.children?.map(content).join("") ?? "";
       const headings =
         rows.find((n) => n.children.some((c) => c.meta?.tag === "th"))?.children.map(content) || [];
@@ -31042,10 +31081,7 @@ function nativeProjection(view, state = {}) {
           control.props = { ...control.props, tabIndex: -1 };
           control.style = {
             ...control.style,
-            padding: 2,
-            minHeight: 22,
-            borderWidth: 0,
-            background: "transparent",
+            opacity: 1,
             pointerEvents: "none",
           };
         }
@@ -31137,7 +31173,7 @@ function nativeProjection(view, state = {}) {
         flexDirection: "row",
         flexWrap: "wrap",
         alignItems: "center",
-        gap: 2,
+        gap: props.role === "checkbox" ? 9 : 2,
       });
     if (a.id === "cards") Object.assign(style, { gridTemplateColumns: 3, gap: 12 });
     if (classes.has("metric-card"))

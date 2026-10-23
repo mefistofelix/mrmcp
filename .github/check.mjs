@@ -1818,6 +1818,68 @@ if (hasTestGpuixRenderer()) {
     native.simulateClick(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
     settle();
   };
+  const checkboxPage = (checked) =>
+    nativeProjection(
+      element(
+        "div",
+        { id: "app" },
+        element(
+          "main",
+          null,
+          element(
+            "label",
+            { id: "checkbox-label" },
+            element("input", { id: "checkbox-labeled", type: "checkbox", checked }),
+            "Enable feature",
+          ),
+          element("input", {
+            id: "checkbox-alone",
+            type: "checkbox",
+            "aria-label": "Standalone feature",
+          }),
+          element("input", {
+            id: "checkbox-disabled",
+            type: "checkbox",
+            disabled: true,
+            "aria-label": "Unavailable feature",
+          }),
+        ),
+      ),
+    );
+  host.apply({ revision: revision++, section: "checkbox", projection: checkboxPage(false) });
+  settle();
+  const emptyBox = host.nodes.get("id:checkbox-labeled/box");
+  const boxBounds = native.getElementBounds(emptyBox.nativeId);
+  if (
+    boxBounds.width !== 18 ||
+    boxBounds.height !== 18 ||
+    emptyBox.style.borderWidth !== 1 ||
+    emptyBox.style.borderColor === emptyBox.style.background
+  )
+    throw Error("Unchecked checkbox has no visible square border");
+  click({ id: emptyBox.nativeId });
+  if (events.at(-1)?.id !== "checkbox-labeled" || events.at(-1)?.checked !== true)
+    throw Error("Clicking the checkbox square did not toggle its label");
+  host.apply({ revision: revision++, section: "checkbox", projection: checkboxPage(true) });
+  settle();
+  if (!host.nodes.has("id:checkbox-labeled/check"))
+    throw Error("Checked checkbox has no SVG checkmark");
+  click({ id: host.nodes.get("id:checkbox-label").nativeId });
+  if (events.at(-1)?.id !== "checkbox-labeled" || events.at(-1)?.checked !== false)
+    throw Error("Clicking a checkbox label did not toggle");
+  native.focusElement(host.nodes.get("id:checkbox-alone").nativeId);
+  native.simulateKeystrokes("space");
+  settle();
+  if (events.at(-1)?.id !== "checkbox-alone" || events.at(-1)?.checked !== true)
+    throw Error("Standalone checkbox keyboard activation failed");
+  const beforeDisabledCheckbox = events.length;
+  click({ id: host.nodes.get("id:checkbox-disabled").nativeId });
+  if (events.length !== beforeDisabledCheckbox) throw Error("Disabled checkbox toggled");
+  if (process.argv.includes("--screenshots"))
+    native.captureScreenshot(join(directory, "ui-checkboxes.png"));
+  console.log(
+    "GPUI: visible checkbox borders, SVG checks, label/pointer/keyboard and disabled states passed",
+  );
   const selectPage = (value) =>
     element(
       "div",
@@ -1977,14 +2039,22 @@ if (hasTestGpuixRenderer()) {
         "table",
         { id: "wide" },
         element(
-          "tr",
+          "thead",
           null,
-          ...Array.from({ length: 20 }, (_, i) => element("th", null, "Column " + i)),
+          element(
+            "tr",
+            null,
+            ...Array.from({ length: 20 }, (_, i) => element("th", null, "Column " + i)),
+          ),
         ),
         element(
-          "tr",
+          "tbody",
           null,
-          ...Array.from({ length: 20 }, (_, i) => element("td", null, "Value " + i)),
+          element(
+            "tr",
+            null,
+            ...Array.from({ length: 20 }, (_, i) => element("td", null, "Value " + i)),
+          ),
         ),
       ),
       ...Array.from({ length: 60 }, (_, i) =>
@@ -2026,6 +2096,12 @@ if (hasTestGpuixRenderer()) {
   settle();
   if (native.getScrollOffset(table.nativeId)[0] >= 0)
     throw Error("Native wide table did not pan horizontally");
+  native.scrollTo(table.nativeId, -100000, 0);
+  settle();
+  const tableCells = [...host.nodes.values()].filter((node) => node.meta?.tag === "td");
+  const lastCell = native.getElementBounds(tableCells.at(-1).nativeId);
+  if (lastCell.x + lastCell.width > tableBounds.x + tableBounds.width + 1)
+    throw Error("Final table column is unreachable after horizontal scrolling");
   const beforeChain = native.getScrollOffset(main.nativeId)[1];
   native.simulateScrollWheel(tableBounds.x + 30, tableBounds.y + 10, 0, -120);
   settle();
