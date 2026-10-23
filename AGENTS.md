@@ -15,7 +15,7 @@ MrMCP 0.11.4 consists of thirteen root project files, a Bun dependency manifest/
 - `AGENTS.md` — implementation invariants and release checks.
 - `TOOLS.md` — current built-in tool contracts, arguments, semantics and design rationale.
 - `LICENSE` — sole project license file: MIT for MrMCP plus the complete JSONEditor Apache-2.0 notice/text. Embed it in every standalone build; preserve dependency-owned licenses in their packages.
-- `.github/workflows/release.yml` — tag-driven native builds with Bun 1.4.3. Verify VERSION == tag; build Windows x64, Linux x64 and macOS Apple Silicon desktop. Publish their exact three assets, with an ad-hoc signed app/DMG on Apple Silicon. Never add extra checksum/tar/zip release assets.
+- `.github/workflows/release.yml` — tag-driven native builds with Bun 1.4.4. Verify VERSION == tag; build Windows x64, Linux x64 and macOS Apple Silicon desktop. Publish their exact three assets, with an ad-hoc signed app/DMG on Apple Silicon. Never add extra checksum/tar/zip release assets.
 - `package.json`, `bun.lock` — Bun dependency metadata and reproducible installation.
 - `.github/build.mjs`, `.github/check.mjs` — target packaging and integration verification.
 - `assets/` — branding/build assets plus historical vendor files, including `morphlex.js`, vendored `jsoneditor/` (minimalist JS/CSS/icon; license retained in root `LICENSE`), `mrmcp-logo.svg`, `mrmcp-logo.png`, `mrmcp.ico` and the numbered administration screenshots; do not duplicate them in the repository root.
@@ -32,11 +32,11 @@ Bun owns application execution, HTTP/TLS and backend logic in the same event loo
 
 The only application CLI modes remain desktop, --backend and --add-workspace <name> <path>. Build/check scripts under .github are development tooling. Headless mode must never load GPUIX, construct UI projections, send native notifications or read GUI-only assets. The one-shot Workspace path validates/inserts and closes Turso before listener/TLS/browser or GUI startup (the public Turso native package may require software-cache extraction). Inspect schema compatibility before application cleanup or editable sidecar materialization; preserve schema 6 and the recreate-only recovery gate.
 
-Desktop mode is one Bun process/event loop. GPUIX initializes before starting the backend directly on the same thread; keep its 16 ms native tick bounded. There is no backend Worker, Worker message bus, serialization or render-tree copy. NativeUiHost exposes completed backend projections through React useSyncExternalStore. Native intents call the backend directly; independent asynchronous actions remain concurrent. There is no global GUI input queue or transport sequence/acknowledgment protocol. Initialize one window, preserve schema recovery in that window and close the backend gracefully before explicit process exit. Headless and one-shot modes never load GPUIX. Kernel Workers belonging to the explicit js tool remain independent and are not a background backend.
+Desktop mode is one Bun process/event loop. GPUIX initializes before starting the backend directly on the same thread; keep native frame callbacks bounded and let the public runtime pace them, including the macOS display link. There is no backend Worker, Worker message bus, serialization or render-tree copy. NativeUiHost exposes completed backend projections through React useSyncExternalStore. Native intents call the backend directly; independent asynchronous actions remain concurrent. There is no global GUI input queue or transport sequence/acknowledgment protocol. Initialize one window, preserve schema recovery in that window and close the backend gracefully before explicit process exit. Headless and one-shot modes never load GPUIX. Kernel Workers belonging to the explicit js tool remain independent and are not a background backend.
 
 GPUIX owns native painting/window integration; application backend and GUI share the Bun event loop. Document OCR defaults to Rag/Xberg PaddleOCR, avoiding OS COM OCR initialization on this path. The optional native provider and Auto.js AAF scenarios retain their public API. Verify Windows OCR in the actual GUI-first initialization order; do not restore a backend Worker solely for this purpose. Keep expensive synchronous JavaScript work bounded/yielding; asynchronous database APIs do not imply every native CPU operation runs in parallel.
 
-GPUIX 0.10.0 has no public tray, OS notifications, hide-on-close, custom native window-icon setter or reliable minimized/visible event. Tray and OS notification delivery are suspended; retain their saved per-type preferences and show the limitation beside disabled controls. Do not build discarded notification payloads or issue notification-only queries while this capability is unavailable; keep the notification contract below for reactivation. Do not create a fake tray, use another shell/library, add a custom native bridge or silently claim those integrations work. Windows executable branding and macOS app-bundle icons remain enabled. Directory drops add enabled Workspaces using existing deduplication/unique-name rules; Session-to-Workspace drag/drop uses transient numeric Session identity and backend assignment. Closing the native window terminates MrMCP. Backend UI projections may continue while minimized until GPUIX offers authoritative visibility events; never infer visibility from keyboard focus.
+GPUIX 0.11.0 has no public tray, OS notifications, hide-on-close, custom native window-icon setter or reliable minimized/visible event. Tray and OS notification delivery are suspended; retain their saved per-type preferences and show the limitation beside disabled controls. Do not build discarded notification payloads or issue notification-only queries while this capability is unavailable; keep the notification contract below for reactivation. Do not create a fake tray, use another shell/library, add a custom native bridge or silently claim those integrations work. Windows executable branding and macOS app-bundle icons remain enabled. Directory drops add enabled Workspaces using existing deduplication/unique-name rules; Session-to-Workspace drag/drop uses transient numeric Session identity and backend assignment. Closing the native window terminates MrMCP. Backend UI projections may continue while minimized until GPUIX offers authoritative visibility events; never infer visibility from keyboard focus.
 
 Windows x64, Linux x64 and macOS Apple Silicon have a native GUI. macOS Intel is not supported. Build Windows on Windows so both --windows-hide-console and --windows-icon work; build other targets on matching native runners. Keep native package binaries only for the target. Document retrieval uses rag.js with Turso and its native Xberg CPU/ONNX dependency.
 
@@ -57,6 +57,10 @@ Document retrieval uses only the unmodified public @mefistofelix/rag.js package 
 Search without a Workspace uses search.yaml default_path or lazy Desktop/_default without assigning a Workspace. Rag stores live under .mrmcp/search/<real-path-hash>/rag/<profile-hash> (or _default/<hash>/rag/<profile>), with independent lexical/embedding profiles. Profiles separate lexical and embedding/OCR/provider/model/limit configurations; fulltext disables embeddings and downloads no embedding model. OCR models download lazily only when selected files need OCR; preserve models/paddle through cleanup/restart. Rag owns turso.db, models and temporary/lock state; preserve these and all previous indices/model caches through operational cleanup. Old LanceDB indices are preserved without conversion; explicit searches build the new derived store. Keep local fast/multilingual and optional Ollama/OpenAI-compatible configuration.
 
 Pass only current safe exact paths to Rag.index(verify=hash), then query current non-stale eligible documents with search(refresh=none). Register sources restricted to literal selected paths; escape glob metacharacters without Windows backslash escapes. Complete traversal can reconcile missing paths and remove newly ignored records through public addFolder/removeFolder; incomplete traversal never prunes unseen paths. Close every instance in finally and never call watch, so no ingestion loop remains between Tool Calls. Rag may recover known stale records while open; the extraction callback rejects files outside the eligible set. Never use private _storage/_providers or mutate Rag's schema. Return native page/UTF-8 citations; unavailable line coordinates/scoped chunk counts are null, with explicitly separate profile-wide index_counts. Run scoped/pruning/gitignore/MIME, fulltext/vector/hybrid, long-document-tail, Paddle OCR/model-cache/reuse/disabled and explicit native OCR plus standalone empty-package-cache checks after retrieval changes.
+
+TLS inspection uses Bun’s node:crypto X509Certificate. Certificate/ACME CSR generation uses the public
+@peculiar/x509 2.x package, loaded only after reflect-metadata; keep this existing transitive polyfill
+as an explicit runtime dependency so standalone packaging includes the required initialization.
 
 ## Database: direct current schema with a recreate-only version gate
 
@@ -160,15 +164,18 @@ column containers so nested grids do not repeatedly measure intrinsic text width
 coordinates or replace the native layout engine. Use the public native runtime startFrameLoop with no
 application layout/geometry work per tick. Never restore custom scrollbar rails, thumb measurement, drag
 math or geometry polling: synchronous bounds queries can block the Bun event loop for hundreds of
-milliseconds. GPUIX 0.10 does not paint scrollbar thumbs; expose this package limitation honestly until
-the public package supports them. Native textarea/password editing capabilities remain package boundaries;
-do not replace caret/IME/undo with another editor. Retain the small transient password mask because this
+milliseconds. GPUIX 0.11 paints native scrollbar thumbs through scrollbarColor/scrollbarWidth; keep
+these styles on scrollers and Select content. Thumbs are visual only and take no pointer input. Native
+textarea/password editing capabilities remain package boundaries; do not replace caret/IME/undo with
+another editor. Retain the small transient password mask because this
 version exposes no password input mode. Preserve precise trackpad motion and native wheel chaining over
 wide tables; only per-section offsets are buffered to uiState. Keep table descriptions collapsible through
 backend-owned Show more/less, long handles ellipsized, Tool Call IDs readable and Session metadata compact.
 Use official @gpuix/react Select/SelectTrigger/SelectValue/SelectContent/SelectItem: the component owns
 transient opening, anchoring, collision handling, focus and keyboard interaction; the selected value stays
-in backend drafts. Do not rebuild popup geometry, typeahead, focus queues or open/close backend round trips.
+in backend drafts. Register managed dialogs with the public DismissableLayer so Escape closes only the
+top overlay, including a Select nested inside a dialog; do not intercept Escape at window level.
+Do not rebuild popup geometry, typeahead, focus queues or open/close backend round trips.
 React.memo compares immutable native declarations using Bun.deepEquals; committed widget refs/metadata
 are separate objects, never mutations of those declarations. An identical projection must emit no native
 updates, and changing the header must leave the page subtree untouched. GPUI events do not bubble: wire
@@ -447,7 +454,7 @@ Listener lifecycle fixtures use ephemeral ports and report startup errors, avoid
 requirements. Native dialog checks compare the overlay with its viewport and assert title/actions remain visible at short heights,
 not hard-coded Windows pixel dimensions. Manual workflow dispatch may set publish=false to verify a
 branch/ref and build artifacts without changing release tags; publishing always verifies VERSION==tag.
-Use hasTestGpuixRenderer in source and standalone checks. GPUIX 0.10.0 exposes its interaction harness
+Use hasTestGpuixRenderer in source and standalone checks. GPUIX 0.11.0 exposes its interaction harness
 only on Windows/macOS; Linux verifies projections and the complete public React/native/host closure
 from an empty cache without claiming native interaction coverage or constructing an unsupported test renderer.
 

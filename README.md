@@ -31,7 +31,7 @@ MrMCP is a stateless Model Context Protocol server implemented in Bun. It expose
 
 ## Requirements
 
-- Bun 1.4.3 or newer for source mode; release binaries include the runtime.
+- Bun 1.4.4 or newer for source mode; release binaries include the runtime.
 - Windows x64, Linux x64 or macOS Apple Silicon for the native GUI.
 - Permission to bind public ports 80 and 443 when those listeners are enabled.
 
@@ -201,9 +201,9 @@ Bun compiles inline JSX in mrmcp.js with a small local declaration factory and f
 extra JSX configuration. The official React/GPUIX renderer reconciles the immutable keyed widget declarations
 and skips unchanged subtrees. Flex/Grid layout and scrolling stay native; explicit column widths avoid
 expensive intrinsic layout. Dropdowns use the official GPUIX Select components. Dialogs keep title/actions
-visible while their body scrolls. There is no application scrollbar or geometry polling loop. GPUIX 0.10
-currently scrolls without visible scrollbar thumbs; support awaits the public package. Precise trackpad
-motion stays native and line-wheel steps are enhanced.
+visible while their body scrolls. Escape closes the top overlay first. GPUIX 0.11 paints native
+scrollbar thumbs that follow content without JavaScript polling; these visual thumbs do not take pointer
+input. Precise trackpad motion stays native and line-wheel steps are enhanced.
 
 The administrative GUI has no WebView, DOM, HTML generation/parsing, Morphlex, Tauri bridge or network
 listener. Eta loads only for editable guided_prompts.yaml templates. OAuth consent and published MCP Apps

@@ -18,6 +18,10 @@ import iconv from "iconv-lite";
 let autoPromise;
 let cdp;
 const loadAuto = () => (autoPromise ||= loadRuntimePackage("@mefistofelix/auto.js"));
+async function loadX509() {
+  await loadRuntimePackage("reflect-metadata");
+  return loadRuntimePackage("@peculiar/x509");
+}
 const loadAutoVips = async () => (await loadAuto()).vips;
 import { inflateRawSync, gunzipSync, createGzip, createBrotliCompress } from "node:zlib";
 import { Readable, Writable } from "node:stream";
@@ -8383,7 +8387,7 @@ html[data-mode="fullscreen"] #frame {
   async function ensureSelfSigned() {
     let current = await inspectCertificate(SELF_CERT_PATH, SELF_KEY_PATH, "self-signed");
     if (current.valid) return current;
-    const x509 = await loadRuntimePackage("@peculiar/x509");
+    const x509 = await loadX509();
     const algorithm = { name: "ECDSA", namedCurve: "P-256", hash: "SHA-256" };
     const keys = await crypto.subtle.generateKey(algorithm, true, ["sign", "verify"]);
     const ip = getCfg("public_ip", "").trim();
@@ -8480,10 +8484,7 @@ html[data-mode="fullscreen"] #frame {
     ).trim();
 
     try {
-      const [x509, cryptoNode] = await Promise.all([
-        loadRuntimePackage("@peculiar/x509"),
-        import("node:crypto"),
-      ]);
+      const [x509, cryptoNode] = await Promise.all([loadX509(), import("node:crypto")]);
 
       let accountKey;
       try {
@@ -31411,13 +31412,20 @@ function nativeScrollContent(node) {
       0,
       ...content.children.map((child) => Number(child.style?.minWidth) || 0),
     );
-    // GPUIX 0.10 needs both axes to retain horizontal content extent.
+    // Horizontal-only GPUIX viewports still lose their scroll extent.
     if (!vertical) node.style.overflowY = "scroll";
   }
   node.children = [content];
   node.style.display = "flex";
   node.style.flexDirection = "column";
   node.style.gap = 0;
+  node.style.scrollbarColor = "#697384";
+  node.style.scrollbarWidth = 6;
+  if (vertical)
+    node.style.paddingRight = Math.max(
+      10,
+      Number(node.style.paddingRight ?? node.style.padding ?? 0),
+    );
   node.events = { ...node.events, scroll: { type: "native-scroll" } };
   node.meta = {
     ...node.meta,
@@ -31564,6 +31572,8 @@ class NativeUiHost {
                   display: "flex",
                   flexDirection: "column",
                   overflowY: "scroll",
+                  scrollbarColor: "#697384",
+                  scrollbarWidth: 6,
                   padding: 5,
                   background: "#20242b",
                   borderRadius: 8,
@@ -31614,7 +31624,7 @@ class NativeUiHost {
         for (const name of Object.keys(node.events || {}))
           props["on" + name[0].toUpperCase() + name.slice(1)] = (event) =>
             host.event({ ...event, elementId: instance.current.id, eventType: name });
-        return createElement(
+        const element = createElement(
           node.type,
           props,
           ...(text === undefined ? [] : [text]),
@@ -31622,6 +31632,21 @@ class NativeUiHost {
             createElement(NativeWidget, { key: child.key, node: child }),
           ),
         );
+        return node.meta?.tag === "dialog"
+          ? createElement(
+              gpuix.DismissableLayer,
+              {
+                onEscapeKeyDown: () =>
+                  host.send({
+                    type: "action",
+                    action: "close-dialog",
+                    dataset: {},
+                    values: {},
+                  }),
+              },
+              element,
+            )
+          : element;
       },
       (previous, next) => Bun.deepEquals(previous.node, next.node),
     );
@@ -31633,7 +31658,6 @@ class NativeUiHost {
       return payload ? createElement(NativeWidget, { node: payload.projection.tree }) : null;
     }
     this.root = gpuix.createRoot(renderer, {
-      onKeyDown: (event) => this.event({ ...event, elementId: 0, eventType: "windowKeyDown" }),
       onUncaughtError: (error) => {
         throw error;
       },
@@ -31660,14 +31684,6 @@ class NativeUiHost {
     );
   }
   event(event) {
-    if (
-      event.elementId === 0 &&
-      ["keyDown", "windowKeyDown"].includes(event.eventType) &&
-      event.key === "escape"
-    ) {
-      this.send({ type: "action", action: "close-dialog", dataset: {}, values: {} });
-      return;
-    }
     const node = this.nodes.get(this.ids.get(event.elementId));
     if (!node) return;
     const intent = node.events?.[event.eventType];
@@ -31874,7 +31890,6 @@ async function desktop() {
     renderer.activateWindow();
     const nativeRuntime = await loadRuntimePackage("@gpuix/native/runtime");
     pump = nativeRuntime.startFrameLoop(renderer, {
-      frameMs: 16,
       onTerminated: resolveClosed,
       onError: rejectClosed,
     });

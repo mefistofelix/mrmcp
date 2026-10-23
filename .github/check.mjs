@@ -953,6 +953,20 @@ const webp = await (await loadAutoVips()).encodeImage(image, "webp");
 check(webp instanceof Uint8Array || webp.data?.length > 0, "public Auto.js codec");
 const material = await ensureSelfSigned();
 check(material.valid, "self-signed certificate generation and inspection");
+const certificateLibrary = await loadX509();
+const csrAlgorithm = { name: "ECDSA", namedCurve: "P-256", hash: "SHA-256" };
+const csrKeys = await crypto.subtle.generateKey(csrAlgorithm, true, ["sign", "verify"]);
+const certificateRequest = await certificateLibrary.Pkcs10CertificateRequestGenerator.create({
+  keys: csrKeys,
+  signingAlgorithm: csrAlgorithm,
+  name: "",
+  extensions: [new certificateLibrary.SubjectAlternativeNameExtension([
+    { type: "ip", value: "127.0.0.1" },
+    { type: "dns", value: "localhost" },
+  ], true)],
+});
+check(await certificateRequest.verify() && certificateRequest.rawData.byteLength > 0,
+  "X.509 ACME CSR generation and signature verification");
 let delivered = 0;
 let cancelled = 0;
 let aborted = 0;
@@ -1721,8 +1735,8 @@ if (hasTestGpuixRenderer()) {
         viewport.width <= 0 ||
         Math.abs(bounds.height - viewport.height) > 1 ||
         Math.abs(bounds.width - viewport.width) > 1 ||
-        Math.abs(bounds.y - viewport.y) > 32 ||
-        Math.abs(bounds.x - viewport.x) > 32
+        Math.abs(bounds.y - viewport.y) > 1 ||
+        Math.abs(bounds.x - viewport.x) > 1
       )
         throw Error(
           "Dialog does not fill the native viewport: " +
@@ -1873,6 +1887,40 @@ if (hasTestGpuixRenderer()) {
   native.simulateClick(350, 20);
   settle();
   if (prop("aria-id", "choice/options")) throw Error("Official Select outside click did not close");
+  const nestedDialog = element(
+    "div",
+    { id: "app" },
+    element(
+      "div",
+      { class: "dialog-overlay" },
+      element(
+        "dialog",
+        { id: "nested-dialog", open: true },
+        element("h2", null, "Nested Select"),
+        selectPage("disk").children[1],
+        element("button", { "data-action": "close-dialog" }, "Cancel"),
+      ),
+    ),
+  );
+  host.apply({
+    revision: revision++,
+    section: "nested-dialog",
+    projection: nativeProjection(nestedDialog),
+  });
+  settle();
+  click(prop("aria-id", "choice"));
+  const beforeNestedEscape = events.length;
+  native.simulateKeystrokes("escape");
+  settle();
+  if (
+    prop("aria-id", "choice/options") ||
+    events.slice(beforeNestedEscape).some((event) => event.action === "close-dialog")
+  )
+    throw Error("Escape closed the dialog behind its Select");
+  native.simulateKeystrokes("escape");
+  settle();
+  if (events.at(-1)?.action !== "close-dialog")
+    throw Error("Second Escape did not close the dialog");
   const longSelect = nativeProjection(
     element(
       "div",

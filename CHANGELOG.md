@@ -2,10 +2,13 @@
 
 ## Unreleased
 
+- Update Bun to 1.4.4, GPUIX native/React to 0.11.0, React to 19.3.1, X.509 to 2.2.0, chardet to 2.2.0 and iconv-lite to 0.7.3; refresh compatible transitive dependencies and preserve latest policies for Auto.js/CDP.js/Rag.js. Pin CI and source runtime requirements to Bun 1.4.4.
+- Initialize X.509 2.x with the already-used reflect-metadata polyfill, declared explicitly for reproducible standalone packaging. Verify self-signed certificates and signed ACME CSRs.
+- Enable native GPUIX scrollbar thumbs and default frame pacing. Use the public overlay stack so Escape dismisses a nested Select before its dialog. Native thumbs are visual only.
 - Align Select labels, chevrons and option text with explicit native Flex layout and consistent padding.
 - Fix severe GUI stalls by removing application scrollbar geometry polling and using the native frame loop. Explicit column widths avoid repeated intrinsic measurements in native nested grids, including during window resizing.
 - Keep native declarations immutable and memoize React widgets, so unchanged projections send no native updates and header changes preserve the active page subtree.
-- Replace custom dropdown geometry, focus/typeahead and backend open/close round trips with official GPUIX Select components. GPUIX 0.10 scrolls natively but does not yet paint scrollbar thumbs.
+- Replace custom dropdown geometry, focus/typeahead and backend open/close round trips with official GPUIX Select components.
 - Keep every dialog title and action row visible around one constrained scrolling body. Fix Session drag/drop and OS directory drop dispatch on nested content, where GPUI events do not bubble.
 
 ## 0.11.4

@@ -40,7 +40,7 @@ jobs:
           ref: ${{ inputs.release_tag || github.ref }}
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1.4.3"
+          bun-version: "1.4.4"
       - name: Verify version matches tag
         run: |
           set -euo pipefail
