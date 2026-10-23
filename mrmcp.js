@@ -30095,6 +30095,7 @@ function nativeProjection(view, state = {}) {
     refresh: "M20 7v5h-5 M4 17v-5h5 M6 7a7 7 0 0 1 12-2l2 2 M18 17a7 7 0 0 1-12 2l-2-2",
     copy: "M9 8V3h11v14h-4 M4 8h11v14H4z",
     chevron: "m8 10 4 4 4-4",
+    branch: "m9 6 6 6-6 6",
     check: "m5 12 4 4L19 6",
   };
   const icon = (key, name, color = theme.muted, size = 16) => ({
@@ -30175,6 +30176,7 @@ function nativeProjection(view, state = {}) {
       borderColor: theme.border,
       cursor: "pointer",
       hover: { background: "#2a303b", borderColor: "#424b5b" },
+      focusVisible: { outlineWidth: 1, outlineColor: theme.accent, outlineOffset: 1 },
       active: { background: "#32394a" },
       ...style,
     },
@@ -30182,14 +30184,96 @@ function nativeProjection(view, state = {}) {
     events: { click: event, keyDown: { ...event, keyboard: true } },
     children: [textNode(key + "/label", label)],
   });
+  const treeFont = { fontFamily: "monospace", fontSize: 13, lineHeight: 20 };
+  function treeBranch(key, label, info, open, event, children) {
+    const toggle = button(key + "/toggle", [label, info].filter(Boolean).join(" · "), event, {
+      minHeight: 28,
+      paddingLeft: 4,
+      paddingRight: 8,
+      background: "transparent",
+      borderWidth: 0,
+      borderRadius: 4,
+      gap: 6,
+      hover: { background: theme.hover },
+    });
+    toggle.props["aria-expanded"] = open;
+    toggle.children = [
+      icon(key + "/arrow", open ? "chevron" : "branch", theme.muted, 16),
+      textNode(key + "/name", label, { ...treeFont, fontWeight: 600, minWidth: 0, flexShrink: 1 }),
+      ...(info
+        ? [textNode(key + "/info", info, { ...treeFont, fontSize: 11, color: theme.muted })]
+        : []),
+    ];
+    return {
+      key,
+      type: "div",
+      style: { display: "flex", flexDirection: "column", minWidth: 0, gap: 0 },
+      children: [
+        toggle,
+        ...(open
+          ? [
+              {
+                key: key + "/children",
+                type: "div",
+                style: {
+                  display: "flex",
+                  flexDirection: "column",
+                  minWidth: 0,
+                  paddingLeft: 20,
+                  borderLeftWidth: 1,
+                  borderColor: "#343c49",
+                  gap: 0,
+                },
+                children,
+              },
+            ]
+          : []),
+      ],
+    };
+  }
+  function treeEntry(key, label, children) {
+    return row(
+      key,
+      [
+        textNode(key + "/key", label, {
+          ...treeFont,
+          color: "#c4ccda",
+          width: 160,
+          maxWidth: "40%",
+          flexShrink: 1,
+          userSelect: "text",
+        }),
+        ...children,
+      ],
+      {
+        width: "100%",
+        minWidth: 0,
+        minHeight: 28,
+        paddingTop: 4,
+        paddingBottom: 4,
+        paddingLeft: 26,
+        paddingRight: 6,
+        alignItems: "flex-start",
+        gap: 10,
+      },
+    );
+  }
   function jsonTree(value, path, key, sourceId, editable, depth = 0) {
     const scalar = value === null || typeof value !== "object";
     const tokens = JSON.stringify(path);
+    const label = path.length ? String(path.at(-1)) || '""' : "JSON";
     if (scalar) {
       if (!editable)
-        return textNode(key, `${path.at(-1) ?? "value"}: ${JSON.stringify(value)}`, {
-          color: typeof value === "string" ? "#9ce8b1" : "#c7a0ff",
-        });
+        return treeEntry(key, label + ":", [
+          textNode(key + "/value", JSON.stringify(value), {
+            ...treeFont,
+            color: typeof value === "string" ? "#9ce8b1" : value === null ? theme.muted : "#c7a0ff",
+            flexGrow: 1,
+            flexBasis: 0,
+            minWidth: 0,
+            userSelect: "text",
+          }),
+        ]);
       const controlId = "json:" + sourceId + ":" + tokens;
       const raw = state.jsonEdits?.[sourceId + ":" + tokens] ?? JSON.stringify(value);
       controls[controlId] = { value: raw, scope: "json-node", form: "" };
@@ -30198,38 +30282,41 @@ function nativeProjection(view, state = {}) {
         type: "input",
         style: {
           flexGrow: 1,
+          flexBasis: 0,
           minWidth: 80,
-          padding: 6,
-          background: "#111722",
+          ...treeFont,
+          padding: 5,
+          background: theme.input,
           borderWidth: 1,
-          borderColor: "#384457",
+          borderColor: Object.hasOwn(state.jsonEdits || {}, sourceId + ":" + tokens)
+            ? "#c56d76"
+            : "#384457",
           borderRadius: 4,
         },
-        props: { value: raw },
+        props: { value: raw, "aria-label": label + " · JSON value" },
         events: { change: { type: "native-json", sourceId, path: tokens } },
         meta: { id: controlId, control: true, nativeJson: true },
         children: [],
       };
-      return row(key, [
-        textNode(key + "/key", String(path.at(-1) ?? "value")),
+      return treeEntry(key, label + ":", [
         field,
-        button(key + "/remove", "−", {
-          type: "native-json",
-          sourceId,
-          path: tokens,
-          operation: "delete",
-        }),
+        button(
+          key + "/remove",
+          "Remove",
+          { type: "native-json", sourceId, path: tokens, operation: "delete" },
+          {
+            minHeight: 28,
+            paddingLeft: 6,
+            paddingRight: 6,
+            background: "transparent",
+            borderWidth: 0,
+          },
+        ),
       ]);
     }
     const openKey = "json:" + sourceId + ":" + tokens;
     const open = state.details?.[openKey] ?? depth < 2;
-    const children = [
-      button(
-        key + "/toggle",
-        `${open ? "▾" : "▸"} ${path.at(-1) ?? "JSON"} · ${Array.isArray(value) ? "Array" : "Object"} (${Object.keys(value).length})`,
-        { type: "native-details", key: openKey, open: !open },
-      ),
-    ];
+    const children = [];
     if (open) {
       for (const [k, v] of Object.entries(value))
         children.push(
@@ -30244,27 +30331,28 @@ function nativeProjection(view, state = {}) {
         );
       if (editable)
         children.push(
-          button(key + "/add", "+ Add value", {
-            type: "native-json",
-            sourceId,
-            path: tokens,
-            operation: "add",
-          }),
+          button(
+            key + "/add",
+            "+ Add value",
+            { type: "native-json", sourceId, path: tokens, operation: "add" },
+            {
+              minHeight: 26,
+              alignSelf: "flex-start",
+              marginLeft: 26,
+              marginTop: 4,
+              marginBottom: 6,
+            },
+          ),
         );
     }
-    return {
+    return treeBranch(
       key,
-      type: "div",
-      style: {
-        display: "flex",
-        flexDirection: "column",
-        gap: 5,
-        paddingLeft: depth ? 12 : 0,
-        borderLeftWidth: depth ? 1 : 0,
-        borderColor: "#2b3544",
-      },
+      label,
+      `${Array.isArray(value) ? "array" : "object"} · ${Object.keys(value).length}`,
+      open,
+      { type: "native-details", key: openKey, open: !open },
       children,
-    };
+    );
   }
   function project(node, path, inherited = {}, suppressed = false) {
     if (typeof node === "string") {
@@ -30382,6 +30470,28 @@ function nativeProjection(view, state = {}) {
         marginBottom: 12,
       });
     if (classes.has("field-warning")) Object.assign(textStyle, { fontSize: 12 });
+    if (/\bdebug-(?:key|string|scalar|null)\b/.test(a.class || "")) {
+      Object.assign(textStyle, treeFont, {
+        color: classes.has("debug-string")
+          ? "#9ce8b1"
+          : classes.has("debug-scalar")
+            ? "#c7a0ff"
+            : classes.has("debug-null")
+              ? theme.muted
+              : "#c4ccda",
+      });
+      style.userSelect = "text";
+    }
+    if (classes.has("debug-payload-tree") || classes.has("json-editor-host"))
+      Object.assign(style, {
+        background: theme.input,
+        borderWidth: 1,
+        borderColor: theme.border,
+        borderRadius: 6,
+        padding: 8,
+        gap: 0,
+      });
+    if (classes.has("debug-children")) style.gap = 0;
     if (classes.has("tool-command-preview"))
       return textNode(key, nativeText(node), {
         fontSize: 12,
@@ -30754,6 +30864,24 @@ function nativeProjection(view, state = {}) {
       Object.assign(style, { width: "100%", minWidth: 160 });
       const open = state.details?.[key] ?? Object.hasOwn(a, "open");
       const summary = node.children.find((n) => typeof n !== "string" && n.tag === "summary");
+      if (classes.has("debug-node") || classes.has("debug-decoded")) {
+        const label = summary?.children.find((child) => child.attrs?.class === "debug-key");
+        const name = label ? nativeText(label) : "JSON";
+        const info = (summary ? nativeText(summary) : "").slice(label ? name.length : 0).trim();
+        return treeBranch(
+          key,
+          name,
+          info,
+          open,
+          { type: "native-details", key, open: !open },
+          open
+            ? node.children
+                .filter((child) => child !== summary)
+                .map((child, index) => project(child, key + "/" + index, treeFont))
+                .filter(Boolean)
+            : [],
+        );
+      }
       return {
         key,
         type: "div",
@@ -30858,6 +30986,16 @@ function nativeProjection(view, state = {}) {
     const children = node.children
       .map((n, i) => project(n, key + "/" + i, textStyle))
       .filter(Boolean);
+    if (classes.has("debug-entry")) {
+      const label = node.children.find((child) => child.attrs?.class === "debug-key");
+      if (label) {
+        const values = children.slice(1);
+        for (const child of values)
+          Object.assign(child.style, { flexGrow: 1, flexBasis: 0, minWidth: 0 });
+        return treeEntry(key, nativeText(label), values);
+      }
+      style.gap = 0;
+    }
     if (tag === "table") {
       const rows = [];
       const collectRows = (n) => {
@@ -31129,7 +31267,7 @@ function nativeProjection(view, state = {}) {
       });
     if (a.id === "uiStatus")
       Object.assign(style, { flexGrow: 1, justifyContent: "flex-end", fontSize: 11 });
-    if (tag === "aside")
+    if (tag === "aside" && !classes.has("tool-descriptor"))
       Object.assign(style, {
         width: 208,
         padding: 10,
@@ -31139,6 +31277,16 @@ function nativeProjection(view, state = {}) {
         borderColor: theme.border,
         overflowY: "scroll",
         flexShrink: 0,
+      });
+    if (classes.has("tool-descriptor"))
+      Object.assign(style, {
+        background: theme.panel,
+        borderWidth: 1,
+        borderColor: theme.border,
+        borderRadius: 8,
+        padding: 14,
+        gap: 8,
+        alignSelf: "flex-start",
       });
     if (a.id === "sidebar") Object.assign(style, { gap: 3 });
     if (tag === "main") {
@@ -31568,6 +31716,7 @@ class NativeUiHost {
       return payload ? createElement(NativeWidget, { node: payload.projection.tree }) : null;
     }
     this.root = gpuix.createRoot(renderer, {
+      keyboardFocusDim: false,
       onUncaughtError: (error) => {
         throw error;
       },

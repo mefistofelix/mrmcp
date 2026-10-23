@@ -174,6 +174,11 @@ backend-owned Show more/less, long handles ellipsized, Tool Call IDs readable an
 Checkboxes use bordered native squares and SVG checkmarks, not Unicode glyphs; retain clear unchecked
 and disabled states and label/keyboard activation. Project table header/body groups into shared native
 rows so their minimum width reaches the horizontal scroll content and the final column stays reachable.
+Share compact branch/entry layout between JSON editors and decoded Tool Call packet trees. Indent
+the child group once so scalar leaves and nested containers align at every level; wrap values inside
+bounded columns, preserve selectable text, keyed folds, exact edit paths and invalid partial drafts.
+Set createRoot keyboardFocusDim=false: native Tab/Shift+Tab navigation must not dim other controls.
+GPUIX 0.11 has no public native editor Tab-indent/caret-insertion API; do not emulate cursor or undo.
 Use official @gpuix/react Select/SelectTrigger/SelectValue/SelectContent/SelectItem: the component owns
 transient opening, anchoring, collision handling, focus and keyboard interaction; the selected value stays
 in backend drafts. Register managed dialogs with the public DismissableLayer so Escape closes only the

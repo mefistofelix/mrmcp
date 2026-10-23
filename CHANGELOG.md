@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Rework parameter/schema and decoded Tool Call trees with consistent branch/leaf indentation, vertical guides, compact SVG expanders, aligned keys/values and type colors. Wrap long values inside narrow panels and preserve editing, partial drafts and keyed collapse state.
+- Let the Tool Definition panel fill its detail-grid column instead of inheriting the fixed navigation-sidebar width and nested scrollbar.
+- Disable GPUIX's default keyboard focus dimming so Tab no longer grays the administration window. Preserve native Tab/Shift+Tab focus navigation; literal Tab indentation remains a native editor limitation.
 - Remove the subagent ChatGPT app ID/name settings and composer mention injection. Send the plain task/join/report/finish prompt through CDP Ext, using the operator's already-connected MrMCP app; retain exact delivery receipts and Session isolation.
 - Draw clear bordered checkbox squares with SVG checkmarks; preserve label, keyboard and disabled interactions. Fix horizontal table scrolling so header/body groups cannot hide the final column.
 - Fix GUI Copy writing `[object Object]` by passing text directly to Auto.js clipboard; use the same copy action for keyboard activation.

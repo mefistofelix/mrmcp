@@ -1411,6 +1411,42 @@ nativePages.push({
 });
 uiState.dialog = null;
 nativePages.push(JSON.parse(await fs.readFile(join(APP_DIR, "subagent-page.json"), "utf8")));
+uiState.currentSection = "logs";
+const treeLogState = structuredClone(uiState.logs);
+uiState.logs.toolQuery = guiDetail.tool;
+uiState.logs.page = 1;
+uiState.logs.openRowId = String(guiDetail.id);
+nativePages.push({
+  section: "tool-detail",
+  projection: nativeProjection(await renderUiView(uiRenderGeneration), uiState.native),
+});
+uiState.logs = treeLogState;
+const treeFixture = {
+  query: "Find matching source documents",
+  options: {
+    mode: "hybrid",
+    limits: { files: 50, chunks: 12 },
+    flags: [true, false, null],
+    description: "A long parameter value stays readable and wraps inside its column without covering adjacent keys or controls.",
+  },
+  paths: ["src/**/*.js", "docs/**/*.md"],
+  empty: {},
+};
+nativePages.push({
+  section: "json-trees",
+  projection: nativeProjection(
+    <div id="app">
+      <header>Parameter trees</header>
+      <main>
+        <h3>JSON parameters</h3>
+        <pre id="tree-fixture-source" hidden>{JSON.stringify(treeFixture)}</pre>
+        <div id="tree-fixture" class="json-editor-host" data-json-source="tree-fixture-source" />
+        <h3>Tool Call packet</h3>
+        {fragmentDebugPayload(JSON.stringify({ jsonrpc: "2.0", method: "tools/call", params: { name: "document_grep", arguments: treeFixture } }))}
+      </main>
+    </div>,
+  ),
+});
 await writeFile(join(APP_DIR, "native-pages.json"), JSON.stringify(nativePages));
 for (const section of [
   "network",
@@ -1675,7 +1711,16 @@ const { TestGpuixRenderer, hasTestGpuixRenderer } = await import("@gpuix/native"
 if (hasTestGpuixRenderer()) {
   const native = new TestGpuixRenderer(1180, 760);
   const events = [];
+  const initialBatch = native.applyBatch.bind(native);
+  const rootMutations = [];
+  native.applyBatch = (packet) => {
+    rootMutations.push(...JSON.parse(packet));
+    return initialBatch(packet);
+  };
   const host = await NativeUiHost.create(native, (event) => events.push(event));
+  if (!rootMutations.some(([name, enabled]) => name === "setKeyboardFocusDim" && enabled === false))
+    throw Error("Keyboard navigation dims the administration window");
+  native.applyBatch = initialBatch;
   const page = (value) =>
     nativeProjection(
       element(
@@ -1711,6 +1756,12 @@ if (hasTestGpuixRenderer()) {
   )) {
     host.apply({ ...payload, revision: revision++ });
     native.flush();
+    if (payload.section === "tool-detail") {
+      const panels = [...host.nodes.values()].filter((node) => node.meta?.tag === "aside");
+      const definition = panels.find((node) => !node.meta?.scroller);
+      if (!definition || native.getElementBounds(definition.nativeId).width <= 208)
+        throw Error("Tool definition inherits the narrow navigation sidebar layout");
+    }
     if (process.argv.includes("--screenshots"))
       native.captureScreenshot(
         join(directory, "ui-" + payload.section.replaceAll(":", "-") + ".png"),
@@ -1811,6 +1862,114 @@ if (hasTestGpuixRenderer()) {
     native.simulateClick(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
     settle();
   };
+  host.apply({
+    revision: revision++,
+    section: "keyboard",
+    projection: nativeProjection(
+      element(
+        "div",
+        { id: "app" },
+        element(
+          "main",
+          null,
+          element("textarea", { id: "tab-editor", value: "line one\nline two" }),
+          element("input", { id: "tab-next", value: "Next field" }),
+        ),
+      ),
+    ),
+  });
+  settle();
+  native.focusElement(host.nodes.get("id:tab-editor").nativeId);
+  native.simulateKeystrokes("tab");
+  settle();
+  if (native.getFocusedElementId() !== host.nodes.get("id:tab-next").nativeId)
+    throw Error("Tab did not move focus to the next field");
+  native.simulateKeystrokes("shift-tab");
+  settle();
+  if (native.getFocusedElementId() !== host.nodes.get("id:tab-editor").nativeId)
+    throw Error("Shift+Tab did not return focus to the multiline field");
+  console.log("GPUI: native Tab/Shift+Tab navigation without global keyboard dimming passed");
+
+  const treeData = {
+    query: "A long value ".repeat(12),
+    options: { mode: "hybrid", limits: { files: 50 } },
+    paths: ["src/**/*.js"],
+  };
+  const treeState = { details: { 'json:mvalue:["options","limits"]': true } };
+  const treePage = (editable = false) =>
+    nativeProjection(
+      element(
+        "div",
+        { id: "app" },
+        element(
+          "main",
+          null,
+          element("textarea", { id: "mvalue", hidden: true }, JSON.stringify(treeData)),
+          element("div", {
+            id: "parameters",
+            class: "json-editor-host",
+            "data-json-source": "mvalue",
+            ...(editable ? { "data-json-edit": "memory" } : {}),
+          }),
+        ),
+      ),
+      treeState,
+    );
+  const treeKey = "id:parameters/tree";
+  for (const width of [900, 500]) {
+    const projection = treePage();
+    Object.assign(projection.tree.style, { width, height: 620 });
+    host.apply({ revision: revision++, section: "json", projection });
+    settle();
+    const bounds = (key) => native.getElementBounds(host.nodes.get(key).nativeId);
+    const query = bounds(treeKey + "/query/key");
+    const options = bounds(treeKey + "/options/name");
+    const mode = bounds(treeKey + "/options/mode/key");
+    const files = bounds(treeKey + "/options/limits/files/key");
+    const value = bounds(treeKey + "/query/value");
+    const panel = bounds("id:parameters");
+    if (
+      Math.abs(query.x - options.x) > 1 ||
+      Math.abs(mode.x - query.x - 21) > 1 ||
+      Math.abs(files.x - mode.x - 21) > 1
+    )
+      throw Error(
+        "JSON branches and leaves have inconsistent indentation: " +
+          JSON.stringify({ query, options, mode, files }),
+      );
+    if (value.x < query.x + query.width || value.x + value.width > panel.x + panel.width)
+      throw Error("JSON values overlap keys or overflow the panel at width " + width);
+    if (process.argv.includes("--screenshots"))
+      native.captureScreenshot(join(directory, "ui-json-width-" + width + ".png"));
+  }
+  const queryId = host.nodes.get(treeKey + "/query/key").nativeId;
+  click({ id: host.nodes.get(treeKey + "/options/toggle").nativeId });
+  if (events.at(-1)?.key !== 'json:mvalue:["options"]' || events.at(-1)?.open !== false)
+    throw Error("JSON branch toggle did not preserve its exact path");
+  treeState.details['json:mvalue:["options"]'] = false;
+  host.apply({ revision: revision++, section: "json", projection: treePage() });
+  settle();
+  if (
+    host.nodes.has(treeKey + "/options/mode/key") ||
+    host.nodes.get(treeKey + "/query/key").nativeId !== queryId
+  )
+    throw Error("Collapsing a JSON branch affected unrelated rows");
+  treeState.details['json:mvalue:["options"]'] = true;
+  treeState.jsonEdits = { 'mvalue:["options","mode"]': '"unfinished' };
+  host.apply({ revision: revision++, section: "json-edit", projection: treePage(true) });
+  settle();
+  const field = host.nodes.get(treeKey + "/options/mode/value");
+  if (field.props.value !== '"unfinished' || field.style.borderColor !== "#c56d76")
+    throw Error("JSON editing lost its invalid partial draft or warning");
+  host.event({ elementId: field.nativeId, eventType: "change", value: '"fulltext"' });
+  if (events.at(-1)?.type !== "native-json" || events.at(-1)?.path !== '["options","mode"]')
+    throw Error("JSON value edits lost their structured path");
+  click({ id: host.nodes.get(treeKey + "/paths/0/remove").nativeId });
+  if (events.at(-1)?.operation !== "delete" || events.at(-1)?.path !== '["paths",0]')
+    throw Error("JSON array removal lost its numeric path");
+  console.log(
+    "GPUI: JSON indentation, narrow wrapping, keyed folds, invalid drafts and exact edit/remove paths passed",
+  );
   const checkboxPage = (checked) =>
     nativeProjection(
       element(

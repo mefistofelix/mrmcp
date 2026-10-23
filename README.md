@@ -209,7 +209,14 @@ The administrative GUI has no WebView, DOM, HTML generation/parsing, Morphlex, T
 listener. Eta loads only for editable guided_prompts.yaml templates. OAuth consent and published MCP Apps
 remain web content.
 
-Closing the window stops the backend and its managed processes. Tray, hide-on-close and native OS notification delivery are temporarily unavailable; the Notifications tab retains the saved preferences and explains their suspended state. Directory drops and Session-to-Workspace drag/drop remain supported. JSON values use the native tree and an editable JSON source view. GPUIX currently exposes no reliable minimize/visibility event, so backend projections may continue while minimized; native focus and selection remain with GPUIX.
+Closing the window stops the backend and its managed processes. Tray, hide-on-close and native OS
+notification delivery are temporarily unavailable; the Notifications tab retains the saved preferences
+and explains their suspended state. Directory drops and Session-to-Workspace drag/drop remain supported.
+JSON values and Tool Call packets use aligned keys/values, indented branches, guide lines and compact
+expand/collapse controls; editable JSON retains its source view. Tab/Shift+Tab navigate fields without
+dimming the window; literal Tab indentation is not exposed by the current native editor. GPUIX currently
+exposes no reliable minimize/visibility event, so backend projections may continue while minimized;
+native focus and selection remain with GPUIX.
 
 Windows builds use Bun's console-hiding and executable-icon build flags. macOS Apple Silicon is distributed as an ad-hoc signed app bundle in a DMG. macOS Intel is no longer supported.
 
