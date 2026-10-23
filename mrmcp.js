@@ -30150,7 +30150,16 @@ function nativeProjection(view, state = {}) {
     key,
     type: "text",
     text,
-    style: { fontSize: 13, lineHeight: 19, color: theme.text, ...style },
+    style: {
+      fontSize: 13,
+      lineHeight: 19,
+      color: theme.text,
+      minWidth: 0,
+      maxWidth: "100%",
+      flexShrink: 1,
+      whiteSpace: "normal",
+      ...style,
+    },
     children: [],
   });
   const row = (key, children, style = {}) => ({
@@ -30492,13 +30501,18 @@ function nativeProjection(view, state = {}) {
         gap: 0,
       });
     if (classes.has("debug-children")) style.gap = 0;
-    if (classes.has("tool-command-preview"))
-      return textNode(key, nativeText(node), {
+    if (
+      classes.has("tool-command-preview") ||
+      classes.has("terminal-command") ||
+      classes.has("terminal-cwd")
+    )
+      return textNode(key, nativeBlockText(node), {
         fontSize: 12,
         lineHeight: 18,
         color: theme.muted,
-        lineClamp: 2,
-        minWidth: 0,
+        width: "100%",
+        userSelect: "text",
+        ...(classes.has("tool-command-preview") ? { lineClamp: 2 } : {}),
       });
     if (classes.has("settings-tabs"))
       Object.assign(style, {
@@ -30602,6 +30616,9 @@ function nativeProjection(view, state = {}) {
           background: "#090d14",
           borderRadius: 6,
           minWidth: 0,
+          width: "100%",
+          maxWidth: "100%",
+          whiteSpace: "normal",
           userSelect: "text",
         },
         meta,
@@ -31773,15 +31790,7 @@ class NativeUiHost {
         const [x, y] = this.renderer.getScrollOffset(node.nativeId) || [0, 0];
         if (y) this.renderer.scrollTo(node.nativeId, x, 0);
       }
-      // Trackpads retain native pixel deltas; line-based mouse wheels get a usable desktop step.
-      if (event.precise === false) {
-        const [x, y] = this.renderer.getScrollOffset(node.nativeId) || [0, 0];
-        this.renderer.scrollTo(
-          node.nativeId,
-          x + (node.style.overflowX === "scroll" ? Number(event.deltaX || 0) * 32 : 0),
-          y + (node.meta.scrollAxis !== "x" ? Number(event.deltaY || 0) * 32 : 0),
-        );
-      }
+      // GPUIX already applies pixel-converted wheel deltas, including non-precise mouse events.
       this.recordScroll(node);
       return;
     }

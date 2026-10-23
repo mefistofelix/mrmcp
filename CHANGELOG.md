@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Fix Tool Call tree strings and command previews painting outside their columns: bound native text children and wrap long values/tokens without changing their content.
+- Remove duplicate mouse-wheel scaling after GPUIX had already applied pixel-converted deltas. Keep intermediate positions reachable in long Tool Call details, including across tree collapse/expand.
 - Rework parameter/schema and decoded Tool Call trees with consistent branch/leaf indentation, vertical guides, compact SVG expanders, aligned keys/values and type colors. Wrap long values inside narrow panels and preserve editing, partial drafts and keyed collapse state.
 - Let the Tool Definition panel fill its detail-grid column instead of inheriting the fixed navigation-sidebar width and nested scrollbar.
 - Disable GPUIX's default keyboard focus dimming so Tab no longer grays the administration window. Preserve native Tab/Shift+Tab focus navigation; literal Tab indentation remains a native editor limitation.

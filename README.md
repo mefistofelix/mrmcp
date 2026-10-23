@@ -203,7 +203,7 @@ and skips unchanged subtrees. Flex/Grid layout and scrolling stay native; explic
 expensive intrinsic layout. Dropdowns use the official GPUIX Select components. Dialogs keep title/actions
 visible while their body scrolls. Escape closes the top overlay first. GPUIX 0.11 paints native
 scrollbar thumbs that follow content without JavaScript polling; these visual thumbs do not take pointer
-input. Precise trackpad motion stays native and line-wheel steps are enhanced.
+input. Wheel and trackpad motion stay native, without additional application scaling.
 
 The administrative GUI has no WebView, DOM, HTML generation/parsing, Morphlex, Tauri bridge or network
 listener. Eta loads only for editable guided_prompts.yaml templates. OAuth consent and published MCP Apps

@@ -169,7 +169,11 @@ these styles on scrollers and Select content. Thumbs are visual only and take no
 textarea/password editing capabilities remain package boundaries; do not replace caret/IME/undo with
 another editor. Retain the small transient password mask because this
 version exposes no password input mode. Preserve precise trackpad motion and native wheel chaining over
-wide tables; only per-section offsets are buffered to uiState. Keep table descriptions collapsible through
+wide tables; GPUIX has already applied and pixel-converted mouse-wheel events even when precise=false.
+Never scale/reapply those deltas: scroll handlers only persist per-section offsets to uiState (retain
+the horizontal-table Y-axis constraint). Bound native text children as well as their containers so long
+tree strings, tokens, commands and previews wrap without painting over neighboring columns.
+Keep table descriptions collapsible through
 backend-owned Show more/less, long handles ellipsized, Tool Call IDs readable and Session metadata compact.
 Checkboxes use bordered native squares and SVG checkmarks, not Unicode glyphs; retain clear unchecked
 and disabled states and label/keyboard activation. Project table header/body groups into shared native

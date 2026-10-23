@@ -2269,16 +2269,23 @@ if (hasTestGpuixRenderer()) {
           tableBounds,
         }),
     );
-  host.event({
-    elementId: main.nativeId,
-    eventType: "scroll",
-    deltaY: -3,
-    deltaX: 0,
-    precise: false,
-  });
-  settle();
+  const beforeLineWheel = native.getScrollOffset(main.nativeId)[1];
+  native.simulateScrollWheel(x, y, 0, -60);
+  native.flush();
+  gpuix.flushSync(() =>
+    native
+      .drainEvents()
+      .forEach((event) =>
+        host.dispatch(event.eventType === "scroll" ? { ...event, precise: false } : event),
+      ),
+  );
+  native.flush();
   const preserved = native.getScrollOffset(main.nativeId)[1];
-  if (preserved > startOffset - 210) throw Error("Line wheel lost desktop step");
+  if (Math.abs(preserved - beforeLineWheel + 60) > 1)
+    throw Error(
+      "Mouse wheel pixel delta was scaled/applied again: " +
+        JSON.stringify({ beforeLineWheel, preserved }),
+    );
   await Bun.sleep(0);
   settle();
   const applyBatch = native.applyBatch.bind(native);
@@ -2328,6 +2335,131 @@ if (hasTestGpuixRenderer()) {
     "GPUI: native scroll, stable offsets, zero geometry polling, unchanged React bailout; " +
       ((performance.now() - wheelStart) / 12).toFixed(2) +
       " ms/test wheel cycle",
+  );
+
+  const longTreeText = "Long Tool Call text must wrap inside its value column. ".repeat(18);
+  const longTreeToken = "ABCDEF0123456789".repeat(30);
+  const detailState = {};
+  const debugEntry = (key, text, id) =>
+    element(
+      "div",
+      { class: "debug-entry" },
+      element("span", { class: "debug-key" }, key + ":"),
+      element("span", { class: "debug-string", id }, text),
+    );
+  const detailView = element(
+    "div",
+    { id: "app" },
+    element("main", null, "Underlying page"),
+    element(
+      "div",
+      { id: "detail-scroll", class: "tool-detail-overlay" },
+      element(
+        "div",
+        { class: "tool-detail-grid" },
+        element(
+          "div",
+          null,
+          element(
+            "div",
+            { class: "debug-payload-tree" },
+            element(
+              "details",
+              { class: "debug-node", open: true },
+              element("summary", null, "Tool Call response"),
+              element(
+                "div",
+                { class: "debug-children" },
+                debugEntry("text", longTreeText, "long-tree-text"),
+                debugEntry("token", longTreeToken, "long-tree-token"),
+                element(
+                  "details",
+                  { id: "detail-fold", class: "debug-node", open: true },
+                  element("summary", null, "Foldable group"),
+                  ...Array.from({ length: 10 }, (_, i) => debugEntry("child " + i, "value")),
+                ),
+                ...Array.from({ length: 80 }, (_, i) => debugEntry("item " + i, "value " + i)),
+              ),
+            ),
+          ),
+          element(
+            "div",
+            { id: "detail-command", class: "terminal-command" },
+            element("span", { class: "prompt" }, ">"),
+            element("span", null, "bun run task.js " + "--option=value ".repeat(30)),
+          ),
+        ),
+        element("aside", { class: "tool-descriptor" }, "Adjacent tool definition"),
+      ),
+    ),
+  );
+  const detailProjection = () => {
+    const projection = nativeProjection(detailView, detailState);
+    Object.assign(projection.tree.style, { width: 900, height: 620 });
+    return projection;
+  };
+  host.apply({ revision: revision++, section: "detail-scroll", projection: detailProjection() });
+  settle();
+  for (const key of ["id:long-tree-text", "id:long-tree-token"]) {
+    const container = host.nodes.get(key);
+    const text = host.nodes.get(container.children[0].key);
+    const box = native.getElementBounds(container.nativeId);
+    const painted = native.getElementBounds(text.nativeId);
+    if (painted.height <= 20 || painted.x + painted.width > box.x + box.width + 1)
+      throw Error("Tool Call tree text overflows its value column: " + key);
+  }
+  if (native.getElementBounds(host.nodes.get("id:detail-command").nativeId).height <= 20)
+    throw Error("Long command preview does not wrap");
+  const overlay = host.nodes.get("id:detail-scroll");
+  const detailBounds = native.getElementBounds(overlay.nativeId);
+  const scrollTo = native.scrollTo.bind(native);
+  let scrollWrites = 0;
+  native.scrollTo = (...args) => {
+    scrollWrites++;
+    return scrollTo(...args);
+  };
+  for (let tick = 1; tick <= 8; tick++) {
+    native.simulateScrollWheel(detailBounds.x + 40, detailBounds.y + 50, 0, -60);
+    native.flush();
+    gpuix.flushSync(() =>
+      native
+        .drainEvents()
+        .forEach((event) =>
+          host.dispatch(event.eventType === "scroll" ? { ...event, precise: false } : event),
+        ),
+    );
+    native.flush();
+    if (Math.abs(native.getScrollOffset(overlay.nativeId)[1] + tick * 60) > 1)
+      throw Error("Mouse wheel skipped intermediate Tool Call detail content at tick " + tick);
+  }
+  if (scrollWrites) throw Error("Application rewrote native wheel offsets in the detail overlay");
+  native.scrollTo = scrollTo;
+  detailState.details = { "id:detail-fold": false };
+  host.apply({ revision: revision++, section: "detail-scroll", projection: detailProjection() });
+  settle();
+  if (Math.abs(native.getScrollOffset(overlay.nativeId)[1] + 480) > 1)
+    throw Error("Collapsing a Tool Call tree reset its intermediate scroll position");
+  detailState.details["id:detail-fold"] = true;
+  host.apply({ revision: revision++, section: "detail-scroll", projection: detailProjection() });
+  settle();
+  if (Math.abs(native.getScrollOffset(overlay.nativeId)[1] + 480) > 1)
+    throw Error("Expanding a Tool Call tree reset its intermediate scroll position");
+  native.simulateScrollWheel(detailBounds.x + 40, detailBounds.y + 50, 0, 60);
+  native.flush();
+  gpuix.flushSync(() =>
+    native
+      .drainEvents()
+      .forEach((event) =>
+        host.dispatch(event.eventType === "scroll" ? { ...event, precise: false } : event),
+      ),
+  );
+  native.flush();
+  if (Math.abs(native.getScrollOffset(overlay.nativeId)[1] + 420) > 1)
+    throw Error("Mouse wheel cannot return upward through intermediate detail content");
+  if (process.argv.includes("--screenshots"))
+    native.captureScreenshot(join(directory, "ui-tool-tree-scroll.png"));
+  console.log(
+    "GPUI: long tree/token/command wrapping and incremental mouse wheel scrolling across folds passed",
   );
 
   const dragView = element(
