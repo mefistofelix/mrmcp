@@ -30926,6 +30926,7 @@ function nativeProjection(view, state = {}) {
         type: "native-copy",
         value: nativeText(sources.get(data.target) || { children: [] }),
       };
+    if (events.click?.type === "native-copy") events.keyDown = { ...events.click, keyboard: true };
     if (tag === "a" && a.href) {
       events.click = { type: "native-open-url", url: String(a.href) };
       Object.assign(style, {
@@ -31705,7 +31706,7 @@ class NativeUiHost {
     if (intent.keyboard && !["enter", "space", " "].includes(event.key)) return;
     if (intent.type === "native-copy") {
       void loadAuto()
-        .then((auto) => auto.clipboard({ write: { text: String(intent.value || "") } }))
+        .then((auto) => auto.clipboard({ write: String(intent.value ?? "") }))
         .catch(console.error);
       return;
     }
