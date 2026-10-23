@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Update CDP.js to 0.7.0 and use its reverse API mode for goals, matching and subagents. Navigate, inspect React/DOM, insert prompts and submit/stop through extension APIs without Chrome Debugger, network capture or CSP changes. Document the required Allow User Scripts grant and visible failures without debugger fallback.
+- Share one purple MrMCP tab-group name across goals/matching/workers, preserving owned group identities on reconnect. Export all four unchanged extension files, including its connection/debug sidebar. Keep general CDP tools and explicit debugger mode available.
 - Fix Tool Call tree strings and command previews painting outside their columns: bound native text children and wrap long values/tokens without changing their content.
 - Remove duplicate mouse-wheel scaling after GPUIX had already applied pixel-converted deltas. Keep intermediate positions reachable in long Tool Call details, including across tree collapse/expand.
 - Rework parameter/schema and decoded Tool Call trees with consistent branch/leaf indentation, vertical guides, compact SVG expanders, aligned keys/values and type colors. Wrap long values inside narrow panels and preserve editing, partial drafts and keyed collapse state.

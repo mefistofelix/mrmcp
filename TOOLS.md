@@ -106,7 +106,7 @@ conversation. Clearing the goal retains its ID, including one supplied in the sa
 
 #### Global settings and browser lifetime
 
-Goals use the user's system Chrome through public CDP.js 0.5.0 URL bootstrap and reverse transport.
+Goals use the user's system Chrome through public CDP.js 0.7.0 URL bootstrap and reverse transport.
 The operator installs CDP Ext and signs in normally. MrMCP sets cdp_ext=true, cdp_ext_install=false,
 user_data_dir=null and update_preferences=false; login/translations remain enabled. CDP.js opens its
 loopback bootstrap URL through Chrome, reusing the running system profile or opening Chrome if
@@ -116,7 +116,7 @@ One-time setup:
 
 1. In Settings → Goals, choose the CDP Ext export folder and click **Save CDP Ext folder**. The default
    is APP_DIR/cdp_ext, beside the editable catalogs; macOS uses the application-support directory.
-   Export uses the exact manifest.json and cdp_ext.js from the bundled public package, including offline.
+   Export copies the package’s unchanged manifest.json, cdp_ext.js, sidebar.html and sidebar.js, including offline.
 2. In chrome://extensions in the intended system profile, enable **Developer mode**, click **Load
    unpacked** and select that exact folder. See also the [upstream instructions](https://github.com/mefistofelix/cdp.js#reverse-chrome-extension-transport).
 3. Keep the export path stable. After upgrading MrMCP, save to the same folder, confirm replacement
@@ -124,7 +124,9 @@ One-time setup:
    are preserved; unrelated nonempty folders, symlink destinations or nonregular extension files are
    refused. Export alone opens no browser or connection and never installs/enables an extension.
    No extension ID or WebSocket address is entered in MrMCP.
-4. Sign in to ChatGPT in the system profile. Set a goal to request matching, or supply chatgpt_chat_id.
+4. In the extension’s **Details**, enable **Allow User Scripts** (Chrome 138+; Developer mode on older
+   supported Chrome). Sign in to ChatGPT in the system profile. Set a goal to request matching,
+   or supply chatgpt_chat_id. MrMCP never enables the permission by editing your profile.
 
 CDP.js lazily starts its shared loopback listener (default port 9223), then opens a real local HTTP
 /cdp_ext URL with browser=mrmcp-goals, the effective WebSocket endpoint and a generated binding token.
@@ -132,7 +134,8 @@ The installed extension intercepts the tab URL and announces its logical browser
 token. CDP.js validates the token and extension origin; MrMCP does no socket scanning or guessed-profile
 selection. One extension copy/native ID can serve distinct profiles with distinct logical names.
 A profile already connected to another name/manager fails explicitly rather than changing its binding.
-Disconnect it from that manager before retrying. Bootstrap and owned page tabs remain open on Quit.
+Disconnect it from that manager before retrying. The extension closes the bootstrap tab after connection, or replaces it with its connection page
+when it is the window’s only tab. Owned working tabs remain open on Quit.
 Chrome's singleton routing and any user-selected raw launch flags determine instance reuse. The external
 opener skips the automation launch preset; its process is not owned Chrome and is never terminated by
 MrMCP. Reconnects are handled by the library without replaying interrupted commands or duplicating pages.
@@ -153,15 +156,28 @@ These settings use the existing config table, schema 6. Headless, process visibi
 launch settings no longer apply to Goals; Chrome is controlled by its user. The former dedicated
 profile is unused and remains untouched. Saved goals and conversation associations are preserved.
 
+Goals, matching and subagents use `execution_mode:"api"`. CDP.js registers logical tabs and manages
+their native groups without attaching Chrome Debugger. Navigation uses `chrome.tabs.update`.
+`chrome.userScripts.execute` runs the self-contained DOM adapter in `USER_SCRIPT` and the read-only
+React-cache adapter in `MAIN`. Script text is injected directly: no `eval`, binding, domain enabling,
+network interception, debugger fallback or CSP modification. Native textarea setters/InputEvent and
+contenteditable insertion update the editor; ordinary form submission/Stop clicks retain the existing
+draft, conversation, activity/revision and exact receipt guards. Missing script permission fails
+visibly with setup instructions. This path requires Chrome 135+; Chrome 138+ needs **Allow User Scripts**
+in the extension’s Details and Chrome 135–137 needs Developer mode. Only the disposable automated-test profile has this
+toggle enabled programmatically. Changes to ChatGPT’s DOM/React model may still require an adapter
+update; selecting debugger transport would not remove that dependency.
+
 The browser label is mrmcp-goals and its shared logical target is goals, in the native purple
-**MrMCP Goals** tab group, using CDP.js target.group. Attach/create the target only for an explicit
+**MrMCP** tab group shared with subagents, using CDP.js target.group. Attach/create the target only for an explicit
 matching attempt, a due delivery or a user-requested debug action. Startup without due work, Settings
 opening/saving and status diagnostics create no tab or browser connection. The opt-in startup matching
 policy and delivery retries still count as requested goal work. Reuse a surviving target by logical
 name; recreate a closed target only when the next action needs it. Do not adopt unrelated ChatGPT tabs
 or groups with the same visible title. A namespaced chrome.storage.session marker confirms the owned
-tab across MrMCP/extension-worker reconnects; a Chrome restart clears it so recycled numeric tab IDs
-cannot select a personal tab. Only the logical tab ID is stored there, never chat content or tokens.
+tab and owned per-window group IDs across MrMCP/extension-worker reconnects; a Chrome restart clears
+these markers so recycled numeric IDs cannot select personal tabs/groups. They contain no chat
+content or credentials. One named MrMCP group is shared across features; Chrome groups are per window.
 
 Goals/Subagents share the logical browser mrmcp-goals; explicit browser tools can reuse that name
 to operate on the same profile. Another logical name cannot take over an already-connected profile. Native extension IDs
@@ -235,7 +251,7 @@ Replacing/clearing a goal, disabling management, Session deletion/expiry and new
 | `matching` | That attempt is in progress; it has already been consumed persistently, so a crash cannot repeat it. |
 | `ready` | Associated and scheduled. Login/composer checks still happen at delivery time. |
 | `waiting_login` | The site requires sign-in. Sign in normally in system Chrome and retry chat_set_goal or a debug action. This goal remains suspended until that explicit retry. |
-| `waiting_browser` | CDP Ext ID is not configured. Install the extension, save its ID in Settings → Goals and repeat the set. |
+| `waiting_browser` | CDP Ext cannot connect. Install/reload it in system Chrome, enable Allow User Scripts and repeat the set; no extension ID is entered. |
 | `not_found` | No exact Session match in the bounded recent candidates. Ensure the correct account/chat and a visible MrMCP tool call, then call `chat_set_goal` again. No automatic discovery retry. |
 | `busy` | An associated chat still has in-flight Tool Calls; the scheduler waits for completion and a fresh full timeout. For an unassociated chat it can also mean discovery was interrupted or exhausted its budget; call `chat_set_goal` again to request another match. |
 | `draft_present` | The shared page contains text that MrMCP will not overwrite. Send or remove that draft manually. An unassociated goal needs another `chat_set_goal` call to retry matching. |
@@ -301,7 +317,7 @@ an additional OS process. No extra quota, model access, worktree, software insta
 isolation is created. Workers share the parent's selected Workspace and must coordinate edits.
 
 Setup uses **Settings → Goals**, shared with Goals: install CDP Ext in system Chrome and sign in normally.
-CDP.js 0.5.0 opens or reuses the system browser through URL bootstrap; no extension ID is entered.
+CDP.js 0.7.0 opens or reuses the system browser through URL bootstrap; no extension ID is entered.
 Connect and authorize MrMCP once as an MCP app in ChatGPT so it is available to new worker chats.
 The bootstrap is a plain task prompt: initialize a fresh Session, join with the exact agent_id and
 one-use claim_token, report progress/messages and finish through the tool. No app ID/display-name
@@ -309,8 +325,8 @@ configuration, app discovery or injected composer mention is used. If tools are 
 worker is instructed to report that blocker; MrMCP does not install/authorize apps or answer consent.
 
 The Goals enable flag controls Goals alone. Subagents operate independently through the same browser
-label mrmcp-goals, using targets subagent-<opaque agent id> in the native cyan **MrMCP Subagents** group.
-Goals keep their purple group. Each target has its own namespaced extension session-storage tab-ID
+label mrmcp-goals, using targets subagent-<opaque agent id> in the shared purple **MrMCP** group
+also used for goals and matching. Each target has its own namespaced extension session-storage tab-ID
 marker, preventing adoption of recycled personal tab IDs. Browser bootstrap may open Chrome; no
 managed profile is created or edited.
 Tabs are acquired for requested work/resume; passive inspection does not connect or create targets.
@@ -698,13 +714,13 @@ Arguments:
   - `target` — optional persistent logical page label string or advanced object with required `name`. If its saved page still exists, MrMCP resolves a current flattened `sessionId`; if it disappeared, MrMCP creates a new page (default `about:blank`, customizable through `create_params`), initializes its session and replaces the persisted `targetId`. `_.click` and `_.find` require a target; standard browser-level CDP methods may omit it.
   - `call` — one object with required `method` and optional `params`; no separate extension selector. Never supply transport `id` or `sessionId`.
     - Standard `method` names such as `Page.navigate`, `Runtime.evaluate`, `Network.getResponseBody` or `Page.captureScreenshot` pass through with `params` unchanged.
-    - `method:"_.click"` accepts `params.xpath` plus optional `attempts` (default 5, max 20) and `interval_ms` (default 300); it performs the reference `Runtime.evaluate` retry/click flow with `awaitPromise`, `returnByValue`, `silent` and `userGesture`.
-    - `method:"_.find"` accepts `params.xpath` plus optional `limit` (default 20, max 100) and returns compact matching node/element metadata including text and client rects. Both extensions preprocess augmented XPath: `ends-with(a,b)` becomes the XPath-1.0 `substring(...) = b` equivalent and `icontains(a,b)` becomes a case-insensitive `contains(translate(...),b)` expression. The reserved `_.` methods translate locally to `Runtime.evaluate`; unknown names in that namespace fail per entry.
+    - `method:"_.click"` accepts `params.xpath` plus optional `attempts` (default 5, max 20) and `interval_ms` (default 300); it retains the library's retry/click semantics. Reverse API mode uses the extension's fixed native scripting helper; direct/debugger mode uses `Runtime.evaluate` with `awaitPromise`, `returnByValue`, `silent` and `userGesture`.
+    - `method:"_.find"` accepts `params.xpath` plus optional `limit` (default 20, max 100) and returns compact matching node/element metadata including text and client rects. Both helpers preprocess augmented XPath: `ends-with(a,b)` becomes the XPath-1.0 `substring(...) = b` equivalent and `icontains(a,b)` becomes a case-insensitive `contains(translate(...),b)` expression. Unknown `_.` names fail per entry. Reverse API XPath needs no User Scripts grant, string eval or debugger; arbitrary script-text execution is separate.
   - `_image` — optional MrMCP response post-processing **only** for a standard `Page.captureScreenshot` call and only with `wait=true`. The standard screenshot request remains untouched, so every normal CDP screenshot parameter remains available. `return` is currently `base64`; `format:"original"` keeps the browser-returned encoding without loading an image codec, while `format:"webp"` lazily uses the public Auto.js `auto.vips.decodeImage` / `auto.vips.encodeImage` API. Its current WebP encoder is fixed at `quality:80`; `scale` multiplies dimensions before encoding. PNG/WebP browser screenshots can enter this post-processing path. The resulting Base64 stays in `cdp.result.data`; an `image` metadata object reports encoding, resulting format/MIME, byte size, scale and quality. MrMCP never imports Sharp directly and does not save CDP screenshots to disk unless a later explicit tool does so.
 - `wait` — one batch-wide flag, default `true`. `true` dispatches every entry and waits independently for every response; one failed entry does not abort siblings. `false` dispatches all possible entries and returns assigned request ids immediately; retrieve eventual responses with `cdp_poll`. `_image` is intentionally unavailable with `wait=false` because post-processing happens on the waited response.
 - `chat_session`.
 
-The result is `{wait, results[]}` in input order. Each row reports browser/target/session diagnostics, assigned request `id`, `queued`, `cdp`, nullable `image`, setup errors, `success` and a compact row error. For local extensions, the ring/response envelope remembers the requested logical method name, `_.click` or `_.find`, even though the wire command is `Runtime.evaluate`.
+The result is `{wait, results[]}` in input order. Each row reports browser/target/session diagnostics, assigned request `id`, `queued`, `cdp`, nullable `image`, setup errors, `success` and a compact row error. The ring remembers the logical `_.click`/`_.find` name for both native extension scripting and direct/debugger evaluation; the canonical raw response and its stable request id remain available with either `wait` setting.
 
 Example entry: `{"target":"page","call":{"method":"_.click","params":{"xpath":"//button[@id='save']"}}}`.
 
@@ -718,7 +734,7 @@ Advanced browser options are shared by `cdp_call`, `cdp_subs` and `cdp_poll`:
 - `user_data_dir` — profile directory. Empty restores `.mrmcp/cdp/<name>/`; omitted with cdp_ext or explicit null selects Chromium's system profile. Relative executable/profile paths resolve against the application directory. Modern Chrome requires a separate profile for ordinary debugging-port launches. System-profile preference files are never written.
 - `args` — up to 100 verbatim arguments, or the public cdp.js switch object. A matching switch replaces its generated default; object `false`/`null` removes a flag, `true` emits a flag, strings/numbers emit `--key=value`, arrays become comma-separated. Keys omit `--`. Empty clears overrides. `headless`, `user-data-dir`, `remote-debugging-*` and the argv terminator remain managed. Extension launches require named switches rather than positional arguments.
 - `reverse` — passive attachment to an already installed bridge, opening no URL and changing no profile. Supply extension_id from chrome://extensions, or use that native ID as the browser name. The initial manifest endpoint must reach the shared listener. Prefer cdp_ext for automatic system-browser bootstrap.
-- `cdp_ext` — public token-bound URL bootstrap. Defaults to the system profile and an extension installed by the user; opens/reuses Chrome without a debugging port or manually entered extension ID/endpoint. The bootstrap tab remains open. With an explicit custom user_data_dir, extension installation defaults on. Reload the extension after upgrades.
+- `cdp_ext` — public token-bound URL bootstrap. Defaults to the system profile and an extension installed by the user; opens/reuses Chrome without a debugging port or manually entered extension ID/endpoint. The extension closes the bootstrap tab after connection, or replaces it with a connection page when it is the only tab. With an explicit custom user_data_dir, extension installation defaults on. Reload the extension after upgrades.
 - `cdp_ext_install` — only for cdp_ext=true; default false for the system profile, true for a custom directory. False uses the already-installed extension and skips the automation launch preset. True prepares/loads an extension copy and owns the launched process. It cannot install into an already running Chrome through forwarded flags; user/agent must explicitly choose that setup.
 - `translations` / `login` — browser translation and browser-account/sync integration flags. Default true for the external opener, false for managed launches. Website sign-in is independent. Existing Chrome does not apply newly forwarded flags.
 - `extension_id` — native identity only for passive reverse attachment, optional if the browser name is that ID. cdp_ext observes it automatically. Bootstrapped profiles with distinct logical names may share an extension directory/native ID; one profile has one active logical connection.
@@ -736,7 +752,7 @@ Choose one transport (`reverse`, `cdp_ext`, `port`, `http_url`, `websocket_url`)
 
 The tool supports all modes; agent and user choose the appropriate one. Direct CDP has its ordinary protocol coverage. Extension mode uses Chrome's restricted `chrome.debugger` domains: Runtime/Page/Network/DOM/Input/Emulation are available, ServiceWorker/BackgroundService are unsupported and their optional setup errors remain visible. Browser-level Target commands are limited; `create_params` accepts only `url`/`background`. Opening DevTools can detach the bridge. Unknown/unsupported operations return the original upstream errors. This requires an extension-capable public cdp.js npm release; an older installed package returns a clear unsupported-release error before launching or creating a listener.
 
-Extension connections also accept `chrome.<namespace>.<method>` with positional `params.args` and optional `params.callback:true`. Example: `chrome.tabs.query` with `args:[{}]`. Native JSON results are preserved in `cdp.result`. The logical target does not supply an implicit tab ID to these APIs: use native tab IDs inside `args`. There is no generic remote Chrome event registration. CDP.js 0.5.0 also forwards chrome.webRequest.* request lifecycle notifications independently of debugger attachment and target.network. They include native request metadata/headers, without response bodies or WebSocket frames. Existing cdp_subs/cdp_poll method/target filters and bounded rings apply; requests with tabId=-1 have no target. Goals/Subagents do not use this stream for matching or retain it implicitly.
+Extension connections also accept `chrome.<namespace>.<method>` with positional `params.args` and optional `params.callback:true`. Example: `chrome.tabs.query` with `args:[{}]`. Native JSON results are preserved in `cdp.result`. The logical target does not supply an implicit tab ID to these APIs: use native tab IDs inside `args`. There is no generic remote Chrome event registration. CDP.js 0.7.0 also forwards chrome.webRequest.* request lifecycle notifications independently of debugger attachment and target.network. They include native request metadata/headers, without response bodies or WebSocket frames. Existing cdp_subs/cdp_poll method/target filters and bounded rings apply; requests with tabId=-1 have no target. Goals/Subagents do not use this stream for matching or retain it implicitly.
 
 Typical system-browser request inside calls[]: {"browser":{"name":"personal","cdp_ext":true},"call":{"method":"chrome.tabs.query","params":{"args":[{}]}}}. Install CDP Ext manually using the [CDP.js instructions](https://github.com/mefistofelix/cdp.js#reverse-chrome-extension-transport); reload it after updates. Explicit managed setup: {"browser":{"name":"bridge","cdp_ext":true,"user_data_dir":"profiles/bridge","cdp_ext_install":true},"target":"page","call":{"method":"Runtime.evaluate","params":{"expression":"document.title","returnByValue":true}}}. Passive attachment remains available with reverse=true and extension_id. A profile already connected to another name/manager rejects rebinding until disconnected.
 
@@ -755,7 +771,8 @@ Advanced target options apply only to `cdp_call.target`; subscription/poll targe
 - `name` — required logical page label, 1–128 characters.
 - `group` — reverse/extension-only false, a logical group name, or an object with required name and optional Chrome color (grey, blue, red, yellow, green, pink, purple, cyan, orange). Configure on first use. CDP.js groups targets natively, scoped to browser/window; direct CDP rejects grouping.
 - `create_params` — native [Target.createTarget parameters](https://chromedevtools.github.io/devtools-protocol/tot/Target/#method-createTarget), merged over `{url:"about:blank",background:true}`. For example `url`, `background`, `newWindow`, `width`, `height`, `browserContextId` or `hidden`. Chrome validates supported parameters/combinations; `forTab:true` is rejected because logical targets route to pages. Applied only when creating/recreating a page; existing pages are not navigated or resized. Supplying a new object replaces the saved create_params object.
-- `initialize` — default true; false skips all optional setup below. The debugger pause is always released.
+- `execution_mode` — reverse target default `"api"`: selecting/grouping tabs and `_.find`/`_.click` use browser APIs without Chrome Debugger. `"debugger"` opts into CDP setup. Explicit session CDP commands still attach lazily in API mode; `chrome.*` calls do not. Direct CDP is unchanged. A helper may override the mode for one call via `call.params.execution_mode`.
+- `initialize` — default true in direct/debugger mode; false skips optional setup. Reverse API mode skips all CDP domain/binding/resume setup.
 - `runtime` — default `"bootstrap"` enables Runtime during setup then disables reporting before resume; true leaves reporting enabled; false sends neither enable nor disable. JavaScript execution and explicit `Runtime.evaluate` remain available.
 - `page`, `network`, `service_worker`, `focus_emulation`, `binding`, `background_service` — independent booleans, all default true, controlling Page.enable, Network.enable, ServiceWorker.enable, focus emulation, the _send_to_cdp binding and pushMessaging BackgroundService setup. `network:false` skips automatic Network reporting; it does not block network access.
 
@@ -767,7 +784,7 @@ The persistent database stores browser-to-reserved-local-port and `(browser,targ
 
 The desktop **Browser** page combines persistent browser/profile + logical-target state with current connection/ring/subscription diagnostics. Historical request/response inspection and Replay use only `cdp_call` Tool Calls recorded in **Payload** mode, because Metadata deliberately does not retain a replay source. A replay reruns only the selected recorded batch item through the shared low-level CDP engine; it does not enter the MCP dispatcher, create a Tool Call, write replay history or emit Tool Call notifications. The page adds no new CDP telemetry or replay persistence.
 
-The library uses flattened auto-attach with `waitForDebuggerOnStart:false` and discovery. It initializes each logical page when resolved, using its selected options: Runtime/Page/Network, best-effort ServiceWorker, focus emulation, `_send_to_cdp` binding and pushMessaging BackgroundService. The default `runtime:"bootstrap"` enables Runtime during setup, then sends `Runtime.disable` before `Runtime.runIfWaitingForDebugger`. This leaves explicit `Runtime.evaluate` available. A binding installed in the current document emits `Runtime.bindingCalled`; navigation can replace that document, so use `runtime:true` when binding availability across navigation is needed. Protocol failures in optional setup steps appear in `setup_errors`; transport failures/timeouts fail the entry. Unrelated auto-attached pages are not initialized with MrMCP defaults.
+Direct and explicit reverse-debugger targets use flattened auto-attach with `waitForDebuggerOnStart:false` and discovery. It initializes each logical page when resolved, using its selected options: Runtime/Page/Network, best-effort ServiceWorker, focus emulation, `_send_to_cdp` binding and pushMessaging BackgroundService. The default `runtime:"bootstrap"` enables Runtime during setup, then sends `Runtime.disable` before `Runtime.runIfWaitingForDebugger`. This leaves explicit `Runtime.evaluate` available. A binding installed in the current document emits `Runtime.bindingCalled`; navigation can replace that document, so use `runtime:true` when binding availability across navigation is needed. Protocol failures in optional setup steps appear in `setup_errors`; transport failures/timeouts fail the entry. Unrelated auto-attached pages are not initialized with MrMCP defaults.
 
 ### `cdp_subs`
 

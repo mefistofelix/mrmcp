@@ -2360,7 +2360,15 @@ async function backend({ addWorkspace = null } = {}) {
           initialize: {
             type: "boolean",
             description:
-              "Defaults true. false skips all optional page setup below; the debugger pause is always released.",
+              "Defaults true for direct/debugger targets. false skips optional setup. Reverse API targets skip setup entirely.",
+          },
+          execution_mode: {
+            type: "string",
+            enum: ["api", "debugger"],
+            description:
+              "Reverse-only target mode, default api: select/group tabs and run XPath helpers without " +
+              "Chrome Debugger. debugger opts into CDP setup. Explicit session CDP commands attach " +
+              "lazily even in api mode; chrome.* calls never attach implicitly. Direct CDP is unchanged.",
           },
           runtime: {
             anyOf: [{ type: "boolean" }, { type: "string", enum: ["bootstrap"] }],
@@ -3421,9 +3429,14 @@ async function backend({ addWorkspace = null } = {}) {
       if (!entry?.sessionId) {
         // Resolve/create/setup through the package's public API. This read has no
         // page-side effects and leaves native dispatch independent of routing keys.
+        const reverse = record.engine.reverse || record.engine.cdp_ext;
         await record.client.call({
-          method: "Page.getFrameTree",
-          params: { browser: record.browser, target: { name: target, ...options } },
+          method: reverse ? "chrome.tabs.query" : "Page.getFrameTree",
+          params: {
+            browser: record.browser,
+            target: { name: target, ...options },
+            ...(reverse ? { args: [{}] } : {}),
+          },
         });
         entry = record.engine.targets[target];
       }
@@ -3455,7 +3468,8 @@ async function backend({ addWorkspace = null } = {}) {
 
   const CHAT_GOAL_BROWSER = "mrmcp-goals";
   const CHAT_GOAL_TARGET = "goals";
-  const CHAT_GOAL_GROUP = { name: "MrMCP Goals", color: "purple" };
+  const CHAT_BROWSER_GROUP = { name: "MrMCP", color: "purple" };
+  const CHAT_BROWSER_GROUP_KEY = "mrmcp.browser.groups";
   const CHAT_GOAL_TAB_KEY = "mrmcp.goals.tab";
   const CHAT_GOAL_RETRY_MS = 60000;
   const CHAT_GOAL_STATUSES = [
@@ -3495,7 +3509,8 @@ async function backend({ addWorkspace = null } = {}) {
       connect_timeout_ms: 15000,
     });
   const CHAT_GOAL_BROWSER_HINT =
-    "Install or reload the current CDP Ext in your system Chrome profile and sign in to ChatGPT there. " +
+    "Install or reload the current CDP Ext in your system Chrome profile, enable Allow User Scripts " +
+    "in its extension details and sign in to ChatGPT there. " +
     "CDP.js opens the local bootstrap link automatically; no extension ID, endpoint or separate profile is required. " +
     "If the profile is connected to another manager, disconnect it there and retry.";
   const chatGoalDefaultTimeout = () =>
@@ -3508,7 +3523,7 @@ async function backend({ addWorkspace = null } = {}) {
     const packageDirectory = dirname(
       Bun.resolveSync("@mefistofelix/cdp.js", runtimePackageDirectory || MODULE_DIR),
     );
-    const names = ["manifest.json", "cdp_ext.js"];
+    const names = ["manifest.json", "cdp_ext.js", "sidebar.html", "sidebar.js"];
     const files = await Promise.all(
       names.map(async (name) => ({
         name,
@@ -3726,7 +3741,9 @@ async function backend({ addWorkspace = null } = {}) {
   async function chatGoalRpc(page, method, params = {}) {
     if (shuttingDown || !(page.subagent || chatGoalsEnabled()))
       throw new Error("ChatGPT browser control is disabled, unconfigured or stopping");
-    const { id, promise } = cdpRequest(page.record, method, params, page.session_id, {
+    if (!["chrome.tabs.update", "chrome.userScripts.execute"].includes(method))
+      throw new Error(`ChatGPT control requires browser APIs, not ${method}`);
+    const { id, promise } = cdpRequest(page.record, method, params, "", {
       wait: true,
       reject_on_error: true,
     });
@@ -3746,6 +3763,46 @@ async function backend({ addWorkspace = null } = {}) {
       clearTimeout(timer);
       page.record.pending.delete(id);
     }
+  }
+  const chatGoalOpenUrl = (page, url) =>
+    chatGoalRpc(page, "chrome.tabs.update", { args: [Number(page.target_id), { url }] });
+
+  async function chatGoalScript(page, fn, args, world = "USER_SCRIPT") {
+    // Native script-text injection needs no eval, CSP changes or debugger.
+    // Only the read-only React reader uses MAIN to see the page's objects.
+    const frames = await chatGoalRpc(page, "chrome.userScripts.execute", {
+      args: [
+        {
+          target: { tabId: Number(page.target_id) },
+          world,
+          js: [
+            {
+              code: `(() => {
+                try {
+                  return { value: (${fn.toString()})(...${JSON.stringify(args)}) };
+                } catch (error) {
+                  return { error: String(error?.message || error) };
+                }
+              })()`,
+            },
+          ],
+        },
+      ],
+    }).catch((error) => {
+      throw new Error(
+        "ChatGPT user-script access failed. Enable Allow User Scripts in CDP Ext details, " +
+          "reload the extension and retry. " +
+          errorMessage(error),
+      );
+    });
+    const result = frames.find?.((frame) => frame.frameId === 0)?.result;
+    if (!result || !Object.hasOwn(result, "value"))
+      throw new Error(
+        result?.error ||
+          "ChatGPT script execution failed. Enable Allow User Scripts in CDP Ext details, " +
+            "reload the extension and retry. No debugger fallback was used.",
+      );
+    return result.value;
   }
   // Re-resolve rendered DOM on every operation. Never classify controls by translated text, generated CSS or icons.
   function chatGoalDom(action, input) {
@@ -4123,6 +4180,29 @@ async function backend({ addWorkspace = null } = {}) {
       }
       return { cleared: !!editor && !editorText() };
     }
+    if (action === "insert") {
+      if (
+        !["ready", "busy"].includes(base.status) ||
+        !expectedChat ||
+        base.draft ||
+        document.activeElement !== editor
+      )
+        return { inserted: false };
+      if (editor instanceof HTMLTextAreaElement) {
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(
+          editor,
+          input.text,
+        );
+        editor.dispatchEvent(
+          new InputEvent("input", {
+            bubbles: true,
+            inputType: "insertText",
+            data: input.text,
+          }),
+        );
+      } else document.execCommand("insertText", false, input.text);
+      return { inserted: editorText() === input.text };
+    }
     if (action === "send") {
       // During generation the site's native form may accept a queued prompt
       // while its only visible button is Stop. Never click Stop as a submit.
@@ -4161,15 +4241,17 @@ async function backend({ addWorkspace = null } = {}) {
   }
 
   async function chatGoalEvaluate(page, action, input = {}) {
-    const result = await chatGoalRpc(page, "Runtime.evaluate", {
-      expression: `(${chatGoalDom.toString()})(${JSON.stringify(action)},${JSON.stringify({ ...input, tool_names: BASE_TOOLS })})`,
-      returnByValue: true,
-      userGesture: true,
-    });
-    if (result.exceptionDetails)
-      throw new Error("The ChatGPT page could not be inspected. Its interface may have changed.");
-    const state = result.result?.value || { status: "not_ready" };
-    return state;
+    // A new worker starts blank. Chrome may reject script injection there;
+    // inspect the native tab until it has a real document, then use the adapter.
+    const url = page.record.live_targets.get(page.target_id)?.url;
+    if (action === "state" && (!url || url === "about:blank")) {
+      const tab = await cdpInternal(page.record, "chrome.tabs.get", {
+        args: [Number(page.target_id)],
+      });
+      if (tab.url === "about:blank")
+        return { status: "not_ready", url: tab.url, draft: "", users: [], responding: false };
+    }
+    return await chatGoalScript(page, chatGoalDom, [action, { ...input, tool_names: BASE_TOOLS }]);
   }
   // Minimal read-only Fiber/query-cache inspection, adapted from Chat On Steroids
   // (MIT): extension/fiber.js at 5456eb390bb9c4d54b7a3d076a5201ec5677f5e2.
@@ -4569,15 +4651,12 @@ async function backend({ addWorkspace = null } = {}) {
     return result;
   }
   async function chatGoalReadReact(page, input = {}) {
-    const response = await chatGoalRpc(page, "Runtime.evaluate", {
-      expression: `(${chatGoalReact.toString()})(${JSON.stringify({ ...input, tool_names: BASE_TOOLS })})`,
-      returnByValue: true,
-      awaitPromise: false,
-    });
-    if (response.exceptionDetails)
-      return { status: "unavailable", detail: "The mounted React model could not be inspected." };
-    const model = response.result?.value || { status: "unavailable" };
-    return model;
+    return await chatGoalScript(
+      page,
+      chatGoalReact,
+      [{ ...input, tool_names: BASE_TOOLS }],
+      "MAIN",
+    );
   }
 
   async function chatGoalPage(options = {}) {
@@ -4585,7 +4664,6 @@ async function backend({ addWorkspace = null } = {}) {
     const allowed = () => !shuttingDown && (subagent || chatGoalsEnabled());
     if (!allowed()) throw new Error(CHAT_GOAL_BROWSER_HINT);
     const targetName = options.target || CHAT_GOAL_TARGET;
-    const group = options.group || CHAT_GOAL_GROUP;
     const storageKey = options.storage_key || CHAT_GOAL_TAB_KEY;
     const generation = chatGoalGeneration;
     const record = await chatGoalBridge().catch((error) => {
@@ -4605,8 +4683,23 @@ async function backend({ addWorkspace = null } = {}) {
     // restart that could recycle numeric tab IDs. Never adopt a personal tab
     // just because it happens to have the old persisted ID.
     const stored = await cdpInternal(record, "chrome.storage.session.get", {
-      args: [storageKey],
+      args: [[storageKey, CHAT_BROWSER_GROUP_KEY]],
     });
+    if (!current()) throw new Error("Chat goal configuration changed");
+    // Restore only our marked native groups, not personal groups with the same
+    // title. Publish one initialization promise before concurrent workers enter.
+    record.chat_group_setup ??= (async () => {
+      const groups = await cdpInternal(record, "chrome.tabGroups.query", { args: [{}] });
+      record.engine.groups[CHAT_BROWSER_GROUP.name] ??= {
+        ...CHAT_BROWSER_GROUP,
+        window_groups: Object.fromEntries(
+          groups
+            .filter((group) => stored[CHAT_BROWSER_GROUP_KEY]?.[group.windowId] === group.id)
+            .map((group) => [group.windowId, group.id]),
+        ),
+      };
+    })();
+    await record.chat_group_setup;
     if (!current()) throw new Error("Chat goal configuration changed");
     const entry = (record.engine.targets[targetName] ??= {
       name: targetName,
@@ -4622,9 +4715,10 @@ async function backend({ addWorkspace = null } = {}) {
       const target = await Promise.race([
         cdpEnsureTarget(record, {
           name: targetName,
-          group,
+          group: CHAT_BROWSER_GROUP,
           create_params: { url: "about:blank", background: true },
           initialize: false,
+          execution_mode: "api",
         }),
         new Promise((_, reject) => {
           timer = setTimeout(
@@ -4635,13 +4729,22 @@ async function backend({ addWorkspace = null } = {}) {
       ]);
       if (!current()) throw new Error("Chat goal configuration changed");
       await cdpInternal(record, "chrome.storage.session.set", {
-        args: [{ [storageKey]: target.target_id }],
+        args: [
+          {
+            [storageKey]: target.target_id,
+            [CHAT_BROWSER_GROUP_KEY]: record.engine.groups[CHAT_BROWSER_GROUP.name].window_groups,
+          },
+        ],
       });
       if (!current()) throw new Error("Chat goal configuration changed");
       const page = { record, ...target, subagent };
       if (!subagent) chatGoalObservedPage = page;
-      if (!subagent && record.live_targets.get(target.target_id)?.url === "about:blank")
-        await chatGoalRpc(page, "Page.navigate", { url: chatGoalUrl("") });
+      if (!subagent) {
+        const tab = await cdpInternal(record, "chrome.tabs.get", {
+          args: [Number(target.target_id)],
+        });
+        if (tab.url === "about:blank") await chatGoalOpenUrl(page, chatGoalUrl(""));
+      }
       return page;
     } finally {
       clearTimeout(timer);
@@ -4652,8 +4755,7 @@ async function backend({ addWorkspace = null } = {}) {
       throw new Error("Invalid ChatGPT conversation URL");
     if (!(await chatGoalCurrent(context))) return null;
     const chatId = chatGoalChatId(url);
-    const navigation = await chatGoalRpc(page, "Page.navigate", { url });
-    if (navigation.errorText) throw new Error(`ChatGPT navigation failed: ${navigation.errorText}`);
+    await chatGoalOpenUrl(page, url);
     const deadline = Date.now() + 15000;
     let lastState = null;
     while (Date.now() < deadline && (await chatGoalCurrent(context))) {
@@ -4876,7 +4978,7 @@ async function backend({ addWorkspace = null } = {}) {
         await chatGoalState(
           context,
           "draft_present",
-          "The MrMCP Goals tab contains a draft; it was left untouched.",
+          "The MrMCP goals tab contains a draft; it was left untouched.",
         );
         return;
       }
@@ -4981,7 +5083,11 @@ async function backend({ addWorkspace = null } = {}) {
       }
       if (!(await canSend())) return;
       inserted = true;
-      await chatGoalRpc(page, "Input.insertText", { text: context.goal_text });
+      const insertion = await chatGoalEvaluate(page, "insert", {
+        chatId: context.chatgpt_chat_id,
+        text: context.goal_text,
+      });
+      if (!insertion.inserted) throw new Error("The goal draft could not be inserted unchanged.");
       if (!(await canSend())) return;
       // Commit before dispatch: a crash/uncertain acknowledgement must never cause an automatic duplicate.
       await chatGoalState(context, "sending", "Waiting for ChatGPT to acknowledge the message.", 0);
@@ -5108,7 +5214,7 @@ async function backend({ addWorkspace = null } = {}) {
             found.status,
             found.status === "waiting_login"
               ? "Sign in to ChatGPT in your system browser, then retry chat_set_goal or chat_goal_debug."
-              : found.detail || "The MrMCP Goals tab is unavailable.",
+              : found.detail || "The MrMCP goals tab is unavailable.",
             found.status === "waiting_login" ? 0 : undefined,
           );
           return;
@@ -5301,7 +5407,6 @@ async function backend({ addWorkspace = null } = {}) {
     "error",
     "delivery_uncertain",
   ];
-  const SUBAGENT_GROUP = { name: "MrMCP Subagents", color: "cyan" };
   const subagentJobs = new Map();
   const subagentPages = new Map();
   const subagentWaiters = new Set();
@@ -5461,7 +5566,6 @@ async function backend({ addWorkspace = null } = {}) {
     const page = await chatGoalPage({
       subagent: true,
       target: row.target,
-      group: SUBAGENT_GROUP,
       storage_key: "mrmcp.subagent." + row.id,
     });
     subagentPages.set(row.id, page);
@@ -5503,12 +5607,12 @@ async function backend({ addWorkspace = null } = {}) {
         if (state.url !== "about:blank" && state.url !== chatGoalUrl("") && state.url !== url.href)
           throw new Error("The unbound worker tab changed; inspect it before resuming.");
         if (state.url === "about:blank") {
-          await chatGoalRpc(page, "Page.navigate", { url: url.href });
+          await chatGoalOpenUrl(page, url.href);
         }
       } else if (chatGoalChatId(state.url) !== row.chatgpt_chat_id) {
         if (state.url !== "about:blank")
           throw new Error("The worker tab left its associated chat.");
-        await chatGoalRpc(page, "Page.navigate", { url: chatGoalUrl(row.chatgpt_chat_id) });
+        await chatGoalOpenUrl(page, chatGoalUrl(row.chatgpt_chat_id));
       }
       const deadline = Date.now() + 15000;
       do {
@@ -5533,7 +5637,12 @@ async function backend({ addWorkspace = null } = {}) {
         throw new Error("The worker composer or chat identity could not be confirmed.");
       if (!(await fresh())) return;
       inserted = true;
-      await chatGoalRpc(page, "Input.insertText", { text });
+      const insertion = await chatGoalEvaluate(page, "insert", {
+        chatId: row.chatgpt_chat_id,
+        new_chat: newChat,
+        text,
+      });
+      if (!insertion.inserted) throw new Error("The worker draft could not be inserted unchanged.");
       if (!(await fresh())) return;
       await withDbTransaction(async () => {
         await run(
@@ -6070,8 +6179,13 @@ async function backend({ addWorkspace = null } = {}) {
   // Compile the package's public XPath helpers into one native request, preserving
   // MrMCP ids, raw responses, wait=false and logical method names in the ring.
   const cdpExtensionCompiler = new cdp.cdp();
-  cdpExtensionCompiler.call = (request) => request;
-  function cdpExtensionRequest(method, params = {}) {
+  cdpExtensionCompiler.evaluate_xpath = (params, fn, options, apiMethod) => ({
+    xpath: cdp.util.normalize_xpath(params.xpath),
+    fn,
+    options,
+    apiMethod,
+  });
+  function cdpExtensionRequest(method, params = {}, api = false) {
     if (method !== "_.click" && method !== "_.find")
       throw new Error(`Unknown CDP extension method: ${method}`);
     const validated = { ...params, xpath: String(params.xpath || ""), target: "page" };
@@ -6085,12 +6199,23 @@ async function backend({ addWorkspace = null } = {}) {
       validated.limit = Math.max(1, Math.min(Number(params.limit || 20), 100));
       if (!Number.isInteger(validated.limit)) throw new Error("_.find limit must be an integer");
     }
-    const request = cdpExtensionCompiler.custom_methods[method].call(
+    const compiled = cdpExtensionCompiler.custom_methods[method].call(
       cdpExtensionCompiler,
       validated,
     );
-    const { browser: _browser, target: _target, ...native } = request.params;
-    return { wire_method: request.method, logical_method: method, params: native };
+    return {
+      wire_method: api ? compiled.apiMethod : "Runtime.evaluate",
+      logical_method: method,
+      params: api
+        ? { xpath: compiled.xpath, options: compiled.options }
+        : {
+            expression: `(${compiled.fn.toString()})(...${JSON.stringify([compiled.xpath, compiled.options])})`,
+            returnByValue: true,
+            awaitPromise: true,
+            silent: true,
+            userGesture: true,
+          },
+    };
   }
   const cdpPollMatches = (message, filters) => {
     if (filters.type && filters.type !== "all" && message.type !== filters.type) return false;
@@ -12188,10 +12313,10 @@ html[data-mode="fullscreen"] #frame {
           "Requires chat_session but no Workspace. spawn creates up to eight independent persistent " +
           "worker chats, each with its own Session after init_chat_session and one-use join. Workers " +
           "inherit the parent's selected Workspace, not its conversation history; supply context and " +
-          "explicit tasks. The operator installs CDP Ext and keeps MrMCP connected in ChatGPT. " +
+          "explicit tasks. The operator installs CDP Ext, enables Allow User Scripts and keeps MrMCP connected in ChatGPT. " +
           "The extension connection is discovered automatically; no Chrome extension ID is required. " +
           "No extension is installed automatically or separate profile created. CDP.js opens/reuses " +
-          "system Chrome only for requested work. Tabs use a cyan MrMCP Subagents group. " +
+          "system Chrome only for requested work. Tabs share the purple MrMCP group with goals/matching. " +
           "status reads only this parent's workers or this worker's own record and ordered messages. " +
           "wait waits up to timeout_ms for a change, without blocking other Tool Calls. message from " +
           "the parent queues text to agent_id, reusing a completed worker; it is delivered only when " +
@@ -12257,8 +12382,9 @@ html[data-mode="fullscreen"] #frame {
           'goal="". Use only when the user asks for automatic follow-ups. The operator installs ' +
           "CDP Ext in their system Chrome and signs in to ChatGPT there. The reverse connection " +
           "uses CDP.js URL bootstrap to open or reuse the system browser, without entering an " +
-          "extension ID or endpoint. Reload CDP Ext after updating it. The logical goals tab in " +
-          "the purple MrMCP Goals group is created/reused only for matching or delivery. For an unassociated " +
+          "extension ID or endpoint. Enable Allow User Scripts in extension details and reload after updates. " +
+          "Browser API control does not attach Chrome Debugger. The logical goals tab in " +
+          "the shared purple MrMCP group is created/reused only for matching or delivery. For an unassociated " +
           "Session, each explicit nonempty set schedules one matching attempt after this call " +
           "returns. It examines up to 20 chats in the rendered recent-list order, reading the mounted React " +
           "conversation cache, and links only one whose active-branch tool call or rendered " +
@@ -12952,7 +13078,8 @@ html[data-mode="fullscreen"] #frame {
           "custom directory. Set cdp_ext_install=false to retain manual installation in either " +
           "profile. Reload CDP Ext after upgrades. URL bootstrap uses a loopback link with logical " +
           "name, endpoint and generated binding token; CDP.js opens/reuses Chrome and leaves the " +
-          "bootstrap tab open. The system-profile opener skips the automation launch preset and does " +
+          "bootstrap tab only until connection; the extension then closes it or shows its connection page. " +
+          "The system-profile opener skips the automation launch preset and does " +
           "not own Chrome; raw launch flags may prevent forwarding into an existing process. A " +
           "profile already connected to another logical name/manager returns an explicit conflict. " +
           "Passive reverse never launches or edits a profile. One shared ws://127.0.0.1:9223 listener " +
@@ -12960,7 +13087,7 @@ html[data-mode="fullscreen"] #frame {
           "(name string or advanced object with required name, default main), optional logical page " +
           "target, and call={method,params}. Target objects support target_id to bind an existing " +
           "page, native create_params, reverse-only group name/{name,color}, and " +
-          "initialize/runtime/page/network/service_worker/focus_emulation/binding/background_service " +
+          "execution_mode=api|debugger and initialize/runtime/page/network/service_worker/focus_emulation/binding/background_service " +
           "controls. Configuration is runtime-only and reused by name. Standard CDP methods/params " +
           "pass through unchanged. Extension transport supports only the CDP subset allowed by " +
           "chrome.debugger and limited browser-level Target commands; create_params supports " +
@@ -12971,7 +13098,9 @@ html[data-mode="fullscreen"] #frame {
           "target's tab ID. The bridge also forwards chrome.webRequest.* lifecycle notifications " +
           "without debugger attachment; cdp_subs/cdp_poll can filter/buffer them. No generic remote " +
           "extension event registration exists. The reserved _.click/_.find XPath helpers require a " +
-          "target and compile to Runtime.evaluate. Batches may span modes/browsers/targets and " +
+          "target. In reverse api mode they use native extension scripting without debugger; direct " +
+          "or debugger mode uses Runtime.evaluate. Explicit session CDP commands attach lazily even " +
+          "in api mode; api skips implicit domain/binding setup. Batches may span modes/browsers/targets and " +
           "preserve input order. Server-owned ids/session routing; wait=false returns ids for " +
           "cdp_poll, wait=true waits independently per entry. Page.captureScreenshot returns Base64 " +
           "without disk writes; optional outer _image (wait=true only) preserves original bytes or " +
@@ -15267,6 +15396,7 @@ html[data-mode="fullscreen"] #frame {
           [
             "create_params",
             "initialize",
+            "execution_mode",
             "runtime",
             "page",
             "network",
@@ -17057,7 +17187,7 @@ html[data-mode="fullscreen"] #frame {
           if (spec._image && !wait) throw new Error("_image requires cdp_call wait=true");
           if (spec._image && spec._image.return !== "base64")
             throw new Error("_image.return must be base64");
-          const operation = extension
+          let operation = extension
             ? cdpExtensionRequest(rawMethod, rawParams)
             : { wire_method: rawMethod, logical_method: rawMethod, params: rawParams };
           const browserSpec = cdpBrowserSpec(browserInput);
@@ -17085,6 +17215,13 @@ html[data-mode="fullscreen"] #frame {
             target = resolvedTarget.target;
             targetId = resolvedTarget.target_id;
             sessionId = resolvedTarget.session_id;
+          }
+          if (extension && (record.engine.reverse || record.engine.cdp_ext)) {
+            const mode =
+              rawParams.execution_mode ?? record.engine.targets[target]?.execution_mode ?? "api";
+            if (!["api", "debugger"].includes(mode))
+              throw new Error("execution_mode must be api or debugger");
+            operation = cdpExtensionRequest(rawMethod, rawParams, mode === "api");
           }
           base = {
             browser: record.browser,
@@ -22021,8 +22158,8 @@ h1 {
             <button data-action="open-chat-goal">Browser / app setup</button>
           </div>
           <p class="muted">
-            Persistent ChatGPT workers · cyan tab group · isolated child Sessions. Restart pauses
-            workers; resume them explicitly. Reports return through subagents status/wait.
+            Persistent ChatGPT workers · shared MrMCP tab group · isolated child Sessions. Restart
+            pauses workers; resume them explicitly. Reports return through subagents status/wait.
           </p>
           <div id="subagentList">{slots?.["subagentList"]}</div>
         </section>
@@ -23075,7 +23212,8 @@ h1 {
                       Enable Developer mode, choose Load unpacked and select that exact folder.
                     </li>
                     <li>
-                      Sign in to ChatGPT normally. Reload CDP Ext here after exporting an update.
+                      Open the extension’s Details and enable Allow User Scripts. Sign in to ChatGPT
+                      normally. Reload CDP Ext here after exporting an update.
                     </li>
                   </ol>
                   <p class="muted">
@@ -23089,15 +23227,20 @@ h1 {
                     CDP Ext installation instructions
                   </a>
                   <p class="muted">
+                    Goals, matching and subagents use browser APIs without Chrome Debugger. User
+                    Scripts must be allowed; MrMCP never changes the site CSP or silently falls back
+                    to debugger control.
+                  </p>
+                  <p class="muted">
                     {settings.chat_goal_browser_connected
                       ? "Extension connected."
                       : "The bootstrap link opens only when an operation needs the browser."}
                   </p>
                   <p class="muted">
                     MrMCP creates or reuses its logical goals tab only when matching or sending. Its
-                    tabs belong to the purple “MrMCP Goals” group. Existing personal tabs stay
-                    separate. Closing MrMCP leaves your browser and tabs open. If login expires,
-                    sign in normally and retry chat_set_goal or a goal debug action.
+                    goal, match and worker tabs share the purple “MrMCP” group. Existing personal
+                    tabs stay separate. Closing MrMCP leaves your browser and tabs open. If login
+                    expires, sign in normally and retry chat_set_goal or a goal debug action.
                   </p>
                   <label>
                     <input
@@ -27813,7 +27956,7 @@ h1 {
         const page = await subagentPage(row);
         const state = await chatGoalEvaluate(page, "state");
         if (state.url === "about:blank")
-          await chatGoalRpc(page, "Page.navigate", { url: chatGoalUrl(row.chatgpt_chat_id) });
+          await chatGoalOpenUrl(page, chatGoalUrl(row.chatgpt_chat_id));
         else if (chatGoalChatId(state.url) !== row.chatgpt_chat_id)
           throw new Error("The worker tab changed; it was preserved");
         await cdpInternal(page.record, "Target.activateTarget", { targetId: page.target_id });

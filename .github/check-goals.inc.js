@@ -1,4 +1,369 @@
 // Injected into the isolated backend by check.mjs. No real account/profile is used.
+async function checkBrowserGoals() {
+  const direct = { name: "bun-probe", headless: true };
+  const version = await call("cdp_call", {
+    calls: [{ browser: direct, call: { method: "Browser.getVersion" } }],
+  });
+  check(JSON.stringify(version).includes("Chrome"), "real direct CDP browser launch");
+  try {
+    const found = await call("cdp_call", {
+      calls: [
+        {
+          browser: direct,
+          target: "fixture",
+          call: {
+            method: "Runtime.evaluate",
+            params: {
+              expression: 'document.body.innerHTML="<button>Direct fixture</button>"',
+              returnByValue: true,
+            },
+          },
+        },
+      ],
+    });
+    check(found.results[0].success, "direct CDP still evaluates through the public transport");
+    const nodes = await call("cdp_call", {
+      calls: [
+        {
+          browser: direct,
+          target: "fixture",
+          call: { method: "_.find", params: { xpath: "//button" } },
+        },
+      ],
+    });
+    check(
+      nodes.results[0].cdp.result.result.value.count === 1,
+      "direct XPath keeps the package evaluator and result envelope",
+    );
+  } finally {
+    await call("cdp_call", { calls: [{ browser: direct, call: { method: "Browser.close" } }] });
+  }
+
+  // Grant user scripts only in this disposable profile through Chrome's own
+  // settings. Production never changes an operator profile or grants access.
+  const profile = join(APP_DIR, "bootstrap-profile");
+  const extension = join(profile, "Default", "cdp_ext");
+  await exportCdpExtension(extension);
+  const preparation = new cdp.cdp({
+    headless: true,
+    extensions: [extension],
+    args: { "user-data-dir": profile, "no-sandbox": true },
+  });
+  try {
+    const grant = await preparation.call({
+      method: "Runtime.evaluate",
+      params: {
+        target: { name: "settings", create_params: { url: "chrome://extensions/" } },
+        expression:
+          "chrome.developerPrivate.updateExtensionConfiguration(" +
+          JSON.stringify({
+            extensionId: cdp.browser.extension_id(extension),
+            userScriptsAccess: true,
+          }) +
+          ").then(() => true)",
+        awaitPromise: true,
+      },
+    });
+    check(grant.result.value === true, "isolated fixture enables the native User Scripts toggle");
+    const exited = new Promise((resolve) => preparation.browsers.main.proc.once("exit", resolve));
+    await preparation.call({ method: "Browser.close" });
+    await exited;
+  } finally {
+    await preparation.close();
+  }
+  const requests = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      requests.push(new URL(request.url).pathname);
+      return new Response(
+        '<main><form data-chatgpt-composer><textarea id="prompt-textarea"></textarea>' +
+          '<button type="submit" data-testid="send-button">Submit</button></form></main>',
+        {
+          headers: { "content-type": "text/html", "content-security-policy": "script-src 'none'" },
+        },
+      );
+    },
+  });
+  const browser = {
+    name: "bootstrap-probe",
+    cdp_ext: true,
+    cdp_ext_install: true,
+    user_data_dir: profile,
+    headless: true,
+    args: { "no-sandbox": true },
+    connect_timeout_ms: 20000,
+  };
+  let record;
+  const enabled = getCfg("chat_goals_enabled", "1");
+  const script = chatGoalScript;
+  try {
+    record = await ensureCdpBrowser(browser);
+    const bootstrap = new URL(record.engine.bootstrap_url);
+    check(
+      bootstrap.pathname === "/cdp_ext" && bootstrap.searchParams.get("browser") === browser.name,
+      "real extension accepts the logical-name/token bootstrap",
+    );
+    const wire = [];
+    const req = record.ws.req;
+    record.ws.req = function (request, ...args) {
+      wire.push(request);
+      return req.call(this, request, ...args);
+    };
+    const target = await cdpEnsureTarget(record, {
+      name: "browser-goals",
+      initialize: false,
+      execution_mode: "api",
+      group: CHAT_BROWSER_GROUP,
+    });
+    const page = { record, ...target };
+    await setCfg("chat_goals_enabled", "1");
+    check(
+      (await chatGoalEvaluate(page, "state")).url === "about:blank",
+      "a new blank worker is inspected through tabs API before any document script injection",
+    );
+    await chatGoalOpenUrl(page, "http://127.0.0.1:" + server.port + "/c/" + goalFixtureId);
+    for (let i = 0; i < 100; i++) {
+      const tab = await cdpInternal(record, "chrome.tabs.get", { args: [Number(page.target_id)] });
+      if (tab.status === "complete") break;
+      await sleep(25);
+    }
+    check(
+      await script(
+        page,
+        () => {
+          try {
+            eval("42");
+            return false;
+          } catch {
+            return true;
+          }
+        },
+        [],
+        "MAIN",
+      ),
+      "the page's restrictive CSP remains in force",
+    );
+    await script(
+      page,
+      {
+        toString: () => `() => {
+          window.goalFixture = (${goalReactFixture.toString()})(
+            ${JSON.stringify(goalFixtureId)}, ${JSON.stringify(handle)}
+          );
+          document.querySelector('main').__reactFiber$fixture = window.goalFixture.leaf;
+          document.querySelector('form').onsubmit = event => {
+            event.preventDefault();
+            const editor = document.querySelector('textarea');
+            const fixture = window.goalFixture;
+            fixture.history.mapping['submitted-user'] = {
+              id: 'submitted-user', parent: fixture.history.current_node,
+              message: {
+                id: 'submitted-user', author: { role: 'user' },
+                content: { content_type: 'text', parts: [editor.value] }
+              }
+            };
+            fixture.history.current_node = 'submitted-user';
+            editor.value = '';
+          };
+          return true;
+        }`,
+      },
+      [],
+      "MAIN",
+    );
+    check(
+      (await script(page, () => typeof window.goalFixture, [])) === "undefined",
+      "USER_SCRIPT DOM operations have separate globals from MAIN React state",
+    );
+    // Keep the fixture on localhost. Supply only a lexical location facade to
+    // the serialized adapters; never navigate the real ChatGPT site/account.
+    chatGoalScript = (page, fn, args, world) =>
+      script(
+        page,
+        {
+          toString: () => `(...args) => {
+            const location = {
+              origin: 'https://chatgpt.com', pathname: window.location.pathname,
+              href: 'https://chatgpt.com' + window.location.pathname
+            };
+            return (${fn.toString()})(...args);
+          }`,
+        },
+        args,
+        world,
+      );
+    let observed = await chatGoalReadReact(page, { chatId: goalFixtureId, handle });
+    check(
+      observed.match && observed.source === "query-cache",
+      "extension MAIN reads the committed React model under restrictive CSP without debugger",
+    );
+    await script(
+      page,
+      () => {
+        window.goalFixture.history.current_node = "user";
+        return true;
+      },
+      [],
+      "MAIN",
+    );
+    check(
+      !(await chatGoalReadReact(page, { chatId: goalFixtureId, handle })).match,
+      "React cache changes are read afresh without navigation or network monitoring",
+    );
+    const focused = await chatGoalEvaluate(page, "focus", {
+      chatId: goalFixtureId,
+      user_ids: observed.user_ids,
+    });
+    const text = "Fixture goal follow-up\n\nSecond paragraph";
+    const inserted = await chatGoalEvaluate(page, "insert", { chatId: goalFixtureId, text });
+    check(
+      !(await chatGoalEvaluate(page, "insert", { chatId: goalFixtureId, text: "Overwrite" }))
+        .inserted && (await chatGoalEvaluate(page, "state")).draft === text,
+      "script insertion preserves an existing draft rather than appending or overwriting",
+    );
+    const sent = await chatGoalEvaluate(page, "send", { chatId: goalFixtureId, text });
+    const receipt = await chatGoalReadReact(page, { chatId: goalFixtureId, expected_text: text });
+    check(
+      focused.focused &&
+        inserted.inserted &&
+        sent.sent &&
+        receipt.goal_receipt === "submitted-user",
+      "native textarea insertion and form submission have an exact MAIN React receipt",
+    );
+    await script(
+      page,
+      () => {
+        history.replaceState(null, "", "/");
+        document.querySelector("main").innerHTML =
+          "<form data-chatgpt-composer>" +
+          '<div id="prompt-textarea" contenteditable="true"></div>' +
+          '<button type="submit" data-testid="send-button">Submit</button></form>';
+        document.querySelector("form").onsubmit = (event) => {
+          event.preventDefault();
+          window.workerSent = true;
+          document.querySelector("#prompt-textarea").textContent = "";
+        };
+        return true;
+      },
+      [],
+      "MAIN",
+    );
+    const worker = { new_chat: true, text: "Worker fixture\n\nPreserve multiline text" };
+    check(
+      (await chatGoalEvaluate(page, "focus", worker)).focused &&
+        (await chatGoalEvaluate(page, "insert", worker)).inserted &&
+        (await chatGoalEvaluate(page, "state")).draft === worker.text &&
+        (await chatGoalEvaluate(page, "send", worker)).sent &&
+        (await script(page, () => window.workerSent, [], "MAIN")),
+      "native rich-editor insertion preserves the exact multiline worker prompt and submits",
+    );
+    await script(
+      page,
+      (chatId) => {
+        history.replaceState(null, "", "/c/" + chatId);
+        const stop = document.createElement("button");
+        stop.type = "button";
+        stop.dataset.testid = "stop-button";
+        stop.textContent = "Stop fixture";
+        stop.onclick = () => {
+          window.stopped = true;
+          stop.remove();
+        };
+        document.querySelector("form").append(stop);
+        return true;
+      },
+      [goalFixtureId],
+      "MAIN",
+    );
+    check(
+      (await chatGoalEvaluate(page, "stop", { chatId: goalFixtureId })).stop_ok &&
+        (await script(page, () => window.stopped, [], "MAIN")),
+      "native DOM Stop reaches the page handler without debugger input",
+    );
+    const xpath = await call("cdp_call", {
+      calls: [
+        {
+          browser: browser.name,
+          target: "browser-goals",
+          call: { method: "_.find", params: { xpath: "//button", limit: 2 } },
+        },
+      ],
+    });
+    check(
+      xpath.results[0].cdp.result.result.value.count === 1,
+      "public reverse XPath uses the fixed extension API helper without debugger",
+    );
+    const click = await call("cdp_call", {
+      wait: false,
+      calls: [
+        {
+          browser: browser.name,
+          target: "browser-goals",
+          call: { method: "_.click", params: { xpath: "//button", attempts: 1 } },
+        },
+      ],
+    });
+    const pendingId = click.results[0].id;
+    for (let i = 0; i < 100 && record.pending.has(pendingId); i++) await sleep(10);
+    check(
+      cdpRingNewest(record)?.cdp.result.result.value === true,
+      "wait=false retains the eventual native API XPath response with its original id",
+    );
+    const attached = await cdpInternal(record, "chrome.debugger.getTargets");
+    check(
+      attached.every((tab) => !tab.attached) &&
+        !wire.some((request) => /^(Runtime\.|Page\.|Input\.|Network\.)/.test(request.method)) &&
+        wire
+          .filter((request) => request.method === "Target.attachToTarget")
+          .every((request) => request.params.execution_mode === "api") &&
+        !wire.some((request) => /BypassCSP|declarativeNetRequest/.test(request.method)),
+      "real reverse execution never attaches Chrome Debugger, changes CSP or enables CDP domains: " +
+        JSON.stringify({
+          attached: attached
+            .filter((tab) => tab.attached)
+            .map((tab) => ({ id: tab.id, type: tab.type })),
+          forbidden: wire
+            .filter((request) => /^(Runtime\.|Page\.|Input\.|Network\.)/.test(request.method))
+            .map((request) => request.method),
+          selection: wire
+            .filter((request) => request.method === "Target.attachToTarget")
+            .map((request) => request.params),
+        }),
+    );
+    check(
+      !requests.some((path) => path.startsWith("/backend-api/")),
+      "readers issue no private REST requests",
+    );
+    const groups = await cdpInternal(record, "chrome.tabGroups.query", { args: [{}] });
+    check(
+      groups.length === 1 && groups[0].title === "MrMCP",
+      "owned targets use one native MrMCP group",
+    );
+    const proc = record.engine.proc;
+    record.ws.close();
+    for (let i = 0; i < 100 && record.open; i++) await sleep(10);
+    const reconnected = await ensureCdpBrowser(browser);
+    const surviving = await cdpEnsureTarget(reconnected, { name: "browser-goals" });
+    check(
+      reconnected.engine.proc === proc && surviving.target_id === target.target_id,
+      "real reverse reconnect preserves the Chrome process and logical API tab",
+    );
+  } finally {
+    chatGoalScript = script;
+    await setCfg("chat_goals_enabled", enabled);
+    await server.stop(true);
+    const owned = record?.engine || cdpReverseClient?.browsers[browser.name];
+    owned?.proc?.kill();
+    owned?.socket?.close();
+    const live = cdpBrowsers.get(browser.name);
+    if (live) cdpDisconnect(live);
+    if (cdpReverseClient) delete cdpReverseClient.browsers[browser.name];
+    cdpBrowserOptions.delete(browser.name);
+    cdpTargetOptions.delete(cdpTargetKey(browser.name, "browser-goals"));
+  }
+}
 const goalVm = await import("node:vm");
 {
   const destination = join(APP_DIR, "exported-cdp-ext");
@@ -16,6 +381,12 @@ const goalVm = await import("node:vm");
       ) &&
       (await fs.readFile(join(destination, "manifest.json"))).equals(
         await fs.readFile(join(source, "manifest.json")),
+      ) &&
+      (await fs.readFile(join(destination, "sidebar.html"))).equals(
+        await fs.readFile(join(source, "sidebar.html")),
+      ) &&
+      (await fs.readFile(join(destination, "sidebar.js"))).equals(
+        await fs.readFile(join(source, "sidebar.js")),
       ) &&
       cdpReverseClient === before,
     "GUI export copies the exact public package extension files without opening Chrome, including standalone extraction",
@@ -514,6 +885,7 @@ for (const mutation of [
   const storage = {};
   let nextTab = 54;
   let created = 0;
+  let scriptError = "";
   let bridge;
   const info = (tab) => ({
     targetId: String(tab.id),
@@ -560,7 +932,6 @@ for (const mutation of [
             notify("Target.targetCreated", { targetInfo: info(tab) });
           break;
         case "Target.setAutoAttach":
-        case "Runtime.runIfWaitingForDebugger":
           break;
         case "Target.createTarget": {
           const tab = { id: ++nextTab, windowId: 7, url: params.url, groupId: -1 };
@@ -571,6 +942,8 @@ for (const mutation of [
           break;
         }
         case "Target.attachToTarget": {
+          if (params.execution_mode !== "api")
+            throw Error("Goals/Subagents must never attach Chrome Debugger");
           const tab = tabs.get(Number(params.targetId));
           result = { sessionId: String(tab.id) };
           notify("Target.attachedToTarget", {
@@ -580,14 +953,27 @@ for (const mutation of [
           });
           break;
         }
-        case "Page.getFrameTree":
-          result = { frameTree: { frame: { id: "frame" } } };
-          break;
-        case "Page.navigate": {
-          const tab = tabs.get(Number(request.sessionId));
-          tab.url = params.url;
+        case "chrome.tabs.update": {
+          const [id, value] = params.args;
+          const tab = tabs.get(id);
+          Object.assign(tab, value);
           notify("Target.targetInfoChanged", { targetInfo: info(tab) });
-          result = { frameId: "frame" };
+          result = tab;
+          break;
+        }
+        case "chrome.tabs.query":
+          result = [...tabs.values()];
+          break;
+        case "chrome.userScripts.execute": {
+          if (scriptError) {
+            bridge.send(
+              JSON.stringify({ id: request.id, error: { code: -32000, message: scriptError } }),
+            );
+            return;
+          }
+          const injection = params.args[0];
+          const value = goalVm.runInNewContext(injection.js[0].code);
+          result = [{ frameId: 0, result: value }];
           break;
         }
         case "chrome.tabs.get":
@@ -600,11 +986,13 @@ for (const mutation of [
           Object.assign(storage, params.args[0]);
           break;
         case "chrome.tabGroups.query":
-          result = [...groups.values()];
+          result = [...groups.values()].filter(
+            (group) => !params.args[0].title || group.title === params.args[0].title,
+          );
           break;
         case "chrome.tabs.group": {
           const groupId = params.args[0].groupId ?? 23 + groups.size;
-          groups.set(groupId, { id: groupId, windowId: 7 });
+          if (!groups.has(groupId)) groups.set(groupId, { id: groupId, windowId: 7 });
           tabs.get(params.args[0].tabIds).groupId = groupId;
           result = groupId;
           break;
@@ -691,8 +1079,8 @@ for (const mutation of [
       "the same logical goals tab is reused and unrelated personal tabs are not adopted",
     );
     check(
-      groups.get(23)?.title === "MrMCP Goals" && groups.get(23)?.color === "purple",
-      "CDP.js creates the named purple native tab group",
+      groups.get(23)?.title === "MrMCP" && groups.get(23)?.color === "purple",
+      "CDP.js creates the shared native MrMCP tab group",
     );
     check(
       !page.record.engine.proc &&
@@ -715,19 +1103,50 @@ for (const mutation of [
       "the system-profile opener preserves normal Chrome routing and browser account integration",
     );
     check(
-      !methods.some((r) => /^(Network\.|Runtime\.enable|Runtime\.addBinding)/.test(r.method)),
-      "goals do not enable network capture, Runtime reporting or a binding",
+      !methods.some((r) =>
+        /^(Network\.|Runtime\.|Page\.|Input\.|chrome\.debugger\.)/.test(r.method),
+      ),
+      "goals use no debugger, page/input/runtime commands or network capture",
     );
+    check(
+      (await chatGoalScript(page, (a, b) => a + b, [19, 23], "MAIN")) === 42,
+      "native script-text execution preserves structured results without Runtime.evaluate",
+    );
+    scriptError = "User Scripts access denied";
+    let permissionHint = "";
+    try {
+      await chatGoalScript(page, () => 42, []);
+    } catch (error) {
+      permissionHint = error.message;
+    }
+    scriptError = "";
+    check(
+      permissionHint.includes("Enable Allow User Scripts") &&
+        !methods.some((request) => request.method === "Runtime.evaluate"),
+      "missing User Scripts permission produces setup guidance without debugger fallback",
+    );
+    let refused = false;
+    try {
+      await chatGoalRpc(page, "Runtime.evaluate", { expression: "42" });
+    } catch (error) {
+      refused = error.message.includes("requires browser APIs");
+    }
+    check(refused, "internal ChatGPT control rejects debugger commands before transport dispatch");
     await cdpReverseClient.close();
     cdpDisconnect(page.record);
     cdpReverseClient = new cdp.cdp({
       base_path: CDP_DIR,
       reverse_server: { hostname: "127.0.0.1", port: 0 },
     });
+    groups.set(99, { id: 99, windowId: 7, title: "MrMCP", color: "orange" });
     page = await attachBridge(chatGoalPage());
     check(
-      created === 1 && page.target_id === again.target_id,
-      "a fresh reverse manager reuses the persisted surviving logical target",
+      created === 1 &&
+        page.target_id === again.target_id &&
+        groups.size === 2 &&
+        tabs.get(Number(page.target_id)).groupId === 23 &&
+        groups.get(99).color === "orange",
+      "a fresh reverse manager reuses its marked group and preserves unrelated same-title groups",
     );
     tabs.delete(Number(page.target_id));
     notify("Target.targetDestroyed", { targetId: page.target_id });
@@ -736,7 +1155,7 @@ for (const mutation of [
     check(
       created === 2 &&
         recreated.target_id !== page.target_id &&
-        groups.get(tabs.get(Number(recreated.target_id)).groupId)?.title === "MrMCP Goals",
+        groups.get(tabs.get(Number(recreated.target_id)).groupId)?.title === "MrMCP",
       "a closed goals target is recreated lazily in the same named group",
     );
     await cdpReverseClient.close();
@@ -764,7 +1183,6 @@ for (const mutation of [
     const workerPage = await chatGoalPage({
       subagent: true,
       target: "fixture-worker",
-      group: SUBAGENT_GROUP,
       storage_key: "mrmcp.fixture-worker",
     });
     subagentPages.set("fixture-worker", workerPage);
@@ -772,9 +1190,10 @@ for (const mutation of [
     chatGoalConfigure();
     check(
       workerPage.record.open &&
-        groups.get(24)?.title === "MrMCP Subagents" &&
-        groups.get(24)?.color === "cyan",
-      "subagent targets use a separate cyan group and remain independent of the Goals enable flag",
+        groups.size === 1 &&
+        tabs.get(Number(workerPage.target_id)).groupId ===
+          tabs.get(Number(afterRestart.target_id)).groupId,
+      "subagent targets share the MrMCP group and remain independent of the Goals enable flag",
     );
     subagentPages.delete("fixture-worker");
     await setCfg("chat_goals_enabled", "1");
@@ -920,6 +1339,10 @@ for (const mutation of [
       clears = 0,
       acknowledged = false;
     chatGoalEvaluate = async (_page, action) => {
+      if (action === "insert") {
+        inserted++;
+        return { inserted: true };
+      }
       if (action === "clear") {
         clears++;
         return { cleared: true };
@@ -946,10 +1369,6 @@ for (const mutation of [
           },
         ],
       };
-    };
-    chatGoalRpc = async (_page, method) => {
-      if (method === "Input.insertText") inserted++;
-      return {};
     };
     await overdue();
     const blocked = await reserveToolCall({ goalActivity: true, contextHandle: owner.handle });

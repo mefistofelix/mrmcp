@@ -83,20 +83,23 @@ The administration UI displays Sessions with short numeric ids. The opaque `ctx_
 `chat_set_goal(chat_session, goal, timeout_seconds?, chatgpt_chat_id?)` enables automatic follow-ups for a ChatGPT
 conversation. Install [CDP Ext](https://github.com/mefistofelix/cdp.js#reverse-chrome-extension-transport)
 yourself in your system Chrome: load its cdp_ext directory from chrome://extensions in Developer mode,
-sign in to ChatGPT normally and reload CDP Ext after updating its files. CDP.js 0.5.0 opens or reuses
+sign in to ChatGPT normally and reload CDP Ext after updating its files. CDP.js 0.7.0 opens or reuses
 that system browser through a token-bound loopback URL carrying its logical name and endpoint.
 No extension ID, endpoint or separate login/profile is configured. Goals use the page React cache,
-without monitoring history responses or WebSocket traffic.
+without monitoring history responses or WebSocket traffic. Goals, matching and subagents use
+browser APIs without attaching Chrome Debugger or changing the site CSP. Missing script permission
+fails visibly; there is no automatic debugger fallback.
 
 Use **Settings → Goals → Save CDP Ext folder** to export the bundled extension, including offline.
 The destination is editable and defaults to `cdp_ext` beside MrMCP's catalogs. In `chrome://extensions`,
-enable Developer mode, select **Load unpacked** and choose that folder. Keep its path stable.
+enable Developer mode, select **Load unpacked** and choose that folder. In the extension’s
+**Details**, enable **Allow User Scripts**. Keep its path stable.
 For updates, export to the same folder, confirm replacement and press **Reload** in Chrome.
 
 Settings retains enable (on), default timeout (5 minutes), missing-match retry at startup (off) and
 Stop-before-send (off). Browser bootstrap and logical goal-tab acquisition happen only when a
 match or due/manual delivery needs them. MrMCP creates/reuses one logical goals tab
-in a purple **MrMCP Goals** group. Settings/status inspection creates nothing. Reconnects reuse the
+in the purple **MrMCP** group shared with matching and subagents. Settings/status inspection creates nothing. Reconnects reuse the
 owned tab; recycled browser tab IDs cannot adopt personal tabs. Disable/Quit leaves Chrome and tabs open.
 
 Each nonempty set for an unassociated Session requests one bounded scan of up to 20 rendered recent
@@ -115,8 +118,8 @@ The `subagents` tool creates reusable ChatGPT worker chats with explicit tasks/s
 messages, status/wait, final reports, Stop and Resume. Each worker initializes its own Session and
 inherits the selected Workspace; workers share files and must coordinate edits. Install CDP Ext
 and connect MrMCP once as an MCP app in ChatGPT. No app ID or composer mention is required. Keep system
-Chrome signed in; CDP.js opens or reuses it on demand. Workers use a separate cyan **MrMCP Subagents** tab group, independently of the
-Goals enable switch. There is no model API, separate browser profile or additional quota.
+Chrome signed in; CDP.js opens or reuses it on demand. Workers share the purple **MrMCP** tab group
+with goals and matching, while remaining independent of the Goals enable switch. There is no model API, separate browser profile or additional quota.
 
 **Subagents** lists workers with parent/child Session, state and text filters, pagination, task,
 Workspace, activity, model evidence, pending messages, running Tool Calls and detached processes.

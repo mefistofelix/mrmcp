@@ -12,6 +12,7 @@ await fs.mkdir(join(root, "build"), { recursive: true });
 const directory = await fs.mkdtemp(join(root, "build", "bun-check-"));
 const semantic = process.argv.includes("--semantic");
 const standalone = process.argv.includes("--standalone");
+const browserChecks = semantic || process.argv.includes("--browser");
 for (const file of [
   "commands.yaml",
   "mcp.yaml",
@@ -719,184 +720,9 @@ if (process.env.MRMCP_TEST_SEMANTIC === "1") {
       await writeFile(SEARCH_PATH, configuration);
     }
   }
-  const browser = { name: "bun-probe", headless: true };
-  const version = await call("cdp_call", {
-    calls: [{ browser, call: { method: "Browser.getVersion", params: {} } }],
-  });
-  check(JSON.stringify(version).includes("Chrome"), "real CDP browser launch");
-  const dom = await call("cdp_call", {
-    calls: [
-      {
-        browser,
-        target: "fixture",
-        call: {
-          method: "Runtime.evaluate",
-          params: {
-            expression:
-              "document.body.innerHTML='<button id=probe>Bun browser</button>'; document.querySelector('#probe').textContent",
-            returnByValue: true,
-          },
-        },
-      },
-    ],
-  });
-  check(JSON.stringify(dom).includes("Bun browser"), "real CDP evaluate");
-  const find = await call("cdp_call", {
-    calls: [
-      {
-        browser,
-        target: "fixture",
-        call: { method: "_.find", params: { xpath: "//button[@id='probe']" } },
-      },
-    ],
-  });
-  check(JSON.stringify(find).includes("Bun browser"), "CDP extension method");
-  const goalBrowserRecord = cdpBrowsers.get(browser.name);
-  const goalTarget = await cdpEnsureTarget(goalBrowserRecord, { name: "goal-model-fixture", initialize: false });
-  const goalPage = { record: goalBrowserRecord, ...goalTarget };
-  const goalEnabledBefore = getCfg("chat_goals_enabled", "1");
-  const goalRequests = [];
-  const goalFulfillments = new Set();
-  const goalHtml = '<main><form data-chatgpt-composer><textarea id="prompt-textarea"></textarea>' +
-    '<button type="submit" data-testid="send-button">Submit</button></form></main><script>window.goalFixture=(' +
-    goalReactFixture.toString() + ')(' + JSON.stringify(goalFixtureId) + ',' + JSON.stringify(handle) + ');' +
-    'document.querySelector("main").__reactFiber$fixture=window.goalFixture.leaf;' +
-    'document.querySelector("form").addEventListener("submit",event=>{' +
-    'event.preventDefault();const editor=document.querySelector("textarea"),f=window.goalFixture;' +
-    'f.history.mapping["submitted-user"]={id:"submitted-user",parent:f.history.current_node,' +
-    'message:{id:"submitted-user",author:{role:"user"},content:{content_type:"text",parts:[editor.value]}}};' +
-    'f.history.current_node="submitted-user";editor.value="";});</script>';
-  const goalRequestHandler = (event) => {
-    if (event.detail.browser !== browser.name || event.detail.target !== "goal-model-fixture") return;
-    goalRequests.push(new URL(event.detail.request.url).pathname);
-    const task = cdpInternal(goalBrowserRecord, "Fetch.fulfillRequest", {
-      requestId: event.detail.requestId, responseCode: 200,
-      responseHeaders: [{ name: "content-type", value: "text/html; charset=utf-8" }],
-      body: Buffer.from(goalHtml).toString("base64"),
-    }, goalPage.session_id);
-    goalFulfillments.add(task);
-    task.finally(() => goalFulfillments.delete(task));
-  };
-  goalBrowserRecord.client.addEventListener("Fetch.requestPaused", goalRequestHandler);
-  try {
-    await setCfg("chat_goals_enabled", "1");
-    await cdpInternal(goalBrowserRecord, "Fetch.enable", {
-      patterns: [{ urlPattern: "https://chatgpt.com/*" }],
-    }, goalPage.session_id);
-    await chatGoalRpc(goalPage, "Page.navigate", { url: chatGoalUrl(goalFixtureId) });
-    let observed;
-    for (let i = 0; i < 60; i++) {
-      observed = await chatGoalReadReact(goalPage, { chatId: goalFixtureId, handle });
-      if (observed.status === "ready") break;
-      await sleep(50);
-    }
-    check(observed?.match && observed.source === "query-cache",
-      "real Chrome/CDP reads the cached conversation model without a history fetch");
-    check(!goalRequests.some((path) => path.startsWith("/backend-api/")),
-      "the goal reader issues no private REST requests");
-    await chatGoalRpc(goalPage, "Runtime.evaluate", {
-      expression: "window.goalFixture.history.current_node='user'", returnByValue: true,
-    });
-    check(!(await chatGoalReadReact(goalPage, { chatId: goalFixtureId, handle })).match,
-      "real page cache changes are read afresh without navigation or network capture");
-    await chatGoalRpc(goalPage, "Runtime.evaluate", {
-      expression: "history.replaceState(null,''," + JSON.stringify("/g/g-p-fixture/c/" + goalFixtureId) + ")",
-      returnByValue: true,
-    });
-    const focused = await chatGoalEvaluate(goalPage, "focus", {
-      chatId: goalFixtureId, user_ids: observed.user_ids,
-    });
-    check(focused.focused, "a project chat can focus its composer using exact model-only message ids");
-    await chatGoalRpc(goalPage, "Input.insertText", { text: "Fixture goal follow-up" });
-    const sent = await chatGoalEvaluate(goalPage, "send", {
-      chatId: goalFixtureId, text: "Fixture goal follow-up",
-    });
-    const receipt = await chatGoalReadReact(goalPage, {
-      chatId: goalFixtureId, expected_text: "Fixture goal follow-up",
-    });
-    check(sent.sent && receipt.goal_receipt === "submitted-user",
-      "real CDP submission can be acknowledged from the React model without legacy message DOM markers");
-    await chatGoalRpc(goalPage, "Runtime.evaluate", {
-      expression: "history.replaceState(null,'','/');document.querySelector('main').innerHTML=" +
-        JSON.stringify('<form data-chatgpt-composer><div id="prompt-textarea" contenteditable="true"></div><button type="submit" data-testid="send-button">Submit</button></form>') +
-        ";document.querySelector('form').onsubmit=e=>{e.preventDefault();window.workerSent=true}",
-      returnByValue: true,
-    });
-    const worker = { new_chat: true };
-    check((await chatGoalEvaluate(goalPage, "focus", worker)).focused,
-      "a proven fresh worker composer can focus without old message IDs");
-    const workerText = "Worker fixture\n\nPreserve multiline text";
-    await chatGoalRpc(goalPage, "Input.insertText", { text: workerText });
-    const workerState = await chatGoalEvaluate(goalPage, "state");
-    check(workerState.draft === workerText,
-      "real CDP preserves the exact multiline worker prompt without injecting app tokens: " + JSON.stringify({draft:workerState.draft, expected:workerText}));
-    check((await chatGoalEvaluate(goalPage, "send", { ...worker, text: workerText })).sent,
-      "a worker first prompt submits through the unique native form without app ID configuration");
-  } finally {
-    goalBrowserRecord.client.removeEventListener("Fetch.requestPaused", goalRequestHandler);
-    await Promise.allSettled([...goalFulfillments]);
-    await setCfg("chat_goals_enabled", goalEnabledBefore);
-    await call("cdp_call", { calls: [{ browser, call: { method: "Browser.close", params: {} } }] });
-  }
-  // Exercise the real packaged extension/URL protocol on an owned disposable
-  // profile. Never launch or connect to the operator's system profile here.
-  const extensionBrowser = {
-    name: "bootstrap-probe",
-    cdp_ext: true,
-    cdp_ext_install: true,
-    user_data_dir: join(APP_DIR, "bootstrap-profile"),
-    headless: true,
-    args: { "no-sandbox": true },
-    connect_timeout_ms: 20000,
-  };
-  let extensionRecord;
-  try {
-    extensionRecord = await ensureCdpBrowser(extensionBrowser);
-    const bootstrap = new URL(extensionRecord.engine.bootstrap_url);
-    const pages = await cdpInternal(extensionRecord, "chrome.tabs.query", { args: [{}] });
-    check(
-      bootstrap.hostname === "127.0.0.1" && bootstrap.pathname === "/cdp_ext" &&
-        bootstrap.searchParams.get("browser") === extensionBrowser.name &&
-        /^[a-p]{32}$/.test(extensionRecord.engine.extension_id) &&
-        pages.some((page) => page.url === bootstrap.href),
-      "real Chrome extension accepts the logical-name/token bootstrap and retains its bootstrap tab",
-    );
-    const target = await cdpEnsureTarget(extensionRecord, {
-      name: "bootstrap-page",
-      initialize: false,
-      group: { name: "Bootstrap fixture", color: "blue" },
-    });
-    const evaluated = await cdpInternal(extensionRecord, "Runtime.evaluate", {
-      expression: "21 * 2", returnByValue: true,
-    }, target.session_id);
-    const groups = await cdpInternal(extensionRecord, "chrome.tabGroups.query", { args: [{}] });
-    check(
-      evaluated.result.value === 42 && groups.some((group) =>
-        group.title === "Bootstrap fixture" && group.color === "blue"),
-      "actual bootstrap transport routes evaluation and native colored groups through the public library",
-    );
-    const proc = extensionRecord.engine.proc;
-    extensionRecord.ws.close();
-    for (let i = 0; i < 50 && extensionRecord.open; i++) await sleep(10);
-    const reconnected = await ensureCdpBrowser(extensionBrowser);
-    const surviving = await cdpEnsureTarget(reconnected, { name: "bootstrap-page" });
-    check(
-      reconnected.engine.proc === proc && surviving.target_id === target.target_id,
-      "real extension reconnect preserves the owned Chrome process and surviving logical tab",
-    );
-  } finally {
-    const owned = extensionRecord?.engine || cdpReverseClient?.browsers[extensionBrowser.name];
-    if (owned?.socket?.readyState === WebSocket.OPEN)
-      await owned.socket.req({ method: "Browser.close" }).catch(() => {});
-    owned?.proc?.kill();
-    owned?.socket?.close();
-    const record = cdpBrowsers.get(extensionBrowser.name);
-    if (record) cdpDisconnect(record);
-    if (cdpReverseClient) delete cdpReverseClient.browsers[extensionBrowser.name];
-    cdpBrowserOptions.delete(extensionBrowser.name);
-    cdpTargetOptions.delete(cdpTargetKey(extensionBrowser.name, "bootstrap-page"));
-  }
 }
+if (process.env.MRMCP_TEST_BROWSER === "1") await checkBrowserGoals();
+
 await fs.mkdir(MCP_BIN_DIR, { recursive: true });
 const mockBin = join(MCP_BIN_DIR, RUNTIME_OS === "windows" ? "probe.exe" : "probe");
 try {
@@ -1545,6 +1371,7 @@ const child = Bun.spawn(command, {
     ...process.env,
     MRMCP_TEST_GUI: "1",
     MRMCP_TEST_SEMANTIC: semantic ? "1" : "0",
+    MRMCP_TEST_BROWSER: browserChecks ? "1" : "0",
     MRMCP_TEST_BUN: process.execPath,
     MRMCP_TEST_ROOT: root,
   },
@@ -1636,6 +1463,11 @@ if (
       refusedError,
   );
 console.log("Lifecycle: CLI relative path and unattended schema-5 refusal/preservation passed");
+if (standalone) {
+  // Both test-only copies have completed; keep space for the native smoke build.
+  await fs.unlink(oldEntry);
+  await fs.unlink(command[0]);
+}
 // Exercise the production listener shutdown with a foreground process active.
 // Waiting for graceful HTTP stop before cancelling that process would deadlock.
 let lifecycle = await fs.readFile(join(root, "mrmcp.js"), "utf8");
@@ -2611,4 +2443,5 @@ process.exit(0);
   const code = await child.exited;
   clearTimeout(deadline);
   if (code) throw Error("Standalone React smoke failed: " + code);
+  await fs.unlink(binary);
 }

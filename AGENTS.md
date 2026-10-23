@@ -254,15 +254,22 @@ The built-in CDP surface remains exactly `cdp_call`, `cdp_subs` and `cdp_poll`. 
 - `target` on `cdp_call` is an optional persistent logical **page** label string or a strict advanced object with required `name`. Reject `create_params.forTab:true` because logical targets require page sessions. Keep native `create_params` and startup options in a runtime-only map per browser/name; omitted options retain their values. Reject conflicting configuration while the page is live/opening, including concurrent first calls; allow changes after it closes. Persist only `(browser,target)->targetId` in `cdp_targets`; never persist `sessionId`. If the saved targetId is still a live `page`, reuse it. If it disappeared because the page/browser was closed, lazily call `Target.createTarget` with native `create_params` merged over `{url:"about:blank",background:true}`, replace the saved targetId and continue. Omit target for browser-level standard commands; `_.click` and `_.find` page operations require target. Chrome/CDP live state is authoritative; the DB is only memory of logical identity.
 - One browser WebSocket uses flattened sessions owned by the library. Seed the documented public target records from persisted ids and runtime options; derive MrMCP UI/ring maps from public `target_info`, `session_targets` and target records. Invalidate projections on Target notifications and disconnect. Resolve/create/setup logical pages with public `client.call`; native requests use public `socket.req` so native `params.browser`/`params.target` are never consumed as routing. The library allocates ids and correlates requests; observe its socket messages only to retain exact raw packets and MrMCP metadata. Never call underscored package methods or accept agent-supplied wire ids/sessionIds.
 - Use the library’s connection/setup policy, currently flattened auto-attach with `waitForDebuggerOnStart:false` and target discovery; add Target.getTargets for persisted identity recovery. Logical page initialization belongs to the library: Runtime/Page/Network, optional ServiceWorker/focus/binding/BackgroundService, then Runtime.disable before Runtime.runIfWaitingForDebugger by default. Page/network/service_worker/focus_emulation/binding/background_service false skips its setup; runtime defaults to bootstrap, true retains reporting, false skips enable/disable; initialize:false skips optional setup. Never initialize unrelated auto-attached pages or race optional-domain initialization ahead of logical options. Keep protocol setup errors visible and fail on transport errors/timeouts. Navigation can replace a document’s binding after Runtime.disable; do not promise cross-navigation binding availability in bootstrap mode. Use runtime:true when that persistence is required. Reapply runtime options on reconnect; shutdown closes sockets only, never library close() or Chrome.
-- `cdp_call` is **always batched**: `calls[]` is required even for one request, accepts 1–100 entries, and a single batch may span browsers and targets. Every entry's `call` uses required `method` and optional `params`, with no separate extension-selector field. Standard `{method,params}` is transported untouched except for server-owned id/session routing. Reserve the `_.` method namespace for local extensions, currently `_.click` and `_.find`, internally translated to `Runtime.evaluate` while preserving those logical method names in retained response metadata. Unknown `_.` methods fail per entry without reaching the browser. Preserve the reference augmented XPath rewrites: `ends-with(a,b)` -> XPath-1.0 `substring(...) = b`, `icontains(a,b)` -> case-insensitive `contains(translate(a,...),translate(b,...))`. `click` preserves the reference `awaitPromise`, `returnByValue`, `silent`, `userGesture`, retry count and interval semantics; `find` returns bounded compact node/element text/attributes/rect metadata. Do not add separate MCP tools `cdp_click`/`cdp_find`.
+- `cdp_call` is **always batched**: `calls[]` is required even for one request, accepts 1–100 entries, and a single batch may span browsers and targets. Every entry's `call` uses required `method` and optional `params`, with no separate extension-selector field. Standard `{method,params}` is transported untouched except for server-owned id/session routing. Reserve the `_.` method namespace for local extensions, currently `_.click` and `_.find`, using fixed native extension helpers in reverse API mode and the package evaluator in direct/debugger mode, while preserving those logical method names in retained response metadata. Unknown `_.` methods fail per entry without reaching the browser. Preserve the reference augmented XPath rewrites: `ends-with(a,b)` -> XPath-1.0 `substring(...) = b`, `icontains(a,b)` -> case-insensitive `contains(translate(a,...),translate(b,...))`. `click` preserves the reference `awaitPromise`, `returnByValue`, `silent`, `userGesture`, retry count and interval semantics; `find` returns bounded compact node/element text/attributes/rect metadata. Do not add separate MCP tools `cdp_click`/`cdp_find`.
 - `wait` is one batch-wide flag: `wait=true` dispatches every entry and waits independently for every response; `wait=false` returns assigned ids immediately while preserving eventual responses for `cdp_poll`. Preserve input order exactly and represent preparation/protocol/transport failures per entry without aborting siblings. Raw CDP errors remain visible in returned/polled `cdp`. Never accept agent-supplied JSON-RPC ids or sessionIds.
 - Standard `Page.captureScreenshot` returns Base64 in CDP `result.data` and does **not** imply disk persistence. Optional per-entry `_image` is MrMCP response metadata/post-processing, never part of raw CDP params and valid only for `Page.captureScreenshot` with `wait=true`. `_image.return` is `base64`; `format=original` preserves browser bytes without loading an image codec. `format=webp` lazily uses public `auto.vips.decodeImage` / `auto.vips.encodeImage`, optionally resizes by positive `scale`, uses the current fixed WebP Q=80, replaces only returned `cdp.result.data`, and adds compact `image` metadata. Never import Sharp directly from MrMCP or reach into Auto.js internal module paths. Every standard screenshot request parameter remains available unchanged to the agent.
 - `cdp_subs` is the single global runtime subscription mutator, never Session-owned or persisted. It requires one `browser`, applies removals before additions, and accepts `add`/`remove` in the same call. `add="*"` creates one catch-all subscription; `remove="*"` removes every live subscription for that browser. Subscription specs may filter logical `targets[]` (including `*`), exact `methods[]`, `method_prefixes[]` (both supporting `*`), optional browser-level traffic, and optional regex source/flags. Regex is evaluated against `JSON.stringify` of the complete raw inbound CDP message, not only its method. Target/method/regex dimensions combine with AND; exact+prefix alternatives combine with OR. Internal target/session bookkeeping always processes required `Target.*` events regardless of public recording filters. Notifications enter the public recorder only when at least one live subscription matches; responses are retained independently.
 - Keep one bounded per-browser ring, not one copy per subscription. The cap is both message count and serialized bytes. Each subscription owns only filters plus an ascending cursor; `cdp_poll(subscription=...)` advances that cursor by default and reports exact ring-loss plus stream-reset diagnostics. Ad-hoc `cdp_poll(browser=...)` has no cursor and returns the latest N matching retained messages from the tail in chronological order. Method filtering applies to notification method names and remembered standard/local extension logical request methods of responses. Oversized messages that exceed the byte cap are dropped rather than partially rewriting raw CDP payloads.
 - Navigation, arbitrary evaluation, screenshots, cookies, DOM, input, target/browser domains and every other protocol operation remain standard `cdp_call` methods. Do not add `cdp_launch`, `cdp_eval`, `cdp_navigate`, `cdp_screenshot`, standalone subscription/unsubscription tools, or other convenience MCP surfaces unless deliberately revisited.
 
-General browser tools use public CDP.js 0.5.0. cdp_ext:true performs token-bound loopback URL
+General browser tools use public CDP.js 0.7.0. cdp_ext:true performs token-bound loopback URL
 bootstrap into the system profile by default, with cdp_ext_install:false and a user-installed bridge.
+Reverse target execution_mode defaults to api: no implicit debugger/domain setup, including with
+runtime/network/binding options. Explicit debugger mode retains that setup; an explicit session CDP
+request still attaches lazily. Keep this choice in the strict target schema and preserve helper
+params.execution_mode overrides. Resolve reverse logical targets using a native chrome.* call,
+never Page.getFrameTree, which would trigger debugger attachment. Capture the package's public
+XPath helper compilation through evaluate_xpath; dispatch its fixed native helpers in reverse api
+mode and its original evaluator in direct/debugger mode, retaining raw IDs, rings and wait=false.
 A custom user_data_dir defaults installation on; explicit cdp_ext_install:false preserves manual
 installation there. Passive reverse:true opens no URL and waits for extension_id (or the native-ID
 browser name). Keep all modes available and let user/agent choose; never infer extension installation
@@ -284,6 +291,18 @@ on status/settings and standalone packaging. Keep dependency metadata/licenses a
 
 ## ChatGPT goals
 
+Goals, matching and subagents use reverse execution_mode:api and the same purple MrMCP group.
+Use native chrome.tabs.update for navigation and chrome.userScripts.execute with direct script text:
+USER_SCRIPT for DOM actions, MAIN only for the read-only committed React/cache reader. Never attach
+Chrome Debugger, issue Runtime/Page/Input/Network commands, add bindings or bypass/strip CSP on this
+internal path. Require the operator's Allow User Scripts grant and fail visibly without debugger
+fallback. Preserve native textarea InputEvent/contenteditable insertion, exact drafts and receipts,
+revision/activity guards and busy/Stop semantics. Automated fixtures may prepare the grant only in
+their own disposable profile; verify actual MAIN/cache and DOM execution under restrictive CSP,
+native API XPath, wait=false/raw response IDs, and zero attached targets using the public extension.
+General cdp_call keeps explicit native CDP access: reverse API defaults do not forbid an agent from
+deliberately requesting CDP, which attaches lazily and can show Chrome's debugger notice.
+
 `chat_set_goal(chat_session,goal,timeout_seconds?)` is a user-requested follow-up tool, independent of Workspace selection. Persist its ChatGPT conversation association, goal text, timeout, revision, explicit-set/activity/check/send timestamps, status and bounded error directly on `contexts`. Current schema version is 6; never migrate old databases. Empty/whitespace goal disables it but preserves the association. Keep this state independent of Tool Call history and preserve it during Clear Operational Data; Session deletion/expiry stops sending. Allow only one active goal per ChatGPT conversation; the newest explicit set replaces an older Session's goal for that conversation.
 
 `chat_goal_debug(chat_session,action?,stop_before_send?)` is a user-requested diagnostic/manual-action surface with no Workspace requirement. Status reads stored association, deadline, extension configuration/connection and enablement without connecting to a browser. Match consumes one immediate exact-Session scan, may recheck a saved association, preserves that id on failure and never sends. Send requires a saved nonempty goal and association, takes the same shared pass lock, and calls the ordinary send path with only the inactivity deadline bypassed. Retain revision/activity/draft/maintenance/Stop/acknowledgement checks, timer reset after confirmation and uncertain-delivery suspension. The per-attempt Stop override must not change Settings. Disabled/unconfigured and sending/uncertain states defer mutations; manual rearm uses chat_set_goal. Report operation outcomes explicitly and never infer success from dispatch alone. These diagnostic Tool Calls count as ordinary activity; do not create synthetic nested Tool Calls for their browser operations.
@@ -292,9 +311,9 @@ Goals/Subagents use public CDP.js URL bootstrap with cdp_ext:true, cdp_ext_insta
 user_data_dir:null, update_preferences:false and login/translations:true. The operator installs CDP
 Ext once and signs in normally. CDP.js opens or reuses system Chrome through its loopback link only
 when an operation needs it; no extension ID, endpoint, separate profile or app login flow is configured.
-Explain chrome://extensions Developer mode/Load unpacked and reload after upgrades. No automatic
+Explain chrome://extensions Developer mode/Load unpacked, Details → Allow User Scripts and reload after upgrades. No automatic
 extension installation, system profile writes, login observer or history Network/WebSocket capture.
-Settings → Goals exports the package's unchanged public cdp_ext/manifest.json and cdp_ext.js to an
+Settings → Goals exports all four unchanged public cdp_ext files (manifest.json, cdp_ext.js, sidebar.html, sidebar.js) to an
 editable stable destination (default APP_DIR/cdp_ext). Resolve package resources through the same
 public entrypoint/software-cache root as runtime loading; this must work offline in a standalone.
 Export is a GUI action, never a new MCP tool or browser operation. Preserve folder identity and other
@@ -307,14 +326,15 @@ The library owns logical-name/token routing and explicit connected-profile confl
 obsolete extension/failed bootstrap must fail visibly with a bounded retry hint, not another transport.
 A site login failure suspends that goal as waiting_login until an explicit set/debug retry after normal
 sign-in. Automatic configuration is not proof of connection/login; expose those distinctions honestly.
-Use browser mrmcp-goals and one reusable logical goals target with initialize:false and public
-target.group={name:"MrMCP Goals",color:"purple"}. Acquire it only for matching, due delivery or explicit
+Use browser mrmcp-goals and one reusable logical goals target with initialize:false, execution_mode:api and
+public target.group={name:"MrMCP",color:"purple"}, shared with every subagent target. Acquire it only for matching, due delivery or explicit
 debug actions; startup/settings/status with no due work creates nothing. Preserve ordinary user tabs
-and same-titled unrelated groups. Use a namespaced extension chrome.storage.session tab-ID marker to
+and same-titled unrelated groups. Persist owned per-window group IDs in an extension session-storage
+marker and restore the public library group mapping on reconnect; never adopt groups by title alone. Use a namespaced extension chrome.storage.session tab-ID marker to
 validate persisted logical targets: a browser restart clears it so recycled numeric IDs cannot adopt
 personal tabs. Never store chat content/credentials in that marker. Recreate closed targets lazily.
 Library bootstrap selects the profile; retain the per-profile ownership marker rather than
-trusting saved numeric tab IDs or a shared native extension ID. Disable/Quit disconnects the inspector without closing Chrome/tabs; other reverse
+trusting saved numeric tab IDs or a shared native extension ID. Disable/Quit disconnects the extension without closing Chrome/tabs; other reverse
 browser users may keep the shared listener. Preserve old unused profile directories without reading,
 importing or deleting them. Remove obsolete launch/login controls and code, keeping schema 6.
 
@@ -351,7 +371,7 @@ return claims/other Session handles through public metadata or GUI. Keep ordered
 50 pending messages per worker and explicit read cursors without dropping older messages.
 
 Reuse public CDP.js reverse with Goals' automatically discovered browser and separate subagent-<id> targets in the
-cyan MrMCP Subagents group. Goals' enable switch does not control workers; disconnecting Goals must
+same purple MrMCP group as goals/matching. Goals' enable switch does not control workers; disconnecting Goals must
 not disrupt live subagents. Use one scoped extension session-storage marker per target to avoid
 recycled tab IDs. No managed profile/extension setup or extra runtime dependency; the public opener may start Chrome.
 The operator connects MrMCP once as an MCP app in ChatGPT. Send the plain bootstrap prompt with
@@ -471,8 +491,13 @@ Use hasTestGpuixRenderer in source and standalone checks. GPUIX 0.11.0 exposes i
 only on Windows/macOS; Linux verifies projections and the complete public React/native/host closure
 from an empty cache without claiming native interaction coverage or constructing an unsupported test renderer.
 
-For Goals test extension-ID validation/persistence, no listener/target before requested work,
-reverse attachment without a process/profile, named purple group creation, owned logical target reuse
+Run `bun .github/check.mjs --browser` for disposable real-Chrome extension/React/CSP checks without
+embedding/OCR model downloads; add `--standalone` to verify the packaged dependency closure/export
+and native React smoke from an empty software cache. Release completed test-only executables after
+their last use so the main and native smoke builds do not retain duplicate large binaries.
+
+For Goals test token-bound bootstrap/extension identity and session-storage markers, no listener/target before requested work,
+reverse attachment without a process/profile, shared MrMCP group creation, owned group/target reuse without debugger
 across reconnects, recycled-ID protection after browser restart, closed-target recreation and preserving
 personal tabs on disable/Quit. Check missing configuration/sign-in suspension, disabled publication,
 single explicit match/startup opt-in, committed React cache match, active branch/exact JSON, completion

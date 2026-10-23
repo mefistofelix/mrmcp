@@ -181,14 +181,13 @@
     let sent = false,
       submittedText = "",
       inserted = 0;
-    chatGoalRpc = async (_page, method, params) => {
-      if (method === "Input.insertText") {
-        submittedText = params.text;
+    chatGoalRpc = async () => ({});
+    chatGoalEvaluate = async (_page, action, input) => {
+      if (action === "insert") {
+        submittedText = input.text;
         inserted++;
+        return { inserted: true };
       }
-      return {};
-    };
-    chatGoalEvaluate = async (_page, action) => {
       if (action === "send") {
         sent = true;
         controls.push(await reserveToolCall({ goalActivity: true, contextHandle: child.handle }));
@@ -242,16 +241,16 @@
       "SELECT * FROM subagent_messages WHERE agent_id=? AND state='queued' ORDER BY id LIMIT 1",
       id,
     );
-    const fakeRpc = chatGoalRpc;
-    chatGoalRpc = async (...args) => {
-      const result = await fakeRpc(...args);
-      if (args[1] === "Input.insertText") toolCallGate = Promise.resolve();
+    const fakeEvaluate = chatGoalEvaluate;
+    chatGoalEvaluate = async (...args) => {
+      const result = await fakeEvaluate(...args);
+      if (args[1] === "insert") toolCallGate = Promise.resolve();
       return result;
     };
     const callsBefore = controls.length;
     await subagentSubmit(await subagentRecord(id), queued);
     toolCallGate = previousGate;
-    chatGoalRpc = fakeRpc;
+    chatGoalEvaluate = fakeEvaluate;
     check(
       controls.length === callsBefore &&
         (await subagentRecord(id)).state === "queued" &&

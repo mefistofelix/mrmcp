@@ -98,7 +98,7 @@
 
     "@mefistofelix/auto.js": ["@mefistofelix/auto.js@0.2.0", "", { "dependencies": { "sharp": "0.35.3" }, "optionalDependencies": { "tesseract.js": "^7.0.0" } }, "sha512-/WrYM76/SYXJYkt+fxmJezhk1FpXMtSheNmpp3Ysf0baBawqaTrBXkzoAnph1QPUVeYlg1rH9smZi+nytjNPxg=="],
 
-    "@mefistofelix/cdp.js": ["@mefistofelix/cdp.js@0.5.0", "", {}, "sha512-2wchQCfySk6VVnLHROTxynNoEWQPzoSptQZmlYAmaY+mpuhn8KOEwliq22MA67LRpD6NZu0hPoKq0xwullnwAw=="],
+    "@mefistofelix/cdp.js": ["@mefistofelix/cdp.js@0.7.0", "", {}, "sha512-HXS88oGp93wSMv6tsdngMtcLGhUd0UwlcKzhHwgotF9CTdQ25TlZNLyIeUAFtqHk1nErEllUXF3Yz693desVyw=="],
 
     "@mefistofelix/rag.js": ["@mefistofelix/rag.js@0.3.0", "", { "dependencies": { "@tursodatabase/database": "0.8.3" }, "optionalDependencies": { "@mefistofelix/auto.js": "0.1.5", "@xberg-io/xberg": "1.3.10", "node-av": "6.1.1" } }, "sha512-4cXr2gS2R7+PMoY2Ml/pGvVSsiY33iubnvFQwBKlYr7LzRQZN2qpDtHViOGSNTpzu2HaK6wsXPMri3k9GdFD4g=="],
 
