@@ -6697,7 +6697,7 @@ async function backend({ addWorkspace = null } = {}) {
         signal: AbortSignal.any([controller.signal, AbortSignal.timeout(args.timeout_ms ?? 60000)]),
       });
       // Read API error bodies too; callers need the provider's structured details.
-      const bytes = await searchReadResponse(new Response(response.body), 16 * 1024 * 1024);
+      const bytes = await readBoundedResponse(new Response(response.body), 16 * 1024 * 1024);
       let result;
       try {
         result = JSON.parse(dec.decode(bytes));
@@ -7127,6 +7127,7 @@ async function backend({ addWorkspace = null } = {}) {
       const rows = await all("SELECT id,handle FROM contexts WHERE server_id=?", p.id);
       for (const worker of await all("SELECT * FROM subagents")) await subagentStop(worker);
       const handles = new Set(rows.map((row) => row.handle));
+      for (const handle of handles) closeMcpRemoteConnections("", handle);
       for (const record of processes.values())
         if (
           (record.persistent || record.mcp_server) &&
@@ -9898,7 +9899,7 @@ html[data-mode="fullscreen"] #frame {
     index_directory: dir,
     workspace_selected: !!selection.root.id,
   });
-  async function searchReadResponse(response, maxBytes) {
+  async function readBoundedResponse(response, maxBytes) {
     if (!response.ok) {
       await response.body?.cancel();
       const e = new Error(`HTTP ${response.status}`);
@@ -10002,7 +10003,7 @@ html[data-mode="fullscreen"] #frame {
               const response = await fetch(source, {
                 signal: AbortSignal.timeout(c.request_timeout_seconds * 1000),
               });
-              const lines = dec.decode(await searchReadResponse(response, 1048576)).split(/\r?\n/);
+              const lines = dec.decode(await readBoundedResponse(response, 1048576)).split(/\r?\n/);
               const parsed = [];
               for (const line of lines) {
                 const value = line.trim();
@@ -10226,7 +10227,7 @@ html[data-mode="fullscreen"] #frame {
       signal: AbortSignal.any([signal, AbortSignal.timeout(60000)]),
     });
     const packet = JSON.parse(
-      new TextDecoder().decode(await searchReadResponse(response, 8388608)),
+      new TextDecoder().decode(await readBoundedResponse(response, 8388608)),
     );
     const vectors = ollama
       ? packet.embeddings
@@ -10782,7 +10783,7 @@ html[data-mode="fullscreen"] #frame {
       const {
         default: { XzReadableStream },
       } = await import("xz-decompress");
-      return await searchReadResponse(
+      return await readBoundedResponse(
         new Response(new XzReadableStream(new Blob([archive]).stream())),
         536870912,
       );
@@ -10933,7 +10934,7 @@ html[data-mode="fullscreen"] #frame {
       await response.body?.cancel();
       return { exists: true, path: target.relative };
     }
-    const archive = await searchReadResponse(response, 536870912);
+    const archive = await readBoundedResponse(response, 536870912);
     const zipped = /\.zip$/i.test(filename) || (archive[0] === 0x50 && archive[1] === 0x4b);
     const bytes = zipped ? archive : await decompressCommandTar(archive, filename);
     const entries = zipped
@@ -11529,6 +11530,32 @@ html[data-mode="fullscreen"] #frame {
   }
   function normalizeMcpEntry(entry) {
     const row = normalizeCommandEntry(entry);
+    const exposure = entry.exposure ?? "exec";
+    if (!["exec", "tools"].includes(exposure))
+      throw new Error("MCP exposure must be exec or tools");
+    let http = null;
+    if (entry.http != null) {
+      if (
+        !entry.http ||
+        typeof entry.http !== "object" ||
+        Array.isArray(entry.http) ||
+        Object.keys(entry.http).some((key) => !["url", "protocol"].includes(key))
+      )
+        throw new Error(
+          "MCP http accepts url and protocol; authentication belongs in the database",
+        );
+      http = { url: mcpRemoteUrl(entry.http.url), protocol: entry.http.protocol ?? "auto" };
+      if (
+        !["auto", MCP_MODERN_PROTOCOL, "2025-11-25", "2025-06-18", "2025-03-26"].includes(
+          http.protocol,
+        )
+      )
+        throw new Error("Unsupported remote MCP protocol");
+      if (entry.stdio || entry.path || entry.download_url || entry.platforms)
+        throw new Error("Remote MCP servers cannot have local launch/download settings");
+    }
+    if (entry.auth || entry.headers || entry.token || entry.password)
+      throw new Error("MCP authentication belongs in the database, not mcp.yaml");
     if (
       row.bundle ||
       row.default_args ||
@@ -11537,7 +11564,13 @@ html[data-mode="fullscreen"] #frame {
       throw new Error("MCP entries use stdio.args; bundle/default_args belong to commands.yaml");
     if (entry.enabled !== undefined && typeof entry.enabled !== "boolean")
       throw new Error("MCP enabled must be boolean");
-    return { ...row, enabled: entry.enabled ?? true, stdio: normalizeMcpStdio(entry.stdio) };
+    return {
+      ...row,
+      enabled: entry.enabled ?? true,
+      exposure,
+      http,
+      stdio: http ? null : normalizeMcpStdio(entry.stdio),
+    };
   }
   async function readMcpConfig() {
     const document = parseYaml(await readTextFile(MCP_CATALOG_PATH));
@@ -11548,7 +11581,7 @@ html[data-mode="fullscreen"] #frame {
     for (const row of rows) {
       if (names.has(row.name.toLowerCase())) throw new Error(`Duplicate MCP name: ${row.name}`);
       names.add(row.name.toLowerCase());
-      await validateCommandEntry(row);
+      if (!row.http) await validateCommandEntry(row);
     }
     for (const entry of [...mcpStdioPool.values()]) {
       const row = rows.find((row) => row.name === entry.name);
@@ -11569,12 +11602,15 @@ html[data-mode="fullscreen"] #frame {
         platforms,
         enabled,
         stdio,
+        http,
+        exposure,
       }) => ({
         logical_name: name,
-        ...(path !== name ? { path } : {}),
+        ...(!http && path !== name ? { path } : {}),
         description,
         enabled,
-        stdio,
+        exposure,
+        ...(http ? { http } : { stdio }),
         ...(download_url ? { download_url } : {}),
         ...(archive_path ? { archive_path } : {}),
         documentation_url,
@@ -11583,13 +11619,37 @@ html[data-mode="fullscreen"] #frame {
     );
     await replaceTextFile(MCP_CATALOG_PATH, stringifyYaml({ servers }));
     for (const entry of [...mcpStdioPool.values()]) entry.close("configuration changed");
+    closeMcpRemoteConnections();
+    for (const [name, job] of mcpOAuthJobs)
+      if (rows.find((row) => row.name === name)?.http?.url !== job.url) job.cancel();
+    serverToolCache.clear();
     emitUiChange(["mcp", "processes"], "mcp-catalog-save");
   }
   async function mcpRows() {
+    const reserved = new Set([
+      ...BASE_TOOLS,
+      ...(await all("SELECT name FROM custom_tools")).map((row) => row.name),
+    ]);
+    const merged = await mcpMergedTools(await serverConfig(), reserved);
     return await Promise.all(
       (await readMcpConfig()).map(async (row) => ({
-        ...(await commandRow(row, MCP_BIN_DIR)),
+        ...(row.http
+          ? {
+              ...row,
+              path: row.http.url,
+              registered: true,
+              supported: true,
+              present: true,
+              executable: true,
+            }
+          : await commandRow(row, MCP_BIN_DIR)),
         catalog: "mcp",
+        exposure: row.exposure,
+        http: row.http,
+        observation: mcpObservation(row),
+        auth_type: mcpAuth(row).type || "none",
+        tool_count: mcpInventory(row).length,
+        merge_warnings: merged.warnings.filter((warning) => warning.mcp === row.name),
       })),
     );
   }
@@ -11619,21 +11679,931 @@ html[data-mode="fullscreen"] #frame {
       catalog: "mcp",
     };
   }
-  async function mcpOptionsWarning(text) {
-    try {
-      const value = parseYaml(text || "{}");
+  // Catalog definitions stay in YAML. Credentials, OAuth grants, observations
+  // and explicitly refreshed descriptors use the existing persistent config store.
+  const mcpDataKey = (kind, name) => `mcp_${kind}:${name.toLowerCase()}`;
+  const mcpData = (kind, name) => parseJson(getCfg(mcpDataKey(kind, name), "{}"), {});
+  const mcpRemoteConnections = new Map();
+  const mcpOAuthJobs = new Map();
+  const mcpRefreshJobs = new Map();
+  function mcpRemoteUrl(value) {
+    const url = new URL(String(value || ""));
+    const loopback = ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+    if (
+      (url.protocol !== "https:" && !(loopback && url.protocol === "http:")) ||
+      url.username ||
+      url.password ||
+      url.hash
+    )
+      throw new Error(
+        "MCP URLs require HTTPS (HTTP is allowed on loopback), without credentials or fragments",
+      );
+    return url.href;
+  }
+  function closeMcpRemoteConnections(name = "", contextHandle = null) {
+    for (const [key, connection] of mcpRemoteConnections)
       if (
-        !value ||
-        typeof value !== "object" ||
-        Array.isArray(value) ||
-        Object.keys(value).some((key) => !["enabled", "stdio"].includes(key))
+        (!name || connection.name === name) &&
+        (contextHandle === null || connection.context_handle === contextHandle)
+      ) {
+        for (const controller of connection.controllers) controller.abort();
+        mcpRemoteConnections.delete(key);
+      }
+  }
+  async function mcpObserve(row, patch) {
+    await setCfg(
+      mcpDataKey("status", row.name),
+      JSON.stringify({
+        ...mcpData("status", row.name),
+        ...patch,
+        url: row.http?.url || "",
+        checked_at: Date.now(),
+      }),
+    );
+    emitUiChange(["mcp"], "mcp-status");
+  }
+  function mcpObservation(row) {
+    const value = mcpData("status", row.name);
+    if (value.url !== (row.http?.url || "")) return {};
+    if (
+      ["discovering", "waiting_browser"].includes(value.auth_state) &&
+      !mcpOAuthJobs.has(row.name)
+    )
+      return {
+        ...value,
+        auth_state: "sign_in_required",
+        auth_error: "Previous login stopped. Sign in again.",
+      };
+    return value;
+  }
+  function mcpAuth(row) {
+    const auth = mcpData("auth", row.name);
+    const url = row.http?.url || "stdio";
+    return auth.url === url ? auth : { type: "none", url };
+  }
+  function normalizeMcpAuth(value, row) {
+    const type = String(value.type || "none");
+    if (
+      !(
+        row.http ? ["none", "bearer", "basic", "headers", "oauth"] : ["none", "environment"]
+      ).includes(type)
+    )
+      throw new Error(
+        row.http ? "Choose None, Bearer, Basic, Headers or OAuth" : "Choose None or Environment",
+      );
+    const auth = { type, url: row.http?.url || "stdio" };
+    auth.environment = value.environment || {};
+    if (
+      !auth.environment ||
+      typeof auth.environment !== "object" ||
+      Array.isArray(auth.environment) ||
+      Object.entries(auth.environment).some(
+        ([key, text]) =>
+          !key || /[=\0]/.test(key) || typeof text !== "string" || text.includes("\0"),
       )
-        throw new Error("MCP options accept enabled and stdio");
-      normalizeMcpEntry({ logical_name: "probe", ...value });
+    )
+      throw new Error("Environment must be a JSON object of variable names and string values");
+    for (const field of ["token", "username", "password", "client_id", "client_secret", "scope"])
+      auth[field] = String(value[field] || "");
+    auth.issuer = value.issuer ? mcpRemoteUrl(value.issuer) : "";
+    auth.redirect_port = Number(value.redirect_port || 0);
+    if (
+      !Number.isInteger(auth.redirect_port) ||
+      auth.redirect_port < 0 ||
+      auth.redirect_port > 65535
+    )
+      throw new Error("OAuth callback port must be 0–65535 (0 selects a free port)");
+    if (type === "bearer" && !auth.token.trim()) throw new Error("Bearer token is required");
+    if (type === "basic" && (!auth.username || auth.username.includes(":")))
+      throw new Error("Basic username is required and cannot contain ':'");
+    auth.headers = value.headers || {};
+    if (!auth.headers || typeof auth.headers !== "object" || Array.isArray(auth.headers))
+      throw new Error("Headers must be a JSON object of header names and string values");
+    const headers = new Headers();
+    for (const [name, text] of Object.entries(auth.headers)) {
+      if (
+        typeof text !== "string" ||
+        /^(host|content-length|content-type|accept|mcp-session-id|mcp-protocol-version|connection|transfer-encoding)$/i.test(
+          name,
+        )
+      )
+        throw new Error(`Unsupported authentication header: ${name}`);
+      headers.set(name, text);
+    }
+    // Validate tokens now, before persistence; never interpolate them into logs.
+    if (auth.token) headers.set("authorization", "Bearer " + auth.token);
+    return auth;
+  }
+  async function mcpSaveAuth(row, value) {
+    const auth = normalizeMcpAuth(value, row);
+    const old = mcpAuth(row);
+    if (
+      auth.type === "oauth" &&
+      old.type === "oauth" &&
+      ["issuer", "client_id", "client_secret", "scope", "redirect_port"].every(
+        (key) => auth[key] === old[key],
+      )
+    )
+      Object.assign(auth, {
+        grant: old.grant,
+        metadata: old.metadata,
+        registration: old.registration,
+      });
+    mcpOAuthJobs.get(row.name)?.cancel();
+    await setCfg(mcpDataKey("auth", row.name), JSON.stringify(auth));
+    closeMcpRemoteConnections(row.name);
+    for (const entry of [...mcpStdioPool.values()])
+      if (entry.name === row.name) entry.close("authentication changed");
+    await mcpObserve(row, {
+      auth_state: auth.type === "none" ? "anonymous" : "not_tested",
+      auth_error: "",
+      network_error: "",
+    });
+  }
+  async function mcpOAuthToken(row, auth, parameters, signal) {
+    const metadata = auth.metadata;
+    const client = auth.client_id
+      ? { client_id: auth.client_id, client_secret: auth.client_secret }
+      : auth.registration;
+    if (!client?.client_id || !metadata?.token_endpoint)
+      throw new Error("Sign in to this MCP server from MCP Servers");
+    const body = new URLSearchParams({
+      ...parameters,
+      client_id: client.client_id,
+      resource: auth.url,
+    });
+    const headers = new Headers({ "content-type": "application/x-www-form-urlencoded" });
+    if (client.client_secret) {
+      if (metadata.token_endpoint_auth_methods_supported?.includes("client_secret_basic"))
+        headers.set(
+          "authorization",
+          "Basic " +
+            Buffer.from(
+              encodeURIComponent(client.client_id) + ":" + encodeURIComponent(client.client_secret),
+            ).toString("base64"),
+        );
+      else body.set("client_secret", client.client_secret);
+    }
+    const response = await fetch(mcpRemoteUrl(metadata.token_endpoint), {
+      method: "POST",
+      headers,
+      body,
+      redirect: "error",
+      signal: signal || AbortSignal.timeout(15000),
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw Object.assign(
+        new Error(`OAuth token exchange failed: HTTP ${response.status}. Sign in again.`),
+        { auth_error: true },
+      );
+    }
+    const grant = JSON.parse(
+      new TextDecoder().decode(await readBoundedResponse(response, 1024 * 1024)),
+    );
+    if (
+      typeof grant.access_token !== "string" ||
+      !grant.access_token ||
+      String(grant.token_type).toLowerCase() !== "bearer"
+    )
+      throw new Error("OAuth server did not return a Bearer access token");
+    if (
+      grant.expires_in != null &&
+      (!Number.isFinite(Number(grant.expires_in)) || Number(grant.expires_in) < 0)
+    )
+      throw new Error("Invalid OAuth token expiration");
+    const fresh = mcpAuth(row);
+    if (JSON.stringify(fresh) !== JSON.stringify(auth))
+      throw new Error("MCP authentication changed during login/refresh");
+    auth.grant = {
+      access_token: grant.access_token,
+      refresh_token: grant.refresh_token || auth.grant?.refresh_token || "",
+      expires_at: grant.expires_in != null ? Date.now() + Number(grant.expires_in) * 1000 : 0,
+      scope: grant.scope || auth.scope || "",
+    };
+    await setCfg(mcpDataKey("auth", row.name), JSON.stringify(auth));
+    await mcpObserve(row, { auth_state: "authorized", auth_error: "" });
+    return auth;
+  }
+  async function mcpAuthHeaders(row, signal, forceRefresh = false) {
+    let auth = mcpAuth(row);
+    if (auth.type === "oauth") {
+      if (!auth.grant?.access_token)
+        throw new Error("Sign in to this MCP server from MCP Servers → Authentication");
+      if (forceRefresh || (auth.grant.expires_at && auth.grant.expires_at < Date.now() + 30000)) {
+        if (!auth.grant.refresh_token)
+          throw new Error("OAuth token expired. Sign in again from MCP Servers");
+        let refresh = mcpRefreshJobs.get(row.name);
+        if (!refresh) {
+          refresh = mcpOAuthToken(
+            row,
+            auth,
+            { grant_type: "refresh_token", refresh_token: auth.grant.refresh_token },
+            signal,
+          )
+            .catch((error) => {
+              error.auth_error = true;
+              throw error;
+            })
+            .finally(() => mcpRefreshJobs.delete(row.name));
+          mcpRefreshJobs.set(row.name, refresh);
+        }
+        auth = await refresh;
+      }
+    }
+    const headers = new Headers(auth.type === "headers" ? auth.headers : {});
+    if (auth.type === "bearer") headers.set("authorization", "Bearer " + auth.token);
+    if (auth.type === "basic")
+      headers.set(
+        "authorization",
+        "Basic " + Buffer.from(auth.username + ":" + auth.password).toString("base64"),
+      );
+    if (auth.type === "oauth") headers.set("authorization", "Bearer " + auth.grant.access_token);
+    return { headers, type: auth.type, sent: [...headers].length > 0 };
+  }
+  async function mcpHttpPost(row, connection, packet, signal, execution, retryAuth = true) {
+    let authorization;
+    let phase = "authentication";
+    const attemptedAt = Date.now();
+    try {
+      authorization = await mcpAuthHeaders(row, signal);
+      const headers = authorization.headers;
+      headers.set("content-type", "application/json");
+      headers.set("accept", "application/json, text/event-stream");
+      headers.set("mcp-protocol-version", connection.protocol);
+      if (connection.session) headers.set("mcp-session-id", connection.session);
+      phase = "network";
+      const response = await fetch(row.http.url, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(packet),
+        redirect: "error",
+        signal,
+      });
+      phase = "protocol";
+      await mcpObserve(row, {
+        http_status: response.status,
+        auth_sent: authorization.sent,
+        auth_type: authorization.type,
+        auth_state:
+          response.status === 401
+            ? "authentication_required"
+            : response.status === 403
+              ? "denied"
+              : authorization.sent
+                ? response.ok
+                  ? "authenticated"
+                  : "credentials_supplied"
+                : "anonymous",
+        network_error: "",
+        protocol_error: "",
+        http_error:
+          !response.ok && ![401, 403].includes(response.status) ? `HTTP ${response.status}` : "",
+        auth_error: [401, 403].includes(response.status) ? `HTTP ${response.status}` : "",
+        last_request_at: attemptedAt,
+      });
+      if (
+        response.status === 401 &&
+        retryAuth &&
+        mcpAuth(row).type === "oauth" &&
+        mcpAuth(row).grant?.refresh_token
+      ) {
+        await response.body?.cancel();
+        const tokenUnchanged =
+          authorization.headers.get("authorization") ===
+          "Bearer " + mcpAuth(row).grant.access_token;
+        await mcpAuthHeaders(row, signal, tokenUnchanged);
+        return await mcpHttpPost(row, connection, packet, signal, execution, false);
+      }
+      if (!response.ok) {
+        await response.body?.cancel();
+        if (response.status === 404) connection.session = "";
+        throw Object.assign(
+          new Error(
+            `MCP HTTP ${response.status}${[401, 403].includes(response.status) ? ": check Authentication in MCP Servers" : ""}`,
+          ),
+          { http_status: response.status },
+        );
+      }
+      const session = response.headers.get("mcp-session-id");
+      if (session) connection.session = session;
+      if (packet.id == null || !packet.method) {
+        await response.body?.cancel();
+        return null;
+      }
+      let result;
+      if (response.headers.get("content-type")?.includes("text/event-stream")) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "",
+          data = [],
+          bytes = 0;
+        try {
+          for (;;) {
+            const chunk = await reader.read();
+            if (chunk.done) break;
+            bytes += chunk.value.length;
+            if (bytes > 16 * 1024 * 1024) throw new Error("MCP HTTP response exceeds 16 MiB");
+            buffer += decoder.decode(chunk.value, { stream: true });
+            let end;
+            while ((end = buffer.search(/[\r\n]/)) >= 0) {
+              if (buffer[end] === "\r" && end === buffer.length - 1) break;
+              const line = buffer.slice(0, end);
+              buffer = buffer.slice(end + (buffer.slice(end, end + 2) === "\r\n" ? 2 : 1));
+              if (line.startsWith("data:")) data.push(line.slice(5).replace(/^ /, ""));
+              if (!line && data.length) {
+                const text = data.join("\n");
+                data = [];
+                if (!text) continue;
+                const message = JSON.parse(text);
+                if (message.id === packet.id && !message.method) {
+                  result = message;
+                  break;
+                }
+                if (message.method === "notifications/progress")
+                  execution?.progress?.(message.params);
+                if (message.id != null && message.method)
+                  await mcpHttpPost(
+                    row,
+                    connection,
+                    {
+                      jsonrpc: "2.0",
+                      id: message.id,
+                      ...(message.method === "ping"
+                        ? { result: {} }
+                        : {
+                            error: {
+                              code: -32601,
+                              message: "No sampling/elicitation capabilities",
+                            },
+                          }),
+                    },
+                    signal,
+                    null,
+                  );
+              }
+            }
+            if (result) break;
+          }
+        } finally {
+          await reader.cancel().catch(() => {});
+        }
+      } else {
+        const bytes = await readBoundedResponse(response, 16 * 1024 * 1024);
+        result = JSON.parse(new TextDecoder().decode(bytes));
+      }
+      if (
+        !result ||
+        result.jsonrpc !== "2.0" ||
+        result.id !== packet.id ||
+        (!Object.hasOwn(result, "result") && !result.error)
+      )
+        throw new Error("Invalid or incomplete MCP HTTP response");
+      return result;
+    } catch (error) {
+      await mcpObserve(row, {
+        last_attempt_at: attemptedAt,
+        ...(!authorization || error.auth_error
+          ? { auth_state: "sign_in_required", auth_error: errorMessage(error) }
+          : !error.http_status
+            ? phase === "network" || signal.aborted
+              ? {
+                  last_request_at: attemptedAt,
+                  http_status: null,
+                  auth_sent: authorization.sent,
+                  network_error: signal.aborted
+                    ? "Request cancelled or timed out"
+                    : errorMessage(error),
+                }
+              : { protocol_error: errorMessage(error) }
+            : {}),
+      });
+      throw error;
+    }
+  }
+  async function execRemoteMcp(row, packet, execution, timeout) {
+    const key = JSON.stringify([execution.selection.context.handle, row.name, row.http]);
+    let connection = mcpRemoteConnections.get(key);
+    if (!connection) {
+      connection = {
+        name: row.name,
+        context_handle: execution.selection.context.handle,
+        protocol: row.http.protocol === "auto" ? MCP_MODERN_PROTOCOL : row.http.protocol,
+        session: "",
+        ready: null,
+        controllers: new Set(),
+      };
+      mcpRemoteConnections.set(key, connection);
+    }
+    const controller = new AbortController();
+    connection.controllers.add(controller);
+    const timer = setTimeout(() => controller.abort(), timeout);
+    execution.setCancel?.(
+      () => {
+        controller.abort();
+        return true;
+      },
+      { kind: "mcp-http" },
+    );
+    execution.onDisconnect?.(() => controller.abort());
+    try {
+      connection.ready ??= (async () => {
+        const modern = connection.protocol === MCP_MODERN_PROTOCOL;
+        let reply;
+        if (modern) {
+          try {
+            reply = await mcpHttpPost(
+              row,
+              connection,
+              { jsonrpc: "2.0", id: randomToken(12), method: "server/discover" },
+              controller.signal,
+            );
+          } catch (error) {
+            if (row.http.protocol !== "auto" || ![400, 404, 405].includes(error.http_status))
+              throw error;
+          }
+        }
+        if (!modern || !reply || (reply.error && [-32601, -32600].includes(reply.error.code))) {
+          if (modern && row.http.protocol !== "auto")
+            throw new Error("Remote server does not support server/discover");
+          connection.protocol = modern ? "2025-11-25" : connection.protocol;
+          reply = await mcpHttpPost(
+            row,
+            connection,
+            {
+              jsonrpc: "2.0",
+              id: randomToken(12),
+              method: "initialize",
+              params: {
+                protocolVersion: connection.protocol,
+                capabilities: {},
+                clientInfo: { name: "MrMCP", version: VERSION },
+              },
+            },
+            controller.signal,
+          );
+          if (reply.error) throw new Error(reply.error.message || "MCP initialization failed");
+          if (!["2025-11-25", "2025-06-18", "2025-03-26"].includes(reply.result?.protocolVersion))
+            throw new Error("Unsupported remote MCP protocol");
+          connection.protocol = reply.result.protocolVersion;
+          await mcpHttpPost(
+            row,
+            connection,
+            { jsonrpc: "2.0", method: "notifications/initialized" },
+            controller.signal,
+          );
+        } else if (reply.error) throw new Error(reply.error.message || "MCP discovery failed");
+      })();
+      await connection.ready;
+      const id = randomToken(12);
+      const response = await mcpHttpPost(
+        row,
+        connection,
+        {
+          ...packet,
+          jsonrpc: "2.0",
+          id,
+          ...(packet.method === "tools/call" && execution.progress
+            ? {
+                params: {
+                  ...packet.params,
+                  _meta: { ...packet.params?._meta, progressToken: `mrmcp-${id}` },
+                },
+              }
+            : {}),
+        },
+        controller.signal,
+        execution,
+      );
+      response.id = packet.id ?? execution.logId;
+      return {
+        mcp: row.name,
+        persistence: "persistent",
+        success: !response.error && !response.result?.isError,
+        response,
+      };
+    } catch (error) {
+      if (mcpRemoteConnections.get(key) === connection) mcpRemoteConnections.delete(key);
+      throw error;
+    } finally {
+      clearTimeout(timer);
+      connection.controllers.delete(controller);
+    }
+  }
+  async function mcpMetadata(url, signal) {
+    const response = await fetch(mcpRemoteUrl(url), { redirect: "error", signal });
+    return JSON.parse(new TextDecoder().decode(await readBoundedResponse(response, 1024 * 1024)));
+  }
+  async function mcpStartOAuth(row) {
+    if (mcpOAuthJobs.has(row.name)) throw new Error("OAuth login is already in progress");
+    const auth = mcpAuth(row);
+    if (auth.type !== "oauth") throw new Error("Save OAuth authentication settings first");
+    const controller = new AbortController();
+    const state = randomToken(32),
+      verifier = randomToken(48);
+    const callback = "/oauth/callback";
+    let server,
+      timer,
+      settled = false;
+    const code = Promise.withResolvers();
+    const finish = () => {
+      clearTimeout(timer);
+      server?.stop(true);
+      if (mcpOAuthJobs.get(row.name)?.cancel === cancel) mcpOAuthJobs.delete(row.name);
+    };
+    const cancel = (report = false) => {
+      controller.abort();
+      code.reject(new Error("OAuth login cancelled"));
+      finish();
+      if (report)
+        void mcpObserve(row, {
+          auth_state: "cancelled",
+          auth_error: "OAuth login cancelled or timed out",
+        });
+    };
+    // The listener accepts only this one OAuth redirect, never GUI/admin requests.
+    mcpOAuthJobs.set(row.name, { cancel, url: row.http.url });
+    code.promise.catch(() => {});
+    try {
+      await mcpObserve(row, { auth_state: "discovering", auth_error: "" });
+      const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(15000)]);
+      let resource;
+      const probe = await fetch(row.http.url, {
+        method: "POST",
+        redirect: "error",
+        signal,
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: "auth-discovery", method: "server/discover" }),
+      });
+      const advertised = /resource_metadata="([^"]+)"/i.exec(
+        probe.headers.get("www-authenticate") || "",
+      )?.[1];
+      await mcpObserve(row, {
+        auth_state: "discovering",
+        auth_sent: false,
+        auth_type: "none",
+        http_status: probe.status,
+        last_request_at: Date.now(),
+        network_error: "",
+      });
+      await probe.body?.cancel();
+      const endpoint = new URL(row.http.url);
+      const candidates = advertised
+        ? [advertised]
+        : [
+            endpoint.origin + "/.well-known/oauth-protected-resource" + endpoint.pathname,
+            endpoint.origin + "/.well-known/oauth-protected-resource",
+          ];
+      for (const url of [...new Set(candidates)]) {
+        try {
+          resource = await mcpMetadata(url, signal);
+          break;
+        } catch (error) {
+          if (url === candidates.at(-1)) throw error;
+        }
+      }
+      const canonical = (url) => {
+        const value = new URL(url);
+        value.search = "";
+        return value.href.replace(/\/$/, "");
+      };
+      if (canonical(resource.resource) !== canonical(row.http.url))
+        throw new Error("OAuth resource metadata does not describe this MCP endpoint");
+      const issuer = mcpRemoteUrl(auth.issuer || resource.authorization_servers?.[0]);
+      const base = new URL(issuer);
+      const metadataUrls = [
+        base.origin + "/.well-known/oauth-authorization-server" + base.pathname.replace(/\/$/, ""),
+        issuer.replace(/\/$/, "") + "/.well-known/oauth-authorization-server",
+        issuer.replace(/\/$/, "") + "/.well-known/openid-configuration",
+      ];
+      let metadata;
+      for (const url of [...new Set(metadataUrls)]) {
+        try {
+          metadata = await mcpMetadata(url, signal);
+          break;
+        } catch (error) {
+          if (url === metadataUrls.at(-1)) throw error;
+        }
+      }
+      if (
+        canonical(metadata.issuer) !== canonical(issuer) ||
+        !metadata.code_challenge_methods_supported?.includes("S256")
+      )
+        throw new Error("OAuth issuer mismatch or missing PKCE S256 support");
+      metadata.authorization_endpoint = mcpRemoteUrl(metadata.authorization_endpoint);
+      metadata.token_endpoint = mcpRemoteUrl(metadata.token_endpoint);
+      auth.metadata = metadata;
+      server = Bun.serve({
+        hostname: "127.0.0.1",
+        port: auth.redirect_port || auth.registration?.callback_port || 0,
+        fetch(request) {
+          const url = new URL(request.url);
+          if (
+            request.method !== "GET" ||
+            url.pathname !== callback ||
+            url.hostname !== "127.0.0.1" ||
+            url.searchParams.get("state") !== state ||
+            settled
+          )
+            return new Response("Invalid OAuth callback", { status: 400 });
+          const callbackIssuer = url.searchParams.get("iss");
+          if (callbackIssuer && canonical(callbackIssuer) !== canonical(metadata.issuer))
+            return new Response("Invalid OAuth issuer", { status: 400 });
+          settled = true;
+          if (url.searchParams.has("error") || !url.searchParams.get("code"))
+            code.reject(new Error("OAuth authorization was denied or returned no code"));
+          else code.resolve(url.searchParams.get("code"));
+          return new Response("Authorization received. You can return to MrMCP.", {
+            headers: {
+              "content-type": "text/plain; charset=utf-8",
+              "cache-control": "no-store",
+              "referrer-policy": "no-referrer",
+            },
+          });
+        },
+      });
+      const redirect = `http://127.0.0.1:${server.port}${callback}`;
+      // Reuse the registered loopback port and exact callback URI on later logins.
+      // Preregistered clients can choose their own fixed port.
+      if (
+        !auth.client_id &&
+        (!auth.registration?.redirect_uris?.includes(redirect) ||
+          auth.registration.issuer !== metadata.issuer)
+      ) {
+        if (!metadata.registration_endpoint)
+          throw new Error(
+            "This issuer requires a preregistered Client ID; enter it in Authentication",
+          );
+        const response = await fetch(mcpRemoteUrl(metadata.registration_endpoint), {
+          method: "POST",
+          redirect: "error",
+          signal,
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            client_name: "MrMCP",
+            redirect_uris: [redirect],
+            grant_types: ["authorization_code", "refresh_token"],
+            response_types: ["code"],
+            token_endpoint_auth_method: "none",
+          }),
+        });
+        auth.registration = JSON.parse(
+          new TextDecoder().decode(await readBoundedResponse(response, 1024 * 1024)),
+        );
+        if (!auth.registration.client_id)
+          throw new Error("OAuth registration returned no client ID");
+        Object.assign(auth.registration, {
+          redirect_uris: [redirect],
+          callback_port: server.port,
+          issuer: metadata.issuer,
+        });
+        delete auth.grant;
+      }
+      const current = mcpAuth(row);
+      if (
+        ["type", "url", "issuer", "client_id", "client_secret", "scope", "redirect_port"].some(
+          (key) => current[key] !== auth[key],
+        )
+      )
+        throw new Error("MCP authentication changed during discovery");
+      await setCfg(mcpDataKey("auth", row.name), JSON.stringify(auth));
+      const authorize = new URL(metadata.authorization_endpoint);
+      for (const [key, value] of Object.entries({
+        response_type: "code",
+        client_id: auth.client_id || auth.registration.client_id,
+        redirect_uri: redirect,
+        state,
+        code_challenge: createHash("sha256").update(verifier).digest("base64url"),
+        code_challenge_method: "S256",
+        resource: row.http.url,
+        scope: auth.scope || (resource.scopes_supported || []).join(" "),
+      }))
+        if (value) authorize.searchParams.set(key, value);
+      timer = setTimeout(() => cancel(true), 5 * 60 * 1000);
+      await mcpObserve(row, { auth_state: "waiting_browser", auth_error: "" });
+      void code.promise
+        .then(async (value) => {
+          await mcpOAuthToken(
+            row,
+            auth,
+            {
+              grant_type: "authorization_code",
+              code: value,
+              code_verifier: verifier,
+              redirect_uri: redirect,
+            },
+            controller.signal,
+          );
+          closeMcpRemoteConnections(row.name);
+          uiNotice(
+            `MCP ${row.name}: authorization completed. Test the connection to verify access.`,
+            "ok",
+          );
+        })
+        .catch(async (error) => {
+          if (mcpOAuthJobs.get(row.name)?.cancel === cancel)
+            await mcpObserve(row, {
+              auth_state: "sign_in_required",
+              auth_error: errorMessage(error),
+            });
+        })
+        .finally(finish);
+      return { url: authorize.href };
+    } catch (error) {
+      finish();
+      await mcpObserve(row, { auth_state: "error", auth_error: errorMessage(error) });
+      throw error;
+    }
+  }
+  const mcpToolDefinition = (row) =>
+    JSON.stringify(
+      processOperationCanonical(
+        row.http
+          ? { http: row.http }
+          : { path: row.path, platforms: row.platforms, stdio: row.stdio },
+      ),
+    );
+  const mcpInventory = (row) => {
+    const inventory = mcpData("tools", row.name);
+    return inventory.definition === mcpToolDefinition(row) ? inventory.tools || [] : [];
+  };
+  function mcpDialogEntry(data) {
+    return {
+      logical_name: data.name,
+      description: data.description,
+      documentation_url: data.documentation_url,
+      enabled: data.enabled !== false,
+      exposure: data.exposure || "exec",
+      ...(data.transport === "http"
+        ? { http: { url: data.remote_url, protocol: data.protocol || "auto" } }
+        : {
+            path: data.path,
+            download_url: data.download_url,
+            archive_path: data.archive_path,
+            platforms: parseYaml(data.platforms_text || "{}"),
+            stdio: {
+              args: JSON.parse(data.args_text || "[]"),
+              persistence: data.persistence || "command",
+              ttl_seconds: Number(data.ttl_seconds || 300),
+              windows_hide: data.windows_hide !== false,
+            },
+          }),
+    };
+  }
+  function mcpDefinitionWarning(data) {
+    try {
+      normalizeMcpEntry(mcpDialogEntry(data));
       return "";
     } catch (error) {
-      return error.message;
+      return errorMessage(error);
     }
+  }
+  function mcpAuthDraft(row) {
+    const auth = mcpAuth(row);
+    return {
+      name: row.name,
+      url: row.http?.url || "stdio",
+      type: auth.type || "none",
+      token: "",
+      password: "",
+      client_secret: "",
+      headers_text: "",
+      environment_text: "",
+      username: auth.username || "",
+      issuer: auth.issuer || "",
+      client_id: auth.client_id || "",
+      scope: auth.scope || "",
+      redirect_port: auth.redirect_port || 0,
+      form_warning: "",
+    };
+  }
+  async function saveMcpAuthDraft(data) {
+    const row = (await readMcpConfig()).find((row) => row.name === data.name);
+    if (!row) throw new Error("MCP server not found");
+    if (data.url && data.url !== (row.http?.url || "stdio"))
+      throw new Error("Server endpoint changed. Reopen Authentication before saving credentials.");
+    const old = mcpAuth(row);
+    await mcpSaveAuth(row, {
+      ...data,
+      environment: data.environment_text
+        ? JSON.parse(data.environment_text)
+        : data.type === old.type
+          ? old.environment
+          : {},
+      token: data.token || (data.type === old.type ? old.token : ""),
+      password: data.password || (data.type === old.type ? old.password : ""),
+      client_secret: data.client_secret || (data.type === old.type ? old.client_secret : ""),
+      headers: data.headers_text
+        ? JSON.parse(data.headers_text)
+        : data.type === old.type
+          ? old.headers
+          : {},
+    });
+    return row;
+  }
+  async function mcpMergedTools(p, reserved) {
+    const rows = (await readMcpConfig()).filter((row) => row.enabled && row.exposure === "tools");
+    const tools = rows.flatMap((row) => mcpInventory(row).map((tool) => ({ row, tool })));
+    const counts = new Map();
+    for (const { tool } of tools) counts.set(tool.name, (counts.get(tool.name) || 0) + 1);
+    const warnings = [],
+      published = [];
+    for (const { row, tool } of tools) {
+      let reason = reserved.has(tool.name)
+        ? "conflicts with a MrMCP tool"
+        : counts.get(tool.name) > 1
+          ? "conflicts with another merged MCP server"
+          : tool.inputSchema?.properties?.chat_session
+            ? "reserves MrMCP's chat_session parameter"
+            : "";
+      if (reason) {
+        warnings.push({ mcp: row.name, tool: tool.name, reason });
+        continue;
+      }
+      published.push({
+        ...tool,
+        description: `${tool.description || tool.name} Upstream MCP: ${row.name}. ${CHAT_SESSION_RULE}`,
+        inputSchema: {
+          ...tool.inputSchema,
+          properties: {
+            ...tool.inputSchema.properties,
+            chat_session: { type: "string", minLength: 1 },
+          },
+          required: [...new Set([...(tool.inputSchema.required || []), "chat_session"])],
+        },
+        outputSchema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            chat_session: { type: "string" },
+            mcp: { type: "string" },
+            success: { type: "boolean" },
+            persistence: { type: "string" },
+            result: { type: "object", additionalProperties: true },
+          },
+          required: ["chat_session", "mcp", "success", "result"],
+        },
+        _meta: { mrmcp_upstream: { server: row.name, tool: tool.name } },
+      });
+    }
+    return { tools: published, warnings };
+  }
+  async function mcpRefreshTools(row) {
+    // GUI introspection is administrative work, not a newly minted chat Session.
+    const context = { id: 0, handle: "" };
+    const execution = {
+      selection: { context, root: unassignedWorkspaceRoot(await serverConfig()) },
+      logId: 0,
+    };
+    const tools = [],
+      cursors = new Set();
+    let cursor;
+    do {
+      const result = await execMcp(
+        await serverConfig(),
+        { mcp: row.name, request: { method: "tools/list", params: cursor ? { cursor } : {} } },
+        execution,
+      );
+      if (!result.success || !Array.isArray(result.response.result?.tools))
+        throw new Error(
+          `MCP tools/list failed: ${String(
+            result.response.error?.message ||
+              result.response.result?.content?.find((item) => item.type === "text")?.text ||
+              "Expected a tools array",
+          ).slice(0, 1000)}`,
+        );
+      for (const tool of result.response.result.tools) {
+        if (
+          !/^[A-Za-z0-9_.-]{1,128}$/.test(tool.name) ||
+          !tool.inputSchema ||
+          tool.inputSchema.type !== "object"
+        )
+          throw new Error("MCP tool descriptor needs a valid name and object inputSchema");
+        tools.push(tool);
+        if (tools.length > 2000) throw new Error("MCP tool inventory exceeds 2000 entries");
+      }
+      cursor = result.response.result.nextCursor;
+      if (cursor && cursors.has(cursor)) throw new Error("Repeated tools/list cursor");
+      cursors.add(cursor);
+    } while (cursor);
+    await setCfg(
+      mcpDataKey("tools", row.name),
+      JSON.stringify({
+        definition: mcpToolDefinition(row),
+        tools,
+        refreshed_at: Date.now(),
+      }),
+    );
+    serverToolCache.clear();
+    await mcpObserve(row, {
+      tool_count: tools.length,
+      tool_error: "",
+      tools_refreshed_at: Date.now(),
+    });
+    return { count: tools.length };
   }
   const mcpStdioPool = new Map();
   async function createMcpStdioServer(p, row, selection, program, argv, cwd, env, key) {
@@ -11915,14 +12885,18 @@ html[data-mode="fullscreen"] #frame {
       return {
         servers: await Promise.all(
           rows
-            .filter((row) => row.enabled)
+            .filter((row) => row.enabled && row.exposure === "exec")
             .map(async (row) => {
-              const runtime = await commandRow(row, MCP_BIN_DIR);
+              const runtime = row.http
+                ? { supported: true, present: true, executable: true }
+                : await commandRow(row, MCP_BIN_DIR);
               return {
                 name: row.name,
                 description: row.description,
                 available: runtime.supported && runtime.present && runtime.executable,
-                persistence: row.stdio.persistence,
+                persistence: row.http ? "persistent" : row.stdio.persistence,
+                transport: row.http ? "http" : "stdio",
+                exposure: row.exposure,
                 documentation_url: row.documentation_url,
               };
             }),
@@ -11947,6 +12921,7 @@ html[data-mode="fullscreen"] #frame {
         !(typeof packet.id === "string" || Number.isSafeInteger(packet.id)))
     )
       throw new Error("Invalid JSON-RPC version or id");
+    if (row.http) return await execRemoteMcp(row, packet, execution, args.timeout_ms ?? 60000);
     const target = await commandRow(row, MCP_BIN_DIR);
     if (!target.supported || !target.present || !target.executable)
       throw new Error(`MCP ${row.name} is unavailable; install its binary on MCP Servers`);
@@ -11967,6 +12942,7 @@ html[data-mode="fullscreen"] #frame {
     const env = mergeProcessEnvironment(
       { ...process.env },
       configuredExecEnvironment(getCfg("exec_environment", ""), placeholders),
+      mcpAuth(row).type === "environment" ? mcpAuth(row).environment : {},
     );
     const program = (await binPath(target.resolved_path, MCP_BIN_DIR)).path;
     const key = createHash("sha256")
@@ -12004,12 +12980,21 @@ html[data-mode="fullscreen"] #frame {
       })();
       const response = await Promise.race([operation, interrupted]);
       response.id = packet.id ?? execution.logId;
+      await mcpObserve(row, {
+        auth_state: "connected",
+        auth_sent: mcpAuth(row).type === "environment",
+        last_request_at: Date.now(),
+        protocol_error: response.error?.message || "",
+      });
       return {
         mcp: row.name,
         persistence: row.stdio.persistence,
         success: !response.error && !response.result?.isError,
         response,
       };
+    } catch (error) {
+      await mcpObserve(row, { protocol_error: errorMessage(error), last_attempt_at: Date.now() });
+      throw error;
     } finally {
       clearTimeout(timer);
       abort = () => {};
@@ -13579,7 +14564,7 @@ html[data-mode="fullscreen"] #frame {
         },
       ],
       exec_mcp: [
-        "Call a separately registered stdio MCP server from mcp.yaml. Omit mcp/request to discover " +
+        "Call a registered local stdio or remote Streamable HTTP MCP server from mcp.yaml. Omit mcp/request to discover " +
           "enabled servers and availability. Otherwise specify mcp by its logical name and supply one " +
           'raw JSON-RPC request object, for example {method:"tools/list",params:{}} or ' +
           '{method:"tools/call",params:{name:"search",arguments:{query:"..."}}}. The object may ' +
@@ -13590,8 +14575,9 @@ html[data-mode="fullscreen"] #frame {
           "automatically and uses no on-disk wrapper. Per-command, idle-TTL or until-quit persistence " +
           "and hidden terminal behavior are configured in the MCP Servers GUI. Server instances are " +
           "isolated by Session, working directory, launch arguments and environment. No automatic " +
-          "download, startup crawl, retries, sampling or interactive elicitation. Configure " +
-          "credentials in the local Process environment; tools/call may write or access network " +
+          "download, startup crawl, tool retries, sampling or interactive elicitation. Configure " +
+          "authentication in MCP Servers; credentials stay in the database. Remote OAuth refreshes " +
+          "expired tokens and retries an HTTP 401 once. tools/call may write or access network " +
           "according to the upstream tool. With a Workspace use its directory; otherwise use the " +
           "Session-specific .mrmcp/mcp/files directory. timeout_ms bounds startup plus the request; " +
           "cancellation/timeout closes that server, including concurrent requests sharing it. Inspect " +
@@ -14940,6 +15926,8 @@ html[data-mode="fullscreen"] #frame {
           openWorldHint: true,
         },
       });
+    const merged = await mcpMergedTools(p, new Set(tools.map((tool) => tool.name)));
+    tools.push(...merged.tools);
     serverToolCache.set(cacheKey, {
       list: tools,
       byName: new Map(tools.map((tool) => [tool.name, tool])),
@@ -17346,6 +18334,27 @@ html[data-mode="fullscreen"] #frame {
         missing: names.filter((name) => !published.has(name)),
       };
     }
+    const upstream = (await serverToolDescriptor(p, name))?._meta?.mrmcp_upstream;
+    if (upstream) {
+      const { chat_session, ...arguments_ } = args;
+      const response = await execMcp(
+        p,
+        {
+          mcp: upstream.server,
+          request: { method: "tools/call", params: { name: upstream.tool, arguments: arguments_ } },
+        },
+        execution,
+      );
+      if (response.response.error)
+        throw new Error(response.response.error.message || "Upstream MCP error");
+      const { content = [], ...result } = response.response.result;
+      return {
+        mcp: upstream.server,
+        success: response.success,
+        result,
+        [TOOL_RESULT_CONTENT]: content,
+      };
+    }
     const requiresWorkspace =
       name.startsWith("fs_") ||
       [
@@ -18974,6 +19983,8 @@ html[data-mode="fullscreen"] #frame {
 
   function toolResultSummary(name, result, status) {
     // Summaries inspect only result metadata, never source text, transcripts or nested payloads.
+    if (result.mcp && result.result)
+      return `${result.mcp}: ${result.success ? "response received" : "upstream error"}`;
     const continuation = (field) => `; continuation available via ${field}`;
     switch (name) {
       case "exec_mcp":
@@ -20797,7 +21808,10 @@ h1 {
                 await releaseToolCall(control);
               }
             };
-            const customProcessTool = !!descriptor && !BASE_TOOLS.includes(x.params.name);
+            const customProcessTool =
+              !!descriptor &&
+              !BASE_TOOLS.includes(x.params.name) &&
+              !descriptor._meta?.mrmcp_upstream;
             const streamingTool =
               x.params.name === "exec_attach" ||
               (progressRequested && (x.params.name === "exec" || customProcessTool));
@@ -22267,10 +23281,10 @@ h1 {
           </div>
           <p class="muted">
             <code>mcp.yaml</code>
-            {" registers stdio servers for "}
+            {" registers local and remote servers for "}
             <code>exec_mcp</code>
             {
-              ". Starts on the first explicit request. Persistence: command, idle TTL or until MrMCP quits. Terminals are hidden by default. Binaries live separately under "
+              ". Default: exec_mcp only. Optionally merge refreshed upstream tools into MrMCP; conflicting names are never overwritten. Authentication and connection diagnostics stay in the database. Local binaries live under "
             }
             <code>.mrmcp/mcp/bin</code>.
           </p>
@@ -23538,12 +24552,271 @@ h1 {
     return null;
   }
 
+  function UiMcpDefinition({ data: d }) {
+    const warning =
+      d.form_warning ||
+      (d.transport !== "http" && d.path_error ? d.path_warning : "") ||
+      mcpDefinitionWarning(d);
+    return (
+      <dialog id="mcpDialog" open data-managed-dialog="mcp">
+        <form id="mcpForm">
+          <h2>MCP Server</h2>
+          <label>Logical name</label>
+          <input id="mcName" value={d.name || ""} />
+          <label>Transport</label>
+          <select id="mcTransport" value={d.transport || "stdio"}>
+            <option value="stdio" selected={d.transport !== "http"}>
+              Local process · stdio
+            </option>
+            <option value="http" selected={d.transport === "http"}>
+              Remote · Streamable HTTP
+            </option>
+          </select>
+          <label>Expose through</label>
+          <select id="mcExposure" value={d.exposure || "exec"}>
+            <option value="exec" selected={d.exposure !== "tools"}>
+              exec_mcp only · default
+            </option>
+            <option value="tools" selected={d.exposure === "tools"}>
+              Merge into MrMCP tools
+            </option>
+          </select>
+          <label>
+            <input id="mcEnabled" type="checkbox" checked={d.enabled !== false} /> Enabled
+          </label>
+          <label>Description</label>
+          <textarea id="mcDescription" value={d.description || ""} />
+          {d.transport === "http" ? (
+            <>
+              <label>MCP endpoint URL</label>
+              <input id="mcUrl" value={d.remote_url || ""} placeholder="https://example.com/mcp" />
+              <label>Protocol</label>
+              <select id="mcProtocol" value={d.protocol || "auto"}>
+                {["auto", MCP_MODERN_PROTOCOL, "2025-11-25", "2025-06-18", "2025-03-26"].map(
+                  (value) => (
+                    <option value={value} selected={value === (d.protocol || "auto")}>
+                      {value}
+                    </option>
+                  ),
+                )}
+              </select>
+              <p class="muted">
+                Credentials stay in the database. Save the server, then open Authentication to
+                configure credentials or OAuth login.
+              </p>
+            </>
+          ) : (
+            <>
+              <label>Executable path · below .mrmcp/mcp/bin</label>
+              <input id="mcPath" value={d.path || ""} placeholder="Defaults to logical name" />
+              {d.path_warning ? (
+                <p class={d.path_error ? "field-warning" : "muted"}>{d.path_warning}</p>
+              ) : null}
+              <label>Launch arguments · JSON array</label>
+              <textarea id="mcArgs" rows="5" value={d.args_text || "[]"} />
+              <label>Process lifetime</label>
+              <select id="mcPersistence" value={d.persistence || "command"}>
+                <option value="command" selected={d.persistence === "command"}>
+                  One request
+                </option>
+                <option value="ttl" selected={d.persistence === "ttl"}>
+                  Idle TTL
+                </option>
+                <option value="persistent" selected={d.persistence === "persistent"}>
+                  Until MrMCP quits
+                </option>
+              </select>
+              {d.persistence === "ttl" ? (
+                <>
+                  <label>Idle TTL · seconds</label>
+                  <input id="mcTtl" value={d.ttl_seconds || 300} />
+                </>
+              ) : null}
+              <label>
+                <input id="mcHide" type="checkbox" checked={d.windows_hide !== false} /> Hide
+                process terminal
+              </label>
+              <label>Download URL · optional</label>
+              <input id="mcDownload" value={d.download_url || ""} />
+              <label>Archive entry · optional</label>
+              <input id="mcArchive" value={d.archive_path || ""} />
+              <details>
+                <summary>Advanced · platform-specific binaries</summary>
+                <p class="muted">
+                  YAML mapping by OS/architecture, using path, download_url and archive_path.
+                </p>
+                <textarea id="mcPlatforms" rows="8" value={d.platforms_text || "{}"} />
+              </details>
+              <p class="muted">
+                Launch credentials belong in MCP Servers → Authentication → Environment. Arguments
+                support CWD, WORKSPACE, MRMCP_DIR and MRMCP_BIN placeholders.
+              </p>
+            </>
+          )}
+          <label>Documentation URL · optional</label>
+          <input id="mcDocs" value={d.documentation_url || ""} />
+          {d.exposure === "tools" ? (
+            <p class="muted">
+              After saving, use Test / Refresh tools. Conflicting names are reported and never
+              overwrite existing tools. Cached schemas survive restart.
+            </p>
+          ) : null}
+          {warning ? <div class="field-warning">{warning}</div> : null}
+          <p class="row">
+            <button class="primary" type="submit" disabled={!!warning}>
+              Save server
+            </button>
+            <button type="button" data-action="close-dialog">
+              Cancel
+            </button>
+          </p>
+        </form>
+      </dialog>
+    );
+  }
+  function UiMcpAuthentication({ data: d }) {
+    const row = { name: d.name, http: d.url === "stdio" ? null : { url: d.url } };
+    const status = mcpObservation(row);
+    const grant = mcpAuth(row).grant;
+    return (
+      <dialog id="mcpAuthDialog" open data-managed-dialog="mcp-auth">
+        <form id="mcpAuthForm">
+          <h2>Authentication · {d.name}</h2>
+          <code>{d.url}</code>
+          <p class="muted">
+            Saved credentials and OAuth tokens stay in the database. Empty secret fields keep the
+            saved value for the same authentication type.
+          </p>
+          <label>Authentication type</label>
+          <select id="maType" value={d.type || "none"}>
+            {(d.url === "stdio"
+              ? ["none", "environment"]
+              : ["none", "bearer", "basic", "headers", "oauth"]
+            ).map((type) => (
+              <option value={type} selected={type === (d.type || "none")}>
+                {type}
+              </option>
+            ))}
+          </select>
+          {d.type === "environment" ? (
+            <>
+              <label>Launch environment · JSON object</label>
+              <textarea
+                id="maEnvironment"
+                rows="6"
+                value={d.environment_text || ""}
+                placeholder="Leave blank to keep saved variables"
+              />
+              <p class="muted">
+                These variables override the global Process environment only for this MCP server.
+              </p>
+            </>
+          ) : null}
+          {d.type === "bearer" ? (
+            <>
+              <label>Bearer token</label>
+              <input
+                id="maToken"
+                type="password"
+                value={d.token || ""}
+                placeholder="Leave blank to keep saved token"
+              />
+            </>
+          ) : null}
+          {d.type === "basic" ? (
+            <>
+              <label>Username</label>
+              <input id="maUser" value={d.username || ""} />
+              <label>Password</label>
+              <input
+                id="maPassword"
+                type="password"
+                value={d.password || ""}
+                placeholder="Leave blank to keep saved password"
+              />
+            </>
+          ) : null}
+          {d.type === "headers" ? (
+            <>
+              <label>Authentication headers · JSON object</label>
+              <textarea
+                id="maHeaders"
+                rows="6"
+                value={d.headers_text || ""}
+                placeholder="Leave blank to keep saved headers"
+              />
+            </>
+          ) : null}
+          {d.type === "oauth" ? (
+            <>
+              <p class="muted">
+                Discover the issuer automatically and use PKCE login in your system browser. Leave
+                Client ID empty for dynamic registration. Preregistered clients use
+                http://127.0.0.1:PORT/oauth/callback.
+              </p>
+              <label>Issuer URL · optional override</label>
+              <input id="maIssuer" value={d.issuer || ""} />
+              <label>Client ID · optional</label>
+              <input id="maClient" value={d.client_id || ""} />
+              <label>Client secret · optional</label>
+              <input id="maSecret" type="password" value={d.client_secret || ""} />
+              <label>Scopes · optional, space-separated</label>
+              <input id="maScope" value={d.scope || ""} />
+              <label>Loopback callback port · 0 selects a free port</label>
+              <input id="maPort" value={d.redirect_port || 0} />
+            </>
+          ) : null}
+          <div>Status: {status.auth_state || "Not tested"}</div>
+          {grant ? (
+            <p class="muted">
+              {grant.expires_at ? (
+                <>Token expires: {fragmentLogDate(grant.expires_at)}</>
+              ) : (
+                "Token has no advertised expiry"
+              )}
+              {grant.scope ? " · Scopes: " + grant.scope : ""}
+            </p>
+          ) : null}
+          {status.auth_error ? <div class="field-warning">{status.auth_error}</div> : null}
+          {status.network_error ? (
+            <div class="field-warning">Network: {status.network_error}</div>
+          ) : null}
+          {d.form_warning ? <div class="field-warning">{d.form_warning}</div> : null}
+          <p class="row">
+            <button type="submit" class="primary">
+              Save authentication
+            </button>
+            {d.type === "oauth" ? (
+              <button type="button" data-action="mcp-login" disabled={mcpOAuthJobs.has(d.name)}>
+                Save and sign in
+              </button>
+            ) : null}
+            {mcpOAuthJobs.has(d.name) ? (
+              <button type="button" data-action="mcp-cancel-login" data-name={d.name}>
+                Cancel login
+              </button>
+            ) : null}
+            <button type="button" data-action="mcp-logout" data-name={d.name}>
+              Disconnect / Clear credentials
+            </button>
+            <button type="button" data-action="close-dialog">
+              Close
+            </button>
+          </p>
+        </form>
+      </dialog>
+    );
+  }
   function UiDialogs({ data }) {
     const dialog = data?.state?.dialog;
     if (dialog) {
       return (
         <div id="dialogOverlay" class="dialog-overlay">
-          {dialog.kind === "root" ? (
+          {dialog.kind === "mcp" ? (
+            <UiMcpDefinition data={dialog.data} />
+          ) : dialog.kind === "mcp-auth" ? (
+            <UiMcpAuthentication data={dialog.data} />
+          ) : dialog.kind === "root" ? (
             (() => {
               const r = dialog.data || {};
               return (
@@ -23605,13 +24878,13 @@ h1 {
                 <dialog id="commandDialog" open data-managed-dialog="command">
                   <form id="commandForm">
                     <input id="coldName" type="hidden" value={c.registered ? c.name : ""} />
-                    <h2>{c.catalog === "mcp" ? "🔌 MCP Server" : "🧰 Command Catalog Entry"}</h2>
+                    <h2>🧰 Command Catalog Entry</h2>
                     <UiFieldLabel data={{ label: "Logical name", warning: c.name_warning }} />
                     <input id="cname" value={c.name || ""} />
                     <div class="row">
                       <label class="grow">
                         {"Path below "}
-                        {c.catalog === "mcp" ? ".mrmcp/mcp/bin" : ".mrmcp/bin"}
+                        {".mrmcp/bin"}
                       </label>
                       {c.path_warning ? (
                         <span class={c.path_error ? "field-warning" : "muted"}>
@@ -23663,19 +24936,11 @@ h1 {
                     <textarea id="coptions" rows="8">
                       {c.options_text || "{}"}
                     </textarea>
-                    {c.catalog === "mcp" ? (
-                      <p class="muted">
-                        {
-                          "enabled: true/false; stdio: {args: [...], persistence: command/ttl/persistent, ttl_seconds: 300, windows_hide: true}. Launch args support ${CWD}, ${WORKSPACE}, ${MRMCP_DIR}, ${MRMCP_BIN}."
-                        }
-                      </p>
-                    ) : (
-                      <p class="muted">
-                        {
-                          "Optional bundle: {archive_prefix, files: [{path, download_url, sha256}]} and default_args list. Bundle paths need a dedicated directory. Arguments may use ${MRMCP_BIN} and ${MRMCP_DIR}."
-                        }
-                      </p>
-                    )}
+                    <p class="muted">
+                      {
+                        "Optional bundle: {archive_prefix, files: [{path, download_url, sha256}]} and default_args list. Bundle paths need a dedicated directory. Arguments may use ${MRMCP_BIN} and ${MRMCP_DIR}."
+                      }
+                    </p>
                     <UiFieldLabel
                       data={{ label: "Documentation URL", warning: c.documentation_warning }}
                     />
@@ -24731,18 +25996,130 @@ h1 {
     return null;
   }
 
+  function UiCatalogNavigation({ data: d }) {
+    return (
+      <div class="row">
+        <button
+          data-action="commands-prev"
+          data-catalog={d.catalog || "commands"}
+          disabled={d.page <= 1}
+        >
+          Previous
+        </button>
+        <span class="muted">
+          Page {d.page || 1} / {d.pages || 1}
+        </span>
+        <button
+          data-action="commands-next"
+          data-catalog={d.catalog || "commands"}
+          disabled={!d.has_more}
+        >
+          Next
+        </button>
+      </div>
+    );
+  }
+  function UiMcpServers({ data: d }) {
+    return (
+      <>
+        <p class="muted">
+          {d.total || 0} servers · <code>{d.config_file}</code>
+        </p>
+        {(d.commands || []).map((server) => {
+          const status = server.observation || {};
+          const problems = [
+            status.auth_error,
+            status.network_error,
+            status.protocol_error,
+            status.http_error,
+            status.tool_error,
+          ].filter(Boolean);
+          const label = (status.auth_state || "Not tested").replaceAll("_", " ");
+          return (
+            <article class="card">
+              <div class="row">
+                <h3 class="grow">{server.name}</h3>
+                <span class={problems.length || !server.enabled ? "failed" : "ok"}>
+                  {server.enabled
+                    ? server.http
+                      ? label
+                      : server.present && server.executable
+                        ? "Available"
+                        : "Binary missing"
+                    : "Disabled"}
+                </span>
+              </div>
+              <div class="muted">
+                {server.http ? "Streamable HTTP" : "Local stdio"} ·{" "}
+                {server.exposure === "tools" ? "Merged into MrMCP" : "exec_mcp only"}
+                {" · "}
+                {server.tool_count || 0} cached tools
+                {server.http ? " · " + server.auth_type : " · " + server.stdio.persistence}
+              </div>
+              <code>{server.path}</code>
+              {server.description ? <p>{server.description}</p> : null}
+              {status.last_request_at ? (
+                <p class="muted">
+                  Last request: {fragmentLogDate(status.last_request_at)}
+                  {server.http
+                    ? " · " + (status.http_status ? "HTTP " + status.http_status : "No response")
+                    : ""}
+                  {" · "}
+                  {status.auth_sent ? "Credentials supplied" : "No authentication supplied"}
+                </p>
+              ) : null}
+              {problems.map((problem) => (
+                <div class="field-warning">{problem}</div>
+              ))}
+              {server.exposure === "tools" && !server.tool_count ? (
+                <div class="field-warning">Use Test / Refresh tools to publish this server.</div>
+              ) : null}
+              {server.merge_warnings.map((warning) => (
+                <div class="field-warning">
+                  {`${warning.tool}: ${warning.reason}. This name is not published.`}
+                </div>
+              ))}
+              <div class="row">
+                <button data-action="edit-command" data-catalog="mcp" data-name={server.name}>
+                  Edit server
+                </button>
+                <button data-action="mcp-auth" data-name={server.name}>
+                  Authentication
+                </button>
+                <button data-action="mcp-test" data-name={server.name} disabled={!server.enabled}>
+                  Test / Refresh tools
+                </button>
+                {!server.http && server.download_url ? (
+                  <button data-action="download-command" data-catalog="mcp" data-name={server.name}>
+                    Download
+                  </button>
+                ) : null}
+                {server.documentation_url ? (
+                  <a href={server.documentation_url}>Documentation</a>
+                ) : null}
+                <button
+                  class="danger"
+                  data-action="delete-command"
+                  data-catalog="mcp"
+                  data-name={server.name}
+                >
+                  Delete
+                </button>
+              </div>
+            </article>
+          );
+        })}
+        <UiCatalogNavigation data={d} />
+      </>
+    );
+  }
   function UiCommands({ data }) {
     const d = data || {};
-    const rows = d.commands || [];
+    if (d.catalog === "mcp") return <UiMcpServers data={d} />;
     return (
       <>
         <div class="muted">
-          {d.total || 0}
-          {" command"}
-          {d.total === 1 ? "" : "s"}
-          {" · page "}
-          {d.page || 1}/{d.pages || 1}
-          {" · config "}
+          {d.total || 0} commands · page {d.page || 1}/{d.pages || 1} · config{" "}
           <code>{d.config_file || ""}</code>
         </div>
         <table class="commands-table">
@@ -24757,90 +26134,69 @@ h1 {
               ["", "command-action-cell"],
             ]}
           />
-          {rows.map((c) => {
-            return (
-              <tr>
-                <td>
-                  <code>{c.name}</code>
-                </td>
-                <td>
-                  <code>{c.path}</code>
-                </td>
-                <td class="command-description">{c.description || "—"}</td>
-                <td>
-                  {c.documentation_url ? (
-                    <a href={c.documentation_url} target="_blank" rel="noopener">
-                      📖 Docs
-                    </a>
-                  ) : (
-                    "—"
-                  )}
-                </td>
-                <td>
-                  {c.catalog === "mcp" ? (c.enabled ? c.stdio.persistence : "disabled") : c.source}
-                </td>
-                <td class={c.present && c.executable && c.enabled !== false ? "ok" : "failed"}>
-                  {c.enabled === false
-                    ? "⏸️ disabled"
-                    : c.supported === false
-                      ? "— unsupported platform"
-                      : c.present
-                        ? c.executable
-                          ? "✅ available"
-                          : "⚠️ not executable"
-                        : "❌ missing"}
-                </td>
-                <td class="command-action-cell">
-                  <div class="command-actions">
+          {(d.commands || []).map((c) => (
+            <tr>
+              <td>
+                <code>{c.name}</code>
+              </td>
+              <td>
+                <code>{c.path}</code>
+              </td>
+              <td class="command-description">{c.description || "—"}</td>
+              <td>
+                {c.documentation_url ? (
+                  <a href={c.documentation_url} target="_blank" rel="noopener">
+                    📖 Docs
+                  </a>
+                ) : (
+                  "—"
+                )}
+              </td>
+              <td>{c.source}</td>
+              <td class={c.present && c.executable ? "ok" : "failed"}>
+                {c.supported === false
+                  ? "— unsupported platform"
+                  : c.present
+                    ? c.executable
+                      ? "✅ available"
+                      : "⚠️ not executable"
+                    : "❌ missing"}
+              </td>
+              <td class="command-action-cell">
+                <div class="command-actions">
+                  <button
+                    data-action="edit-command"
+                    data-catalog="commands"
+                    data-name={c.name}
+                    data-path={c.path}
+                  >
+                    ✏️ Edit
+                  </button>
+                  {c.registered && c.supported !== false && c.download_url ? (
                     <button
-                      data-action="edit-command"
-                      data-catalog={d.catalog || "commands"}
+                      data-action="download-command"
+                      data-catalog="commands"
                       data-name={c.name}
-                      data-path={c.path}
                     >
-                      ✏️ Edit
+                      ⬇️ Download
                     </button>
-                    {c.registered && c.supported !== false && c.download_url ? (
-                      <button
-                        data-action="download-command"
-                        data-catalog={d.catalog || "commands"}
-                        data-name={c.name}
-                      >
-                        ⬇️ Download
-                      </button>
-                    ) : null}
-                    {c.registered ? (
-                      <button
-                        class="danger"
-                        data-action="delete-command"
-                        data-catalog={d.catalog || "commands"}
-                        data-name={c.name}
-                      >
-                        🗑️ Delete
-                      </button>
-                    ) : null}
-                  </div>
-                </td>
-              </tr>
-            );
-          })}
+                  ) : null}
+                  {c.registered ? (
+                    <button
+                      class="danger"
+                      data-action="delete-command"
+                      data-catalog="commands"
+                      data-name={c.name}
+                    >
+                      🗑️ Delete
+                    </button>
+                  ) : null}
+                </div>
+              </td>
+            </tr>
+          ))}
         </table>
-        <div class="row">
-          <button
-            data-action="commands-prev"
-            data-catalog={d.catalog || "commands"}
-            disabled={d.page <= 1}
-          >
-            Previous
-          </button>
-          <button
-            data-action="commands-next"
-            data-catalog={d.catalog || "commands"}
-            {...{ ...(d.has_more ? {} : { disabled: true }) }}
-          >
-            Next
-          </button>
-        </div>
+        <UiCatalogNavigation data={d} />
       </>
     );
   }
@@ -27588,6 +28944,37 @@ h1 {
     return true;
   }
   const UI_DIALOG_FIELDS = {
+    mcp: {
+      mcName: "name",
+      mcTransport: "transport",
+      mcExposure: "exposure",
+      mcEnabled: "enabled",
+      mcDescription: "description",
+      mcUrl: "remote_url",
+      mcProtocol: "protocol",
+      mcPath: "path",
+      mcArgs: "args_text",
+      mcPersistence: "persistence",
+      mcTtl: "ttl_seconds",
+      mcHide: "windows_hide",
+      mcDownload: "download_url",
+      mcArchive: "archive_path",
+      mcPlatforms: "platforms_text",
+      mcDocs: "documentation_url",
+    },
+    "mcp-auth": {
+      maType: "type",
+      maToken: "token",
+      maUser: "username",
+      maPassword: "password",
+      maHeaders: "headers_text",
+      maEnvironment: "environment_text",
+      maIssuer: "issuer",
+      maClient: "client_id",
+      maSecret: "client_secret",
+      maScope: "scope",
+      maPort: "redirect_port",
+    },
     root: { rid: "id", rname: "name", rpath: "path", renabled: "enabled" },
     command: {
       coldName: "old_name",
@@ -27686,7 +29073,10 @@ h1 {
       const { kind, data: draft } = uiState.dialog;
       const fields = UI_DIALOG_FIELDS[kind];
       if (fields && Object.hasOwn(fields, id))
-        draft[fields[id]] = id === "renabled" || id === "mjson" ? !!checked : text;
+        draft[fields[id]] = ["renabled", "mjson", "mcEnabled", "mcHide"].includes(id)
+          ? !!checked
+          : text;
+      if (["mcp", "mcp-auth"].includes(kind)) draft.form_warning = "";
       if (kind === "memory") {
         if (id === "mvalue") {
           uiState.native.jsonEdits = {};
@@ -28054,21 +29444,35 @@ h1 {
         uiState.sessions.oauthClientId = "";
         break;
       case "new-command": {
+        if (data.catalog === "mcp") {
+          uiState.dialog = {
+            kind: "mcp",
+            data: {
+              name: "",
+              enabled: true,
+              transport: "stdio",
+              exposure: "exec",
+              args_text: "[]",
+              persistence: "command",
+              ttl_seconds: 300,
+              windows_hide: true,
+              platforms_text: "{}",
+              old_name: "",
+            },
+          };
+          break;
+        }
         const dialog = {
           kind: "command",
           data: {
-            catalog: data.catalog === "mcp" ? "mcp" : "commands",
+            catalog: "commands",
             name: "",
             path: "",
             description: "",
             download_url: "",
             archive_path: "",
             platforms_text: "{}",
-            options_text:
-              data.catalog === "mcp"
-                ? "enabled: true\nstdio:\n  persistence: command\n  ttl_seconds: 300\n  windows_hide: " +
-                  "true\n  args: []\n"
-                : "{}",
+            options_text: "{}",
             documentation_url: "",
             registered: false,
             name_warning: "Command name is required.",
@@ -28089,6 +29493,29 @@ h1 {
             ? (await mcpRows()).find((row) => row.name === String(data.name || ""))
             : await uiCommandRow(String(data.name || ""), String(data.path || ""));
         if (!row) throw new Error("Command not found");
+        if (data.catalog === "mcp") {
+          if (interaction !== uiInteractionGeneration) return;
+          uiState.dialog = {
+            kind: "mcp",
+            data: {
+              ...row,
+              old_name: row.name,
+              path: row.catalog_path || row.name,
+              transport: row.http ? "http" : "stdio",
+              remote_url: row.http?.url || "",
+              protocol: row.http?.protocol || "auto",
+              args_text: JSON.stringify(row.stdio?.args || [], null, 2),
+              persistence: row.stdio?.persistence || "command",
+              ttl_seconds: row.stdio?.ttl_seconds || 300,
+              windows_hide: row.stdio?.windows_hide !== false,
+              download_url: row.catalog_download_url ?? row.download_url,
+              archive_path: row.catalog_archive_path ?? row.archive_path,
+              platforms_text: stringifyYaml(row.platforms || {}),
+              form_warning: "",
+            },
+          };
+          break;
+        }
         const pathWarning = await commandPathWarning(row.path, row.catalog);
         const dialog = {
           kind: "command",
@@ -28099,13 +29526,10 @@ h1 {
             download_url: row.catalog_download_url ?? row.download_url,
             archive_path: row.catalog_archive_path ?? row.archive_path,
             platforms_text: stringifyYaml(row.platforms || {}),
-            options_text:
-              row.catalog === "mcp"
-                ? stringifyYaml({ enabled: row.enabled, stdio: row.stdio })
-                : stringifyYaml({
-                    ...(row.catalog_bundle ? { bundle: row.catalog_bundle } : {}),
-                    ...(row.catalog_default_args ? { default_args: row.catalog_default_args } : {}),
-                  }),
+            options_text: stringifyYaml({
+              ...(row.catalog_bundle ? { bundle: row.catalog_bundle } : {}),
+              ...(row.catalog_default_args ? { default_args: row.catalog_default_args } : {}),
+            }),
             name_warning: await commandNameWarning(row.name, row.name, row.catalog),
             path_warning: pathWarning,
             path_error: commandPathBlocksSave(pathWarning),
@@ -28126,6 +29550,50 @@ h1 {
           { name: data.name, catalog: data.catalog },
         );
         return;
+      case "mcp-auth": {
+        const row = (await readMcpConfig()).find((row) => row.name === data.name);
+        if (!row) throw new Error("MCP server not found");
+        if (interaction === uiInteractionGeneration)
+          uiState.dialog = { kind: "mcp-auth", data: mcpAuthDraft(row) };
+        break;
+      }
+      case "mcp-login": {
+        const draft = uiState.dialog?.kind === "mcp-auth" ? uiState.dialog.data : null;
+        if (!draft) return;
+        try {
+          const row = await saveMcpAuthDraft(draft);
+          const result = await mcpStartOAuth(row);
+          openExternalUrl(result.url);
+        } catch (error) {
+          draft.form_warning = errorMessage(error);
+        }
+        break;
+      }
+      case "mcp-logout": {
+        mcpOAuthJobs.get(data.name)?.cancel();
+        const row = (await readMcpConfig()).find((row) => row.name === data.name);
+        if (row) {
+          await mcpSaveAuth(row, { type: "none" });
+          await mcpObserve(row, { auth_state: "disconnected", auth_error: "" });
+          uiState.dialog = { kind: "mcp-auth", data: mcpAuthDraft(row) };
+        }
+        break;
+      }
+      case "mcp-cancel-login":
+        mcpOAuthJobs.get(data.name)?.cancel(true);
+        break;
+      case "mcp-test": {
+        const row = (await readMcpConfig()).find((row) => row.name === data.name);
+        if (!row) throw new Error("MCP server not found");
+        try {
+          const result = await mcpRefreshTools(row);
+          uiNotice(`${row.name}: connection verified; ${result.count} tools refreshed.`, "ok");
+        } catch (error) {
+          await mcpObserve(row, { tool_error: errorMessage(error) });
+          uiNotice(`${row.name}: ${errorMessage(error)}`);
+        }
+        break;
+      }
       case "download-command": {
         const row =
           data.catalog === "mcp"
@@ -28649,6 +30117,11 @@ h1 {
         patch.path_warning = await rootPathWarning(value);
         patch.path_checked = true;
       }
+    } else if (dialog.kind === "mcp") {
+      if (id === "mcPath" && blur && d.transport !== "http") {
+        patch.path_warning = await commandPathWarning(value, "mcp");
+        patch.path_error = commandPathBlocksSave(patch.path_warning);
+      }
     } else if (dialog.kind === "command") {
       if (id === "cname")
         patch.name_warning = await commandNameWarning(value, d.old_name, d.catalog);
@@ -28658,10 +30131,7 @@ h1 {
         patch.path_checked = true;
       }
       if (id === "cplatforms") patch.platforms_warning = await commandPlatformsWarning(value);
-      if (id === "coptions")
-        patch.options_warning = await (
-          d.catalog === "mcp" ? mcpOptionsWarning : commandOptionsWarning
-        )(value);
+      if (id === "coptions") patch.options_warning = await commandOptionsWarning(value);
     } else if (dialog.kind === "prompt") {
       if (id === "pname") patch.name_warning = await guidedPromptNameWarning(value, d.old_name);
       if (id === "parguments" && blur) {
@@ -28802,6 +30272,7 @@ h1 {
           let filterLogs = false;
           for (const item of items) {
             const id = String(item.id || "");
+            if (["mcp", "mcp-auth"].includes(uiState.dialog?.kind)) renderDraft = true;
             if (id === "subagentMessage") {
               uiState.subagents.message = String(item.value || "");
               renderDraft = true;
@@ -28913,7 +30384,7 @@ h1 {
         case "submit": {
           const values = event.values || {};
           const dialog = uiState.dialog;
-          const revision = uiDraftRevision;
+          let revision = uiDraftRevision;
           const current = () => uiState.dialog === dialog && uiDraftRevision === revision;
           if (event.formId === "rootForm") {
             const d = uiState.dialog?.kind === "root" ? uiState.dialog.data : null;
@@ -28945,6 +30416,37 @@ h1 {
               queueUiRender("submit:rootForm-warning", 0);
               return;
             }
+          } else if (event.formId === "mcpForm" || event.formId === "mcpAuthForm") {
+            const dialog = uiState.dialog;
+            const data = dialog?.data;
+            if (!data || !["mcp", "mcp-auth"].includes(dialog.kind)) return;
+            for (const [id] of Object.entries(UI_DIALOG_FIELDS[dialog.kind]))
+              if (Object.hasOwn(values, id)) uiUpdateDraft(id, values[id], values[id]);
+            revision = uiDraftRevision;
+            try {
+              if (dialog.kind === "mcp-auth") {
+                await saveMcpAuthDraft(data);
+                const row = (await readMcpConfig()).find((row) => row.name === data.name);
+                if (current())
+                  uiState.dialog = {
+                    kind: "mcp-auth",
+                    data: mcpAuthDraft(row),
+                  };
+                uiNotice("Authentication saved. Test the connection or sign in with OAuth.", "ok");
+              } else {
+                await uiOperation("mcp/save", {
+                  ...mcpDialogEntry(data),
+                  name: data.name,
+                  old_name: data.old_name,
+                });
+                if (current()) uiState.dialog = null;
+                uiState.mcp.page = 1;
+                uiNotice(`MCP ${data.name} saved. Use Test / Refresh tools to verify it.`, "ok");
+              }
+            } catch (error) {
+              data.form_warning = errorMessage(error);
+            }
+            queueUiRender("submit:mcp", 0);
           } else if (event.formId === "commandForm") {
             const d = uiState.dialog?.kind === "command" ? uiState.dialog.data : null;
             if (!d) return;
@@ -28952,7 +30454,7 @@ h1 {
               commandNameWarning(values.cname, values.coldName, d.catalog),
               commandPathWarning(values.cpath, d.catalog),
               commandPlatformsWarning(values.cplatforms),
-              (d.catalog === "mcp" ? mcpOptionsWarning : commandOptionsWarning)(values.coptions),
+              commandOptionsWarning(values.coptions),
             ]);
             if (!current()) return;
             d.name_warning = nameWarning;
@@ -28976,7 +30478,7 @@ h1 {
               return;
             }
             try {
-              await uiOperation(d.catalog === "mcp" ? "mcp/save" : "commands/save", {
+              await uiOperation("commands/save", {
                 old_name: values.coldName,
                 name: values.cname,
                 path: values.cpath,
@@ -28984,9 +30486,7 @@ h1 {
                 download_url: values.cdownloadUrl,
                 archive_path: values.carchivePath,
                 platforms: parseYaml(values.cplatforms || "{}"),
-                ...(d.catalog === "mcp"
-                  ? parseYaml(values.coptions || "{}")
-                  : normalizeCommandOptions(parseYaml(values.coptions || "{}"))),
+                ...normalizeCommandOptions(parseYaml(values.coptions || "{}")),
                 documentation_url: values.cdocumentationUrl,
               });
               if (current()) uiState.dialog = null;
@@ -29463,6 +30963,7 @@ h1 {
         const p = await serverConfig();
         const context = await contextById(p, Number(x.id));
         if (!context) throw uiError("Session not found", 404);
+        closeMcpRemoteConnections("", context.handle);
         for (const worker of await all(
           "SELECT * FROM subagents WHERE parent_context_id=? OR child_context_id=?",
           context.id,
@@ -29495,7 +30996,7 @@ h1 {
       case "mcp/save": {
         try {
           const row = normalizeMcpEntry({ ...x, logical_name: x.name });
-          await validateCommandEntry(row);
+          if (!row.http) await validateCommandEntry(row);
           const rows = await readMcpConfig();
           const old = String(x.old_name || "").toLowerCase();
           if (
@@ -29507,9 +31008,23 @@ h1 {
           )
             throw uiError("MCP name already exists", 409);
           const index = rows.findIndex((entry) => entry.name.toLowerCase() === old);
+          const previous = rows[index];
           if (index < 0) rows.push(row);
           else rows[index] = row;
           await writeMcpConfig(rows);
+          if (previous && previous.name !== row.name && previous.http?.url === row.http?.url) {
+            for (const kind of ["auth", "status"])
+              await setCfg(
+                mcpDataKey(kind, row.name),
+                JSON.stringify(mcpData(kind, previous.name)),
+              );
+          }
+          if (previous && previous.name.toLowerCase() !== row.name.toLowerCase()) {
+            for (const kind of ["auth", "status", "tools"])
+              await setCfg(mcpDataKey(kind, previous.name), "{}");
+          }
+          if (previous?.http?.url !== row.http?.url)
+            await setCfg(mcpDataKey("status", row.name), "{}");
           return { ok: true };
         } catch (error) {
           throw uiError(error.message);
@@ -29517,6 +31032,9 @@ h1 {
       }
       case "mcp/delete": {
         await writeMcpConfig((await readMcpConfig()).filter((row) => row.name !== x.name));
+        mcpOAuthJobs.get(x.name)?.cancel();
+        for (const kind of ["auth", "status", "tools"])
+          await setCfg(mcpDataKey(kind, x.name), "{}");
         return { ok: true };
       }
       case "commands/save": {
@@ -29632,6 +31150,7 @@ h1 {
         const configured = (await (isMcp ? readMcpConfig() : readCommandConfig())).find(
           (entry) => entry.name.toLowerCase() === key,
         );
+        if (configured?.http) throw uiError("Remote MCP servers do not download a local binary");
         const row = configured ? { ...configured, ...commandPlatform(configured) } : null;
         if (!row) throw uiError("Command not found", 404);
         if (!row.supported) throw uiError(`Command does not support ${RUNTIME_OS}-${RUNTIME_ARCH}`);
@@ -29682,7 +31201,7 @@ h1 {
           if (zipped || tarred) {
             const declared = Number(response.headers.get("content-length") || 0);
             if (declared > 512 * 1024 * 1024) throw new Error("Archive download is too large");
-            const archive = await searchReadResponse(response, 512 * 1024 * 1024);
+            const archive = await readBoundedResponse(response, 512 * 1024 * 1024);
             if (archive.byteLength > 512 * 1024 * 1024)
               throw new Error("Archive download is too large");
             if (zipped) {
@@ -30044,6 +31563,8 @@ h1 {
       cdpUiTimer = null;
     }
     for (const entry of [...mcpStdioPool.values()]) entry.close("MrMCP shutdown");
+    closeMcpRemoteConnections();
+    for (const job of mcpOAuthJobs.values()) job.cancel();
     for (const key of [...jsKernels.keys()]) destroyJsKernel(key, "server shutdown");
     for (const record of cdpBrowsers.values()) {
       try {
@@ -30733,9 +32254,14 @@ function nativeProjection(view, state = {}) {
       if (/^h[1-4]$/.test(tag)) text = text.replace(/^[^\p{L}\p{N}]+/u, "");
       const content = textNode(key + "/text", text, { ...textStyle, flexShrink: 1, minWidth: 0 });
       const headingIcon =
-        { rootForm: "roots", commandForm: "commands", promptForm: "prompts", memoryForm: "memory" }[
-          node.scope
-        ] || node.scope;
+        {
+          rootForm: "roots",
+          commandForm: "commands",
+          mcpForm: "mcp",
+          mcpAuthForm: "mcp",
+          promptForm: "prompts",
+          memoryForm: "memory",
+        }[node.scope] || node.scope;
       return {
         key,
         type: "div",

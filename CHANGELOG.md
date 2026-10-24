@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add remote Streamable HTTP MCP servers alongside local stdio, with dedicated native definition/authentication dialogs and readable server cards. Keep URL, transport, enabled and exposure settings in mcp.yaml; persist credentials, OAuth grants, refreshed tool inventories and diagnostics in the existing Turso configuration store, preserving schema 6.
+- Support Bearer, Basic, custom authentication headers, per-server stdio environment credentials and OAuth discovery/browser login with PKCE S256, loopback callback, dynamic or preregistered clients, cancellation, token refresh and reconnection. Show authentication outcome, last-request credentials/HTTP status and separate authentication, network and protocol errors.
+- Default external servers to exec_mcp-only discovery; optionally merge explicitly refreshed upstream tools into MrMCP with the required chat_session envelope. Warn and omit names conflicting with built-in/custom tools, other merged servers or the reserved Session parameter. Forward upstream content once, including images; preserve the independent exec/Commands subsystem.
 - Update CDP.js to 0.7.0 and use its reverse API mode for goals, matching and subagents. Navigate, inspect React/DOM, insert prompts and submit/stop through extension APIs without Chrome Debugger, network capture or CSP changes. Document the required Allow User Scripts grant and visible failures without debugger fallback.
 - Share one purple MrMCP tab-group name across goals/matching/workers, preserving owned group identities on reconnect. Export all four unchanged extension files, including its connection/debug sidebar. Keep general CDP tools and explicit debugger mode available.
 - Fix Tool Call tree strings and command previews painting outside their columns: bound native text children and wrap long values/tokens without changing their content.

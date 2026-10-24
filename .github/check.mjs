@@ -68,6 +68,9 @@ const invoke = async (name, args = {}, meta = null) => {
   return packet.result.structuredContent;
 };
 if (process.env.MRMCP_TEST_RESTART === "1") {
+  check(mcpData("auth", "fixture-http").grant?.access_token === "oauth-refreshed" &&
+    mcpData("auth", "fixture-http").grant?.refresh_token === "refresh-next",
+    "outbound MCP authentication and rotated OAuth tokens survive restart in the database");
   const context = await one("SELECT handle FROM contexts ORDER BY id LIMIT 1");
   const workerState = await invoke("subagents", { chat_session: context.handle, action: "status" });
   check(workerState.agents.some((agent) => agent.id === "agent_restart_fixture" && agent.result === "Durable worker result"),
@@ -1237,6 +1240,7 @@ nativePages.push({
 });
 uiState.dialog = null;
 nativePages.push(JSON.parse(await fs.readFile(join(APP_DIR, "subagent-page.json"), "utf8")));
+nativePages.push(...JSON.parse(await fs.readFile(join(APP_DIR, "mcp-pages.json"), "utf8")));
 uiState.currentSection = "logs";
 const treeLogState = structuredClone(uiState.logs);
 uiState.logs.toolQuery = guiDetail.tool;
@@ -1335,10 +1339,13 @@ const insertion = "  await restoreAcmeBackoff();";
 if (!source.includes(insertion)) throw Error("Backend test insertion point missing");
 const goalChecks = await fs.readFile(join(root, ".github", "check-goals.inc.js"), "utf8");
 const subagentChecks = await fs.readFile(join(root, ".github", "check-subagents.inc.js"), "utf8");
-const fullSuite = suite.replace(
-  "const startingControl =",
-  goalChecks + "\n" + subagentChecks + "\nconst startingControl =",
-);
+const mcpChecks = await fs.readFile(join(root, ".github", "check-mcp.inc.js"), "utf8");
+const fullSuite = suite
+  .replace(
+    "const startingControl =",
+    goalChecks + "\n" + subagentChecks + "\nconst startingControl =",
+  )
+  .replace("const image = await (", mcpChecks + "\nconst image = await (");
 source = source.replace(insertion, fullSuite + "\n  return;\n" + insertion);
 await fs.writeFile(join(directory, "mrmcp.js"), source);
 let command = [process.execPath, join(directory, "mrmcp.js"), "--backend"];
